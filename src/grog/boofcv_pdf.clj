@@ -30,26 +30,47 @@
                                  (catch Exception _ {}))
         :else {}))
 
+(def ^:private reading-guide-for-model
+  "Structured hints returned with every successful analysis so the model interprets the JSON correctly."
+  {:coordinate_system
+   {:origin "top-left of the rendered page image"
+    :axes "x increases right, y increases down (standard image / PDF raster convention)"
+    :units "pixels on the bitmap produced at the given dpi (not PDF points unless you convert)"}
+   :what_each_segment_is
+   "One straight line segment: BoofCV detected edges on the grayscale page and fitted a line from (x1,y1) to (x2,y2). length_px is Euclidean length in pixels. This is raw geometry, not semantics — not a text box, not a labeled net, not an OCR region."
+   :what_this_is_not
+   ["Not OCR — call ocr_pdf_document on the same path/dpi for text and labels."
+    "Not a list of rectangles or symbols — only straight segments; curves appear as many short chords."
+    "Not guaranteed complete — faint lines, anti-aliasing, or dense hatching can split or miss strokes."]
+   :count_fields
+   {:segment_count "Segments detected on that page before applying max_segments_per_page."
+    :segments_returned "How many entries appear in segments (after cap; longest kept first)."
+    :segments_truncated "true if segment_count exceeded the cap and shorter segments were dropped."}
+   :suggested_use
+   "Infer structure by grouping parallel/collinear segments and corner junctions; cross-reference endpoint clusters with OCR word boxes; for a visual check, crop_workspace_image the same PDF page at the same dpi."})
+
 (defn analyze-pdf-line-drawings-tool-spec []
   {:type "function"
    :function
    {:name "analyze_pdf_line_drawings"
-    :description (str "Extract line segments from rasterized .pdf pages using BoofCV (RANSAC grid on edges). "
-                      "For technical drawings, schematics, axes, and diagrams where geometry matters. "
-                      "Use together with ocr_pdf_document on the same path/dpi when the page mixes text and line art. "
-                      "Returns JSON: per-page segment lists (endpoints + length), sorted longest-first; counts and truncation flags.")
+    :description (str "BoofCV line-segment extraction from a rasterized PDF (edge detection + RANSAC line fitting on a grid). "
+                      "Output is **geometry only**: each item is a straight segment (x1,y1)→(x2,y2) in **image pixels** at the chosen dpi, "
+                      "origin **top-left**, y **down**. It is **not** OCR, not labeled objects, and not word bounding boxes — use ocr_pdf_document "
+                      "for text on the same path/dpi. Long diagrams may return many short segments (noise, curves, hatching). "
+                      "The JSON includes a reading_guide object: read it before inferring schematics. "
+                      "Workspace path to a PDF; pair with crop_workspace_image (same dpi) to snapshot a region as PNG.")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path to .pdf under workspace root."}
+                                     :description "Path to PDF under workspace root (any extension if file is PDF)."}
                               :max_pages {:type "integer"
                                           :description "Max pages to analyze (default 15, cap 40)."}
                               :dpi {:type "integer"
-                                    :description "Raster DPI (default 220; 100–400). Match ocr_pdf_document dpi when combining."}
+                                    :description "Raster DPI (default 220; 100–400). Same dpi as ocr_pdf_document when mixing line geometry with OCR."}
                               :max_segments_per_page {:type "integer"
-                                                      :description "Cap segments returned per page (default 400, cap 800), longest first."}
+                                                      :description "Max segments listed per page (default 400, cap 800); list is longest-first, extras omitted."}
                               :region_size {:type "integer"
-                                            :description "Optional BoofCV RANSAC tile size (e.g. 40–80). Omit for library defaults."}}}}})
+                                            :description "Optional BoofCV RANSAC tile size in pixels (e.g. 40–80). Omit for defaults."}}}}})
 
 (defn- segment->map [^LineSegment2D_F32 s]
   (let [a (.getA s) b (.getB s)]
@@ -118,9 +139,6 @@
         (not (.isFile f))
         (json/generate-string {:error "not a regular file" :path path-str})
 
-        (not (str/ends-with? (str/lower-case path-str) ".pdf"))
-        (json/generate-string {:error "only .pdf is supported" :path path-str})
-
         (> (.length f) pdf-max-file-bytes)
         (json/generate-string {:error "PDF too large" :path path-str
                                :size_bytes (.length f) :max_bytes pdf-max-file-bytes})
@@ -150,8 +168,10 @@
               :pages_truncated (> page-count end)
               :max_segments_per_page max-seg
               :pages pages
-              :hint (str "Segments are longest-first in pixel coords at the given dpi. "
-                         "Pair with ocr_pdf_document (same path/dpi) for labels and text.")})))))
+              :reading_guide reading-guide-for-model
+              :hint (str "Read reading_guide first. Each segments[] element: straight line in pixel space at this dpi; "
+                         "not text. To save a region as PNG, bbox segment endpoints (optional pad_px) and crop_workspace_image "
+                         "same path, page, dpi. Pair with ocr_pdf_document for labels.")})))))
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "line drawing analysis failed")
                              :detail (str e)}))))

@@ -3,7 +3,7 @@
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
             [clojure.string :as str]
-            [grog.config :as config]))
+            [grog.secrets :as secrets]))
 
 (def ^:private api-url "https://api.search.brave.com/res/v1/web/search")
 
@@ -43,6 +43,16 @@
        (or url "") "\n   "
        (str/trim (or description ""))))
 
+(defn brave-api-key
+  "Subscription token from OS keyring (service `grog`, account `BRAVE_SEARCH_API`)."
+  []
+  (secrets/get-secret secrets/brave-search-api-account))
+
+(defn brave-search-configured?
+  "True when an API key is present in the keyring."
+  []
+  (boolean (some-> (brave-api-key) not-empty)))
+
 (defn- format-results-body [body]
   (let [results (vec (get-in body [:web :results]))]
     (if (empty? results)
@@ -54,7 +64,7 @@
 (defn run-web-search!
   "Execute Brave web search. Returns a string for the model (or an error explanation)."
   [arguments]
-  (if-let [api-key (config/secret :brave-search-api-key)]
+  (if-let [api-key (brave-api-key)]
     (let [{:keys [query count]} (parse-web-search-args arguments)]
       (if (str/blank? query)
         "brave_web_search error: missing or empty `query` parameter."
@@ -90,4 +100,6 @@
               (str "Brave API HTTP " st ": " (pr-str raw))))
           (catch Exception e
             (str "brave_web_search failed: " (.getMessage e))))))
-    "brave_web_search is not configured: add a non-empty :secrets :brave-search-api-key to grog.edn."))
+    (str "brave_web_search is not configured: store the token in the OS secret store (service \"grog\", account \""
+         secrets/brave-search-api-account
+         "\"), e.g. chat command /secret.")))

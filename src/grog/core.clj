@@ -7,21 +7,27 @@
             [clojure.string :as str]
             [grog.brave :as brave]
             [grog.config :as config]
+            [grog.babashka :as babashka]
             [grog.boofcv-pdf :as boofcv-pdf]
             [grog.fs :as fs]
+            [grog.image-png :as image-png]
             [grog.edn-store :as edn-store]
             [grog.memory-tools :as memory-tools]
             [grog.md-render :as md-render]
+            [grog.oracle :as oracle]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
-            [grog.soul :as soul]))
+            [grog.secrets :as secrets]
+            [grog.skills :as skills]
+            [grog.soul :as soul]
+            [grog.with-api-key :as wkey]))
 
 (def ^:private ansi-reset "\u001B[0m")
 (def ^:private ansi-hot-pink "\u001B[38;2;255;105;180m")
 (def ^:private ansi-thinking "\u001B[38;2;55;165;95m")
 (def ^:private ansi-answer "\u001B[38;2;218;228;248m")
 
-(def ^:private chat-initial-heading "I am Grog, Thou shalt NOT Trifle")
+(def ^:private chat-initial-heading "I am Grog, Ye shall not Trifle with me.")
 
 (defn- print-thinking! [s]
   (when-not (str/blank? s)
@@ -96,7 +102,11 @@
         [{:role "system" :content (wrap-soul-as-system-prompt t)}])
       (when-let [p (config/active-project-name)]
         [{:role "system"
-          :content (str "Active project: **" p "**. `memory_*` tools persist under `Projects/" p "/…` in the configured edn-store; your turns are also logged to `Projects/" p "/dialog/thread.edn`.")}])))
+          :content (str "Active project: **" p "**. `memory_*` tools persist under `Projects/" p "/…` in the configured edn-store; your turns are also logged to `Projects/" p "/dialog/thread.edn`.")}])
+      (when-let [blk (some-> (skills/system-prompt-block) str str/trim not-empty)]
+        [{:role "system" :content blk}])
+      (when-let [blk (some-> (oracle/system-prompt-block) str str/trim not-empty)]
+        [{:role "system" :content blk}])))
     (catch Exception e
       (binding [*out* *err*]
         (println "grog: SOUL not applied:" (.getMessage e)))
@@ -120,7 +130,7 @@
   (history->messages (system-messages)
                      (recent-history-for-cap history (config/chat-history-turns))))
 
-(defn- print-chat-context-line! [history]
+(defn- print-chat-context-line! [history turn-n]
   (let [msgs (chat-context-messages history)
         ^String json (json/generate-string msgs)
         bytes (alength (.getBytes json "UTF-8"))
@@ -128,13 +138,15 @@
         ;; Rough estimate only (English-ish text; real tokenizer is model-specific).
         est-tok (max 1 (long (/ (count json) 4)))]
     (binding [*out* *err*]
-      (printf "grog: chat context %.1f kB JSON, %d tok (est.)\n" kB est-tok)
+      (printf "grog: turn %d — chat context %.1f kB JSON, %d tok (est.)\n"
+              (long turn-n) kB est-tok)
       (flush))))
 
-(defn- chat-prompt-str []
-  (if-let [p (config/active-project-name)]
-    (str p " > ")
-    "chat> "))
+(defn- chat-prompt-str [turn-n]
+  (let [lab (str "[turn " turn-n "] ")]
+    (if-let [p (config/active-project-name)]
+      (str lab p " > ")
+      (str lab "chat> "))))
 
 (defn- chat-answer-prefix []
   (if-let [p (config/active-project-name)]
@@ -142,41 +154,20 @@
     "\n\nchat> "))
 
 (defn- read-chat-line-with-context! [history]
-  (print-chat-context-line! history)
-  (loop []
-    (if-some [line (gread/read-prompt! (chat-prompt-str))]
-      (if (str/blank? line)
-        (recur)
-        line)
-      nil)))
+  (let [turn-n (inc (count history))]
+    (print-chat-context-line! history turn-n)
+    (loop []
+      (if-some [line (gread/read-prompt! (chat-prompt-str turn-n))]
+        (if (str/blank? line)
+          (recur)
+          line)
+        nil))))
 
 (defn- chat-request-payload
   [messages tools stream?]
   (cond-> {:model (config/model) :messages messages :stream stream?}
     (seq tools) (assoc :tools tools)
     (config/chat-show-thinking?) (assoc :think true)))
-
-(defn- use-streaming-chat-round? []
-  (or (and (config/chat-show-thinking?) (config/chat-stream-live-thinking?))
-      (config/chat-stream-live-content?)))
-
-(defn- ollama-post-chat!
-  "POST /api/chat (non-streaming)."
-  [messages tools]
-  (try
-    (let [url (str (str/trim (config/ollama-url)) "/api/chat")
-          payload (chat-request-payload messages tools false)
-          resp (http/post url {:content-type "application/json"
-                               :body (json/generate-string payload)
-                               :as :json
-                               :throw-exceptions false})
-          status (:status resp)
-          body (:body resp)]
-      (if (= 200 status)
-        {:ok true :body body}
-        {:ok false :error (str "HTTP " status " — " (pr-str body))}))
-    (catch Exception e
-      {:ok false :error (.getMessage e)})))
 
 (defn- tool-calls-from-chunk
   "Ollama may put `tool_calls` on `message` and/or only on earlier stream chunks; merge paths."
@@ -203,113 +194,137 @@
      :tool_calls tc}))
 
 (defn- ollama-post-chat-stream!
-  "POST /api/chat with `stream: true`; prints thinking (dark green) and answer (cyan) as deltas arrive."
+  "POST /api/chat with `stream: true` (always; supports Esc cancel via closing the body).
+  Prints thinking / answer per :cli live-stream settings."
   [messages tools stream-opts]
   (let [answer-prefix (or (:answer-prefix stream-opts) (chat-answer-prefix))]
     (try
-    (let [url (str (str/trim (config/ollama-url)) "/api/chat")
-          payload (chat-request-payload messages tools true)
-          resp (http/post url {:content-type "application/json"
-                               :body (json/generate-string payload)
-                               :as :stream
-                               :throw-exceptions false})
-          status (:status resp)]
-      (if-not (= 200 status)
-        (do (try (slurp ^java.io.InputStream (:body resp)) (catch Exception _ nil))
-            {:ok false :error (str "HTTP " status)
-             :live-thinking-printed? false :live-content-printed? false})
-        (with-open [^java.io.Closeable stream (:body resp)]
-          (let [rdr (io/reader stream)
-                think-buf (StringBuilder.)
-                content-buf (StringBuilder.)
-                in-thinking (atom false)
-                any-live (atom false)
-                started-answer (atom false)
-                any-content-live (atom false)]
-            (letfn [(finish! [last-msg last-tc]
-                      (do
-                        (when @in-thinking
+      (let [url (str (str/trim (config/ollama-url)) "/api/chat")
+            payload (chat-request-payload messages tools true)
+            resp (http/post url {:content-type "application/json"
+                                 :body (json/generate-string payload)
+                                 :as :stream
+                                 :throw-exceptions false})
+            status (:status resp)]
+        (if-not (= 200 status)
+          (do (try (slurp ^java.io.InputStream (:body resp)) (catch Exception _ nil))
+              {:ok false :error (str "HTTP " status)
+               :live-thinking-printed? false :live-content-printed? false
+               :cancelled? false})
+          (with-open [^java.io.Closeable stream (:body resp)]
+            (gread/reset-chat-cancel!)
+            (let [stop-watch (or (gread/start-escape-cancel-watcher!
+                                  (fn []
+                                    (gread/mark-chat-cancel!)
+                                    (binding [*out* *err*]
+                                      (println "\ngrog: cancelled (Esc)"))
+                                    (try (.close ^java.io.Closeable stream)
+                                         (catch Exception _))))
+                                (fn []))
+                  rdr (io/reader stream)
+                  think-buf (StringBuilder.)
+                  content-buf (StringBuilder.)
+                  in-thinking (atom false)
+                  any-live (atom false)
+                  started-answer (atom false)
+                  any-content-live (atom false)]
+              (try
+                (letfn [(finish! [last-msg last-tc {:keys [cancelled?] :or {cancelled? false}}]
+                          (when @in-thinking
+                            (print ansi-reset)
+                            (println)
+                            (reset! in-thinking false))
+                          (let [md? (config/format-markdown?)
+                                stream-live? (config/chat-stream-live-content?)
+                                buf-len (.length content-buf)]
+                            (when (and (pos? buf-len) (or (not stream-live?) md?))
+                              (print answer-prefix)
+                              (if md?
+                                (print (md-render/render-to-ansi (image-png/process-tags! (str content-buf))))
+                                (do (print ansi-answer)
+                                    (print (image-png/process-tags! (str content-buf)))))
+                              (println)))
                           (print ansi-reset)
                           (println)
-                          (reset! in-thinking false))
-                        (let [md? (config/format-markdown?)
-                              stream-live? (config/chat-stream-live-content?)
-                              buf-len (.length content-buf)]
-                          (when (and (pos? buf-len) (or (not stream-live?) md?))
-                            (print answer-prefix)
-                            (if md?
-                              (print (md-render/render-to-ansi (str content-buf)))
-                              (do (print ansi-answer)
-                                  (print (str content-buf))))
-                            (println)))
-                        (print ansi-reset)
-                        (println)
-                        (flush)
-                        (let [md? (config/format-markdown?)
-                              stream-live? (config/chat-stream-live-content?)
-                              streamed? (and stream-live? (not md?) @any-content-live)
-                              dumped-buf? (and (pos? (.length content-buf))
-                                               (or (not stream-live?) md?))]
-                          {:ok true
-                           :body {:message (build-message-from-stream-bufs last-msg think-buf content-buf last-tc)}
-                           :live-thinking-printed? @any-live
-                           :live-content-printed? (boolean (or streamed? dumped-buf?))})))]
-              (loop [last-seen-msg nil
-                     last-tc nil]
-                (let [line (.readLine rdr)]
-                  (if (nil? line)
-                    (finish! last-seen-msg last-tc)
-                    (if (str/blank? line)
-                      (recur last-seen-msg last-tc)
-                      (let [obj (try (json/parse-string line true)
-                                     (catch Exception _ nil))]
-                        (if-not (map? obj)
-                          (recur last-seen-msg last-tc)
-                          (let [done (:done obj)
-                                msg (:message obj)
-                                th (some-> (:thinking msg) str)
-                                ct (some-> (:content msg) str)
-                                chunk-tc (tool-calls-from-chunk obj)
-                                last-tc' (or chunk-tc last-tc)
-                                last-msg' (if (some? msg) msg last-seen-msg)]
-                            (when (and (config/chat-show-thinking?) (not (str/blank? th)))
-                              (when-not @in-thinking
-                                (reset! in-thinking true)
-                                (reset! any-live true)
-                                (print ansi-thinking)
-                                (print "── thinking ──\n"))
-                              (print th)
-                              (flush))
-                            (when (not (str/blank? th))
-                              (.append think-buf th))
-                            (when (not (str/blank? ct))
-                              (when @in-thinking
-                                (print ansi-reset)
-                                (println)
-                                (reset! in-thinking false))
-                              (.append content-buf ct)
-                              (when (and (config/chat-stream-live-content?)
-                                         (not (config/format-markdown?)))
-                                (when-not @started-answer
-                                  (reset! started-answer true)
-                                  (reset! any-content-live true)
-                                  (print answer-prefix)
-                                  (print ansi-answer))
-                                (print ct)
-                                (flush)))
-                            (if done
-                              (finish! last-msg' last-tc')
-                              (recur last-msg' last-tc'))))))))))))))
+                          (flush)
+                          (let [md? (config/format-markdown?)
+                                stream-live? (config/chat-stream-live-content?)
+                                streamed? (and stream-live? (not md?) @any-content-live)
+                                dumped-buf? (and (pos? (.length content-buf))
+                                                 (or (not stream-live?) md?))]
+                            {:ok true
+                             :body {:message (build-message-from-stream-bufs last-msg think-buf content-buf last-tc)}
+                             :live-thinking-printed? @any-live
+                             :live-content-printed? (boolean (or streamed? dumped-buf?))
+                             :cancelled? (boolean cancelled?)}))]
+                  (loop [last-seen-msg nil
+                         last-tc nil]
+                    (let [line (try (.readLine ^java.io.BufferedReader rdr)
+                                    (catch java.io.IOException e
+                                      (if (gread/chat-cancel-requested?)
+                                        ::io-cancel
+                                        (throw e))))]
+                      (cond
+                        (= line ::io-cancel)
+                        (finish! last-seen-msg last-tc {:cancelled? true})
+
+                        (nil? line)
+                        (finish! last-seen-msg last-tc nil)
+
+                        (str/blank? line)
+                        (recur last-seen-msg last-tc)
+
+                        :else
+                        (let [obj (try (json/parse-string line true)
+                                       (catch Exception _ nil))]
+                          (if-not (map? obj)
+                            (recur last-seen-msg last-tc)
+                            (let [done (:done obj)
+                                  msg (:message obj)
+                                  th (some-> (:thinking msg) str)
+                                  ct (some-> (:content msg) str)
+                                  chunk-tc (tool-calls-from-chunk obj)
+                                  last-tc' (or chunk-tc last-tc)
+                                  last-msg' (if (some? msg) msg last-seen-msg)]
+                              (when (and (config/chat-show-thinking?) (not (str/blank? th)))
+                                (when-not @in-thinking
+                                  (reset! in-thinking true)
+                                  (reset! any-live true)
+                                  (print ansi-thinking)
+                                  (print "── thinking ──\n"))
+                                (print th)
+                                (flush))
+                              (when (not (str/blank? th))
+                                (.append think-buf th))
+                              (when (not (str/blank? ct))
+                                (when @in-thinking
+                                  (print ansi-reset)
+                                  (println)
+                                  (reset! in-thinking false))
+                                (.append content-buf ct)
+                                (when (and (config/chat-stream-live-content?)
+                                           (not (config/format-markdown?)))
+                                  (when-not @started-answer
+                                    (reset! started-answer true)
+                                    (reset! any-content-live true)
+                                    (print answer-prefix)
+                                    (print ansi-answer))
+                                  (print ct)
+                                  (flush)))
+                              (if done
+                                (finish! last-msg' last-tc' nil)
+                                (recur last-msg' last-tc')))))))))
+                (finally
+                  (stop-watch)
+                  (gread/reset-chat-cancel!)))))))
       (catch Exception e
         {:ok false :error (.getMessage e)
-         :live-thinking-printed? false :live-content-printed? false}))))
+         :live-thinking-printed? false :live-content-printed? false
+         :cancelled? false}))))
 
 (defn- ollama-chat-round!
   [messages tools stream-opts]
-  (if (use-streaming-chat-round?)
-    (ollama-post-chat-stream! messages tools stream-opts)
-    (-> (ollama-post-chat! messages tools)
-        (assoc :live-thinking-printed? false :live-content-printed? false))))
+  (ollama-post-chat-stream! messages tools stream-opts))
 
 (defn- message-thinking [body m]
   (or (some-> (:thinking body) str str/trim not-empty)
@@ -331,19 +346,43 @@
           (if (str/blank? q)
             (println "grog: tool" nm "(query missing or empty)")
             (println "grog: tool" nm (pr-str q))))
-        (#{"read_workspace_file" "write_workspace_file" "read_office_document" "read_pdf_document" "ocr_pdf_document"
-           "analyze_pdf_line_drawings"} nm)
+        (#{"oracle" "pray" "pray_about"} nm)
+        (let [q (:query (oracle/parse-oracle-args args))]
+          (if (str/blank? q)
+            (println "grog: tool" nm "(query missing or empty)")
+            (println "grog: tool" nm (pr-str (if (> (count q) 120) (str (subs q 0 120) "…") q)))))
+        (= nm "crop_workspace_image")
+        (if-let [ln (some-> (fs/tool-log-crop-line args) not-empty)]
+          (println "grog: tool" nm ln)
+          (println "grog: tool" nm "(source_path or out_path missing)"))
+        (#{"read_workspace_file" "read_workspace_dir" "write_workspace_file" "write_workspace_png" "read_office_document"
+           "read_pdf_document" "ocr_pdf_document" "analyze_pdf_line_drawings"} nm)
         (if-let [p (some-> (fs/tool-log-path args) not-empty)]
           (println "grog: tool" nm (pr-str p))
           (println "grog: tool" nm "(path missing or empty)"))
         (#{"memory_save" "memory_load" "memory_list_keys"
            "memory_create_namespace" "memory_delete"} nm)
         (println "grog: tool" nm (pr-str (memory-tools/tool-log-summary nm args)))
+        (#{"list_skills" "read_skill" "save_skill" "delete_skill"} nm)
+        (println "grog: tool" nm
+                 (when (#{"read_skill" "save_skill" "delete_skill"} nm)
+                   (let [m (cond (map? args) args
+                                 (string? args) (try (json/parse-string args true) (catch Exception _ {}))
+                                 :else {})
+                         id (or (:id m) (get m "id"))]
+                     (str " " (pr-str id)))))
+        (= nm "with_api_key")
+        (println "grog: tool" nm (wkey/tool-log-summary args))
+        (= nm "run_babashka")
+        (println "grog: tool" nm (babashka/tool-log-summary args))
         :else (println "grog: tool" nm)))
     (case nm
       "brave_web_search" (brave/run-web-search! args)
       "read_workspace_file" (fs/run-read-workspace-file! args)
+      "read_workspace_dir" (fs/run-read-workspace-dir! args)
       "write_workspace_file" (fs/run-write-workspace-file! args)
+      "write_workspace_png" (fs/run-write-workspace-png! args)
+      "crop_workspace_image" (fs/run-crop-workspace-image! args)
       "read_office_document" (fs/run-read-office-document! args)
       "read_pdf_document" (fs/run-read-pdf-document! args)
       "ocr_pdf_document" (fs/run-ocr-pdf-document! args)
@@ -353,8 +392,21 @@
       "memory_list_keys" (memory-tools/run-memory-list-keys! args)
       "memory_create_namespace" (memory-tools/run-memory-create-namespace! args)
       "memory_delete" (memory-tools/run-memory-delete! args)
-      (str "Unknown tool \"" nm "\". Available: read_workspace_file, write_workspace_file, read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings"
-           (when (config/brave-search-configured?) ", brave_web_search")
+      "list_skills" (skills/run-list-skills! args)
+      "read_skill" (skills/run-read-skill! args)
+      "save_skill" (skills/run-save-skill! args)
+      "delete_skill" (skills/run-delete-skill! args)
+      "oracle" (oracle/run-oracle! args)
+      "pray" (oracle/run-oracle! args)
+      "pray_about" (oracle/run-oracle! args)
+      "with_api_key" (wkey/run-with-api-key! args)
+      "run_babashka" (babashka/run-babashka! args)
+      (str "Unknown tool \"" nm "\". Available: read_workspace_file, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image, read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings"
+           (when (config/skills-configured?) ", list_skills, read_skill, save_skill, delete_skill")
+           (when (brave/brave-search-configured?) ", brave_web_search")
+           (when (oracle/oracle-configured?) ", oracle")
+           (when (config/with-api-key-configured?) ", with_api_key")
+           (when (config/babashka-configured?) ", run_babashka")
            (when (edn-store/configured?)
              ", memory_save, memory_load, memory_list_keys, memory_create_namespace, memory_delete")
            "."))))
@@ -371,32 +423,96 @@
 
 (defn- chat-tools-payload []
   (vec (concat [(fs/read-workspace-file-tool-spec)
+                (fs/read-workspace-dir-tool-spec)
                 (fs/write-workspace-file-tool-spec)
+                (fs/write-workspace-png-tool-spec)
+                (fs/crop-workspace-image-tool-spec)
                 (fs/read-office-document-tool-spec)
                 (fs/read-pdf-document-tool-spec)
                 (fs/ocr-pdf-document-tool-spec)
                 (boofcv-pdf/analyze-pdf-line-drawings-tool-spec)]
-               (when (config/brave-search-configured?)
+               (when (brave/brave-search-configured?)
                  [(brave/tool-spec)])
+               (when (oracle/oracle-configured?)
+                 [(oracle/tool-spec)])
                (when (edn-store/configured?)
-                 (memory-tools/tool-specs)))))
+                 (memory-tools/tool-specs))
+               (when (config/skills-configured?)
+                 [(skills/list-skills-tool-spec)
+                  (skills/read-skill-tool-spec)
+                  (skills/save-skill-tool-spec)
+                  (skills/delete-skill-tool-spec)])
+               (when (config/with-api-key-configured?)
+                 [(wkey/tool-spec)])
+               (when (config/babashka-configured?)
+                 [(babashka/tool-spec)]))))
+
+(defn- tool-spec-name [spec]
+  (str (or (get-in spec [:function :name])
+           (get-in spec ["function" "name"])
+           "")))
+
+(defn- tool-spec-description [spec]
+  (str (or (get-in spec [:function :description])
+           (get-in spec ["function" "description"])
+           "")))
+
+(defn- description-one-liner [desc]
+  (let [s (-> (str desc) str/trim (str/replace #"\s+" " "))]
+    (if (str/blank? s)
+      "(no description)"
+      (let [by-sentence (first (str/split s #"(?<=[.!?])\s+"))
+            cand (if (str/blank? by-sentence) s by-sentence)]
+        (if (> (count cand) 130)
+          (str (subs cand 0 127) "…")
+          cand)))))
+
+(defn- active-tool-rows []
+  (->> (chat-tools-payload)
+       (map (fn [spec]
+              (let [n (tool-spec-name spec)]
+                {:name n
+                 :role (description-one-liner (tool-spec-description spec))})))
+       (remove (comp str/blank? :name))
+       (sort-by :name)
+       vec))
+
+(defn- print-active-tools! []
+  (println "Ollama tools in this session (same set sent to the model):")
+  (doseq [{:keys [name role]} (active-tool-rows)]
+    (println " " name "—" role))
+  (println "Optional tools: grog.edn (:oracle / legacy :god, :with-api-key, :edn-store, …); Brave/oracle/with_api_key use the OS keyring (/secret)."))
+
+(defn- handle-tools-command! [line]
+  (when (re-matches #"(?i)^/tools$" (str/trim line))
+    (print-active-tools!)
+    true))
+
+(defn- handle-skills-command! [line]
+  (when-let [m (re-matches #"(?i)^/skills(?:\s+(.+))?$" (str/trim line))]
+    (if-let [id-raw (some-> (second m) str str/trim not-empty)]
+      (skills/print-cli-skill-body! id-raw)
+      (skills/print-cli-summary!))
+    true))
 
 (defn- print-buffered-reply!
-  "Print full answer (ANSI CommonMark when `format-markdown?`, else plain cyan)."
+  "Print full answer (ANSI CommonMark when `format-markdown?`, else plain cyan).
+  `<image-png>path</image-png>` opens a PNG from the workspace in a Swing viewer (see `grog.image-png`)."
   [content answer-prefix]
   (when-not (str/blank? content)
-    (print (or answer-prefix "\n"))
-    (if (config/format-markdown?)
-      (print (md-render/render-to-ansi content))
-      (do (print ansi-answer)
-          (print content)))
-    (println)
-    (print ansi-reset)
-    (flush)))
+    (let [expanded (image-png/process-tags! content)]
+      (print (or answer-prefix "\n"))
+      (if (config/format-markdown?)
+        (print (md-render/render-to-ansi expanded))
+        (do (print ansi-answer)
+            (print expanded)))
+      (println)
+      (print ansi-reset)
+      (flush))))
 
 (defn- chat-with-tools!
-  "Run /api/chat, executing Ollama `tool_calls` (workspace read/write, Office/PDF, OCR, BoofCV lines, optional Brave,
-  optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
+  "Run /api/chat, executing Ollama `tool_calls` (workspace file/dir read/write/PNG, Office/PDF, OCR, BoofCV lines, optional Brave,
+  optional oracle tool, optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
   ([messages] (chat-with-tools! messages {}))
   ([messages opts]
    (let [answer-prefix (or (:answer-prefix opts) (chat-answer-prefix))
@@ -410,7 +526,8 @@
          {:ok false
           :error (str "Tool loop limit exceeded (" tool-limit " rounds).")
           :thinking last-thinking}
-         (let [{:keys [ok body error live-thinking-printed? live-content-printed?]}
+         (let [{:keys [ok body error live-thinking-printed? live-content-printed? cancelled?]
+                :or {cancelled? false}}
                (ollama-chat-round! msgs tools stream-opts)]
            (if-not ok
              {:ok false :error error :thinking last-thinking}
@@ -418,19 +535,42 @@
                    thinking (message-thinking body m)
                    tcalls (message-tool-calls m)
                    content (str (or (:content m) ""))]
-               (if (seq tcalls)
-                 (recur (into (conj msgs m) (tool-result-messages tcalls))
-                        (inc n)
-                        (or thinking last-thinking))
+               (if cancelled?
                  {:ok true :content content :thinking (or thinking last-thinking)
                   :live-thinking-printed? (boolean live-thinking-printed?)
                   :live-content-printed? (boolean live-content-printed?)
-                  :answer-prefix answer-prefix})))))))))
+                  :answer-prefix answer-prefix
+                  :cancelled? true}
+                 (if (seq tcalls)
+                   (recur (into (conj msgs m) (tool-result-messages tcalls))
+                          (inc n)
+                          (or thinking last-thinking))
+                   {:ok true :content content :thinking (or thinking last-thinking)
+                    :live-thinking-printed? (boolean live-thinking-printed?)
+                    :live-content-printed? (boolean live-content-printed?)
+                    :answer-prefix answer-prefix
+                    :cancelled? false}))))))))))
 
 (defn- brave-status-line []
-  (if (config/brave-search-configured?)
+  (if (brave/brave-search-configured?)
     "Brave web search: enabled (Ollama may call `brave_web_search`)"
-    "Brave web search: off — set :secrets :brave-search-api-key in grog.edn"))
+    (str "Brave web search: off — store token in OS keyring (service \"grog\", account \""
+         secrets/brave-search-api-account
+         "\") or /secret in chat")))
+
+(defn- oracle-status-line []
+  (if (oracle/oracle-configured?)
+    "oracle: enabled (remote model per :oracle in grog.edn — use sparingly per SOUL.md)"
+    (str "oracle: off — set :oracle {:url … :model …} (legacy :god ok) and keyring "
+         (pr-str secrets/oracle-api-account) " or " (pr-str secrets/god-api-account) " (or /secret)")))
+
+(defn- with-api-key-status-line []
+  (if (config/with-api-key-configured?)
+    (str "with_api_key: enabled — allowed secret names " (pr-str (vec (config/with-api-key-allowed-accounts)))
+         (if-let [ps (seq (config/with-api-key-url-prefixes))]
+           (str " · URL prefix allowlist " (pr-str (vec ps)))
+           ""))
+    "with_api_key: off — set :with-api-key {:allowed-secrets […]} in grog.edn (legacy :allowed-accounts; /secret keys only)"))
 
 (defn help-text []
   (str/join
@@ -442,8 +582,11 @@
     "Optional: :workspace {:default-root \".\"} — SOUL path resolves here; SOUL file must stay under this root"
     "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under workspace"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
-    "          :secrets {:brave-search-api-key \"…\"} — optional; enables Brave web search tool"
-    "Tools (Ollama): read_workspace_file / write_workspace_file (UTF-8 under workspace); read_office_document (.docx/.xlsx); read_pdf_document (.pdf text); ocr_pdf_document (Tesseract OCR); analyze_pdf_line_drawings (BoofCV lines); brave_web_search if API key set; memory_* if :edn-store is set."
+    "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
+    "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY (legacy GOD_API_KEY); set via /secret in chat"
+    "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle (legacy :god still read); :max-tokens, :temperature"
+    "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
+    "Tools (Ollama): workspace read_workspace_dir + read/write files + write_workspace_png + crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle (or :god) + key set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* if :edn-store is set."
     "          :cli {:chat-history-turns N} — 0 = no memory; omit = unlimited"
     "              {:chat-show-thinking true|false} — Ollama thinking traces"
     "              {:chat-stream-live-thinking false} — buffer thinking; omit/true streams it live"
@@ -453,7 +596,8 @@
     ""
     "Thinking: dark green; assistant reply: cyan (or ANSI-styled Markdown when :format-markdown is true)."
     "Markdown in <text-markdown>…</text-markdown> or <text-markdown>…<text-markdown/> is parsed; GFM pipe tables draw as box tables."
-    "Chat: before each chat> (or \"<project> >\") prompt, stderr reports context size (JSON kB + rough token est.) for messages on the next turn."
+    "<image-png>workspace-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path must be under :workspace :default-root (requires display / non-headless JVM)."
+    "Chat: prompts are [turn N] chat> (or [turn N] <project> >). Before each prompt, stderr reports turn N and context size (JSON kB + rough token est.). Esc during assistant output cancels generation (partial reply kept); needs JLine terminal (not plain stdin)."
     "Models must support Ollama tool calling for these tools (many recent instruct models)."
     ""
     "Usage:"
@@ -463,11 +607,15 @@
     ""
     "In chat:"
     "  /help /clear /fresh  — help; clear session history"
+    "  /tools — list Ollama tool names plus a one-line role from each tool’s description (reflects current grog.edn)"
+    "  /skills — list skills when :skills :roots is set; /skills <id> — print SKILL.md (same as read_skill)"
     "  /project — list project dirs, or leave project mode if inside one; /project <name> — enter or switch project"
     "  /shell [command] — run one line via sh -lc under workspace cwd, or /shell alone for interactive subshell (exit to return)"
+    "  /secret — list known secret keys and set/unset status (never prints values); /secret <KEY> <value> — store in OS keyring (service grog)"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path)"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
+    "  Esc — while the model is streaming a reply, press Esc to stop early (partial text kept; JLine TTY only)"
     ""
     "Lines are sent as user messages; prior turns are included per :chat-history-turns."]))
 
@@ -531,6 +679,28 @@
               (println "Project:" (pr-str tail))))))
     true))
 
+(defn- parse-secret-key-value [tail]
+  (when-not (str/blank? tail)
+    (when-let [[_ k v] (re-matches #"(\S+)\s+([\s\S]+)" tail)]
+      (let [k (str/trim k)
+            v (str/trim v)]
+        (when-not (or (str/blank? k) (str/blank? v))
+          [k v])))))
+
+(defn- handle-secret-command! [line]
+  (when-let [[_ rest] (re-matches #"(?i)^/secret(?:\s+(.*))?$" (str/trim line))]
+    (let [tail (str/trim (or rest ""))]
+      (if (str/blank? tail)
+        (secrets/print-known-secrets-summary!)
+        (if-let [[k v] (parse-secret-key-value tail)]
+          (try
+            (secrets/set-secret! k v)
+            (println "Stored" (pr-str k) "in OS secret store (service \"grog\").")
+            (catch Exception e
+              (println "grog:/secret error:" (.getMessage e))))
+          (println "grog:/secret: need /secret <KEY> <value> (value may contain spaces). Use /secret alone to list keys."))))
+    true))
+
 (defn- handle-soul-command! [line]
   (when (str/starts-with? line "/soul")
     (let [rest (str/trim (subs line (count "/soul")))]
@@ -541,6 +711,7 @@
         (try (config/reload!)
              (println "Config reloaded.")
              (println (soul/startup-status-line))
+             (println (skills/startup-status-line))
              (println (config/active-project-status-line))
              (catch Exception e (println "Error:" (.getMessage e))))
         (= "show" rest)
@@ -573,14 +744,18 @@
                     user-text)
         msgs (conj (vec (system-messages)) {:role "user" :content user-text})]
     (try
-      (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed? answer-prefix]
-             :or {answer-prefix "\n"}}
+      (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed? answer-prefix
+                    cancelled?]
+             :or {answer-prefix "\n" cancelled? false}}
             (chat-with-tools! msgs {:answer-prefix "\n"})]
         (if ok
           (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
                 (print-thinking! thinking))
               (when-not live-content-printed?
                 (print-buffered-reply! content answer-prefix))
+              (when cancelled?
+                (binding [*out* *err*]
+                  (println "grog: partial reply (Esc stopped generation).")))
               (try
                 (project-dialog/append-turn! :user user-text)
                 (project-dialog/append-turn! :assistant (str content))
@@ -592,20 +767,27 @@
         (System/exit 1)))))
 
 (defn run-chat! []
-  (let [cap (config/chat-history-turns)]
-    (println "grog chat —" (chat-history-hint cap))
+  (println "grog chat —" (chat-history-hint (config/chat-history-turns)))
     (println (soul/startup-status-line))
+    (println (skills/startup-status-line))
+    (println (secrets/startup-status-line))
     (println (brave-status-line))
+    (println (oracle-status-line))
+    (println (with-api-key-status-line))
     (println (fs/startup-status-line))
     (println (edn-store/startup-status-line))
     (println (config/active-project-status-line))
     (println (boofcv-pdf/startup-status-line))
+    (println (babashka/startup-status-line))
+    (println "grog: active :cli"
+             (pr-str {:chat-history-turns (config/chat-history-turns)
+                      :chat-tool-loop-limit (config/chat-tool-loop-limit)}))
     (config/warn-if-ollama-model-missing!)
     (print ansi-hot-pink)
     (println chat-initial-heading)
     (print ansi-reset)
     (flush)
-    (println "Type /help. /shell runs host commands. quit / exit / /quit to stop. Blank line does nothing. Ctrl-D ends.")
+    (println "Type /help, /tools, or /skills. /secret for OS keyring; /shell runs host commands. quit / exit / /quit to stop. Blank line does nothing. Ctrl-D ends. Esc during assistant output stops generation (partial reply kept).")
     (println)
     (loop [history []]
       (if-some [line (read-chat-line-with-context! history)]
@@ -614,11 +796,17 @@
             nil
             (= "/help" (str/lower-case line))
             (do (println (help-text)) (println) (recur history))
+            (handle-tools-command! line)
+            (recur history)
+            (handle-skills-command! line)
+            (recur history)
             (#{"/clear" "/fresh"} (str/lower-case line))
             (do (println "History cleared.") (recur []))
             (handle-shell-command! line)
             (recur history)
             (handle-project-command! line)
+            (recur history)
+            (handle-secret-command! line)
             (recur history)
             (handle-soul-command! line)
             (recur history)
@@ -626,13 +814,14 @@
             (let [prompt (if (str/includes? line "@")
                            (expand-line-at-paths line true)
                            line)
-                  recent (recent-history-for-cap history cap)
+                  recent (recent-history-for-cap history (config/chat-history-turns))
                   msgs (conj (history->messages (system-messages) recent)
                              {:role "user" :content prompt})]
               (recur
                 (try
                   (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed?
-                                answer-prefix]}
+                                answer-prefix cancelled?]
+                         :or {cancelled? false}}
                         (chat-with-tools! msgs)]
                     (if ok
                       (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
@@ -641,6 +830,9 @@
                             (print-buffered-reply! content answer-prefix))
                           (when live-content-printed?
                             (println))
+                          (when cancelled?
+                            (binding [*out* *err*]
+                              (println "grog: turn stopped early (Esc) — partial reply kept in history.")))
                           (try
                             (project-dialog/append-turn! :user prompt)
                             (project-dialog/append-turn! :assistant (str content))
@@ -651,7 +843,7 @@
                   (catch Exception e
                     (do (config/print-ollama-failure-hint! e)
                         history))))))
-        nil))))
+        nil)))
 
 (defn- parse-chat-args [args]
   (doseq [a args]

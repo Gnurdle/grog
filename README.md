@@ -16,9 +16,11 @@ It tries to keep stuff it figures out in the the project to sustain the adventur
 
 - procure a gpu and ollama endpoint
 
-- procure a brave search api key
+- procure a [Brave Search API](https://brave.com/search/api/) subscription token
 
-- hack grog.edn with these tidbits
+- put the token in the **OS secret store** (Grog uses [java-keyring](https://github.com/javakeyring/java-keyring)): service **`grog`**, account **`BRAVE_SEARCH_API`**. In chat, use **`/secret BRAVE_SEARCH_API <token>`**. On GNOME you can use **Passwords and Keys (Seahorse)** or any Secret Service client.
+
+- set `:ollama` in `grog.edn` (see `resources/grog.edn`)
 
 ```
 $ cd grog

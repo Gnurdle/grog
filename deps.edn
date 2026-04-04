@@ -11,7 +11,10 @@
         net.sourceforge.tess4j/tess4j {:mvn/version "5.14.0"}
         ;; https://github.com/lessthanoptimal/BoofCV — line segments on rasterized PDFs (with ocr_pdf_document)
         org.boofcv/boofcv-io {:mvn/version "1.2.2"}
-        org.boofcv/boofcv-feature {:mvn/version "1.2.2"}}
+        org.boofcv/boofcv-feature {:mvn/version "1.2.2"}
+        ;; macOS Keychain / Windows Credential Manager / Linux Secret Service (GNOME/KDE)
+        com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
+        org.slf4j/slf4j-nop {:mvn/version "2.0.9"}}
 
  :aliases
  {:run {:main-opts ["-m" "grog.core"]

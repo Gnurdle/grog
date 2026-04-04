@@ -6,7 +6,8 @@
   (:require [clj-http.client :as http]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.secrets :as secrets])
   (:import (java.io File)))
 
 (defn deep-merge
@@ -74,15 +75,33 @@
   []
   (req-str [:ollama :url] ":ollama :url"))
 
-(defn secret
-  "Looks up `[:secrets k]` in merged config; blank strings are ignored."
-  [k]
-  (some-> (get-in (grog) [:secrets k]) str str/trim not-empty))
-
-(defn brave-search-configured?
-  "True when `:secrets :brave-search-api-key` is set (Brave web search tool enabled for Ollama)."
+(defn oracle-url
+  "`:oracle :url` (preferred) or legacy `:god :url` — OpenAI-compatible chat completions POST URL."
   []
-  (boolean (secret :brave-search-api-key)))
+  (or (some-> (get-in (grog) [:oracle :url]) str str/trim not-empty)
+      (some-> (get-in (grog) [:god :url]) str str/trim not-empty)))
+
+(defn oracle-model
+  "`:oracle :model` or legacy `:god :model` — remote model id (e.g. grok-2-latest)."
+  []
+  (or (some-> (get-in (grog) [:oracle :model]) str str/trim not-empty)
+      (some-> (get-in (grog) [:god :model]) str str/trim not-empty)))
+
+(defn oracle-max-tokens
+  "`:oracle :max-tokens` or legacy `:god :max-tokens` — default 4096, capped at 128000."
+  []
+  (let [v (or (get-in (grog) [:oracle :max-tokens])
+              (get-in (grog) [:god :max-tokens]))]
+    (if (and (number? v) (pos? (long v)))
+      (min 128000 (long v))
+      4096)))
+
+(defn oracle-temperature
+  "`:oracle :temperature` or legacy `:god :temperature` — default 0.5."
+  []
+  (let [v (or (get-in (grog) [:oracle :temperature])
+              (get-in (grog) [:god :temperature]))]
+    (if (number? v) (double v) 0.5)))
 
 (defonce ^:private !active-project (atom nil))
 
@@ -110,9 +129,17 @@
 
 (defn chat-history-turns
   "Max prior user/assistant pairs kept in chat (`:cli :chat-history-turns`).
-  `0` — stateless; `nil`/omit — unlimited (session can grow large)."
+  `0` — stateless; `nil`/omit — unlimited (session can grow large).
+  Coerces positive integer strings; invalid values are treated as unlimited (`nil`)."
   []
-  (:chat-history-turns (cli-cfg)))
+  (let [v (:chat-history-turns (cli-cfg))]
+    (cond
+      (nil? v) nil
+      (and (number? v) (zero? (long v))) 0
+      (and (number? v) (pos? (long v))) (long v)
+      (string? v) (when-let [n (parse-long (str/trim v))]
+                    (cond (zero? n) 0 (pos? n) n :else nil))
+      :else nil)))
 
 (defn chat-show-thinking?
   "When true, print Ollama `:thinking` if present. Config `:cli :chat-show-thinking`;
@@ -151,6 +178,126 @@
     (if (and (number? v) (pos? (long v)))
       (min 1000 (long v))
       8)))
+
+(defn- skills-cfg []
+  (:skills (grog) {}))
+
+(defn skills-configured?
+  "True when `:skills :roots` is a non-empty sequence of paths (under workspace when relative)."
+  []
+  (let [roots (:roots (skills-cfg))]
+    (boolean (and (sequential? roots) (seq roots)))))
+
+(defn skills-roots
+  "Non-blank paths from `:skills :roots` (strings), in order."
+  []
+  (->> (:roots (skills-cfg) [])
+       (map #(str/trim (str %)))
+       (remove str/blank?)
+       vec))
+
+(defn skills-max-body-chars
+  "Max characters returned by read_skill for the body; default 65536, cap 500000."
+  []
+  (let [v (:max-body-chars (skills-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 500000 (long v))
+      65536)))
+
+(defn skills-prompt-skill-lines
+  "Max skill one-liners injected into the system prompt; default 16, cap 64."
+  []
+  (let [v (:prompt-skill-lines (skills-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 64 (long v))
+      16)))
+
+(defn- with-api-key-cfg []
+  (:with-api-key (grog) {}))
+
+(defn with-api-key-allowed-accounts
+  "Keyring secret names the model may pass as `with_api_key` :secret_name (each must be `secrets/known-account?`).
+  Config: `:allowed-secrets` (preferred) and/or legacy `:allowed-accounts` — merged and deduplicated."
+  []
+  (let [cfg (with-api-key-cfg)]
+    (->> (concat (:allowed-secrets cfg []) (:allowed-accounts cfg []))
+         (map #(str/trim (str %)))
+         (remove str/blank?)
+         distinct
+         vec)))
+
+(defn with-api-key-url-prefixes
+  "If non-empty, `with_api_key` URLs must start with one of these strings (after trim)."
+  []
+  (when-let [xs (:allowed-url-prefixes (with-api-key-cfg))]
+    (when (and (sequential? xs) (seq xs))
+      (->> xs (map #(str/trim (str %))) (remove str/blank?) vec))))
+
+(defn with-api-key-max-response-chars
+  "Max response body chars returned to the model; default 256000, cap 2e6."
+  []
+  (let [v (:max-response-chars (with-api-key-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 2000000 (long v))
+      256000)))
+
+(defn with-api-key-allow-http?
+  "When true, http:// URLs are allowed (default false — https only)."
+  []
+  (true? (:allow-insecure-http (with-api-key-cfg))))
+
+(defn with-api-key-configured?
+  "True when :with-api-key :allowed-secrets and/or :allowed-accounts is non-empty and every entry is a known keyring account."
+  []
+  (let [accts (with-api-key-allowed-accounts)]
+    (boolean
+      (and (seq accts)
+           (every? #(secrets/known-account? %) accts)))))
+
+(defn- babashka-cfg []
+  (:babashka (grog) {}))
+
+(defn babashka-configured?
+  "True when `:babashka :enabled` is true — exposes `run_babashka` to the model."
+  []
+  (true? (:enabled (babashka-cfg))))
+
+(defn babashka-command
+  "Shell command for Babashka (default `bb`). Override with `:babashka :command`."
+  []
+  (or (some-> (:command (babashka-cfg)) str str/trim not-empty) "bb"))
+
+(defn babashka-max-script-chars
+  []
+  (let [v (:max-script-chars (babashka-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 500000 (long v))
+      128000)))
+
+(defn babashka-default-timeout-sec
+  []
+  (let [v (:timeout-seconds (babashka-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 300 (long v))
+      30)))
+
+(defn babashka-max-timeout-sec
+  []
+  300)
+
+(defn babashka-max-stdout-chars
+  []
+  (let [v (:max-stdout-chars (babashka-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 2000000 (long v))
+      256000)))
+
+(defn babashka-max-stderr-chars
+  []
+  (let [v (:max-stderr-chars (babashka-cfg))]
+    (if (and (number? v) (pos? (long v)))
+      (min 256000 (long v))
+      32768)))
 
 (defn- http-status-in-chain
   [^Throwable e]
