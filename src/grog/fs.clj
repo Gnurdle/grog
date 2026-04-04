@@ -3,7 +3,8 @@
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.workspace-paths :as wsp])
   (:import [java.awt Graphics2D RenderingHints]
            [java.awt.image BufferedImage RescaleOp]
            [java.io File FileInputStream]
@@ -20,30 +21,13 @@
            [org.apache.poi.ss.usermodel DataFormatter WorkbookFactory]
            [org.apache.poi.xwpf.usermodel IBodyElement XWPFDocument XWPFParagraph
             XWPFTable XWPFTableCell XWPFTableRow]
-           (java.nio.file Path StandardOpenOption)))
-
-(defn- workspace-root-path
-  (^Path []
-   (-> ^File (.getCanonicalFile (io/file (cfg/workspace-root)))
-       .toPath
-       .normalize
-       .toAbsolutePath)))
+           (java.nio.file StandardOpenOption)))
 
 (defn- resolve-file-under-workspace!
-  "Returns canonical `File` for `path` (relative to workspace root or absolute). Throws if outside root."
+  "Returns `File` for `path` under workspace (symlinks allowed in `path`; I/O follows them).
+  Throws on `..` escape or absolute path outside the workspace."
   ^File [^String path]
-  (when (str/blank? path)
-    (throw (ex-info "path is empty" {:path path})))
-  (let [f (io/file path)
-        abs (.getCanonicalFile (if (.isAbsolute f)
-                                 f
-                                 (io/file (cfg/workspace-root) path)))
-        p (-> abs .toPath .normalize .toAbsolutePath)
-        root (workspace-root-path)]
-    (when-not (.startsWith p root)
-      (throw (ex-info "path escapes workspace :default-root"
-                      {:path path :resolved (.getPath abs) :workspace (cfg/workspace-root)})))
-    abs))
+  (wsp/resolve-under-workspace! path))
 
 (defn resolve-workspace-path!
   "Canonical `java.io.File` for `path` under :workspace :default-root (same rules as file tools)."

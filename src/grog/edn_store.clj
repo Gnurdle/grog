@@ -18,32 +18,16 @@
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.workspace-paths :as wsp])
   (:import [java.io File]
-           [java.net URLDecoder]
-           [java.nio.file Path]))
-
-(defn- workspace-root-path
-  (^Path []
-   (-> ^File (.getCanonicalFile (io/file (cfg/workspace-root)))
-       .toPath
-       .normalize
-       .toAbsolutePath)))
+           [java.net URLDecoder]))
 
 (defn- resolve-root!
   (^File []
    (let [raw (some-> (get-in (cfg/grog) [:edn-store :root]) str str/trim not-empty)]
      (when raw
-       (let [f (io/file raw)
-             abs (.getCanonicalFile (if (.isAbsolute f)
-                                       f
-                                       (io/file (cfg/workspace-root) raw)))
-             p (-> abs .toPath .normalize .toAbsolutePath)
-             root (workspace-root-path)]
-         (when-not (.startsWith p root)
-           (throw (ex-info "edn-store :root must stay under :workspace :default-root"
-                           {:edn-store-root raw :resolved (.getPath abs) :workspace (cfg/workspace-root)})))
-         abs)))))
+       (wsp/resolve-under-workspace! raw)))))
 
 (defn configured?
   []
@@ -106,10 +90,8 @@
   [keypath]
   (when-let [^File root (resolve-root!)]
     (when-let [rel (keypath->relative-edn-path keypath)]
-      (let [^File f (io/file root rel)
-            ^File cr (.getCanonicalFile root)
-            ^File cf (.getCanonicalFile f)]
-        (when (.startsWith (.toPath cf) (.toPath cr))
+      (let [^File f (io/file root rel)]
+        (when (wsp/path-under-base? root f)
           f)))))
 
 (defn read-leaf
@@ -127,10 +109,8 @@
                        (throw (ex-info "edn-store not configured" {})))
         rel (or (keypath->relative-edn-path keypath)
                 (throw (ex-info "keypath must be non-empty" {})))
-        ^File f (io/file root rel)
-        ^File cr (.getCanonicalFile root)
-        ^File cf (.getCanonicalFile f)]
-    (when-not (.startsWith (.toPath cf) (.toPath cr))
+        ^File f (io/file root rel)]
+    (when-not (wsp/path-under-base? root f)
       (throw (ex-info "keypath escapes edn-store root" {:keypath keypath})))
     (.mkdirs (.getParentFile f))
     (spit f (with-out-str (pprint/pprint value)) :encoding "UTF-8")
@@ -149,11 +129,9 @@
   [rel-segments]
   (if (and (seq rel-segments) (resolve-root!))
     (let [^File root (resolve-root!)
-          ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)
-          ^File cr (.getCanonicalFile root)
-          ^File cd (.getCanonicalFile dir)]
-      (if (and (.exists cd) (.isDirectory cd) (.startsWith (.toPath cd) (.toPath cr)))
-        (do (doseq [^File f (reverse (file-seq cd))]
+          ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)]
+      (if (and (.exists dir) (.isDirectory dir) (wsp/path-under-base? root dir))
+        (do (doseq [^File f (reverse (file-seq dir))]
               (.delete f))
             true)
         false))
@@ -166,11 +144,9 @@
   (if-not (and (seq rel-segments) (resolve-root!))
     []
     (let [^File root (resolve-root!)
-          ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)
-          ^File cr (.getCanonicalFile root)
-          ^File cd (.getCanonicalFile dir)]
-      (if (and (.isDirectory cd) (.startsWith (.toPath cd) (.toPath cr)))
-        (->> (.listFiles cd)
+          ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)]
+      (if (and (.isDirectory dir) (wsp/path-under-base? root dir))
+        (->> (.listFiles dir)
              (filter some?)
              (filter #(.isFile ^File %))
              (filter #(str/ends-with? (.getName ^File %) ".edn"))
@@ -183,11 +159,9 @@
   Empty vector if edn-store is off or the tree does not exist yet."
   []
   (if-let [^File root (root-directory)]
-    (let [^File p (io/file root "grog-memory" "Projects")
-          ^File cr (.getCanonicalFile root)
-          ^File cp (.getCanonicalFile p)]
-      (if (and (.isDirectory cp) (.startsWith (.toPath cp) (.toPath cr)))
-        (->> (.listFiles cp)
+    (let [^File p (io/file root "grog-memory" "Projects")]
+      (if (and (.isDirectory p) (wsp/path-under-base? root p))
+        (->> (.listFiles p)
              (filter some?)
              (filter #(.isDirectory ^File %))
              (map #(.getName ^File %))

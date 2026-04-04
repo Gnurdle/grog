@@ -11,30 +11,15 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
-  (:import (java.io File)))
-
-(defn- workspace-root-path ^java.nio.file.Path []
-  (-> ^File (.getCanonicalFile (io/file (cfg/workspace-root)))
-      .toPath
-      .normalize
-      .toAbsolutePath))
+            [grog.config :as cfg]
+            [grog.workspace-paths :as wsp])
+  (:import (java.io File)
+           (java.nio.file Path)))
 
 (defn- resolve-under-workspace!
-  "Canonical File for path relative to workspace or absolute under workspace."
+  "File for path relative to workspace or absolute under workspace (symlinks in path allowed)."
   ^File [^String path]
-  (when (str/blank? path)
-    (throw (ex-info "path is empty" {:path path})))
-  (let [f (io/file path)
-        abs (.getCanonicalFile (if (.isAbsolute f)
-                                 f
-                                 (io/file (cfg/workspace-root) path)))
-        p (-> abs .toPath .normalize .toAbsolutePath)
-        root (workspace-root-path)]
-    (when-not (.startsWith p root)
-      (throw (ex-info "path escapes workspace :default-root"
-                      {:path path :resolved (.getPath abs) :workspace (cfg/workspace-root)})))
-    abs))
+  (wsp/resolve-under-workspace! path))
 
 (def ^:private skill-md-filename "SKILL.md")
 (def ^:private skill-edn-filename "skill.edn")
@@ -61,14 +46,18 @@
       root)))
 
 (defn- skill-home-for-id!
-  "Canonical directory `<first-root>/<id>`; must be a direct child of the root."
+  "Directory `<first-root>/<id>`; `id` must be one path segment (no `/` or `..` escape)."
   ^File [^String id]
   (let [^File base (primary-write-root-file!)
-        ^File sh (.getCanonicalFile (io/file base id))
-        bp (-> sh .getParentFile .getCanonicalFile)]
-    (when-not (= bp (.getCanonicalFile base))
+        ^Path bp (-> base .toPath .toAbsolutePath .normalize)
+        ^Path sp (-> bp (.resolve id) .normalize)]
+    (when-not (.startsWith sp bp)
       (throw (ex-info "skill id resolves outside skills root" {:id id})))
-    sh))
+    (when (= sp bp)
+      (throw (ex-info "invalid skill id" {:id id})))
+    (when-not (= (.getParent sp) bp)
+      (throw (ex-info "skill id must be a single path segment" {:id id})))
+    (.toFile sp)))
 
 (defn- normalize-tags-arg [x]
   (vec (distinct (for [t (cond (sequential? x) x (nil? x) [] :else [x])]
@@ -148,8 +137,8 @@
       (vec out))))
 
 (defn- root-relative-path [^File abs-file]
-  (let [root (workspace-root-path)
-        ap (-> abs-file .getCanonicalFile .toPath .normalize)]
+  (let [root (wsp/workspace-base-path)
+        ap (-> abs-file .toPath .toAbsolutePath .normalize)]
     (if (= ap root)
       "."
       (if (.startsWith ap root)

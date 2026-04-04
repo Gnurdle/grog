@@ -1,7 +1,6 @@
 (ns grog.oracle
   "Stronger remote model via OpenAI-compatible `POST …/chat/completions` (e.g. xAI Grok).
-  Configure `:oracle` in grog.edn; legacy `:god` is still read. Ollama tool name **`oracle`**
-  (aliases `pray`, `pray_about` accepted by the executor for old sessions)."
+  Configure `:oracle` in grog.edn. Ollama tool name **`oracle`**."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
             [clojure.string :as str]
@@ -10,10 +9,9 @@
             [grog.secrets :as secrets]))
 
 (defn oracle-api-key
-  "Bearer token: `ORACLE_API_KEY` in OS keyring, else legacy `GOD_API_KEY`."
+  "Bearer token: `ORACLE_API_KEY` in OS keyring."
   []
-  (or (secrets/get-secret secrets/oracle-api-account)
-      (secrets/get-secret secrets/god-api-account)))
+  (secrets/get-secret secrets/oracle-api-account))
 
 (defn oracle-configured?
   "True when oracle URL, model, and an API key are all present."
@@ -29,7 +27,7 @@
    :function
    {:name "oracle"
     :description
-    (str "Consult the **oracle** — a stronger remote model (`:oracle` in grog.edn; legacy `:god` supported). "
+    (str "Consult the **oracle** — a stronger remote model (`:oracle` in grog.edn). "
          "**Activate proactively** when the system message **Tool: oracle** applies: after a real try you still lack "
          "depth, the user wants expert-level help, or you are materially uncertain on something high-stakes. "
          "**Do not** use for casual chat, obvious answers, or tasks you can finish with files, web search, memory, "
@@ -94,9 +92,9 @@
   [arguments]
   (if-not (oracle-configured?)
     (finalize-tool-text
-     (str "oracle is not configured: set :oracle {:url … :model …} in grog.edn (legacy :god still works). "
+     (str "oracle is not configured: set :oracle {:url … :model …} in grog.edn. "
           "Store the API token in the OS keyring as " (pr-str secrets/oracle-api-account)
-          " (or legacy " (pr-str secrets/god-api-account) ") — e.g. /secret in chat."))
+          " — e.g. /secret in chat."))
     (let [{:keys [query]} (parse-oracle-args arguments)]
       (if (str/blank? query)
         (finalize-tool-text "oracle error: missing or empty `query`.")

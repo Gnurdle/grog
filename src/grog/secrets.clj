@@ -14,16 +14,12 @@
 
 (def oracle-api-account "ORACLE_API_KEY")
 
-(def god-api-account "GOD_API_KEY")
-
 (def known-secret-defs
   "Accounts Grog knows about; used for `/secret` list and validation."
   [{:account brave-search-api-account
     :description "Brave Search API subscription token (header X-Subscription-Token)"}
    {:account oracle-api-account
-    :description "Oracle (strong remote model) API Bearer token — tool `oracle`, OpenAI-style chat completions"}
-   {:account god-api-account
-    :description "Legacy keyring name for the same oracle token; prefer ORACLE_API_KEY"}])
+    :description "Oracle (strong remote model) API Bearer token — tool `oracle`, OpenAI-style chat completions"}])
 
 (defn- known-account-set []
   (set (map :account known-secret-defs)))

@@ -76,31 +76,27 @@
   (req-str [:ollama :url] ":ollama :url"))
 
 (defn oracle-url
-  "`:oracle :url` (preferred) or legacy `:god :url` — OpenAI-compatible chat completions POST URL."
+  "`:oracle :url` — OpenAI-compatible chat completions POST URL."
   []
-  (or (some-> (get-in (grog) [:oracle :url]) str str/trim not-empty)
-      (some-> (get-in (grog) [:god :url]) str str/trim not-empty)))
+  (some-> (get-in (grog) [:oracle :url]) str str/trim not-empty))
 
 (defn oracle-model
-  "`:oracle :model` or legacy `:god :model` — remote model id (e.g. grok-2-latest)."
+  "`:oracle :model` — remote model id (e.g. grok-2-latest)."
   []
-  (or (some-> (get-in (grog) [:oracle :model]) str str/trim not-empty)
-      (some-> (get-in (grog) [:god :model]) str str/trim not-empty)))
+  (some-> (get-in (grog) [:oracle :model]) str str/trim not-empty))
 
 (defn oracle-max-tokens
-  "`:oracle :max-tokens` or legacy `:god :max-tokens` — default 4096, capped at 128000."
+  "`:oracle :max-tokens` — default 4096, capped at 128000."
   []
-  (let [v (or (get-in (grog) [:oracle :max-tokens])
-              (get-in (grog) [:god :max-tokens]))]
+  (let [v (get-in (grog) [:oracle :max-tokens])]
     (if (and (number? v) (pos? (long v)))
       (min 128000 (long v))
       4096)))
 
 (defn oracle-temperature
-  "`:oracle :temperature` or legacy `:god :temperature` — default 0.5."
+  "`:oracle :temperature` — default 0.5."
   []
-  (let [v (or (get-in (grog) [:oracle :temperature])
-              (get-in (grog) [:god :temperature]))]
+  (let [v (get-in (grog) [:oracle :temperature])]
     (if (number? v) (double v) 0.5)))
 
 (defonce ^:private !active-project (atom nil))
@@ -172,12 +168,12 @@
 
 (defn chat-tool-loop-limit
   "Max successive tool rounds (model returns `tool_calls` → Grog runs them → model again).
-  Config `:cli :chat-tool-loop-limit` — positive integer, default 8, capped at 1000."
+  Config `:cli :chat-tool-loop-limit` — positive integer, default 32, capped at 1000."
   []
   (let [v (:chat-tool-loop-limit (cli-cfg))]
     (if (and (number? v) (pos? (long v)))
       (min 1000 (long v))
-      8)))
+      32)))
 
 (defn- skills-cfg []
   (:skills (grog) {}))

@@ -29,10 +29,12 @@
 
 (def ^:private chat-initial-heading "I am Grog, Ye shall not Trifle with me.")
 
-(defn- print-thinking! [s]
+(defn- print-thinking! [s & {:keys [iter max]}]
   (when-not (str/blank? s)
     (print ansi-thinking)
-    (println "── thinking ──")
+    (println (if (and iter max)
+               (str "── thinking " iter "/" max " ──")
+               "── thinking ──"))
     (println (str/trim s))
     (print ansi-reset)
     (flush)))
@@ -130,7 +132,7 @@
   (history->messages (system-messages)
                      (recent-history-for-cap history (config/chat-history-turns))))
 
-(defn- print-chat-context-line! [history turn-n]
+(defn- print-chat-context-line! [history]
   (let [msgs (chat-context-messages history)
         ^String json (json/generate-string msgs)
         bytes (alength (.getBytes json "UTF-8"))
@@ -138,15 +140,13 @@
         ;; Rough estimate only (English-ish text; real tokenizer is model-specific).
         est-tok (max 1 (long (/ (count json) 4)))]
     (binding [*out* *err*]
-      (printf "grog: turn %d — chat context %.1f kB JSON, %d tok (est.)\n"
-              (long turn-n) kB est-tok)
+      (printf "grog: chat context %.1f kB JSON, %d tok (est.)\n" kB est-tok)
       (flush))))
 
-(defn- chat-prompt-str [turn-n]
-  (let [lab (str "[turn " turn-n "] ")]
-    (if-let [p (config/active-project-name)]
-      (str lab p " > ")
-      (str lab "chat> "))))
+(defn- chat-prompt-str []
+  (if-let [p (config/active-project-name)]
+    (str p " > ")
+    "chat> "))
 
 (defn- chat-answer-prefix []
   (if-let [p (config/active-project-name)]
@@ -154,14 +154,13 @@
     "\n\nchat> "))
 
 (defn- read-chat-line-with-context! [history]
-  (let [turn-n (inc (count history))]
-    (print-chat-context-line! history turn-n)
-    (loop []
-      (if-some [line (gread/read-prompt! (chat-prompt-str turn-n))]
-        (if (str/blank? line)
-          (recur)
-          line)
-        nil))))
+  (print-chat-context-line! history)
+  (loop []
+    (if-some [line (gread/read-prompt! (chat-prompt-str))]
+      (if (str/blank? line)
+        (recur)
+        line)
+      nil)))
 
 (defn- chat-request-payload
   [messages tools stream?]
@@ -197,7 +196,9 @@
   "POST /api/chat with `stream: true` (always; supports Esc cancel via closing the body).
   Prints thinking / answer per :cli live-stream settings."
   [messages tools stream-opts]
-  (let [answer-prefix (or (:answer-prefix stream-opts) (chat-answer-prefix))]
+  (let [answer-prefix (or (:answer-prefix stream-opts) (chat-answer-prefix))
+        thinking-iter (:thinking-iter stream-opts)
+        thinking-max (:thinking-max stream-opts)]
     (try
       (let [url (str (str/trim (config/ollama-url)) "/api/chat")
             payload (chat-request-payload messages tools true)
@@ -291,7 +292,9 @@
                                   (reset! in-thinking true)
                                   (reset! any-live true)
                                   (print ansi-thinking)
-                                  (print "── thinking ──\n"))
+                                  (print (if (and thinking-iter thinking-max)
+                                           (str "── thinking " thinking-iter "/" thinking-max " ──\n")
+                                           "── thinking ──\n")))
                                 (print th)
                                 (flush))
                               (when (not (str/blank? th))
@@ -346,7 +349,7 @@
           (if (str/blank? q)
             (println "grog: tool" nm "(query missing or empty)")
             (println "grog: tool" nm (pr-str q))))
-        (#{"oracle" "pray" "pray_about"} nm)
+        (= nm "oracle")
         (let [q (:query (oracle/parse-oracle-args args))]
           (if (str/blank? q)
             (println "grog: tool" nm "(query missing or empty)")
@@ -397,8 +400,6 @@
       "save_skill" (skills/run-save-skill! args)
       "delete_skill" (skills/run-delete-skill! args)
       "oracle" (oracle/run-oracle! args)
-      "pray" (oracle/run-oracle! args)
-      "pray_about" (oracle/run-oracle! args)
       "with_api_key" (wkey/run-with-api-key! args)
       "run_babashka" (babashka/run-babashka! args)
       (str "Unknown tool \"" nm "\". Available: read_workspace_file, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image, read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings"
@@ -481,7 +482,7 @@
   (println "Ollama tools in this session (same set sent to the model):")
   (doseq [{:keys [name role]} (active-tool-rows)]
     (println " " name "—" role))
-  (println "Optional tools: grog.edn (:oracle / legacy :god, :with-api-key, :edn-store, …); Brave/oracle/with_api_key use the OS keyring (/secret)."))
+  (println "Optional tools: grog.edn (:oracle, :with-api-key, :edn-store, …); Brave/oracle/with_api_key use the OS keyring (/secret)."))
 
 (defn- handle-tools-command! [line]
   (when (re-matches #"(?i)^/tools$" (str/trim line))
@@ -517,8 +518,8 @@
   ([messages opts]
    (let [answer-prefix (or (:answer-prefix opts) (chat-answer-prefix))
          tools (chat-tools-payload)
-         stream-opts {:answer-prefix answer-prefix}
-         tool-limit (config/chat-tool-loop-limit)]
+         tool-limit (config/chat-tool-loop-limit)
+         iter-max (inc tool-limit)]
      (loop [msgs messages
             n 0
             last-thinking nil]
@@ -526,7 +527,10 @@
          {:ok false
           :error (str "Tool loop limit exceeded (" tool-limit " rounds).")
           :thinking last-thinking}
-         (let [{:keys [ok body error live-thinking-printed? live-content-printed? cancelled?]
+         (let [stream-opts {:answer-prefix answer-prefix
+                            :thinking-iter (inc n)
+                            :thinking-max iter-max}
+               {:keys [ok body error live-thinking-printed? live-content-printed? cancelled?]
                 :or {cancelled? false}}
                (ollama-chat-round! msgs tools stream-opts)]
            (if-not ok
@@ -534,13 +538,16 @@
              (let [m (:message body)
                    thinking (message-thinking body m)
                    tcalls (message-tool-calls m)
-                   content (str (or (:content m) ""))]
+                   content (str (or (:content m) ""))
+                   ti (inc n)]
                (if cancelled?
                  {:ok true :content content :thinking (or thinking last-thinking)
                   :live-thinking-printed? (boolean live-thinking-printed?)
                   :live-content-printed? (boolean live-content-printed?)
                   :answer-prefix answer-prefix
-                  :cancelled? true}
+                  :cancelled? true
+                  :thinking-iter ti
+                  :thinking-max iter-max}
                  (if (seq tcalls)
                    (recur (into (conj msgs m) (tool-result-messages tcalls))
                           (inc n)
@@ -549,7 +556,9 @@
                     :live-thinking-printed? (boolean live-thinking-printed?)
                     :live-content-printed? (boolean live-content-printed?)
                     :answer-prefix answer-prefix
-                    :cancelled? false}))))))))))
+                    :cancelled? false
+                    :thinking-iter ti
+                    :thinking-max iter-max}))))))))))
 
 (defn- brave-status-line []
   (if (brave/brave-search-configured?)
@@ -561,8 +570,8 @@
 (defn- oracle-status-line []
   (if (oracle/oracle-configured?)
     "oracle: enabled (remote model per :oracle in grog.edn — use sparingly per SOUL.md)"
-    (str "oracle: off — set :oracle {:url … :model …} (legacy :god ok) and keyring "
-         (pr-str secrets/oracle-api-account) " or " (pr-str secrets/god-api-account) " (or /secret)")))
+    (str "oracle: off — set :oracle {:url … :model …} and keyring "
+         (pr-str secrets/oracle-api-account) " (or /secret)")))
 
 (defn- with-api-key-status-line []
   (if (config/with-api-key-configured?)
@@ -583,21 +592,21 @@
     "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under workspace"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
     "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
-    "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY (legacy GOD_API_KEY); set via /secret in chat"
-    "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle (legacy :god still read); :max-tokens, :temperature"
+    "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY; set via /secret in chat"
+    "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle; :max-tokens, :temperature"
     "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
-    "Tools (Ollama): workspace read_workspace_dir + read/write files + write_workspace_png + crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle (or :god) + key set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* if :edn-store is set."
+    "Tools (Ollama): workspace read_workspace_dir + read/write files + write_workspace_png + crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* if :edn-store is set."
     "          :cli {:chat-history-turns N} — 0 = no memory; omit = unlimited"
     "              {:chat-show-thinking true|false} — Ollama thinking traces"
     "              {:chat-stream-live-thinking false} — buffer thinking; omit/true streams it live"
     "              {:chat-stream-live-content false} — buffer the answer; omit/true streams it in cyan"
     "              {:format-markdown false} — plain cyan text; omit/true renders replies as styled Markdown"
-    "              {:chat-tool-loop-limit N} — max tool round-trips (default 8, max 1000)"
+    "              {:chat-tool-loop-limit N} — max tool round-trips (default 32, max 1000)"
     ""
     "Thinking: dark green; assistant reply: cyan (or ANSI-styled Markdown when :format-markdown is true)."
     "Markdown in <text-markdown>…</text-markdown> or <text-markdown>…<text-markdown/> is parsed; GFM pipe tables draw as box tables."
     "<image-png>workspace-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path must be under :workspace :default-root (requires display / non-headless JVM)."
-    "Chat: prompts are [turn N] chat> (or [turn N] <project> >). Before each prompt, stderr reports turn N and context size (JSON kB + rough token est.). Esc during assistant output cancels generation (partial reply kept); needs JLine terminal (not plain stdin)."
+    "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each Ollama round opens with a thinking banner `── thinking k/n ──` (tool-loop round k of up to n). Esc during assistant output cancels generation (partial reply kept); needs JLine terminal (not plain stdin)."
     "Models must support Ollama tool calling for these tools (many recent instruct models)."
     ""
     "Usage:"
@@ -745,12 +754,12 @@
         msgs (conj (vec (system-messages)) {:role "user" :content user-text})]
     (try
       (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed? answer-prefix
-                    cancelled?]
+                    cancelled? thinking-iter thinking-max]
              :or {answer-prefix "\n" cancelled? false}}
             (chat-with-tools! msgs {:answer-prefix "\n"})]
         (if ok
           (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
-                (print-thinking! thinking))
+                (print-thinking! thinking :iter thinking-iter :max thinking-max))
               (when-not live-content-printed?
                 (print-buffered-reply! content answer-prefix))
               (when cancelled?
@@ -820,19 +829,19 @@
               (recur
                 (try
                   (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed?
-                                answer-prefix cancelled?]
+                                answer-prefix cancelled? thinking-iter thinking-max]
                          :or {cancelled? false}}
                         (chat-with-tools! msgs)]
                     (if ok
                       (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
-                            (print-thinking! thinking))
+                            (print-thinking! thinking :iter thinking-iter :max thinking-max))
                           (when-not live-content-printed?
                             (print-buffered-reply! content answer-prefix))
                           (when live-content-printed?
                             (println))
                           (when cancelled?
                             (binding [*out* *err*]
-                              (println "grog: turn stopped early (Esc) — partial reply kept in history.")))
+                              (println "grog: assistant output stopped early (Esc) — partial reply kept in history.")))
                           (try
                             (project-dialog/append-turn! :user prompt)
                             (project-dialog/append-turn! :assistant (str content))

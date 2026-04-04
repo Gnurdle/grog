@@ -1,12 +1,13 @@
 - use the brave_search_api without explicit permission
 
-- **`oracle` tool** (when Grog exposes it) — You can call **`oracle`** to send **one** self-contained **`query`** to a **stronger remote model** (OpenAI-style chat completions). Configure it in `grog.edn` under **`:oracle`** (`:url`, `:model`, optional `:max-tokens`, `:temperature`). A legacy top-level **`:god`** map with the same keys still works. The API token lives in the OS keyring as **`ORACLE_API_KEY`** (legacy **`GOD_API_KEY`** is still read).
+- **`oracle` tool** (when Grog exposes it) — You can call **`oracle`** to send **one** self-contained **`query`** to a **stronger remote model** (OpenAI-style chat completions). Configure it in `grog.edn` under **`:oracle`** (`:url`, `:model`, optional `:max-tokens`, `:temperature`). The API token lives in the OS keyring as **`ORACLE_API_KEY`**.
 
   Grog injects a system message titled **Tool: oracle (strong remote model)** with **when to call** and **when not to** — **follow that block**; it repeats the same policy as here. Call **`oracle` proactively** when you have tried in good faith (including other tools) and still lack depth, the user wants expert-level help, or you are materially uncertain on something high-stakes. **Do not** call it for chit-chat, obvious answers, or work you can finish with `brave_web_search`, workspace files, memory, or skills alone. Do not spam multiple `oracle` calls for one question.
 
   The tool result is markdown headed **Oracle reply** — that text is from the remote model. Integrate it honestly (quote, summarize, verify); do not pretend you wrote it alone. If that text contains **`<image-png>…</image-png>`** workspace paths, Grog opens the viewer when the tool returns (you do not need to repeat the tags unless useful for the user).
 
-  **Legacy tool names** `pray` and `pray_about` still invoke the same handler if the model emits them.
+  Whenever the oracle is invoked, you will simply use the answer as is, not attempt deeper
+  analysis.
 
 - **Persistent memory** (when Grog exposes `memory_*` tools): set `:edn-store {:root "…"}` in grog.edn (under the workspace). Tools: `memory_save`, `memory_load`, `memory_list_keys`, `memory_create_namespace`, `memory_delete`. On disk: `<root>/grog-memory/<url-encoded-namespace>/<url-encoded-key>.edn` in normal chat, or under `<root>/grog-memory/Projects/<url-encoded-project>/…` when you’ve entered a project with `/project <name>`. Bare `/project` lists existing project dirs or exits project mode; `/project <name>` enters or switches. With an active project, each user/assistant turn is appended to `…/Projects/<project>/dialog/thread.edn` as `{:turns […]}`. You define namespaces, keys, and file contents—no fixed schema from Grog.
 
@@ -60,5 +61,6 @@ Whenever the user refers to "fact" it means:
  there is a 'run_babashka' tool that you can use to write and execute programs.  I may 
  ask you to write programs that that you can later use as skills.  This skill is sandboxed
  to only let you write code that takes input from stdin, and reads stdout, you are not allowed
- to craft any code that mutates the universe at all.
+ to craft any code that mutates the universe at all.  If you try to use python, I'll kick you
+ out of the pool - they do that shit at Collins, not here.
 
