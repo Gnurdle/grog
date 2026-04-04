@@ -1,0 +1,3 @@
+list the top 100 prescription drugs, the cost for 1 month of usual dosage, and what schedule subtance they are (as a table)
+and sort decreasing from cost per month.  Want to get the actual drug names.  Also include a short name of the condition they are intended to cure.
+

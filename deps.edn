@@ -1,0 +1,23 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        clj-http/clj-http {:mvn/version "3.13.0"}
+        cheshire/cheshire {:mvn/version "5.13.0"}
+        org.jline/jline {:mvn/version "3.29.0"}
+        org.commonmark/commonmark {:mvn/version "0.21.0"}
+        org.commonmark/commonmark-ext-gfm-tables {:mvn/version "0.21.0"}
+        org.apache.poi/poi-ooxml {:mvn/version "5.3.0"}
+        org.apache.pdfbox/pdfbox {:mvn/version "3.0.4"}
+        ;; PDF OCR (image / scanned pages); needs native Tesseract + tessdata on the host
+        net.sourceforge.tess4j/tess4j {:mvn/version "5.14.0"}
+        ;; https://github.com/lessthanoptimal/BoofCV — line segments on rasterized PDFs (with ocr_pdf_document)
+        org.boofcv/boofcv-io {:mvn/version "1.2.2"}
+        org.boofcv/boofcv-feature {:mvn/version "1.2.2"}}
+
+ :aliases
+ {:run {:main-opts ["-m" "grog.core"]
+       ;; JDK 21+: native / reflective access for some transitive deps (e.g. JLine, OCR)
+       :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                  "--enable-native-access=ALL-UNNAMED"]}
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
+          :ns-default build}
+  :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
