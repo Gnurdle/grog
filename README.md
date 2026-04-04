@@ -14,14 +14,18 @@ It tries to keep stuff it figures out in the the project to sustain the adventur
 
 ## Quick Start
 
-procure a gpu and ollama endpoint
-procure a brave search api key
-hack grog.edn with these tidbits
+- procure a gpu and ollama endpoint
 
+- procure a brave search api key
+
+- hack grog.edn with these tidbits
+
+```
 $ cd grog
 $ clojure -M:run chat
 chat> /help
 (go bannanas)
+```
 
 ## tools presented to llm:
 
