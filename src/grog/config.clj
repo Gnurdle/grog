@@ -167,13 +167,37 @@
   (not (false? (:format-markdown (cli-cfg)))))
 
 (defn chat-tool-loop-limit
-  "Max successive tool rounds (model returns `tool_calls` → Grog runs them → model again).
-  Config `:cli :chat-tool-loop-limit` — positive integer, default 32, capped at 1000."
+  "Max successive tool rounds (each Ollama request after tool results counts as one step).
+  **Omit** `:cli :chat-tool-loop-limit` (or set `null` in merged EDN) for **no limit** — the loop runs until the model returns text (or error / cancel).
+  If set, must be a **positive integer** (no upper cap)."
   []
   (let [v (:chat-tool-loop-limit (cli-cfg))]
+    (when (and (number? v) (pos? (long v)))
+      (long v))))
+
+(defn- chron-cfg []
+  (:chron (grog) {}))
+
+(defn chron-scheduler-enabled?
+  "True when `:chron {:enabled true}` and `:tasks` is non-empty."
+  []
+  (let [c (chron-cfg)]
+    (and (true? (:enabled c))
+         (sequential? (:tasks c))
+         (seq (:tasks c)))))
+
+(defn chron-tasks
+  "Task maps: `:id` (string), `:instruction` (string), and either `:every-minutes` (number) or `:interval-seconds` (number)."
+  []
+  (vec (filter map? (:tasks (chron-cfg)))))
+
+(defn jobs-thread-context-turns
+  "`:jobs {:max-thread-turns N}` — dialog turns loaded for jobs/chron (default 40)."
+  []
+  (let [v (get-in (grog) [:jobs :max-thread-turns])]
     (if (and (number? v) (pos? (long v)))
-      (min 1000 (long v))
-      32)))
+      (long v)
+      40)))
 
 (defn- skills-cfg []
   (:skills (grog) {}))
