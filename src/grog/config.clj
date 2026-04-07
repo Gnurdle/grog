@@ -166,6 +166,12 @@
   []
   (not (false? (:format-markdown (cli-cfg)))))
 
+(defn reply-pager?
+  "When true (default), final assistant text is shown through **`less -R -F -X`** (ANSI, quit if one screen)
+  when JLine/console detects an interactive tty and `less` is on `PATH`. Set `:cli :reply-pager false` to print inline."
+  []
+  (not (false? (:reply-pager (cli-cfg)))))
+
 (defn chat-tool-loop-limit
   "Max successive tool rounds (each Ollama request after tool results counts as one step).
   **Omit** `:cli :chat-tool-loop-limit` (or set `null` in merged EDN) for **no limit** — the loop runs until the model returns text (or error / cancel).
@@ -333,7 +339,9 @@
   []
   (try
     (let [resp (http/get (str (str/trim (ollama-url)) "/api/tags")
-                         {:as :json :throw-exceptions false})
+                         {:as :json :throw-exceptions false
+                          :socket-timeout 8000
+                          :conn-timeout 3000})
           raw (:body resp)]
       (when (= 200 (:status resp))
         (->> (:models raw)

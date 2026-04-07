@@ -28,18 +28,46 @@
   [^String account]
   (boolean (when account ((known-account-set) account))))
 
+(defonce ^:private keyring-read-timeout-ms 4000)
+
+;; Keyring/create can block forever without a working Secret Service / D-Bus (e.g. SSH session).
+(defonce ^:private !keyring-unreachable (atom false))
+
+(defn- fetch-secret-blocking!
+  "Open keyring and read one password; may block. Used only inside a capped `future`."
+  ^String [^String account]
+  (with-open [^Keyring kr (Keyring/create)]
+    (try
+      (let [^String p (.getPassword kr service-id account)]
+        (some-> p str str/trim not-empty))
+      (catch PasswordAccessException _ nil))))
+
 (defn get-secret
-  "Return the password for `account` under service `grog`, or nil if missing / unsupported / error."
+  "Return the password for `account` under service `grog`, or nil if missing / unsupported / error.
+  Uses a time-bounded read so a hung OS backend cannot freeze the JVM (chat prompt, startup banners)."
   ^String [^String account]
   (when-not (str/blank? account)
-    (try
-      (with-open [^Keyring kr (Keyring/create)]
-        (try
-          (let [^String p (.getPassword kr service-id account)]
-            (some-> p str str/trim not-empty))
-          (catch PasswordAccessException _ nil)))
-      (catch BackendNotSupportedException _ nil)
-      (catch Exception _ nil))))
+    (if @!keyring-unreachable
+      nil
+      (try
+        (let [f (future
+                  (try
+                    (fetch-secret-blocking! account)
+                    (catch BackendNotSupportedException _ ::unsupported)
+                    (catch Exception _ ::error)))
+              v (deref f keyring-read-timeout-ms ::timeout)]
+          (cond
+            (= ::timeout v)
+            (do (reset! !keyring-unreachable true)
+                (binding [*out* *err*]
+                  (println "grog: OS keyring did not respond within"
+                           (long (/ keyring-read-timeout-ms 1000))
+                           "s; secret reads disabled for this process (D-Bus / Secret Service / desktop session?)."))
+                nil)
+            (= ::unsupported v) nil
+            (= ::error v) nil
+            :else v))
+        (catch Exception _ nil)))))
 
 (defn set-secret!
   "Persist `password` for `account` under service `grog`. `account` must be in `known-secret-defs`.
@@ -56,6 +84,7 @@
   (try
     (with-open [^Keyring kr (Keyring/create)]
       (.setPassword kr service-id account password))
+    (reset! !keyring-unreachable false)
     nil
     (catch BackendNotSupportedException e
       (throw (ex-info (str "no OS secret backend: " (.getMessage e)) {})))
@@ -76,16 +105,8 @@
     (println "   keyring:" (if (keyring-set? account) "set" "unset")))
   (println "Set with: /secret <KEY> <value> — value may contain spaces."))
 
-(defn- try-backend-label
-  []
-  (try
-    (with-open [^Keyring kr (Keyring/create)]
-      (str (.getKeyringStorageType kr)))
-    (catch Exception _ nil)))
-
 (defn startup-status-line
-  "One line for chat startup (Brave / keyring hint)."
+  "One line for chat startup (Brave / keyring hint). Does not open the keyring — that can block without D-Bus."
   []
-  (if-let [b (try-backend-label)]
-    (str "Secrets store: " b " (service \"" service-id "\"); /secret lists " brave-search-api-account ", " oracle-api-account ", …")
-    (str "Secrets store: no OS backend — use a platform with a keyring (or install Secret Service); /secret lists keys")))
+  (str "Secrets: OS keyring service \"" service-id "\" — /secret lists "
+       brave-search-api-account ", " oracle-api-account " (values never printed)"))

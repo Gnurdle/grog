@@ -1,6 +1,7 @@
 (ns grog.md-render
   "CommonMark → ANSI for terminal display (matches grog.core answer / thinking palette).
-  Markdown may be wrapped in <text-markdown>…</text-markdown> or <text-markdown>…<text-markdown/>.
+  Markdown may be wrapped in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/>
+  (MIME-style, RFC 7763). Legacy <text-markdown>…</text-markdown> is normalized to the same.
   GFM pipe tables render as Unicode box tables."
   (:require [clojure.string :as str])
   (:import [java.util Arrays]
@@ -23,9 +24,17 @@
 (def ^:private quote-style "\u001B[38;2;160;180;210m")
 (def ^:private link-url "\u001B[2m\u001B[38;2;150;170;210m")
 
-(def ^:private ^String open-marker "<text-markdown>")
-(def ^:private ^String close-std "</text-markdown>")
-(def ^:private ^String close-alt "<text-markdown/>")
+(def ^:private ^String open-marker "<text/markdown>")
+(def ^:private ^String close-std "</text/markdown>")
+(def ^:private ^String close-alt "<text/markdown/>")
+
+(defn- normalize-legacy-markdown-tags
+  "Map old <text-markdown> delimiters to <text/markdown> (order matters: self-close before open tag)."
+  ^String [^String s]
+  (-> s
+      (str/replace "<text-markdown/>" close-alt)
+      (str/replace "</text-markdown>" close-std)
+      (str/replace "<text-markdown>" open-marker)))
 
 (defn- make-parser []
   (let [exts (Arrays/asList (into-array [(TablesExtension/create)]))]
@@ -355,16 +364,17 @@
     :md (render-md-chunk payload)))
 
 (defn render-to-ansi
-  "Parse `markdown` as CommonMark (with GFM tables). If the string contains `<text-markdown>`,
-  only the regions up to `</text-markdown>` or `<text-markdown/>` are parsed as Markdown;
-  outside text is shown in the default body color. On failure, returns the original text
-  in the default body color."
+  "Parse `markdown` as CommonMark (with GFM tables). If the string contains `<text/markdown>`,
+  only the regions up to `</text/markdown>` or `<text/markdown/>` are parsed as Markdown;
+  outside text is shown in the default body color. Legacy `<text-markdown>` tags are accepted.
+  On failure, returns the original text in the default body color."
   ^String [^String markdown]
   (if (str/blank? markdown)
     ""
     (try
-      (if (str/includes? markdown open-marker)
-        (str/join "" (map render-segment (split-text-markdown-segments markdown)))
-        (render-md-chunk markdown))
+      (let [s (normalize-legacy-markdown-tags markdown)]
+        (if (str/includes? s open-marker)
+          (str/join "" (map render-segment (split-text-markdown-segments s)))
+          (render-md-chunk s)))
       (catch Exception _
         (str body markdown)))))

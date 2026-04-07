@@ -21,6 +21,10 @@
        ;; JDK 21+: native / reflective access for some transitive deps (e.g. JLine, OCR)
        :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                   "--enable-native-access=ALL-UNNAMED"]}
+  ;; Shorthand: `clojure -M:chat` → interactive chat (no extra `chat` token after :run)
+  :chat {:main-opts ["-m" "grog.core" "chat"]
+         :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                    "--enable-native-access=ALL-UNNAMED"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :ns-default build}
   :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}

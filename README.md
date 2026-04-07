@@ -11,6 +11,7 @@ Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, G
 - [Tools](#tools)
 - [Chat commands](#chat-commands)
 - [Configuration](#configuration)
+  - [MCP servers](#mcp-servers)
 - [Jobs and chron](#jobs-and-chron)
 - [Example `grog.edn`](#example-grogedn)
 - [Quick start](#quick-start)
@@ -26,7 +27,7 @@ Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, G
 | **Modest hardware** | Useful with smaller models (e.g. Qwen3.5-class on ~8 GB VRAM); tool use still buys you a lot. |
 | **Oracle** | Optional stronger remote model (`:oracle` + keyring); the stack is wired so the agent can escalate when stuck—see SOUL for policy. |
 | **Projects** | `/project` ties **`memory_*`** tools and dialog logging into per-project trees—iterable, restartable workstreams. |
-| **Jobs** | With **`:edn-store`**, **`/job`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
+| **Jobs** | With **`:edn-store`**, **`/jobs`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
 | **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same Ollama+tools stack); respects **active project** and thread context when set. |
 | **Skills** | Packaged `skill.edn` + **SKILL.md** dirs; the model can list, read, create, and update skills. |
 | **Babashka** | Optional **`run_babashka`** for short scripted side effects (`bb` on `PATH`). |
@@ -44,6 +45,7 @@ Symlinks **inside** the workspace are followed for tools; `..` cannot escape the
 - **Session history** — `:cli :chat-history-turns` or **`/clear`** / **`/fresh`**.
 - **Streaming** — optional live thinking + streamed answer; **Esc** cancels mid-stream (JLine TTY).
 - **Markdown** — optional ANSI rendering (tables, code fences, etc.).
+- **Reply pager** — by default, finished assistant text is shown in **`less -R -F -X`** when you have a normal terminal and **`less`** on `PATH` (ANSI, quit if one screen). Set **`:cli :reply-pager false`** for inline printing only.
 - **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits.
 
 ### Workspace
@@ -67,8 +69,9 @@ Active set depends on `grog.edn`. Use **`/tools`** in chat for the live list and
 | **Stronger model** | `oracle` — OpenAI-style chat completions; `:oracle` + **`ORACLE_API_KEY`** |
 | **HTTP + secrets** | `with_api_key` — allowlisted keyring names + optional URL prefixes |
 | **Skills** | `list_skills`, `read_skill`, `save_skill`, `delete_skill` — needs `:skills {:roots […]}` |
-| **Memory** | `memory_save`, `memory_load`, `memory_list_keys`, `memory_create_namespace`, `memory_delete` — needs `:edn-store {:root "…"}` |
+| **Memory** | `memory_save`, `memory_load`, `memory_list_keys`, `memory_namespaces`, `memory_create_namespace`, `memory_delete` — needs `:edn-store {:root "…"}` |
 | **Scripts** | `run_babashka` — needs `:babashka {:enabled true}` and **`bb`** on `PATH` |
+| **MCP** | **`:edn-store`** + **`/mcp`** or **`mcp_*`** tools; persisted **`grog-mcp/servers.edn`** (project-scoped); after **`mcp_reload`**, tools **`<id>_<tool>`** |
 
 </details>
 
@@ -84,10 +87,11 @@ These are **user** commands, not model tools.
 | `/clear`, `/fresh` | Clear session history |
 | `/tools`, `/skills` | Inspect tools / skill packs |
 | `/project`, `/project <name>` | Projects: memory namespaces + `Projects/<name>/dialog/thread.edn` |
-| `/job` | **`add` \| `list` \| `next` \| `status`** — project job queue in edn-store (`grog-jobs/`); needs **active project** + **`:edn-store`** |
+| `/jobs` | **`add` \| `list` \| `next` \| `status`** — project job queue in edn-store (`grog-jobs/`); needs **active project** + **`:edn-store`** |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
 | `/secret` | Keyring **`grog`** — list/set keys (values never printed) |
 | `/shell` | `sh -lc` under workspace cwd, or interactive subshell |
+| `/mcp` | MCP server list in edn-store: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
 | `/soul` | Path, append, reload |
 | `@path` | Inline files into the prompt (whitespace-separated tokens) |
 
@@ -103,7 +107,14 @@ Config merges in order:
 
 **Required:** `:ollama {:url … :model …}`.
 
-**Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
+**Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:cli` (history, thinking, streaming, markdown, **reply pager** (`:reply-pager`), optional **`chat-tool-loop-limit`** only).
+
+### MCP servers
+
+MCP is **not** configured in `grog.edn`. With **`:edn-store`**, the server list lives under the store as **`grog-memory/grog-mcp/servers.edn`**, or **`grog-memory/Projects/<project>/grog-mcp/servers.edn`** when **`/project`** is active (same scoping idea as **`memory_*`**). Use **`/mcp`** in chat or the Ollama tools **`mcp_config_load`**, **`mcp_config_save`**, **`mcp_servers_set`**, **`mcp_reload`**. Subprocesses **do not** start when chat opens; call **`mcp_reload`** (or **`/mcp reload`**) after you have a valid declaration. Ollama then sees remote tools as **`<id>_<tool>`** (longest `:id` prefix wins).
+
+- **Filesystem (Node):** `@modelcontextprotocol/server-filesystem` via **`npx`** — example entry: **`{:id "fs" :command ["npx" "-y" "@modelcontextprotocol/server-filesystem" "/abs/path"]}`**.
+- **DataScript (Clojure):** [xlisp/datascript-mcp-server](https://github.com/xlisp/datascript-mcp-server) — clone the repo, set **`:cwd`** to that root, and run **`clojure -M -m datascript-mcp.core`** (needs **`clojure`** on `PATH` and a first-run dependency download). Tools include **`init_db`**, **`query`**, **`load_db`**, **`add_data`**, etc.
 
 ### Persistent text
 
@@ -116,19 +127,19 @@ Config merges in order:
 
 Both use the **same agent stack** as normal chat (`run-tool-loop-on-messages`) and the **edn-store** tree under your workspace.
 
-### Jobs (`/job`)
+### Jobs (`/jobs`)
 
 - **Requires:** **`:edn-store`** and **`/project <name>`** (active project).
 - **Queue:** `grog-memory/Projects/<project>/grog-jobs/queue.edn`.
 - **Findings:** `grog-memory/Projects/<project>/grog-jobs/findings-<job-id>.edn`.
-- **Commands:** `/job add <goal>`, `/job list`, `/job next`, `/job status` (see **`/help`**).
+- **Commands:** `/jobs add <goal>`, `/jobs list`, `/jobs next`, `/jobs status` (see **`/help`**).
 
 Each run loads **SOUL, skills, oracle hints, and recent project dialog** into the message list before the job prompt.
 
 ### Chron (`:chron`)
 
 - **Requires:** **`:chron {:enabled true :tasks […]}`** in `grog.edn`.
-- **Runs only during** **`clojure -M:run chat`** (started after the banner, stopped when you leave chat).
+- **Runs only during** **`clojure -M:chat`** / **`clojure -M:run chat`** (started after the banner, stopped when you leave chat).
 - Each task: **`:id`**, **`:instruction`** (or **`:prompt`**), plus **`:every-minutes`** or **`:interval-seconds`** (minimum **15** seconds if using seconds).
 - Output goes to **stderr** with a visible banner (it can interleave with typing). If a **project** is active, chron may append **`[chron] …`** turns to **`thread.edn`**. Last run summaries can live under **`grog-chron/last-run/…`** in the store.
 
@@ -161,7 +172,7 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
  ;; :chron {:enabled true
  ;;         :tasks [{:id "heartbeat" :every-minutes 60 :instruction "Short status check; use memory_* if useful."}]}
 
- ;; Optional: dialog turns loaded for /job and chron (default 40)
+ ;; Optional: dialog turns loaded for /jobs and chron (default 40)
  ;; :jobs {:max-thread-turns 40}
 
  ;; Optional: xAI Grok (or any OpenAI-style chat/completions URL) for the `oracle` tool
@@ -173,6 +184,8 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 
  ;; Optional: Babashka scripts (`bb` on PATH)
  :babashka {:enabled true}
+
+ ;; Optional: MCP — not in this file; needs :edn-store, then /mcp or mcp_* tools (see README "MCP servers")
 
  ;; Optional: Brave web search — keyring BRAVE_SEARCH_API; uncomment:
  ;; :with-api-key {:allowed-secrets ["BRAVE_SEARCH_API"]
@@ -197,8 +210,10 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 
 ```bash
 cd grog
-clojure -M:run chat
+clojure -M:chat
 ```
+
+(`clojure -M:run chat` is equivalent; `:chat` is a shorter alias in `deps.edn`.)
 
 At the prompt:
 
@@ -222,7 +237,8 @@ Set `:oracle` with `:url` (e.g. `…/v1/chat/completions`) and `:model`; put the
 
 | Command | Effect |
 | --- | --- |
-| `clojure -M:run chat` | Interactive chat |
+| `clojure -M:chat` | Interactive chat (shorthand alias) |
+| `clojure -M:run chat` | Same as `-M:chat` |
 | `clojure -M:run "your message"` | One-shot reply, then exit |
 | `clojure -M:run help` | Print help |
 

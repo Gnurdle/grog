@@ -4,6 +4,7 @@
   When a **session active project** is set (`/project <name>` in chat), paths become
   `grog-memory/Projects/<url-encoded-project>/<url-encoded-ns>/<url-encoded-key>.edn`."
   (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.config :as cfg]
             [grog.edn-store :as store])
@@ -11,6 +12,10 @@
 
 (def ^:private ^String mem-root "grog-memory")
 (def ^:private ^String namespace-marker-key "__grog_namespace__")
+
+(def ^:private reserved-top-mem-dir-names
+  "Subdirs of `grog-memory/` that are not memory namespaces (`Projects/`, MCP config)."
+  #{"Projects" "grog-mcp"})
 
 (defn- enc-seg ^String [^String s]
   (URLEncoder/encode s "UTF-8"))
@@ -125,6 +130,15 @@
                                :limit {:type "integer"}}}}}
    {:type "function"
     :function
+    {:name "memory_namespaces"
+     :description (str "List memory namespaces in the current scope: without /project, top-level dirs under "
+                       "grog-memory/ (each is a namespace; Projects/ is excluded). With an active /project, "
+                       "namespaces under grog-memory/Projects/<that project>/. Each entry has :namespace (decoded name) "
+                       "and :key_count (.edn files). Use before memory_list_keys when you need to discover where data lives.")
+     :parameters {:type "object"
+                  :properties {}}}}
+   {:type "function"
+    :function
     {:name "memory_create_namespace"
      :description (str "Optional marker file for a namespace (reserved key __grog_namespace__). "
                        "Idempotent if marker already exists.")
@@ -150,6 +164,8 @@
     (case tool-name
       "memory_list_keys"
       (select-keys m [:namespace :key_prefix :limit])
+      "memory_namespaces"
+      {}
       "memory_create_namespace"
       (select-keys m [:namespace :description])
       "memory_delete"
@@ -180,6 +196,56 @@
       (if (nil? v)
         (json/generate-string {:found false :namespace ns :key mem-k})
         (json/generate-string {:found true :namespace ns :key mem-k :value (value->tool-string v)})))
+    (catch Exception e
+      (json/generate-string {:error (.getMessage e)}))))
+
+(defn- memory-namespaces-scope-dir
+  "Directory whose immediate subdirs are encoded namespace names (`grog-memory` or `…/Projects/<project>`)."
+  ^java.io.File []
+  (when-let [^java.io.File root (store/root-directory)]
+    (let [^java.io.File mem (io/file root mem-root)]
+      (when (.isDirectory mem)
+        (if-let [p (cfg/active-project-name)]
+          (let [^java.io.File d (io/file mem "Projects" (enc-seg p))]
+            (when (.isDirectory d) d))
+          mem)))))
+
+(defn- ns-dir-rel-segments ^clojure.lang.PersistentVector [^String enc-dir-name]
+  (if-let [p (cfg/active-project-name)]
+    [mem-root "Projects" (enc-seg p) enc-dir-name]
+    [mem-root enc-dir-name]))
+
+(defn run-memory-namespaces!
+  "JSON: namespaces with decoded :namespace and :key_count; :active_project when set."
+  [_arguments]
+  (try
+    (require-store!)
+    (let [^java.io.File scope (memory-namespaces-scope-dir)
+          proj (cfg/active-project-name)]
+      (if-not scope
+        (json/generate-string
+         {:active_project proj
+          :scope (if proj (str mem-root "/Projects/…") mem-root)
+          :namespaces []
+          :hint (if proj
+                  "No project memory tree yet — save something with memory_save or create a namespace."
+                  "No grog-memory directory yet — use memory_save / memory_create_namespace.")})
+        (let [subs (->> (.listFiles scope)
+                        (filter some?)
+                        (filter #(.isDirectory ^java.io.File %)))
+              subs (vec (remove #(reserved-top-mem-dir-names (.getName ^java.io.File %)) subs))
+              rows (for [^java.io.File d subs
+                         :let [enc (.getName d)
+                               nm (try (dec-seg enc) (catch Exception _ enc))
+                               segs (ns-dir-rel-segments enc)
+                               n (count (store/list-edn-files-in-subdir segs))]]
+                     {:namespace nm :key_count n})
+              rows (vec (sort-by (comp str/lower-case str :namespace) rows))]
+          (json/generate-string
+           {:active_project proj
+            :scope (.getPath scope)
+            :count (count rows)
+            :namespaces rows}))))
     (catch Exception e
       (json/generate-string {:error (.getMessage e)}))))
 
