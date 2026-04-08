@@ -154,27 +154,24 @@
   (not (false? (:chat-stream-live-thinking (cli-cfg)))))
 
 (defn chat-stream-live-content?
-  "When true (default), stream assistant answer tokens to the terminal as they arrive.
-  Set `:cli :chat-stream-live-content false` to buffer the reply and print once."
+  "When true (default), stream assistant answer tokens as they arrive **only when**
+  `:format-markdown` is false (plain cyan). When `:format-markdown` is true, the reply is
+  buffered and rendered once so GFM tables and full ANSI Markdown work. Set
+  `:cli :chat-stream-live-content false` to always buffer until the round completes."
   []
   (not (false? (:chat-stream-live-content (cli-cfg)))))
 
 (defn format-markdown?
   "When true (default), assistant replies are rendered as CommonMark with ANSI styles.
-  Answer text is buffered for the whole round when streaming would otherwise print tokens,
-  so layout is correct. Set `:cli :format-markdown false` for plain cyan text."
+  Answer text is buffered for the round (not token-streamed) so layout, pipe tables, etc. are correct.
+  Set `:cli :format-markdown false` for plain cyan text with optional live streaming per
+  `:chat-stream-live-content`."
   []
   (not (false? (:format-markdown (cli-cfg)))))
 
-(defn reply-pager?
-  "When true (default), final assistant text is shown through **`less -R -F -X`** (ANSI, quit if one screen)
-  when JLine/console detects an interactive tty and `less` is on `PATH`. Set `:cli :reply-pager false` to print inline."
-  []
-  (not (false? (:reply-pager (cli-cfg)))))
-
 (defn chat-tool-loop-limit
   "Max successive tool rounds (each Ollama request after tool results counts as one step).
-  **Omit** `:cli :chat-tool-loop-limit` (or set `null` in merged EDN) for **no limit** — the loop runs until the model returns text (or error / cancel).
+  **Omit** `:cli :chat-tool-loop-limit` (or set `null` in merged EDN) for **no limit** — the loop runs until the model returns text (or error).
   If set, must be a **positive integer** (no upper cap)."
   []
   (let [v (:chat-tool-loop-limit (cli-cfg))]

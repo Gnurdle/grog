@@ -20,7 +20,6 @@
 (def ^:private line-max-pages-cap 40)
 (def ^:private default-line-dpi 220)
 (def ^:private min-line-dpi 100)
-(def ^:private max-line-dpi 400)
 (def ^:private default-max-segments-per-page 400)
 (def ^:private max-segments-per-page-cap 800)
 
@@ -66,7 +65,8 @@
                               :max_pages {:type "integer"
                                           :description "Max pages to analyze (default 15, cap 40)."}
                               :dpi {:type "integer"
-                                    :description "Raster DPI (default 220; 100–400). Same dpi as ocr_pdf_document when mixing line geometry with OCR."}
+                                    :description (str "Raster DPI (default 220; min 100, max " fs/max-pdf-raster-dpi
+                                                      "). Same dpi as ocr_pdf_document when mixing line geometry with OCR.")}
                               :max_segments_per_page {:type "integer"
                                                       :description "Max segments listed per page (default 400, cap 800); list is longest-first, extras omitted."}
                               :region_size {:type "integer"
@@ -122,7 +122,7 @@
                       (cond (number? x) (min line-max-pages-cap (max 1 (long x)))
                             :else default-line-max-pages))
           dpi (let [x (or (:dpi m) (get m "dpi"))]
-                (cond (number? x) (min max-line-dpi (max min-line-dpi (long x)))
+                (cond (number? x) (min fs/max-pdf-raster-dpi (max min-line-dpi (long x)))
                       :else default-line-dpi))
           max-seg (let [x (or (:max_segments_per_page m) (get m "max_segments_per_page"))]
                     (cond (number? x) (min max-segments-per-page-cap (max 10 (long x)))

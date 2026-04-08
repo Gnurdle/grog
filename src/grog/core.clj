@@ -29,9 +29,24 @@
 (def ^:private ansi-reset "\u001B[0m")
 (def ^:private ansi-hot-pink "\u001B[38;2;255;105;180m")
 (def ^:private ansi-thinking "\u001B[38;2;55;165;95m")
-(def ^:private ansi-answer "\u001B[38;2;218;228;248m")
+(def ^:private ansi-answer "\u001B[38;2;100;220;255m")
+(def ^:private ansi-tool-call "\u001B[38;2;255;0;255m")
+(def ^:private ansi-snark "\u001B[2m\u001B[3m")
 
-(def ^:private chat-initial-heading "I am Grog, Ye shall not Trifle with me.")
+(defn- tool-call-println!
+  "Log a tool invocation line to stderr in magenta."
+  [& args]
+  (binding [*out* *err*]
+    (print ansi-tool-call)
+    (apply println args)
+    (print ansi-reset)
+    (flush)))
+
+(def ^:private chat-initial-heading "I am Grog -- Trifle with me at your own peril.")
+
+(def ^:private chat-startup-snark-fallback
+  "Last-resort banner if the snark pool is somehow empty (should not happen)."
+  "No snark pool — someone edited the wrong file. Pity.")
 
 (defn- print-thinking! [s & {:keys [iter max]}]
   (when-not (str/blank? s)
@@ -158,8 +173,7 @@
      :tool_calls tc}))
 
 (defn- ollama-post-chat-stream!
-  "POST /api/chat with `stream: true` (always; supports Esc cancel via closing the body).
-  Prints thinking / answer per :cli live-stream settings."
+  "POST /api/chat with `stream: true` (always). Prints thinking / answer per :cli live-stream settings."
   [messages tools stream-opts]
   (let [answer-prefix (or (:answer-prefix stream-opts) (chat-answer-prefix))
         thinking-iter (:thinking-iter stream-opts)
@@ -175,65 +189,46 @@
         (if-not (= 200 status)
           (do (try (slurp ^java.io.InputStream (:body resp)) (catch Exception _ nil))
               {:ok false :error (str "HTTP " status)
-               :live-thinking-printed? false :live-content-printed? false
-               :cancelled? false})
+               :live-thinking-printed? false :live-content-printed? false})
           (with-open [^java.io.Closeable stream (:body resp)]
-            (gread/reset-chat-cancel!)
-            (let [stop-watch (or (gread/start-escape-cancel-watcher!
-                                  (fn []
-                                    (gread/mark-chat-cancel!)
-                                    (binding [*out* *err*]
-                                      (println "\ngrog: cancelled (Esc)"))
-                                    (try (.close ^java.io.Closeable stream)
-                                         (catch Exception _))))
-                                (fn []))
-                  rdr (io/reader stream)
+            (let [rdr (io/reader stream)
                   think-buf (StringBuilder.)
                   content-buf (StringBuilder.)
                   in-thinking (atom false)
                   any-live (atom false)
                   started-answer (atom false)
                   any-content-live (atom false)]
-              (try
-                (letfn [(finish! [last-msg last-tc {:keys [cancelled?] :or {cancelled? false}}]
+              (letfn [(finish! [last-msg last-tc]
                           (when @in-thinking
                             (print ansi-reset)
                             (println)
                             (reset! in-thinking false))
                           (let [md? (config/format-markdown?)
                                 stream-live? (config/chat-stream-live-content?)
-                                buf-len (.length content-buf)]
-                            (when (and (pos? buf-len) (or (not stream-live?) md?))
+                                buf-len (.length content-buf)
+                                ;; Plain + live stream: chunks already printed; skip final. Markdown is always
+                                ;; buffered and rendered once (tables, etc. need md-render); do not stream raw MD.
+                                skip-final-render? (and stream-live? (not md?) @any-content-live)
+                                streamed? (and stream-live? @any-content-live)
+                                dumped-buf? (and (pos? buf-len) (not skip-final-render?))]
+                            (when dumped-buf?
                               (pager/emit-final-reply! {:answer-prefix answer-prefix
                                                         :raw-content (str content-buf)
                                                         :ansi-answer ansi-answer
-                                                        :ansi-reset ansi-reset})))
-                          (print ansi-reset)
-                          (println)
-                          (flush)
-                          (let [md? (config/format-markdown?)
-                                stream-live? (config/chat-stream-live-content?)
-                                streamed? (and stream-live? (not md?) @any-content-live)
-                                dumped-buf? (and (pos? (.length content-buf))
-                                                 (or (not stream-live?) md?))]
+                                                        :ansi-reset ansi-reset}))
+                            (print ansi-reset)
+                            (println)
+                            (flush)
                             {:ok true
                              :body {:message (build-message-from-stream-bufs last-msg think-buf content-buf last-tc)}
                              :live-thinking-printed? @any-live
-                             :live-content-printed? (boolean (or streamed? dumped-buf?))
-                             :cancelled? (boolean cancelled?)}))]
+                             :live-content-printed? (boolean (or streamed? dumped-buf?))}))]
                   (loop [last-seen-msg nil
                          last-tc nil]
-                    (let [line (try (.readLine ^java.io.BufferedReader rdr)
-                                    (catch java.io.IOException e
-                                      (if (gread/chat-cancel-requested?)
-                                        ::io-cancel
-                                        (throw e))))]
+                    (let [line (.readLine ^java.io.BufferedReader rdr)]
                       (cond
-                        (= line ::io-cancel)
-                        (finish! last-seen-msg last-tc {:cancelled? true})
-
                         (nil? line)
-                        (finish! last-seen-msg last-tc nil)
+                        (finish! last-seen-msg last-tc)
 
                         (str/blank? line)
                         (recur last-seen-msg last-tc)
@@ -281,15 +276,11 @@
                                   (print ct)
                                   (flush)))
                               (if done
-                                (finish! last-msg' last-tc' nil)
-                                (recur last-msg' last-tc')))))))))
-                (finally
-                  (stop-watch)
-                  (gread/reset-chat-cancel!)))))))
+                                (finish! last-msg' last-tc')
+                                (recur last-msg' last-tc')))))))))))))
       (catch Exception e
         {:ok false :error (.getMessage e)
-         :live-thinking-printed? false :live-content-printed? false
-         :cancelled? false}))))
+         :live-thinking-printed? false :live-content-printed? false}))))
 
 (defn- ollama-chat-round!
   [messages tools stream-opts]
@@ -308,49 +299,48 @@
   (let [f (or (:function tc) (get tc "function"))
         nm (str (or (:name f) (get f "name") ""))
         args (or (:arguments f) (get f "arguments"))]
-    (binding [*out* *err*]
-      (cond
-        (= nm "brave_web_search")
-        (let [q (:query (brave/parse-web-search-args args))]
-          (if (str/blank? q)
-            (println "grog: tool" nm "(query missing or empty)")
-            (println "grog: tool" nm (pr-str q))))
-        (= nm "oracle")
-        (let [q (:query (oracle/parse-oracle-args args))]
-          (if (str/blank? q)
-            (println "grog: tool" nm "(query missing or empty)")
-            (println "grog: tool" nm (pr-str (if (> (count q) 120) (str (subs q 0 120) "…") q)))))
-        (= nm "crop_workspace_image")
-        (if-let [ln (some-> (fs/tool-log-crop-line args) not-empty)]
-          (println "grog: tool" nm ln)
-          (println "grog: tool" nm "(source_path or out_path missing)"))
-        (#{"read_workspace_file" "read_workspace_dir" "write_workspace_file" "write_workspace_png" "read_office_document"
-           "read_pdf_document" "ocr_pdf_document" "analyze_pdf_line_drawings"} nm)
-        (if-let [p (some-> (fs/tool-log-path args) not-empty)]
-          (println "grog: tool" nm (pr-str p))
-          (println "grog: tool" nm "(path missing or empty)"))
-        (#{"memory_save" "memory_load" "memory_list_keys" "memory_namespaces"
-           "memory_create_namespace" "memory_delete"} nm)
-        (println "grog: tool" nm (pr-str (memory-tools/tool-log-summary nm args)))
-        (#{"list_skills" "read_skill" "save_skill" "delete_skill"} nm)
-        (println "grog: tool" nm
-                 (when (#{"read_skill" "save_skill" "delete_skill"} nm)
-                   (let [m (cond (map? args) args
-                                 (string? args) (try (json/parse-string args true) (catch Exception _ {}))
-                                 :else {})
-                         id (or (:id m) (get m "id"))]
-                     (str " " (pr-str id)))))
-        (= nm "with_api_key")
-        (println "grog: tool" nm (wkey/tool-log-summary args))
-        (= nm "run_babashka")
-        (println "grog: tool" nm (babashka/tool-log-summary args))
-        (mcp/mcp-admin-tool-name? nm)
-        (when-let [s (mcp/tool-log-summary nm args)]
-          (println "grog: tool" nm (pr-str s)))
-        (mcp/tool-name-mcp? nm)
-        (when-let [s (mcp/tool-log-summary nm args)]
-          (println "grog: tool" nm (pr-str s)))
-        :else (println "grog: tool" nm)))
+    (cond
+      (= nm "brave_web_search")
+      (let [q (:query (brave/parse-web-search-args args))]
+        (if (str/blank? q)
+          (tool-call-println! "grog: tool" nm "(query missing or empty)")
+          (tool-call-println! "grog: tool" nm (pr-str q))))
+      (= nm "oracle")
+      (let [q (:query (oracle/parse-oracle-args args))]
+        (if (str/blank? q)
+          (tool-call-println! "grog: tool" nm "(query missing or empty)")
+          (tool-call-println! "grog: tool" nm (pr-str (if (> (count q) 120) (str (subs q 0 120) "…") q)))))
+      (= nm "crop_workspace_image")
+      (if-let [ln (some-> (fs/tool-log-crop-line args) not-empty)]
+        (tool-call-println! "grog: tool" nm ln)
+        (tool-call-println! "grog: tool" nm "(source_path or out_path missing)"))
+      (#{"read_workspace_file" "read_workspace_dir" "write_workspace_file" "write_workspace_png" "read_office_document"
+         "read_pdf_document" "ocr_pdf_document" "analyze_pdf_line_drawings"} nm)
+      (if-let [p (some-> (fs/tool-log-path args) not-empty)]
+        (tool-call-println! "grog: tool" nm (pr-str p))
+        (tool-call-println! "grog: tool" nm "(path missing or empty)"))
+      (#{"memory_save" "memory_load" "memory_list_keys" "memory_namespaces"
+         "memory_create_namespace" "memory_delete"} nm)
+      (tool-call-println! "grog: tool" nm (pr-str (memory-tools/tool-log-summary nm args)))
+      (#{"list_skills" "read_skill" "save_skill" "delete_skill"} nm)
+      (tool-call-println! "grog: tool" nm
+                          (when (#{"read_skill" "save_skill" "delete_skill"} nm)
+                            (let [m (cond (map? args) args
+                                          (string? args) (try (json/parse-string args true) (catch Exception _ {}))
+                                          :else {})
+                                  id (or (:id m) (get m "id"))]
+                              (str " " (pr-str id)))))
+      (= nm "with_api_key")
+      (tool-call-println! "grog: tool" nm (wkey/tool-log-summary args))
+      (= nm "run_babashka")
+      (tool-call-println! "grog: tool" nm (babashka/tool-log-summary args))
+      (mcp/mcp-admin-tool-name? nm)
+      (when-let [s (mcp/tool-log-summary nm args)]
+        (tool-call-println! "grog: tool" nm (pr-str s)))
+      (mcp/tool-name-mcp? nm)
+      (when-let [s (mcp/tool-log-summary nm args)]
+        (tool-call-println! "grog: tool" nm (pr-str s)))
+      :else (tool-call-println! "grog: tool" nm))
     (cond
       (= nm "brave_web_search") (brave/run-web-search! args)
       (= nm "read_workspace_file") (fs/run-read-workspace-file! args)
@@ -385,7 +375,7 @@
            (when (config/with-api-key-configured?) ", with_api_key")
            (when (config/babashka-configured?) ", run_babashka")
            (when (edn-store/configured?)
-             ", memory_save, memory_load, memory_list_keys, memory_namespaces, memory_create_namespace, memory_delete; mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload; after mcp_reload also <serverId>_<toolName> for MCP")
+             ", memory_save, memory_load, memory_list_keys, memory_namespaces, memory_create_namespace, memory_delete; mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload; <serverId>_<toolName> from cached MCP tools/list (process starts on first call)")
            "."))))
 
 (defn- tool-result-messages [tool-calls]
@@ -459,7 +449,7 @@
   (println "Ollama tools in this session (same set sent to the model):")
   (doseq [{:keys [name role]} (active-tool-rows)]
     (println " " name "—" role))
-  (println "Optional tools: grog.edn (:oracle, :with-api-key, :edn-store, …); MCP via edn-store + /mcp or mcp_* tools; Brave/oracle/with_api_key use the OS keyring (/secret)."))
+  (println "Optional tools: grog.edn (:oracle, :with-api-key, :edn-store, …); MCP via edn-store + /mcp or mcp_* (cached tools/list, lazy server processes); Brave/oracle/with_api_key use the OS keyring (/secret)."))
 
 (defn- handle-tools-command! [line]
   (when (re-matches #"(?i)^/tools$" (str/trim line))
@@ -474,7 +464,7 @@
     true))
 
 (defn- print-buffered-reply!
-  "Show full answer via `grog.pager` (less-style when enabled) or inline.
+  "Show full answer (markdown vs plain per config) via `grog.pager/emit-final-reply!`.
   `<image-png>path</image-png>` opens a PNG from the workspace in a Swing viewer (see `grog.image-png`)."
   [content answer-prefix]
   (pager/emit-final-reply! {:answer-prefix answer-prefix
@@ -501,8 +491,7 @@
          (let [stream-opts (cond-> {:answer-prefix answer-prefix
                                     :thinking-iter (inc n)}
                             iter-max (assoc :thinking-max iter-max))
-               {:keys [ok body error live-thinking-printed? live-content-printed? cancelled?]
-                :or {cancelled? false}}
+               {:keys [ok body error live-thinking-printed? live-content-printed?]}
                (ollama-chat-round! msgs tools stream-opts)]
            (if-not ok
              {:ok false :error error :thinking last-thinking}
@@ -511,25 +500,16 @@
                    tcalls (message-tool-calls m)
                    content (str (or (:content m) ""))
                    ti (inc n)]
-               (if cancelled?
+               (if (seq tcalls)
+                 (recur (into (conj msgs m) (tool-result-messages tcalls))
+                        (inc n)
+                        (or thinking last-thinking))
                  {:ok true :content content :thinking (or thinking last-thinking)
                   :live-thinking-printed? (boolean live-thinking-printed?)
                   :live-content-printed? (boolean live-content-printed?)
                   :answer-prefix answer-prefix
-                  :cancelled? true
                   :thinking-iter ti
-                  :thinking-max iter-max}
-                 (if (seq tcalls)
-                   (recur (into (conj msgs m) (tool-result-messages tcalls))
-                          (inc n)
-                          (or thinking last-thinking))
-                   {:ok true :content content :thinking (or thinking last-thinking)
-                    :live-thinking-printed? (boolean live-thinking-printed?)
-                    :live-content-printed? (boolean live-content-printed?)
-                    :answer-prefix answer-prefix
-                    :cancelled? false
-                    :thinking-iter ti
-                    :thinking-max iter-max}))))))))))
+                  :thinking-max iter-max})))))))))
 
 (defn run-tool-loop-on-messages
   "Run one full Ollama tool loop from initial `messages` (for `/jobs`, chron, etc.). Returns same map as internal chat round."
@@ -574,22 +554,21 @@
     "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY; set via /secret in chat"
     "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle; :max-tokens, :temperature"
     "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
-    "Tools (Ollama): workspace read_workspace_dir + read/write files + write_workspace_png + crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; after mcp_reload, MCP remote tools as serverId_toolName (stdio, NDJSON — same as Node/Java MCP SDK)."
-    "          MCP server list is stored in edn-store (project-scoped): grog-memory/grog-mcp/servers.edn or under Projects/<project>/ — configure with /mcp or the mcp_* tools; subprocesses start only after mcp_reload (not at chat startup)."
+    "Tools (Ollama): workspace read_workspace_dir + read/write files + write_workspace_png + crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
+    "          MCP: servers.edn + tools-cache.edn under grog-memory/grog-mcp/ (or Projects/<project>/…) — /mcp or mcp_* tools; mcp_reload (or set/servers_set) re-probes servers and refreshes the cache without leaving subprocesses running."
     "          :chron {:enabled true :tasks [{:id \"…\" :every-minutes 30 :instruction \"…\"}]} — periodic Ollama+tools while chat runs (stderr banner); optional :interval-seconds"
     "          :jobs {:max-thread-turns 40} — project dialog turns injected for /jobs and chron (default 40)"
     "          :cli {:chat-history-turns N} — 0 = no memory; omit = unlimited"
     "              {:chat-show-thinking true|false} — Ollama thinking traces"
     "              {:chat-stream-live-thinking false} — buffer thinking; omit/true streams it live"
-    "              {:chat-stream-live-content false} — buffer the answer; omit/true streams it in cyan"
-    "              {:format-markdown false} — plain cyan text; omit/true renders replies as styled Markdown"
-    "              {:reply-pager false} — print assistant replies inline; omit/true uses less -R -F -X when possible"
+    "              {:chat-stream-live-content false} — always buffer the answer until the round ends"
+    "              {:format-markdown false} — plain cyan text; omit/true ANSI Markdown (buffered; tables and blocks render correctly)"
     "              {:chat-tool-loop-limit N} — optional positive cap on tool round-trips; omit for no limit"
     ""
-    "Thinking: dark green; assistant reply: cyan (or ANSI-styled Markdown when :format-markdown is true)."
+    "Thinking: dark green; assistant reply: cyan. With :format-markdown true, the answer is buffered then ANSI-rendered once (GFM tables, etc.). With :format-markdown false and :chat-stream-live-content true, answer tokens stream in cyan."
     "Markdown in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/> is parsed (legacy <text-markdown> still works); GFM pipe tables draw as box tables."
     "<image-png>workspace-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path must be under :workspace :default-root (requires display / non-headless JVM)."
-    "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each Ollama round opens with a thinking banner `── thinking k/n ──` if :chat-tool-loop-limit is set, else `── thinking k ──`. Esc during assistant output cancels generation (partial reply kept); needs JLine terminal (not plain stdin)."
+    "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each Ollama round opens with a thinking banner `── thinking k/n ──` if :chat-tool-loop-limit is set, else `── thinking k ──`."
     "Models must support Ollama tool calling for these tools (many recent instruct models)."
     ""
     "Usage:"
@@ -607,11 +586,10 @@
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under workspace cwd, or /shell alone for interactive subshell (exit to return)"
     "  /secret — list known secret keys and set/unset status (never prints values); /secret <KEY> <value> — store in OS keyring (service grog)"
-    "  /mcp — MCP server list in edn-store (/mcp help); load|save|reload|set <edn>|show [memory|disk]"
-    "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project)"
+    "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
+    "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
-    "  Esc — while the model is streaming a reply, press Esc to stop early (partial text kept; JLine TTY only)"
     ""
     "Lines are sent as user messages; prior turns are included per :chat-history-turns."]))
 
@@ -699,34 +677,87 @@
     (println (chron/status-line))
     true))
 
+(defn- mcp-print-mutation-summary! []
+  (println "MCP updated —"
+           (count (mcp/declared-servers-raw)) "server(s);"
+           (count (mcp/tool-specs-from-cache)) "cached tool(s)."
+           "/mcp save writes servers.edn."))
+
 (defn- handle-mcp-command! [line]
-  (when-let [[_ rest] (re-matches #"(?i)^/mcp(?:\s+(.*))?$" (str/trim line))]
-    (let [tail (str/trim (or rest ""))
+  ;; Bind capture as `more`, not `rest` — `rest` would shadow `clojure.core/rest` and break `(rest parts)` below.
+  (when-let [[_ more] (re-matches #"(?i)^/mcp(?:\s+(.*))?$" (str/trim line))]
+    (let [tail (str/trim (or more ""))
           tl (str/lower-case tail)]
       (try
         (cond
           (str/blank? tail)
-          (do (println "/mcp help | status | show [memory|disk] | load | save | reload | set <edn>")
+          (do (println "/mcp help | list | status | add | remove | update | set | show | load | save | reload")
               (when (edn-store/configured?)
-                (println "Persisted:" (mcp-store/store-path-hint)))
+                (println "Persisted:" (mcp-store/store-path-hint) "+" (mcp-store/tools-cache-path-hint)))
               (println (mcp/startup-status-line)))
           (= tl "help")
-          (do (println "/mcp status | show [memory|disk] | load | save | reload | set <edn>")
+          (do (println "/mcp list | status | add <id> -- <argv…> | remove <id>")
+              (println "/mcp update <id> command -- <argv…> | cwd <path|-|clear|none> | env KEY=val | env -KEY | enabled true|false")
+              (println "/mcp set <edn>   (replace whole {:servers […]} — power users)")
+              (println "/mcp show [memory|disk] | load | save | reload")
               (when (edn-store/configured?)
-                (println "Persisted:" (mcp-store/store-path-hint))))
+                (println "Store:" (mcp-store/store-path-hint))))
           (= tl "status")
           (println (mcp/startup-status-line))
-          (str/starts-with? tl "set ")
-          (let [s (str/trim (subs tail (count "set ")))]
-            (mcp/set-declared-servers-from-edn-string! s)
-            (println "MCP declarations updated in memory."
-                     (count (mcp/declared-servers-raw))
-                     "entries — /mcp reload or tool mcp_reload to spawn."))
+          (= tl "list")
+          (let [xs (mcp/declared-servers-raw)]
+            (if (empty? xs)
+              (println "No MCP servers declared.")
+              (doseq [m xs]
+                (let [cmd (:command m)
+                      c0 (str/join " " (take 6 cmd))
+                      c1 (if (> (count cmd) 6) " …" "")]
+                  (println (str (:id m)
+                                (cond (false? (:enabled m)) " [disabled]"
+                                      (:cwd m) (str "  cwd=" (pr-str (:cwd m)))
+                                      :else "")
+                                "  "
+                                c0 c1))))))
           :else
-          (let [parts (str/split tail #"\s+")
-                c (str/lower-case (first parts))
-                arg (str/trim (str/join " " (rest parts)))]
-            (case c
+          (or
+           (when-let [[_ id rest] (re-matches #"(?i)^add\s+(\S+)\s+--\s*(.*)$" tail)]
+             (mcp/add-declared-server-with-command! id (mcp/parse-shell-ish-argv rest))
+             (mcp-print-mutation-summary!)
+             true)
+           (when-let [[_ id] (re-matches #"(?i)^remove\s+(\S+)$" tail)]
+             (mcp/remove-declared-server-by-id! id)
+             (mcp-print-mutation-summary!)
+             true)
+           (when-let [[_ id rest] (re-matches #"(?i)^update\s+(\S+)\s+command\s+--\s*(.*)$" tail)]
+             (mcp/replace-declared-server-command-by-id! id (mcp/parse-shell-ish-argv rest))
+             (mcp-print-mutation-summary!)
+             true)
+           (when-let [[_ id path] (re-matches #"(?i)^update\s+(\S+)\s+cwd\s+(.*)$" tail)]
+             (mcp/set-declared-server-cwd-by-id! id path)
+             (mcp-print-mutation-summary!)
+             true)
+           (when-let [[_ id ev] (re-matches #"(?i)^update\s+(\S+)\s+env\s+(\S+)$" tail)]
+             (if (str/starts-with? ev "-")
+               (mcp/set-declared-server-env-by-id! id (subs ev 1) nil)
+               (let [pair (str/split ev #"=" 2)]
+                 (when (< (count pair) 2)
+                   (throw (ex-info "env expects KEY=value or -KEY to unset" {:token ev})))
+                 (mcp/set-declared-server-env-by-id! id (first pair) (second pair))))
+             (mcp-print-mutation-summary!)
+             true)
+           (when-let [[_ id en] (re-matches #"(?i)^update\s+(\S+)\s+enabled\s+(true|false)$" tail)]
+             (mcp/set-declared-server-enabled-by-id! id (= "true" (str/lower-case en)))
+             (mcp-print-mutation-summary!)
+             true)
+           (when (str/starts-with? tl "set ")
+             (let [s (str/trim (subs tail (count "set ")))]
+               (mcp/set-declared-servers-from-edn-string! s)
+               (mcp-print-mutation-summary!))
+             true)
+           (let [parts (str/split tail #"\s+")
+                 c (str/lower-case (first parts))
+                 arg (str/trim (str/join " " (rest parts)))]
+             (case c
               "show" (case (str/lower-case arg)
                        "" (do (println "— in-memory —")
                               (prn (mcp/declared-servers-raw))
@@ -751,9 +782,9 @@
                            (println "Saved" (mcp-store/store-path-hint)))
                        (println ":edn-store not configured — cannot save."))
               "reload" (if-not (mcp/has-declared-servers?)
-                         (println "No valid server entries — /mcp set <edn> or /mcp load first.")
+                         (println "No valid servers — /mcp add …, /mcp load, or /mcp set …")
                          (println (pr-str (mcp/reload-running-servers!))))
-              (println "Unknown /mcp — try /mcp with no args."))))
+              (println "Unknown /mcp — try /mcp help.")))))
         (catch Exception e
           (println "grog:/mcp error:" (.getMessage e)))))
     true))
@@ -808,7 +839,8 @@
     (let [rest (str/trim (subs line (count "/soul")))]
       (cond
         (str/blank? rest)
-        (println "SOUL: /soul show | path | add <markdown> | reload")
+        (do (println "SOUL: /soul show | path | add <markdown> | reload")
+            (println "     Optional `## Startup snark` in SOUL.md — add lines or bullets; one snark picked at random each chat launch (plus built-ins)."))
         (= "reload" rest)
         (try (mcp/stop-all!)
              (config/reload!)
@@ -851,17 +883,14 @@
         msgs (conj (vec (chat-ctx/system-messages)) {:role "user" :content user-text})]
     (try
       (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed? answer-prefix
-                    cancelled? thinking-iter thinking-max]
-             :or {answer-prefix "\n" cancelled? false}}
+                    thinking-iter thinking-max]
+             :or {answer-prefix "\n"}}
             (chat-with-tools! msgs {:answer-prefix "\n"})]
         (if ok
           (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
                 (print-thinking! thinking :iter thinking-iter :max thinking-max))
               (when-not live-content-printed?
                 (print-buffered-reply! content answer-prefix))
-              (when cancelled?
-                (binding [*out* *err*]
-                  (println "grog: partial reply (Esc stopped generation).")))
               (try
                 (project-dialog/append-turn! :user user-text)
                 (project-dialog/append-turn! :assistant (str content))
@@ -892,14 +921,18 @@
     (println (chron/status-line))
     (println "grog: active :cli"
              (pr-str {:chat-history-turns (config/chat-history-turns)
-                      :chat-tool-loop-limit (config/chat-tool-loop-limit)
-                      :reply-pager (config/reply-pager?)}))
+                      :chat-tool-loop-limit (config/chat-tool-loop-limit)}))
     (config/warn-if-ollama-model-missing!)
+    (println "Type /help, /tools, or /skills. /secret for OS keyring; /shell runs host commands; /jobs and /chron when :edn-store / :chron are set. quit / exit / /quit to stop. Blank line does nothing. Ctrl-D ends.")
+    (println)
     (print ansi-hot-pink)
     (println chat-initial-heading)
     (print ansi-reset)
+    (println (str ansi-snark
+                  (or (some-> (soul/startup-snark-line) str/trim not-empty)
+                      chat-startup-snark-fallback)
+                  ansi-reset))
     (flush)
-    (println "Type /help, /tools, or /skills. /secret for OS keyring; /shell runs host commands; /jobs and /chron when :edn-store / :chron are set. quit / exit / /quit to stop. Blank line does nothing. Ctrl-D ends. Esc during assistant output stops generation (partial reply kept).")
     (println)
     (try
       (chron/start!)
@@ -940,8 +973,7 @@
               (recur
                 (try
                   (let [{:keys [ok content thinking error live-thinking-printed? live-content-printed?
-                                answer-prefix cancelled? thinking-iter thinking-max]
-                         :or {cancelled? false}}
+                                answer-prefix thinking-iter thinking-max]}
                         (chat-with-tools! msgs)]
                     (if ok
                       (do (when (and (config/chat-show-thinking?) thinking (not live-thinking-printed?))
@@ -950,9 +982,6 @@
                             (print-buffered-reply! content answer-prefix))
                           (when live-content-printed?
                             (println))
-                          (when cancelled?
-                            (binding [*out* *err*]
-                              (println "grog: assistant output stopped early (Esc) — partial reply kept in history.")))
                           (try
                             (project-dialog/append-turn! :user prompt)
                             (project-dialog/append-turn! :assistant (str content))

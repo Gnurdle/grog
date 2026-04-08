@@ -109,6 +109,14 @@
 (def ^:private crop-max-pad 256)
 (def ^:private crop-default-pdf-dpi 220)
 
+(def max-pdf-raster-dpi
+  "Upper bound on PDF rasterization DPI for `ocr_pdf_document`, PDF `crop_workspace_image`, and
+  `analyze_pdf_line_drawings`. Use the same dpi when pairing OCR with line geometry or crops."
+  1200)
+
+(def ^:private default-ocr-dpi 300)
+(def ^:private min-ocr-dpi 120)
+
 (defn crop-workspace-image-tool-spec []
   {:type "function"
    :function
@@ -130,7 +138,9 @@
                               :page {:type "integer"
                                      :description "1-based page index when source is PDF (required for .pdf)."}
                               :dpi {:type "integer"
-                                    :description (str "Render DPI for PDF only (default " crop-default-pdf-dpi "; use same dpi as analyze_pdf_line_drawings).")}
+                                    :description (str "Render DPI for PDF only (default " crop-default-pdf-dpi
+                                                      "; max " max-pdf-raster-dpi
+                                                      "; use same dpi as analyze_pdf_line_drawings / ocr_pdf_document).")}
                               :pad_px {:type "integer"
                                        :description "Optional uniform margin added around the box before clamping to image bounds (0–256)."}}}}})
 
@@ -167,8 +177,10 @@
    {:name "ocr_pdf_document"
     :description (str "OCR for PDF files under the workspace that are scanned or image-only (any path under root; must be a valid PDF). "
                       "Uses high-DPI render, LSTM engine, grayscale+contrast preprocessing, and text cleanup for LLM parsing. "
-                      "If quality is poor, raise dpi (e.g. 400) or set page_seg_mode: 3=auto, 4=single column, 6=single block (default), "
-                      "11=sparse text. For diagrams/line art on the same raster, also call analyze_pdf_line_drawings (BoofCV). Requires tessdata.")
+                      "If quality is poor, raise dpi (try 400–800; up to " max-pdf-raster-dpi
+                      " for very fine print or dense diagrams — high RAM and slow; reduce max_pages). "
+                      "page_seg_mode: 3=auto, 4=single column, 6=single block (default), 11=sparse text. "
+                      "For line art on the same raster, call analyze_pdf_line_drawings at the same dpi (BoofCV). Requires tessdata.")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
@@ -176,7 +188,9 @@
                               :max_pages {:type "integer"
                                           :description "Max pages to OCR (default 30, cap 100)."}
                               :dpi {:type "integer"
-                                    :description "Render DPI (default 300; higher = sharper OCR, slower; 120–400)."}
+                                    :description (str "Render DPI (default " default-ocr-dpi "; min "
+                                                      min-ocr-dpi ", max " max-pdf-raster-dpi
+                                                      "; higher = sharper OCR, slower, more memory).")}
                               :language {:type "string"
                                          :description "Tesseract language code(s), e.g. eng, deu, eng+deu (default eng)."}
                               :page_seg_mode {:type "integer"
@@ -236,9 +250,6 @@
 
 (def ^:private default-ocr-max-pages 30)
 (def ^:private ocr-max-pages-cap 100)
-(def ^:private default-ocr-dpi 300)
-(def ^:private min-ocr-dpi 120)
-(def ^:private max-ocr-dpi 400)
 (def ^:private ocr-psm-max 13)
 
 (defn- tessdata-dir-has-lang? [^File d]
@@ -618,7 +629,7 @@
           w (get-long-opt m :width "width")
           h (get-long-opt m :height "height")
           page (get-long-opt m :page "page")
-          dpi (long (min 400 (max 72 (or (get-long-opt m :dpi "dpi") (long crop-default-pdf-dpi)))))
+          dpi (long (min max-pdf-raster-dpi (max 72 (or (get-long-opt m :dpi "dpi") (long crop-default-pdf-dpi)))))
           pad-raw (or (get-long-opt m :pad_px "pad_px")
                       (get-long-opt m :padPx "padPx"))
           pad (if (nil? pad-raw) 0 (min crop-max-pad (max 0 (long pad-raw))))]
@@ -854,7 +865,7 @@
                       (cond (number? x) (min ocr-max-pages-cap (max 1 (long x)))
                             :else default-ocr-max-pages))
           dpi (let [x (or (:dpi m) (get m "dpi"))]
-                (cond (number? x) (min max-ocr-dpi (max min-ocr-dpi (long x)))
+                (cond (number? x) (min max-pdf-raster-dpi (max min-ocr-dpi (long x)))
                       :else default-ocr-dpi))
           lang-out (or (some-> (:language m) str str/trim not-empty)
                        (some-> (get m "language") str str/trim not-empty)

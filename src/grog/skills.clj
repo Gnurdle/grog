@@ -118,7 +118,7 @@
           out (java.util.ArrayList.)]
       (doseq [^File ch arr]
         (when (and (.isDirectory ch)
-                   (.exists (io/file ch "skill.edn"))
+                   (.exists (io/file ch skill-edn-filename))
                    (.exists (io/file ch skill-md-filename)))
           (let [md-f (io/file ch skill-md-filename)
                 md-preview (slurp-skill-file! md-f)]
@@ -126,7 +126,7 @@
               (.add out {:ok false
                          :error "SKILL.md is empty"
                          :path (.getPath md-f)})
-              (let [edn-f (io/file ch "skill.edn")]
+              (let [edn-f (io/file ch skill-edn-filename)]
                 (when-some [raw (try (edn/read-string {:eof nil} (or (slurp-skill-file! edn-f) ""))
                                      (catch Exception e
                                        (.add out {:ok false
@@ -407,7 +407,7 @@
              "### Tools\n\n"
              "- **list_skills** — ids, descriptions, workspace-relative paths.\n"
              "- **read_skill** — full SKILL.md; **call this before save_skill** when editing an existing skill.\n"
-             "- **save_skill** — create or replace `skill.edn` + SKILL.md (`id`, `description`, `skill_md`; optional `title`, `tags`).\n"
+             "- **save_skill** — create or replace `skill.edn` + `SKILL.md` (`id`, `description`, `skill_md`; optional `title`, `tags`).\n"
              "- **delete_skill** — remove a skill directory (only if it contains skill.edn and/or SKILL.md).\n\n"
              "Use list_skills/read_skill when a skill matches the user's task. Use save_skill/delete_skill when they want to add, change, or remove a reusable playbook; after save_skill, call list_skills to confirm.\n\n"
              inventory

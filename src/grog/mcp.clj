@@ -1,6 +1,11 @@
 (ns grog.mcp
   "Model Context Protocol over stdio: **newline-delimited JSON** (same as `@modelcontextprotocol/sdk`
-  `serializeMessage` / `ReadBuffer`). Spawns subprocess servers, merges `tools/list`, dispatches `tools/call`."
+  `serializeMessage` / `ReadBuffer`).
+
+  Declarations live in edn-store (`servers.edn`). On **define/reload**, each server is started briefly,
+  `tools/list` is fetched, results are persisted to `tools-cache.edn`, then processes stop. Ollama sees
+  tools from that cache without subprocesses running. A server process is started **on first** matching
+  `tools/call`, then kept alive until `stop-all!` (e.g. chat exit or config reload)."
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -53,6 +58,10 @@
 
 (defonce ^:private !declared-servers (atom []))
 
+(defonce ^:private !tool-cache
+  ;; server-id string → {:fingerprint long :tools [mcp-tool-map …]}
+  (atom {}))
+
 (defn- normalize-server-cfg [m]
   (when (and (map? m) (not (false? (:enabled m))))
     (let [id-raw (some-> (:id m) str str/trim not-empty)
@@ -75,6 +84,16 @@
   "In-memory MCP server maps (same shape as persisted `{:servers [...]}` entries)."
   []
   @!declared-servers)
+
+(defn parse-shell-ish-argv
+  "Split a line into argv tokens; double-quoted and single-quoted segments stay one token."
+  [^String s]
+  (let [s (str/trim (or s ""))]
+    (if (str/blank? s)
+      []
+      (->> (re-seq #"\"([^\"]*)\"|'([^']*)'|(\S+)" s)
+           (mapv (fn [[_ dq sq w]] (first (filter some? [dq sq w]))))
+           (vec)))))
 
 (defn- normalized-declared-cfgs []
   (->> @!declared-servers (keep normalize-server-cfg) vec))
@@ -197,29 +216,39 @@
                  ^Runnable
                  (fn []
                    (try
-                     (while (.isAlive proc)
-                       (try
-                         (let [line (read-mcp-json! in)
-                               t (str/trim line)]
-                           ;; Node/Java MCP SDKs use one JSON object per line. Some servers (e.g. xlisp/datascript-mcp-server)
-                           ;; print a plain-text banner on stdout first; skip without logging.
-                           (when (str/starts-with? t "{")
-                             (try
-                               (let [msg (json/parse-string t true)]
-                                 (when-some [rid (:id msg)]
-                                   (when-some [k (pending-key rid)]
-                                     (when-some [p (.remove ^ConcurrentHashMap pending k)]
-                                       (deliver p msg)))))
-                               (catch Exception e
-                                 (when (.isAlive proc)
-                                   (binding [*out* *err*]
-                                     (println "grog mcp [" id "] bad JSON line:" (.getMessage e)))
-                                   (Thread/sleep 20))))))
-                         (catch Exception e
-                           (when (.isAlive proc)
-                             (binding [*out* *err*]
-                               (println "grog mcp [" id "] read error:" (.getMessage e)))
-                             (Thread/sleep 50)))))
+                     (letfn [(read-one! []
+                               (try
+                                 (let [line (read-mcp-json! in)
+                                       t (str/trim line)]
+                                   (when (str/starts-with? t "{")
+                                     (try
+                                       (let [msg (json/parse-string t true)]
+                                         (when-some [rid (:id msg)]
+                                           (when-some [k (pending-key rid)]
+                                             (when-some [p (.remove ^ConcurrentHashMap pending k)]
+                                               (deliver p msg)))))
+                                       (catch Exception e
+                                         (when (.isAlive proc)
+                                           (binding [*out* *err*]
+                                             (println "grog mcp [" id "] bad JSON line:" (.getMessage e)))
+                                           (Thread/sleep 20)))))
+                                   :continue)
+                                 (catch Exception e
+                                   (let [msg (.getMessage e)]
+                                     (if (= "EOF reading MCP line" msg)
+                                       ;; Child closed stdout (normal when the process is stopped).
+                                       :stop
+                                       (do
+                                         (when (.isAlive proc)
+                                           (binding [*out* *err*]
+                                             (println "grog mcp [" id "] read error:" msg))
+                                           (Thread/sleep 50))
+                                         :continue))))))]
+                       (loop []
+                         (when (.isAlive proc)
+                           (case (read-one!)
+                             :stop nil
+                             :continue (recur)))))
                      (catch Exception _ nil))))
             (.setDaemon true)
             (.start))]
@@ -294,34 +323,51 @@
       (stop-server! srv))
     (swap! !state assoc :servers {})))
 
-(defn- ensure-servers!
-  []
+(defn- cfg-fingerprint
+  "Invalidate cached `tools/list` when command/cwd/env/id change."
+  [c]
+  (hash (select-keys c [:id :command :cwd :env])))
+
+(defn- probe-one-server-for-tools!
+  "Start server, initialize, return tools/list, always stop process."
+  [{:keys [id] :as c}]
+  (try
+    (let [srv (make-server! c)
+          in (init-server! srv)]
+      (try
+        (if (:error in)
+          {:error (str "init failed: " (pr-str (:error in))) :id id}
+          (let [tools (all-mcp-tools! srv)]
+            (if (:error tools)
+              {:error (str "tools/list failed: " (pr-str (:error tools))) :id id}
+              {:ok (:ok tools) :id id})))
+        (finally (stop-server! srv))))
+    (catch Exception e
+      {:error (.getMessage e) :id id})))
+
+(defn- start-new-mcp-server! [^String sid cfg]
+  (let [srv (make-server! cfg)
+        in (init-server! srv)]
+    (if (:error in)
+      (do (stop-server! srv)
+          (throw (ex-info "MCP initialize failed" {:id sid :mcp (:error in)})))
+      (let [tools (all-mcp-tools! srv)]
+        (if (:error tools)
+          (do (stop-server! srv)
+              (throw (ex-info "MCP tools/list failed" {:id sid :mcp (:error tools)})))
+          (let [srv2 (assoc srv :tools (:ok tools))]
+            (swap! !state update :servers assoc sid srv2)
+            srv2))))))
+
+(defn- ensure-server-running!
+  "Start `sid` if needed; returns server state map with :process :tools …"
+  ^clojure.lang.IPersistentMap [^String sid]
   (locking registry-lock
-    (when (empty? (:servers @!state))
-      (let [cfgs (normalized-declared-cfgs)
-            started (reduce (fn [acc {:keys [id] :as c}]
-                              (try
-                                (let [srv (make-server! c)
-                                      in (init-server! srv)]
-                                  (if (:error in)
-                                    (do (binding [*out* *err*]
-                                          (println "grog mcp: server" (pr-str id) "init failed:" (:error in)))
-                                        (stop-server! srv)
-                                        acc)
-                                    (let [tools (all-mcp-tools! srv)]
-                                      (if (:error tools)
-                                        (do (binding [*out* *err*]
-                                              (println "grog mcp: server" (pr-str id) "tools/list failed:" (:error tools)))
-                                            (stop-server! srv)
-                                            acc)
-                                        (assoc acc id (assoc srv :tools (:ok tools)))))))
-                                (catch Exception e
-                                  (binding [*out* *err*]
-                                    (println "grog mcp: server" (pr-str id) "start error:" (.getMessage e)))
-                                  acc)))
-                            {}
-                            cfgs)]
-        (swap! !state assoc :servers started)))))
+    (or (get-in @!state [:servers sid])
+        (let [cfg (some #(when (= sid (:id %)) %) (normalized-declared-cfgs))]
+          (when-not cfg
+            (throw (ex-info "unknown MCP server id" {:id sid})))
+          (start-new-mcp-server! sid cfg)))))
 
 (defn configured?
   "True when at least one valid server is declared in memory (disk may differ until load)."
@@ -332,34 +378,47 @@
   []
   (boolean (seq (:servers @!state))))
 
-(defn tool-specs-dynamic
-  "Ollama tools from running MCP servers only (after `mcp_reload` / `reload-running-servers!`)."
+(defn- mcp-tool-maps->specs [^String sid tools]
+  (vec
+   (for [t tools
+         :let [tn (str (or (:name t) ""))
+               td (str (or (:description t) ""))
+               schema (:inputSchema t)]
+         :when (not (str/blank? tn))]
+     {:type "function"
+      :function
+      {:name (mcp-tool-fn-name sid tn)
+       :description (str "[MCP " sid "] " td)
+       :parameters (input-schema->parameters schema)}})))
+
+(defn tool-specs-from-cache
+  "Ollama tools from persisted `tools/list` (fingerprint must match current declaration)."
   []
-  (when (mcp-servers-running?)
-    (let [servers (:servers @!state)]
-      (vec
-       (for [[sid srv] servers
-             t (:tools srv)
-             :let [tn (str (or (:name t) ""))
-                   td (str (or (:description t) ""))
-                   schema (:inputSchema t)]
-             :when (not (str/blank? tn))]
-         {:type "function"
-          :function
-          {:name (mcp-tool-fn-name sid tn)
-           :description (str "[MCP " sid "] " td)
-           :parameters (input-schema->parameters schema)}})))))
+  (vec
+   (mapcat
+    (fn [c]
+      (let [sid (:id c)
+            fp (cfg-fingerprint c)
+            ent (get @!tool-cache sid)]
+        (when (and ent (= fp (:fingerprint ent)))
+          (mcp-tool-maps->specs sid (:tools ent)))))
+    (normalized-declared-cfgs))))
+
+(defn tool-specs-dynamic
+  "Deprecated name: specs come from cache, not running processes."
+  []
+  (tool-specs-from-cache))
 
 (defn mcp-admin-tool-specs
-  "Load/save/replace declaration and start subprocesses — requires `:edn-store` in grog.edn."
+  "Load/save/replace declarations and refresh cached `tools/list` — requires `:edn-store` in grog.edn."
   []
   (when (store/configured?)
     [{:type "function"
       :function
       {:name "mcp_config_load"
-       :description (str "Load MCP server list from edn-store file (project-scoped: "
-                         (mcp-store/store-path-hint)
-                         "). Replaces in-memory list and stops running MCP; call mcp_reload to spawn.")
+       :description (str "Load MCP server list from edn-store (" (mcp-store/store-path-hint)
+                         ") and tools cache (" (mcp-store/tools-cache-path-hint)
+                         "). Stops running MCP subprocesses.")
        :parameters {:type "object" :properties {}}}}
      {:type "function"
       :function
@@ -369,8 +428,8 @@
      {:type "function"
       :function
       {:name "mcp_servers_set"
-       :description (str "Replace MCP server declarations entirely. Each entry: :id, :command (vector or shell string), optional :cwd :env :enabled. "
-                         "Stops running MCP. Call mcp_reload to start.")
+       :description (str "Replace MCP server declarations. Each entry: :id, :command (vector or shell string), optional :cwd :env :enabled. "
+                         "Probes each server, updates " (mcp-store/tools-cache-path-hint) ", stops processes.")
        :parameters {:type "object"
                     :properties {:servers {:type "array"
                                            :description "Vector of server maps"}}
@@ -378,44 +437,40 @@
      {:type "function"
       :function
       {:name "mcp_reload"
-       :description "Stop MCP subprocesses, spawn all declared servers, refresh tools/list for Ollama (next round includes fs_* etc.)."
+       :description (str "Re-probe every declared server (tools/list), refresh " (mcp-store/tools-cache-path-hint)
+                         ", stop subprocesses. Ollama then sees updated MCP tools without leaving servers running.")
        :parameters {:type "object" :properties {}}}}]))
 
 (defn tool-specs-for-chat
-  "Admin tools + dynamic MCP tools (if processes are up)."
+  "Admin tools + MCP tools from cached tools/list (subprocesses start on first tools/call)."
   []
-  (vec (concat (or (mcp-admin-tool-specs) []) (or (tool-specs-dynamic) []))))
+  (vec (concat (or (mcp-admin-tool-specs) []) (tool-specs-from-cache))))
 
 (defn run-tool!
-  "Execute tools/call; returns JSON string for Ollama tool result."
+  "Execute tools/call; starts the backing MCP process on demand if needed."
   [^String fn-name arguments]
   (if-let [[sid tname] (parse-mcp-tool-fn-name fn-name)]
     (try
-      (if-not (mcp-servers-running?)
-        (json/generate-string
-         {:error true
-          :message "MCP servers are not running — call tool mcp_reload (or /mcp reload) after declaring servers."})
-        (if-let [srv (get (:servers @!state) sid)]
-          (let [args (cond
-                       (map? arguments) arguments
-                       (string? arguments) (try (json/parse-string arguments true)
-                                                (catch Exception _ {}))
-                       :else {})
-                r (rpc! srv "tools/call" {:name tname :arguments args})]
-            (if (:error r)
-              (json/generate-string {:error true :mcp (:error r)})
-              (let [content (get-in r [:ok :content])]
-                (json/generate-string
-                 {:ok true
-                  :mcp_tool tname
-                  :content (if (sequential? content)
-                             (str/join "\n\n"
-                                       (for [c content]
-                                         (case (keyword (str/lower-case (str (:type c))))
-                                           :text (str (:text c))
-                                           (pr-str c))))
-                             (pr-str (:ok r)))}))))
-          (json/generate-string {:error true :message (str "MCP server not in running set: " sid)})))
+      (let [srv (ensure-server-running! sid)
+            args (cond
+                   (map? arguments) arguments
+                   (string? arguments) (try (json/parse-string arguments true)
+                                              (catch Exception _ {}))
+                   :else {})
+            r (rpc! srv "tools/call" {:name tname :arguments args})]
+        (if (:error r)
+          (json/generate-string {:error true :mcp (:error r)})
+          (let [content (get-in r [:ok :content])]
+            (json/generate-string
+             {:ok true
+              :mcp_tool tname
+              :content (if (sequential? content)
+                         (str/join "\n\n"
+                                   (for [c content]
+                                     (case (keyword (str/lower-case (str (:type c))))
+                                       :text (str (:text c))
+                                       (pr-str c))))
+                         (pr-str (:ok r)))}))))
       (catch Exception e
         (json/generate-string {:error true :message (.getMessage e)})))
     (json/generate-string {:error true :message "not an mcp tool name"})))
@@ -438,14 +493,155 @@
                                  (catch Exception _ {}))
         :else {}))
 
+(defn- cache-map-key->sid [k]
+  (str (if (keyword? k) (name k) k)))
+
+(defn load-tool-cache-from-disk!
+  "Read `tools-cache.edn` into `!tool-cache` (project-scoped). Call after declarations are loaded."
+  []
+  (reset! !tool-cache {})
+  (when (store/configured?)
+    (when-let [raw (mcp-store/read-tools-cache-map)]
+      (when-let [by (:by-server raw)]
+        (reset! !tool-cache
+                (into {}
+                      (for [[k v] by
+                            :when (map? v)]
+                        [(cache-map-key->sid k)
+                         {:fingerprint (:fingerprint v)
+                          :tools (vec (or (:tools v) []))}])))))))
+
+(defn probe-all-and-persist-cache!
+  "Start each declared server briefly, fetch tools/list, write tools-cache.edn, leave no processes running."
+  []
+  (if-not (store/configured?)
+    (throw (ex-info "edn-store not configured" {}))
+    (do
+      (stop-all!)
+      (let [results (for [c (normalized-declared-cfgs)]
+                      (let [sid (:id c)
+                            fp (cfg-fingerprint c)
+                            r (probe-one-server-for-tools! c)]
+                        [sid fp r]))
+            by-server
+            (into {}
+                  (keep (fn [[sid fp r]]
+                          (when (:ok r)
+                            [sid {:fingerprint fp :tools (vec (:ok r))}])))
+                  results)]
+        (doseq [[sid _ r] results :when (:error r)]
+          (binding [*out* *err*]
+            (println "grog mcp: probe" (pr-str (or (:id r) sid)) "-" (:error r))))
+        (reset! !tool-cache by-server)
+        (mcp-store/write-tools-cache-map! {:by-server by-server})
+        {:ok true
+         :probed (count results)
+         :cached-servers (count by-server)
+         :tool-count (reduce + (map (comp count :tools val) by-server))}))))
+
+(defn- find-server-index-by-sanitized-id [^String id-str]
+  (let [want (sanitize-server-id id-str)]
+    (first (keep-indexed (fn [i m]
+                           (when (= want (sanitize-server-id (str (:id m))))
+                             i))
+                         @!declared-servers))))
+
+(defn- replace-declared-and-probe!
+  "Replace declaration vector, stop subprocesses, re-probe or clear cache.
+  Returns the probe summary map (or `{:ok true :no-edn-store true}` when store is off)."
+  [servers-vec]
+  (reset! !declared-servers (vec servers-vec))
+  (stop-all!)
+  (if (store/configured?)
+    (probe-all-and-persist-cache!)
+    (do (reset! !tool-cache {})
+        {:ok true :no-edn-store true})))
+
+(defn add-declared-server-with-command!
+  "`argv` is command vector (e.g. from `parse-shell-ish-argv`). Id is normalized via `sanitize-server-id`."
+  [^String id-str argv]
+  (when (empty? argv)
+    (throw (ex-info "command argv empty (need tokens after --)" {})))
+  (let [sid (sanitize-server-id id-str)]
+    (when (str/blank? sid)
+      (throw (ex-info "invalid server id" {:id id-str})))
+    (when (some? (find-server-index-by-sanitized-id sid))
+      (throw (ex-info "server id already exists" {:id sid})))
+    (replace-declared-and-probe!
+     (conj @!declared-servers {:id sid :command (vec (map str argv))}))))
+
+(defn remove-declared-server-by-id!
+  [^String id-str]
+  (let [want (sanitize-server-id id-str)
+        sv (vec (remove (fn [m] (= want (sanitize-server-id (str (:id m)))))
+                        @!declared-servers))]
+    (when (= (count sv) (count @!declared-servers))
+      (throw (ex-info "no such server id" {:id id-str})))
+    (replace-declared-and-probe! sv)))
+
+(defn replace-declared-server-command-by-id!
+  [^String id-str argv]
+  (when (empty? argv)
+    (throw (ex-info "command argv empty" {})))
+  (if-let [i (find-server-index-by-sanitized-id id-str)]
+    (replace-declared-and-probe!
+     (update @!declared-servers i assoc :command (vec (map str argv))))
+    (throw (ex-info "no such server id" {:id id-str}))))
+
+(defn set-declared-server-cwd-by-id!
+  "`path` blank, `-`, `clear`, or `none` (case-insensitive) clears :cwd."
+  [^String id-str path]
+  (if-let [i (find-server-index-by-sanitized-id id-str)]
+    (replace-declared-and-probe!
+     (update @!declared-servers i
+             (fn [m]
+               (let [raw (some-> path str str/trim)
+                     p (when raw
+                         (if (contains? #{"-" "clear" "none"} (str/lower-case raw))
+                           nil
+                           raw))]
+                 (if (str/blank? p)
+                   (dissoc m :cwd)
+                   (assoc m :cwd p))))))
+    (throw (ex-info "no such server id" {:id id-str}))))
+
+(defn set-declared-server-env-by-id!
+  "Merge one env var (`val` nil removes key). Keys are strings."
+  [^String id-str ^String key ^String val]
+  (when (str/blank? key)
+    (throw (ex-info "env key empty" {})))
+  (if-let [i (find-server-index-by-sanitized-id id-str)]
+    (replace-declared-and-probe!
+     (update @!declared-servers i
+             (fn [m]
+               (let [k (str key)
+                     env (or (:env m) {})]
+                 (assoc m :env
+                        (if (and val (not (str/blank? (str val))))
+                          (assoc env k (str val))
+                          (dissoc env k)))))))
+    (throw (ex-info "no such server id" {:id id-str}))))
+
+(defn set-declared-server-enabled-by-id!
+  [^String id-str enabled?]
+  (if-let [i (find-server-index-by-sanitized-id id-str)]
+    (replace-declared-and-probe!
+     (update @!declared-servers i
+             (fn [m]
+               (if enabled?
+                 (dissoc m :enabled)
+                 (assoc m :enabled false)))))
+    (throw (ex-info "no such server id" {:id id-str}))))
+
 (defn try-load-declared-config!
-  "Read MCP servers from edn-store (`grog-mcp/servers.edn`, project-scoped). Clears running subprocesses."
+  "Read MCP servers from edn-store (`grog-mcp/servers.edn`, project-scoped). Clears running subprocesses; loads tools cache."
   []
   (when (store/configured?)
     (let [raw (mcp-store/read-servers-map)
           sv (when (map? raw) (:servers raw))]
       (reset! !declared-servers (vec (if (sequential? sv) sv [])))
-      (stop-all!))))
+      (stop-all!)
+      (load-tool-cache-from-disk!))))
 
 (defn save-declared-config-to-store!
   "Persist current in-memory declarations."
@@ -455,30 +651,23 @@
     (mcp-store/write-servers-map! @!declared-servers)))
 
 (defn set-declared-servers-from-edn-string!
-  "Parse `{:servers [...]}` or a vector of server maps; replaces in-memory list and stops MCP."
+  "Parse `{:servers [...]}` or a vector of server maps; replaces in-memory list, probes and caches tools."
   [^String s]
   (when (str/blank? s)
     (throw (ex-info "expected EDN after /mcp set" {})))
   (let [o (edn/read-string s)]
     (cond
       (and (map? o) (sequential? (:servers o)))
-      (do (reset! !declared-servers (mapv walk/keywordize-keys (:servers o)))
-          (stop-all!))
+      (replace-declared-and-probe! (mapv walk/keywordize-keys (:servers o)))
       (sequential? o)
-      (do (reset! !declared-servers (mapv walk/keywordize-keys o))
-          (stop-all!))
+      (replace-declared-and-probe! (mapv walk/keywordize-keys o))
       :else
       (throw (ex-info "expected {:servers [...]} or a vector of server maps" {:read o})))))
 
 (defn reload-running-servers!
-  "Stop MCP, spawn from declared list, return summary (for tool + /mcp)."
+  "Re-probe all servers, refresh tools cache, stop subprocesses. Return summary (for tool + /mcp)."
   []
-  (stop-all!)
-  (ensure-servers!)
-  (let [live (:servers @!state)]
-    {:ok (boolean (seq live))
-     :server-ids (vec (keys live))
-     :tool-count (reduce + (map (comp count :tools val) live))}))
+  (probe-all-and-persist-cache!))
 
 (defn run-mcp-admin-tool!
   "Returns JSON string for Ollama tool role."
@@ -503,15 +692,19 @@
         (let [sv (or (:servers m) (get m "servers"))]
           (if-not (sequential? sv)
             (json/generate-string {:error true :message ":servers must be an array"})
-            (let [norm (mapv walk/keywordize-keys sv)]
-              (reset! !declared-servers norm)
-              (stop-all!)
-              (json/generate-string {:ok true :declared (count (normalized-declared-cfgs))
-                                     :hint "call mcp_reload to start subprocesses"}))))
+            (let [norm (mapv walk/keywordize-keys sv)
+                  sum (replace-declared-and-probe! norm)]
+              (json/generate-string
+               (merge sum
+                      {:declared (count norm)}
+                      (when (:no-edn-store sum)
+                        {:hint "edn-store off — no tools cache persisted"}))))))
         "mcp_reload"
         (if-not (has-declared-servers?)
           (json/generate-string {:error true :message "No valid servers declared — mcp_servers_set or mcp_config_load first"})
-          (json/generate-string (reload-running-servers!)))
+          (if-not (store/configured?)
+            (json/generate-string {:error true :message "edn-store not configured"})
+            (json/generate-string (reload-running-servers!))))
         (json/generate-string {:error true :message (str "unknown mcp admin tool: " nm)})))
     (catch Exception e
       (json/generate-string {:error true :message (.getMessage e)}))))
@@ -522,8 +715,9 @@
   (if-not (store/configured?)
     "mcp: needs :edn-store — then /mcp, tools mcp_config_load | mcp_config_save | mcp_servers_set | mcp_reload"
     (str "mcp: " (mcp-store/store-path-hint)
+         " + " (mcp-store/tools-cache-path-hint)
          " — " (count (normalized-declared-cfgs)) " declared"
+         ", " (count (tool-specs-from-cache)) " cached tool(s)"
          (when (mcp-servers-running?)
-           (str ", " (count (:servers @!state)) " running, "
-                (reduce + (map (comp count :tools val) (:servers @!state))) " tools"))
+           (str ", " (count (:servers @!state)) " server process(es) up"))
          " — /mcp help")))

@@ -1,6 +1,6 @@
 # Grog
 
-Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, Grog runs them on your machine, and the turn ends when you get a plain-text answer (or an error / you press Esc). There is **no tool-round cap by default**; you can set `:cli :chat-tool-loop-limit` only if you want an explicit ceiling. Behavior is shaped by **`grog.edn`** and optional **SOUL.md**—no code changes required.
+Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, Grog runs them on your machine, and the turn ends when you get a plain-text answer (or an error). There is **no tool-round cap by default**; you can set `:cli :chat-tool-loop-limit` only if you want an explicit ceiling. Behavior is shaped by **`grog.edn`** and optional **SOUL.md**—no code changes required.
 
 ---
 
@@ -29,7 +29,7 @@ Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, G
 | **Projects** | `/project` ties **`memory_*`** tools and dialog logging into per-project trees—iterable, restartable workstreams. |
 | **Jobs** | With **`:edn-store`**, **`/jobs`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
 | **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same Ollama+tools stack); respects **active project** and thread context when set. |
-| **Skills** | Packaged `skill.edn` + **SKILL.md** dirs; the model can list, read, create, and update skills. |
+| **Skills** | Packaged `skill.edn` + `SKILL.md` directories; the model can list, read, create, and update skills. |
 | **Babashka** | Optional **`run_babashka`** for short scripted side effects (`bb` on `PATH`). |
 
 Symlinks **inside** the workspace are followed for tools; `..` cannot escape the configured root.
@@ -43,9 +43,8 @@ Symlinks **inside** the workspace are followed for tools; `..` cannot escape the
 - **Ollama `/api/chat`** with **tool calling** (use a model that supports tools).
 - **Multi-step rounds** — **unlimited by default** (runs until the model returns text without `tool_calls`). Set `:cli :chat-tool-loop-limit` to a **positive integer** only if you want a hard stop. With thinking enabled: banner is **`── thinking k ──`** when unlimited, **`── thinking k/n ──`** when a limit is set.
 - **Session history** — `:cli :chat-history-turns` or **`/clear`** / **`/fresh`**.
-- **Streaming** — optional live thinking + streamed answer; **Esc** cancels mid-stream (JLine TTY).
-- **Markdown** — optional ANSI rendering (tables, code fences, etc.).
-- **Reply pager** — by default, finished assistant text is shown in **`less -R -F -X`** when you have a normal terminal and **`less`** on `PATH` (ANSI, quit if one screen). Set **`:cli :reply-pager false`** for inline printing only.
+- **Streaming** — optional live thinking; answer tokens stream in cyan only when **`:format-markdown` is false**. With default Markdown rendering, the reply is buffered for the round so GFM tables and layout render correctly. Set **`:cli :chat-stream-live-content false`** to buffer plain text too until the round completes.
+- **Markdown** — optional ANSI rendering (tables, code fences, etc.); replies are buffered for the round when Markdown is on so GFM pipe tables draw as box tables.
 - **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits.
 
 ### Workspace
@@ -107,7 +106,7 @@ Config merges in order:
 
 **Required:** `:ollama {:url … :model …}`.
 
-**Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:cli` (history, thinking, streaming, markdown, **reply pager** (`:reply-pager`), optional **`chat-tool-loop-limit`** only).
+**Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
 
 ### MCP servers
 
@@ -119,7 +118,7 @@ MCP is **not** configured in `grog.edn`. With **`:edn-store`**, the server list 
 ### Persistent text
 
 - **SOUL.md** (`:soul {:path …}`) — prepended as a **system** message every request.  
-- **Skills** — `<root>/<id>/skill.edn` + **SKILL.md**; preview with **`/skills <id>`**.
+- **Skills** — `<root>/<id>/skill.edn` + `SKILL.md`; preview with **`/skills <id>`**.
 
 ---
 
