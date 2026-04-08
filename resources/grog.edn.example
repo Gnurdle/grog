@@ -1,0 +1,28 @@
+{:workspace {:default-root "/absolute/path/to/project"
+             ;; Reads, docx :write-to, and workspace-write: paths must fall under one of these roots (or under default-root).
+             :allowed-roots ["/absolute/path/to/project" "/tmp"]}
+ ;; Brave: store subscription token in OS keyring (service "grog", account "BRAVE_SEARCH_API") — chat: /secret BRAVE_SEARCH_API <token>
+ :ollama {:url "http://localhost:11434"
+          :model "qwen3.5:9b"}
+ :soul {:path "SOUL.md"}
+ ;; Skills: each subdir of these roots under workspace must contain skill.edn + SKILL.md
+ :skills {:roots ["skills"]
+          ;; :max-body-chars 65536
+          ;; :prompt-skill-lines 16
+          }
+ ;; Optional: Babashka binary for :babashka-run (default bb on PATH).
+ :babashka {:executable "bb"}
+ ;; Optional: Grog-owned SQLite (:path relative to workspace or absolute).
+ ;; Todos (`/todo`, tool :todo) use `grog_todos`; project memory uses `grog_project_memory`.
+ :sqlite {:path ".grog/grog.db"
+          :max-rows 500}
+ ;; Optional: project memory — optional git-friendly markdown mirror (rewritten on add/rm).
+ ;; :max-chars caps text injected into every :grog prompt (default 24000).
+ :project {:export-path "PROJECT_MEMORY.md"
+           :max-chars 24000}
+ :cli {:verbose-steps false
+       ;; Prior user/assistant pairs prepended to each chat message. `0` = stateless (no old replies).
+       ;; Omit key = unlimited (grows forever; use /clear or /fresh in chat to reset).
+       :chat-history-turns 12
+       ;; When true/false: always/never print model `:thinking` in chat (pale green). Omit: only if JVM has a console.
+       :chat-show-thinking true}}
