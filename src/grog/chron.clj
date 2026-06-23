@@ -1,6 +1,6 @@
 (ns grog.chron
   "Scheduled tasks while chat is running (`:chron` in grog.edn). Each tick prints a banner on stderr
-  and runs the Ollama tool loop with current session context (project + thread when applicable)."
+  and runs the LLM tool loop with current session context (project + thread when applicable)."
   (:require [clojure.string :as str]
             [grog.chat-context :as chat]
             [grog.config :as cfg]

@@ -1,5 +1,5 @@
 (ns grog.fs
-  "Workspace-scoped file tools for Ollama: read/write text, Office, PDF, OCR."
+  "Workspace-scoped file tools: read/write text, Office, PDF, OCR."
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -47,11 +47,14 @@
     :description (str "Read any regular file under the workspace (any path at or below :workspace :default-root). "
                       "Valid UTF-8 is returned as text; otherwise bytes are returned as Base64 (`:type` binary). "
                       "For structured PDF/Office extraction prefer read_pdf_document / read_office_document / ocr_pdf_document. "
-                      "To write text use write_workspace_file; PNG binary use write_workspace_png.")
+                      "To write text use write_workspace_file; PNG binary use write_workspace_png. "
+                      "Use `offset` to read a file in chunks when it exceeds `max_bytes`.")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
                                     :description "Path relative to workspace root, or absolute if still under that root."}
+                              :offset {:type "integer"
+                                       :description "Byte offset to start reading from (default 0)."}
                               :max_bytes {:type "integer"
                                           :description "Max bytes to read (default 524288). Capped at 2097152."}}}}})
 
@@ -435,12 +438,25 @@
       (json/generate-string {:error (or (.getMessage e) "directory listing failed")
                              :detail (str e)}))))
 
+(defn- read-file-range [^File f ^long offset ^long max-bytes]
+  (let [len (.length f)
+        off (max 0 (min offset len))
+        to-read (max 0 (min max-bytes (- len off)))
+        ba (byte-array to-read)]
+    (when (pos? to-read)
+      (with-open [raf (java.io.RandomAccessFile. f "r")]
+        (.seek raf off)
+        (.readFully raf ba)))
+    {:bytes ba :offset off :has_more (< (+ off to-read) len)}))
+
 (defn run-read-workspace-file!
   [arguments]
   (try
     (let [m (parse-args-map arguments)
           path-str (or (some-> (:path m) str str/trim not-empty)
                        (some-> (get m "path") str str/trim not-empty))
+          offset (let [x (or (:offset m) (get m "offset"))]
+                   (if (number? x) (max 0 (long x)) 0))
           max-bytes (let [x (or (:max_bytes m) (get m "max_bytes"))]
                       (cond (number? x) (min text-max-cap (max 1 (long x)))
                             :else default-text-max))
@@ -452,25 +468,213 @@
         (not (.isFile f))
         (json/generate-string {:error "not a regular file" :path path-str})
 
-        (> (.length f) max-bytes)
-        (json/generate-string {:error "file too large for read_workspace_file"
-                               :path path-str
-                               :size_bytes (.length f)
-                               :max_bytes max-bytes})
-
         :else
-        (let [^bytes bs (Files/readAllBytes (.toPath f))]
+        (let [{:keys [bytes ^long offset has-more]} (read-file-range f offset max-bytes)
+              bs ^bytes bytes]
           (if (bytes-valid-utf-8? bs)
             (json/generate-string {:type "text"
                                    :path path-str
-                                   :size_bytes (alength bs)
+                                   :size_bytes (.length f)
+                                   :offset offset
+                                   :bytes_read (alength bs)
+                                   :has_more has-more
                                    :content (String. bs StandardCharsets/UTF_8)})
             (json/generate-string {:type "binary"
                                    :path path-str
-                                   :size_bytes (alength bs)
+                                   :size_bytes (.length f)
+                                   :offset offset
+                                   :bytes_read (alength bs)
+                                   :has_more has-more
                                    :encoding "base64"
                                    :note "Not valid UTF-8; content is Base64."
                                    :content (.encodeToString (Base64/getEncoder) bs)})))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "read failed")
+                             :detail (str e)}))))
+
+(defn grep-workspace-file-tool-spec []
+  {:type "function"
+   :function
+   {:name "grep_workspace_file"
+    :description (str "Search for lines matching a regex pattern inside a text file under the workspace. "
+                      "Returns matching lines with their line numbers. Useful for finding settings in config files "
+                      "without reading the entire file.")
+    :parameters {:type "object"
+                 :required ["path" "search"]
+                 :properties {:path {:type "string"
+                                    :description "Path relative to workspace root, or absolute if still under that root."}
+                              :search {:type "string"
+                                       :description "Regex pattern to search for (Java regex syntax)."}
+                              :max_results {:type "integer"
+                                           :description "Max number of matching lines to return (default 500, cap 5000)."}
+                              :case_sensitive {:type "boolean"
+                                              :description "Whether the search is case-sensitive (default true)."}}}}})
+
+(defn- grep-file-lines [^File f ^java.util.regex.Pattern pattern ^long max-results]
+  (with-open [rdr (io/reader f)]
+    (loop [line-num 1
+           matches []]
+      (if-let [line (.readLine ^java.io.BufferedReader rdr)]
+        (if (>= (count matches) max-results)
+          matches
+          (recur (inc line-num)
+                 (if (.find (.matcher pattern line))
+                   (conj matches {:line line-num :text line})
+                   matches)))
+        matches))))
+
+(defn run-grep-workspace-file!
+  [arguments]
+  (try
+    (let [m (parse-args-map arguments)
+          path-str (or (some-> (:path m) str str/trim not-empty)
+                       (some-> (get m "path") str str/trim not-empty))
+          search-str (or (some-> (:search m) str str/trim not-empty)
+                         (some-> (get m "search") str str/trim not-empty))
+          case-sensitive? (if (contains? m :case_sensitive)
+                            (boolean (:case_sensitive m))
+                            (if (contains? m "case_sensitive")
+                              (boolean (get m "case_sensitive"))
+                              true))
+          max-results (let [x (or (:max_results m) (get m "max_results"))]
+                        (cond (number? x) (min 5000 (max 1 (long x)))
+                              :else 500))
+          ^File f (resolve-file-under-workspace! path-str)]
+      (cond
+        (not (.exists f))
+        (json/generate-string {:error "file not found" :path path-str})
+
+        (not (.isFile f))
+        (json/generate-string {:error "not a regular file" :path path-str})
+
+        (str/blank? search-str)
+        (json/generate-string {:error "search pattern is required" :path path-str})
+
+        :else
+        (let [pattern (if case-sensitive?
+                        (re-pattern search-str)
+                        (re-pattern (str "(?i:" search-str ")")))
+              matches (grep-file-lines f pattern max-results)]
+          (json/generate-string {:path path-str
+                                 :pattern search-str
+                                 :matches matches
+                                 :count (count matches)
+                                 :truncated (>= (count matches) max-results)}))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "grep failed")
+                             :detail (str e)}))))
+
+(defn stat-workspace-file-tool-spec []
+  {:type "function"
+   :function
+   {:name "stat_workspace_file"
+    :description (str "Get metadata for a file under the workspace: size in bytes, line count, and newline type "
+                      "(LF or CRLF). This helps plan chunk sizes before reading a large file.")
+    :parameters {:type "object"
+                 :required ["path"]
+                 :properties {:path {:type "string"
+                                    :description "Path relative to workspace root, or absolute if still under that root."}}}}})
+
+(defn- file-newline-type [^File f]
+  (with-open [rdr (io/reader f)]
+    (loop [crlf 0
+           lf 0]
+      (let [ch (.read ^java.io.BufferedReader rdr)]
+        (cond
+          (neg? ch) (cond (> crlf 0) "CRLF" (> lf 0) "LF" :else "unknown")
+          (== ch (int \return)) (let [next-ch (.read ^java.io.BufferedReader rdr)]
+                                  (if (== next-ch (int \newline))
+                                    (recur (inc crlf) lf)
+                                    (do (when (not (neg? next-ch))
+                                          (.unread ^java.io.BufferedReader rdr next-ch))
+                                        (recur crlf (inc lf)))))
+          (== ch (int \newline)) (recur crlf (inc lf))
+          :else (recur crlf lf))))))
+
+(defn- file-line-count [^File f]
+  (with-open [rdr (io/reader f)]
+    (loop [cnt 0]
+      (if (nil? (.readLine ^java.io.BufferedReader rdr))
+        cnt
+        (recur (inc cnt))))))
+
+(defn run-stat-workspace-file!
+  [arguments]
+  (try
+    (let [m (parse-args-map arguments)
+          path-str (or (some-> (:path m) str str/trim not-empty)
+                       (some-> (get m "path") str str/trim not-empty))
+          ^File f (resolve-file-under-workspace! path-str)]
+      (cond
+        (not (.exists f))
+        (json/generate-string {:error "file not found" :path path-str})
+
+        (not (.isFile f))
+        (json/generate-string {:error "not a regular file" :path path-str})
+
+        :else
+        (json/generate-string {:path path-str
+                               :size_bytes (.length f)
+                               :line_count (file-line-count f)
+                               :newline_type (file-newline-type f)})))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "stat failed")
+                             :detail (str e)}))))
+
+(defn read-workspace-file-lines-tool-spec []
+  {:type "function"
+   :function
+   {:name "read_workspace_file_lines"
+    :description (str "Read a specific line range from a text file under the workspace. "
+                      "Ideal for config files where you care about specific line ranges. "
+                      "Returns the requested lines with their line numbers.")
+    :parameters {:type "object"
+                 :required ["path"]
+                 :properties {:path {:type "string"
+                                    :description "Path relative to workspace root, or absolute if still under that root."}
+                              :start_line {:type "integer"
+                                          :description "1-based line number to start from (default 1)."}
+                              :max_lines {:type "integer"
+                                         :description "Max lines to read (default 500, cap 5000)."}}}}})
+
+(defn- read-file-lines-range [^File f ^long start-line ^long max-lines]
+  (with-open [rdr (io/reader f)]
+    (loop [line-num 1
+           lines []]
+      (if-let [line (.readLine ^java.io.BufferedReader rdr)]
+        (if (>= (count lines) max-lines)
+          {:lines lines :has_more true}
+          (if (>= line-num start-line)
+            (recur (inc line-num) (conj lines {:line line-num :text line}))
+            (recur (inc line-num) lines)))
+        {:lines lines :has_more false}))))
+
+(defn run-read-workspace-file-lines!
+  [arguments]
+  (try
+    (let [m (parse-args-map arguments)
+          path-str (or (some-> (:path m) str str/trim not-empty)
+                       (some-> (get m "path") str str/trim not-empty))
+          start-line (let [x (or (:start_line m) (get m "start_line"))]
+                       (if (number? x) (max 1 (long x)) 1))
+          max-lines (let [x (or (:max_lines m) (get m "max_lines"))]
+                      (cond (number? x) (min 5000 (max 1 (long x)))
+                            :else 500))
+          ^File f (resolve-file-under-workspace! path-str)]
+      (cond
+        (not (.exists f))
+        (json/generate-string {:error "file not found" :path path-str})
+
+        (not (.isFile f))
+        (json/generate-string {:error "not a regular file" :path path-str})
+
+        :else
+        (let [{:keys [lines has-more]} (read-file-lines-range f start-line max-lines)]
+          (json/generate-string {:path path-str
+                                 :start_line start-line
+                                 :lines lines
+                                 :count (count lines)
+                                 :has_more has-more}))))
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "read failed")
                              :detail (str e)}))))

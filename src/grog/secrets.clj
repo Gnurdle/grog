@@ -14,12 +14,16 @@
 
 (def oracle-api-account "ORACLE_API_KEY")
 
+(def llm-api-account "LLM_API_KEY")
+
 (def known-secret-defs
   "Accounts Grog knows about; used for `/secret` list and validation."
   [{:account brave-search-api-account
     :description "Brave Search API subscription token (header X-Subscription-Token)"}
    {:account oracle-api-account
-    :description "Oracle (strong remote model) API Bearer token — tool `oracle`, OpenAI-style chat completions"}])
+    :description "Oracle (strong remote model) API Bearer token — tool `oracle`, OpenAI-style chat completions"}
+   {:account llm-api-account
+    :description "LLM API key for OpenAI-compatible providers (OpenRouter, OpenAI, Groq, etc.)"}])
 
 (defn- known-account-set []
   (set (map :account known-secret-defs)))
@@ -109,4 +113,4 @@
   "One line for chat startup (Brave / keyring hint). Does not open the keyring — that can block without D-Bus."
   []
   (str "Secrets: OS keyring service \"" service-id "\" — /secret lists "
-       brave-search-api-account ", " oracle-api-account " (values never printed)"))
+       brave-search-api-account ", " oracle-api-account ", " llm-api-account " (values never printed)"))

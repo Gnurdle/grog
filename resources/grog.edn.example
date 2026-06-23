@@ -1,9 +1,24 @@
 {:workspace {:default-root "/absolute/path/to/project"
              ;; Reads, docx :write-to, and workspace-write: paths must fall under one of these roots (or under default-root).
              :allowed-roots ["/absolute/path/to/project" "/tmp"]}
- ;; Brave: store subscription token in OS keyring (service "grog", account "BRAVE_SEARCH_API") — chat: /secret BRAVE_SEARCH_API <token>
- :ollama {:url "http://localhost:11434"
-          :model "qwen3.5:9b"}
+ ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
+ ;; For local Ollama use: :url "http://localhost:11434/v1"
+ :llm {:url "http://localhost:11434/v1"
+       :model "qwen3.5:9b"
+       ;; Optional: inline API key (not recommended). Prefer OS keyring account LLM_API_KEY set via /secret.
+       ;; :api-key "${LLM_API_KEY}"
+       ;; Optional: debug request payload and/or raw response content to stderr.
+       ;; :debug-payload true
+       ;; :debug-response true
+       ;; Optional: token budget. Oldest non-system messages are dropped before each request.
+       ;; Rough estimate (~4 chars/token). Default 200000; set to nil to disable.
+       ;; :max-context-tokens 200000
+       ;; Optional: cap individual tool result length. Default 50000; set to nil to disable.
+       ;; :max-tool-result-chars 50000
+       ;; Optional: provider-specific fields merged into every request payload.
+       ;; E.g. OpenRouter context compression: :extra-payload {:transforms ["middle-out"]}
+       ;; :extra-payload {:transforms ["middle-out"]}
+       }
  :soul {:path "SOUL.md"}
  ;; Skills: each subdir of these roots under workspace must contain skill.edn + SKILL.md
  :skills {:roots ["skills"]

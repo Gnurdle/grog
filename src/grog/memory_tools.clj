@@ -1,5 +1,5 @@
 (ns grog.memory-tools
-  "Ollama tools for persistent memory under `:edn-store` in grog.edn (tree of `.edn` files).
+  "LLM tools for persistent memory under `:edn-store` in grog.edn (tree of `.edn` files).
   Logical keys are `namespace` + `key`. On disk: `grog-memory/<url-encoded-ns>/<url-encoded-key>.edn`.
   When a **session active project** is set (`/project <name>` in chat), paths become
   `grog-memory/Projects/<url-encoded-project>/<url-encoded-ns>/<url-encoded-key>.edn`."
@@ -97,7 +97,7 @@
     :else (pr-str v)))
 
 (defn tool-specs
-  "Ollama function tools; register only when `:edn-store` is configured."
+  "LLM function tools; register only when `:edn-store` is configured."
   []
   [{:type "function"
     :function

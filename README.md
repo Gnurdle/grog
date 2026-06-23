@@ -1,6 +1,6 @@
 # Grog
 
-Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, Grog runs them on your machine, and the turn ends when you get a plain-text answer (or an error). There is **no tool-round cap by default**; you can set `:cli :chat-tool-loop-limit` only if you want an explicit ceiling. Behavior is shaped by **`grog.edn`** and optional **SOUL.md**—no code changes required.
+Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the model calls tools, Grog runs them on your machine, and the turn ends when you get a plain-text answer (or an error). There is **no tool-round cap by default**; you can set `:cli :chat-tool-loop-limit` only if you want an explicit ceiling. Behavior is shaped by **`grog.edn`** and optional **SOUL.md**—no code changes required.
 
 ---
 
@@ -28,7 +28,7 @@ Terminal chat for **Ollama** with a real **tool loop**: the model calls tools, G
 | **Oracle** | Optional stronger remote model (`:oracle` + keyring); the stack is wired so the agent can escalate when stuck—see SOUL for policy. |
 | **Projects** | `/project` ties **`memory_*`** tools and dialog logging into per-project trees—iterable, restartable workstreams. |
 | **Jobs** | With **`:edn-store`**, **`/jobs`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
-| **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same Ollama+tools stack); respects **active project** and thread context when set. |
+| **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same LLM+tools stack); respects **active project** and thread context when set. |
 | **Skills** | Packaged `skill.edn` + `SKILL.md` directories; the model can list, read, create, and update skills. |
 | **Babashka** | Optional **`run_babashka`** for short scripted side effects (`bb` on `PATH`). |
 
@@ -40,7 +40,7 @@ Symlinks **inside** the workspace are followed for tools; `..` cannot escape the
 
 ### Core runtime
 
-- **Ollama `/api/chat`** with **tool calling** (use a model that supports tools).
+- **OpenAI-compatible `/v1/chat/completions`** with **tool calling** (use a model that supports tools).
 - **Multi-step rounds** — **unlimited by default** (runs until the model returns text without `tool_calls`). Set `:cli :chat-tool-loop-limit` to a **positive integer** only if you want a hard stop. With thinking enabled: banner is **`── thinking k ──`** when unlimited, **`── thinking k/n ──`** when a limit is set.
 - **Session history** — `:cli :chat-history-turns` or **`/clear`** / **`/fresh`**.
 - **Streaming** — optional live thinking; answer tokens stream in cyan only when **`:format-markdown` is false**. With default Markdown rendering, the reply is buffered for the round so GFM tables and layout render correctly. Set **`:cli :chat-stream-live-content false`** to buffer plain text too until the round completes.
@@ -104,13 +104,15 @@ Config merges in order:
 2. `~/.config/grog/grog.edn` — user overrides  
 3. `./grog.edn` — project overrides  
 
-**Required:** `:ollama {:url … :model …}`.
+**Required:** `:llm {:url "…/v1" :model "…"}`. For local Ollama use `:url "http://localhost:11434/v1"`.
+
+**Optional:** `:llm` also accepts `:max-context-tokens` (drop oldest non-system messages before each request; default 200000, set `nil` to disable), `:max-tool-result-chars` (truncate oversized tool outputs; default 50000, set `nil` to disable), and `:extra-payload` (provider-specific fields merged into every request — e.g. OpenRouter `{:transforms ["middle-out"]}` for context compression).
 
 **Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
 
 ### MCP servers
 
-MCP is **not** configured in `grog.edn`. With **`:edn-store`**, the server list lives under the store as **`grog-memory/grog-mcp/servers.edn`**, or **`grog-memory/Projects/<project>/grog-mcp/servers.edn`** when **`/project`** is active (same scoping idea as **`memory_*`**). Use **`/mcp`** in chat or the Ollama tools **`mcp_config_load`**, **`mcp_config_save`**, **`mcp_servers_set`**, **`mcp_reload`**. Subprocesses **do not** start when chat opens; call **`mcp_reload`** (or **`/mcp reload`**) after you have a valid declaration. Ollama then sees remote tools as **`<id>_<tool>`** (longest `:id` prefix wins).
+MCP is **not** configured in `grog.edn`. With **`:edn-store`**, the server list lives under the store as **`grog-memory/grog-mcp/servers.edn`**, or **`grog-memory/Projects/<project>/grog-mcp/servers.edn`** when **`/project`** is active (same scoping idea as **`memory_*`**). Use **`/mcp`** in chat or the tools **`mcp_config_load`**, **`mcp_config_save`**, **`mcp_servers_set`**, **`mcp_reload`**. Subprocesses **do not** start when chat opens; call **`mcp_reload`** (or **`/mcp reload`**) after you have a valid declaration. The LLM then sees remote tools as **`<id>_<tool>`** (longest `:id` prefix wins).
 
 - **Filesystem (Node):** `@modelcontextprotocol/server-filesystem` via **`npx`** — example entry: **`{:id "fs" :command ["npx" "-y" "@modelcontextprotocol/server-filesystem" "/abs/path"]}`**.
 - **DataScript (Clojure):** [xlisp/datascript-mcp-server](https://github.com/xlisp/datascript-mcp-server) — clone the repo, set **`:cwd`** to that root, and run **`clojure -M -m datascript-mcp.core`** (needs **`clojure`** on `PATH` and a first-run dependency download). Tools include **`init_db`**, **`query`**, **`load_db`**, **`add_data`**, etc.
@@ -157,9 +159,15 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 ```clojure
 {:workspace {:default-root "."}
 
- ;; Required: local Ollama (tool-capable model)
- :ollama {:url "http://localhost:11434"
-          :model "qwen3.5:4b"}
+ ;; Required: OpenAI-compatible chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
+ :llm {:url "http://localhost:11434/v1"
+       :model "qwen3.5:4b"
+       ;; Optional: token budget. Oldest non-system messages are dropped before each request.
+       ;; Rough estimate (~4 chars/token). Set below your provider's context limit.
+       ;; :max-context-tokens 200000
+       ;; Optional: cap individual tool result length. Longer results are truncated with a note.
+       ;; :max-tool-result-chars 50000
+       }
 
  :soul {:path "SOUL.md"}
  :skills {:roots ["skills"]}
@@ -167,7 +175,7 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
  ;; Optional: structured memory + project dialog trees (path under workspace)
  :edn-store {:root "edn-store"}
 
- ;; Optional: periodic checks while chat is running (stderr banner + Ollama + tools)
+ ;; Optional: periodic checks while chat is running (stderr banner + LLM + tools)
  ;; :chron {:enabled true
  ;;         :tasks [{:id "heartbeat" :every-minutes 60 :instruction "Short status check; use memory_* if useful."}]}
 
@@ -203,7 +211,7 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 
 ## Quick start
 
-1. Run **Ollama**; pull a **tool-capable** model and name it in `grog.edn`.  
+1. Run an **OpenAI-compatible server** (e.g., Ollama at `/v1`); pull a **tool-capable** model and name it in `grog.edn`.  
 2. **JDK 21+** (see `deps.edn` / `:run` `:jvm-opts` if needed).  
 3. Copy or edit **`grog.edn`** — `resources/grog.edn` has annotated examples.
 

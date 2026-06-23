@@ -3,7 +3,7 @@
   `serializeMessage` / `ReadBuffer`).
 
   Declarations live in edn-store (`servers.edn`). On **define/reload**, each server is started briefly,
-  `tools/list` is fetched, results are persisted to `tools-cache.edn`, then processes stop. Ollama sees
+  `tools/list` is fetched, results are persisted to `tools-cache.edn`, then processes stop. The LLM sees
   tools from that cache without subprocesses running. A server process is started **on first** matching
   `tools/call`, then kept alive until `stop-all!` (e.g. chat exit or config reload)."
   (:require [cheshire.core :as json]
@@ -392,7 +392,7 @@
        :parameters (input-schema->parameters schema)}})))
 
 (defn tool-specs-from-cache
-  "Ollama tools from persisted `tools/list` (fingerprint must match current declaration)."
+  "LLM tools from persisted `tools/list` (fingerprint must match current declaration)."
   []
   (vec
    (mapcat
@@ -438,7 +438,7 @@
       :function
       {:name "mcp_reload"
        :description (str "Re-probe every declared server (tools/list), refresh " (mcp-store/tools-cache-path-hint)
-                         ", stop subprocesses. Ollama then sees updated MCP tools without leaving servers running.")
+                         ", stop subprocesses. The LLM then sees updated MCP tools without leaving servers running.")
        :parameters {:type "object" :properties {}}}}]))
 
 (defn tool-specs-for-chat
@@ -670,7 +670,7 @@
   (probe-all-and-persist-cache!))
 
 (defn run-mcp-admin-tool!
-  "Returns JSON string for Ollama tool role."
+  "Returns JSON string for LLM tool role."
   [^String nm arguments]
   (try
     (let [m (parse-tool-args arguments)]

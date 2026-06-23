@@ -1,6 +1,6 @@
 (ns grog.oracle
   "Stronger remote model via OpenAI-compatible `POST …/chat/completions` (e.g. xAI Grok).
-  Configure `:oracle` in grog.edn. Ollama tool name **`oracle`**."
+  Configure `:oracle` in grog.edn. LLM tool name **`oracle`**."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
             [clojure.string :as str]
@@ -84,7 +84,7 @@
     (some-> parsed :choices first :message :content str str/trim not-empty)))
 
 (defn- finalize-tool-text
-  "Run `<image-png>` handling on oracle tool output (opens viewer, strips tags) before returning to Ollama."
+  "Run `<image-png>` handling on oracle tool output (opens viewer, strips tags) before returning to the LLM."
   ^String [^String s]
   (image-png/process-tags! s))
 

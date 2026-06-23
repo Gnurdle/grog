@@ -428,7 +428,7 @@
         (if (empty? rows)
           (do (println "No skills found under roots:" (str/join ", " roots))
               (println "Add one directory per skill with skill.edn + SKILL.md inside each."))
-          (do (println "EDN skills (Ollama tools list_skills / read_skill; same data). Roots:" (str/join ", " roots))
+          (do (println "EDN skills (LLM tools list_skills / read_skill; same data). Roots:" (str/join ", " roots))
               (doseq [r rows]
                 (println " " (:id r) "—" (:title r))
                 (println "   " (truncate-desc (:description r) 220))

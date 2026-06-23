@@ -1,5 +1,5 @@
 (ns grog.chat-context
-  "Shared Ollama message construction: SOUL, project banner, skills, oracle system blocks."
+  "Shared LLM message construction: SOUL, project banner, skills, oracle system blocks."
   (:require [clojure.string :as str]
             [grog.config :as config]
             [grog.oracle :as oracle]

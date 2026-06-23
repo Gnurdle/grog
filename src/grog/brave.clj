@@ -8,7 +8,7 @@
 (def ^:private api-url "https://api.search.brave.com/res/v1/web/search")
 
 (defn tool-spec
-  "Ollama `tools[]` entry for `brave_web_search`."
+  "LLM `tools[]` entry for `brave_web_search`."
   []
   {:type "function"
    :function {:name "brave_web_search"
@@ -23,7 +23,7 @@
                                                 :description "Max results to return (1–10, default 5)."}}}}})
 
 (defn parse-web-search-args
-  "Parse Ollama `function.arguments` for brave_web_search (map or JSON string)."
+  "Parse LLM `function.arguments` for brave_web_search (map or JSON string)."
   [arguments]
   (let [m (cond
             (map? arguments) arguments

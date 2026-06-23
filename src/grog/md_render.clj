@@ -349,10 +349,72 @@
       (iter-children n #(walk % sb))
       nil)))
 
+(defn- rewrite-single-backtick-code-with-newlines
+  "CommonMark treats line endings inside inline code spans as spaces. Some models misuse
+   single backticks for multi-line code, collapsing it. Detect single-backtick spans that
+   contain a newline, are at the start of a line, and rewrite them as fenced code blocks
+   before parsing. Mid-paragraph inline code is left as-is so paragraphs stay intact."
+  [^String s]
+  (let [n (count s)]
+    (loop [i 0, acc (StringBuilder.)]
+      (if (>= i n)
+        (str acc)
+        (let [c (.charAt s i)]
+          (if (and (= \` c)
+                   (or (zero? i) (not= \` (.charAt s (dec i))))
+                   (< (inc i) n) (not= \` (.charAt s (inc i))))
+            ;; Potential single-backtick inline code opening
+            (let [close-idx (loop [j (inc i)]
+                              (cond
+                                (>= j n) nil
+                                (= \` (.charAt s j))
+                                (if (or (= j (dec n)) (not= \` (.charAt s (inc j))))
+                                  j
+                                  (recur (inc j)))
+                                :else (recur (inc j))))
+                  at-line-start?
+                  (let [prev (when (pos? i) (.charAt s (dec i)))]
+                    (or (zero? i)
+                        (= \newline prev)
+                        (and (Character/isWhitespace prev)
+                             (loop [k (dec i)]
+                               (cond
+                                 (< k 0) true
+                                 (= \newline (.charAt s k)) true
+                                 (Character/isWhitespace (.charAt s k)) (recur (dec k))
+                                 :else false)))))]
+              (if close-idx
+                (let [content (subs s (inc i) close-idx)]
+                  (if (and (str/includes? content "\n") at-line-start?)
+                    (let [trimmed (str/trim content)
+                          max-run (loop [k 0 max-run 0 cur 0]
+                                    (if (>= k (count trimmed))
+                                      max-run
+                                      (if (= \` (.charAt trimmed k))
+                                        (recur (inc k) max-run (inc cur))
+                                        (recur (inc k) (max max-run cur) 0))))
+                          fence-len (max 4 (inc max-run))
+                          fence (str/join (repeat fence-len \`))]
+                      (.append acc fence)
+                      (.append acc "\n")
+                      (.append acc trimmed)
+                      (.append acc "\n")
+                      (.append acc fence)
+                      (.append acc "\n")
+                      (recur (inc close-idx) acc))
+                    (do (.append acc \`)
+                        (.append acc content)
+                        (.append acc \`)
+                        (recur (inc close-idx) acc))))
+                (do (.append acc c)
+                    (recur (inc i) acc))))
+            (do (.append acc c)
+                (recur (inc i) acc))))))))
+
 (defn- render-md-chunk
   ^String [^String markdown]
   (let [parser (make-parser)
-        ^Document doc (.parse parser markdown)
+        ^Document doc (.parse parser (rewrite-single-backtick-code-with-newlines markdown))
         sb (StringBuilder.)]
     (.append sb body)
     (walk doc sb)

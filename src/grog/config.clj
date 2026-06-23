@@ -3,8 +3,7 @@
 
   Merge order (later wins): classpath `resources/grog.edn` →
   `~/.config/grog/grog.edn` → `./grog.edn` in the current working directory."
-  (:require [clj-http.client :as http]
-            [clojure.edn :as edn]
+  (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.secrets :as secrets])
@@ -65,15 +64,103 @@
       "."
       (str/trim (str r)))))
 
-(defn model
-  "`:ollama :model` from grog.edn (required)."
-  []
-  (req-str [:ollama :model] ":ollama :model"))
+(defn- interpolate-env-var
+  "Replace `${ENV}` and `${ENV:-default}` in a string with environment variable values."
+  [^String s]
+  (when s
+    (str/replace s #"\$\{([^}]+)\}"
+                 (fn [[_ var-spec]]
+                   (let [[var-name default-val] (str/split var-spec #":-" 2)]
+                     (or (System/getenv var-name) default-val ""))))))
 
-(defn ollama-url
-  "`:ollama :url` from grog.edn (required)."
+(defn- cfg-str [path]
+  (some-> (get-in (grog) path) str str/trim not-empty))
+
+(defn llm-url
+  "Chat completions POST URL. Use :llm :url."
   []
-  (req-str [:ollama :url] ":ollama :url"))
+  (req-str [:llm :url] ":llm :url"))
+
+(defn llm-model
+  "Model id. Use :llm :model."
+  []
+  (req-str [:llm :model] ":llm :model"))
+
+(defn llm-api-key
+  "API key for OpenAI-compatible providers. Supports `${ENV}` and `${ENV:-default}` interpolation.
+   Reads :llm :api-key (inline, not recommended) or OS keyring LLM_API_KEY."
+  []
+  (or (some-> (cfg-str [:llm :api-key]) interpolate-env-var not-empty)
+      (some-> (secrets/get-secret "LLM_API_KEY") not-empty)))
+
+(defn llm-auth-headers
+  "Authorization headers. Bearer token when an API key is configured."
+  []
+  (when-let [key (llm-api-key)]
+    {"Authorization" (str "Bearer " key)}))
+
+(defn llm-max-tokens
+  "Max tokens for LLM requests. Default nil (provider default)."
+  []
+  (let [v (get-in (grog) [:llm :max-tokens])]
+    (when (and (number? v) (pos? (long v)))
+      (long v))))
+
+(defn llm-temperature
+  "Temperature for LLM requests. Default nil (provider default)."
+  []
+  (let [v (get-in (grog) [:llm :temperature])]
+    (when (number? v) (double v))))
+
+(defn llm-debug-payload?
+  "When true, prints full request payload to stderr."
+  []
+  (true? (get-in (grog) [:llm :debug-payload])))
+
+(defn llm-debug-response?
+  "When true, prints the raw accumulated response content to stderr before rendering."
+  []
+  (true? (get-in (grog) [:llm :debug-response])))
+
+(defn max-context-tokens
+  "Context token budget. When set, oldest non-system messages are dropped before each
+   request so the total stays under this limit. Rough estimate (~4 chars/token).
+   Default 200000 to stay safely under common 256K–262K provider limits."
+  []
+  (let [v (get-in (grog) [:llm :max-context-tokens])]
+    (cond
+      (nil? v) 200000
+      (and (number? v) (pos? (long v))) (long v)
+      :else nil)))
+
+(defn max-tool-result-chars
+  "Max characters for individual tool results. Results longer than this are truncated
+   with a note. Default 50000 (~10–15K tokens). Set to nil in grog.edn to disable."
+  []
+  (let [v (get-in (grog) [:llm :max-tool-result-chars])]
+    (cond
+      (nil? v) 50000
+      (and (number? v) (pos? (long v))) (long v)
+      :else nil)))
+
+(defn llm-extra-payload
+  "Provider-specific fields merged into every /v1/chat/completions request payload.
+   E.g. OpenRouter {:transforms [\"middle-out\"]} or {:plugins {…}}.
+   Deep-merged after the standard payload fields so it can override them."
+  []
+  (get-in (grog) [:llm :extra-payload]))
+
+;; Backward-compat alias — old code calls config/model
+(defn model
+  "Model id. Delegates to `llm-model`."
+  []
+  (llm-model))
+
+(defn provider-name
+  "Human-readable provider name for status lines."
+  []
+  (or (some-> (cfg-str [:llm :provider-name]) not-empty)
+      "OpenAI-compatible"))
 
 (defn oracle-url
   "`:oracle :url` — OpenAI-compatible chat completions POST URL."
@@ -138,7 +225,7 @@
       :else nil)))
 
 (defn chat-show-thinking?
-  "When true, print Ollama `:thinking` if present. Config `:cli :chat-show-thinking`;
+  "When true, print reasoning/thinking traces if present. Config `:cli :chat-show-thinking`;
   omitted uses JVM console detection."
   []
   (let [v (:chat-show-thinking (cli-cfg))]
@@ -148,8 +235,8 @@
       :else (some? (System/console)))))
 
 (defn chat-stream-live-thinking?
-  "When true (default) and `chat-show-thinking?`, use Ollama `stream: true` so reasoning
-  prints incrementally. Set `:cli :chat-stream-live-thinking false` to buffer and print once."
+  "When true (default) and `chat-show-thinking?`, stream reasoning/thinking traces
+  incrementally. Set `:cli :chat-stream-live-thinking false` to buffer and print once."
   []
   (not (false? (:chat-stream-live-thinking (cli-cfg)))))
 
@@ -170,7 +257,7 @@
   (not (false? (:format-markdown (cli-cfg)))))
 
 (defn chat-tool-loop-limit
-  "Max successive tool rounds (each Ollama request after tool results counts as one step).
+  "Max successive tool rounds (each LLM request after tool results counts as one step).
   **Omit** `:cli :chat-tool-loop-limit` (or set `null` in merged EDN) for **no limit** — the loop runs until the model returns text (or error).
   If set, must be a **positive integer** (no upper cap)."
   []
@@ -331,59 +418,28 @@
                 (when (map? (:object d)) (:status (:object d)))))
           (recur (.getCause t))))))
 
-(defn ollama-installed-model-names
-  "Set of model names from Ollama `GET /api/tags`, or nil if not 200."
+(defn warn-if-model-missing!
+  "No-op: model availability is server-side for OpenAI-compatible providers."
   []
-  (try
-    (let [resp (http/get (str (str/trim (ollama-url)) "/api/tags")
-                         {:as :json :throw-exceptions false
-                          :socket-timeout 8000
-                          :conn-timeout 3000})
-          raw (:body resp)]
-      (when (= 200 (:status resp))
-        (->> (:models raw)
-             (keep :name)
-             (map str)
-             set)))
-    (catch Exception _ nil)))
+  nil)
 
-(defn warn-if-ollama-model-missing!
-  []
-  (try
-    (when-let [have (ollama-installed-model-names)]
-      (let [want (model)]
-        (when-not (have want)
-          (binding [*out* *err*]
-            (println "")
-            (println "grog: warning: Ollama has no model" (pr-str want) "(see `ollama ls`).")
-            (when (seq have)
-              (println "        Models present:" (str/join ", " (sort have))))
-            (println "        Install with: ollama pull" want)
-            (println "        Or change :ollama :model in grog.edn")
-            (println "")))))
-    (catch Exception _ nil)))
-
-(defn print-ollama-failure-hint!
+(defn print-llm-failure-hint!
+  "Print LLM failure diagnostics."
   [^Throwable e]
   (try
     (let [st (http-status-in-chain e)
           m (model)
-          url (ollama-url)
-          have (try (ollama-installed-model-names) (catch Exception _ nil))]
+          url (llm-url)]
       (binding [*out* *err*]
         (println "")
         (cond
-          (= 404 st)
-          (do (println "grog: Ollama HTTP 404 — often the configured :model is missing.")
-              (println "       :ollama :model" (pr-str m) "— :url" url)
-              (println "       Run: ollama pull" m)
-              (when (seq have)
-                (println "       This server reports models:" (str/join ", " (sort have)))))
-
           (some? st)
-          (println "grog: Ollama HTTP" st "-" (.getMessage e))
-
+          (do (println "grog: LLM HTTP" st "-" (.getMessage e))
+              (println "       :llm :model" (pr-str m) "— :url" url)
+              (when (and (= 401 st) (not (llm-api-key)))
+                (println "       No API key found. Set :llm :api-key or store LLM_API_KEY in OS keyring.")))
           :else
-          (println "grog: Ollama request failed:" (.getMessage e)))
+          (do (println "grog: LLM request failed:" (.getMessage e))
+              (println "       :llm :model" (pr-str m) "— :url" url)))
         (println "")))
     (catch Exception _ nil)))
