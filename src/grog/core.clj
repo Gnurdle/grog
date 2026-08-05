@@ -14,6 +14,7 @@
             [grog.fs :as fs]
             [grog.jobs :as jobs]
             [grog.edn-store :as edn-store]
+            [grog.md-stream :as md-stream]
             [grog.memory-tools :as memory-tools]
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
@@ -24,7 +25,8 @@
             [grog.secrets :as secrets]
             [grog.skills :as skills]
             [grog.soul :as soul]
-            [grog.with-api-key :as wkey]))
+            [grog.with-api-key :as wkey]
+            [grog.appearance :as appearance]))
 
 (def ^:private ansi-reset "\u001B[0m")
 (def ^:private ansi-hot-pink "\u001B[38;2;255;105;180m")
@@ -37,7 +39,7 @@
   "Log a tool invocation line to stderr in magenta."
   [& args]
   (binding [*out* *err*]
-    (print ansi-tool-call)
+    (print (appearance/ansi-tool-call))
     (apply println args)
     (print ansi-reset)
     (flush)))
@@ -50,7 +52,7 @@
 
 (defn- print-thinking! [s & {:keys [iter max]}]
   (when-not (str/blank? s)
-    (print ansi-thinking)
+    (print (appearance/ansi-thinking))
     (println (cond
                  (and iter max) (str "── thinking " iter "/" max " ──")
                  iter (str "── thinking " iter " ──")
@@ -216,6 +218,33 @@
         (try (json/parse-string payload true)
              (catch Exception _ nil))))))
 
+(defn- line-source
+  "Read lines from `rdr` on a daemon thread into an unbounded queue, so the
+  streaming loop can poll with `:next` instead of blocking forever on a read
+  that `cancel!` may not be able to interrupt promptly. Returns
+  {:next <fn -> String-or-nil (poll 200ms)> :eof <fn -> bool when the reader has
+   finished and the queue is drained> :close <fn>}.
+  `:close` closes the reader, which unblocks (and terminates) the daemon thread;
+  the daemon is daemon-scoped so a stray blocked read is never fatal to the app."
+  [^java.io.BufferedReader rdr]
+  (let [q    (java.util.concurrent.LinkedBlockingQueue.)
+        done (atom false)]
+    (doto (Thread.
+            (fn []
+              (try
+                (loop []
+                  (when-let [l (.readLine rdr)]
+                    (.put q l)
+                    (recur)))
+                (catch Throwable _))
+              (reset! done true))
+            "grog-sse-reader")
+      (.setDaemon true)
+      (.start))
+    {:next  (fn [] (.poll q 200 java.util.concurrent.TimeUnit/MILLISECONDS))
+     :eof   (fn [] (and @done (.isEmpty q)))
+     :close (fn [] (try (.close rdr) (catch Throwable _)))}))
+
 (defn- extract-llm-delta
   "Extract content/thinking/tool_calls from an LLM SSE delta object."
   [delta]
@@ -271,6 +300,11 @@
   (let [answer-prefix (or (:answer-prefix stream-opts) (chat-answer-prefix))
         thinking-iter (:thinking-iter stream-opts)
         thinking-max (:thinking-max stream-opts)
+        ;; Optional cancellation context (GUI Stop). `cancel-state` is a map
+        ;; {:flag <atom bool> :stream <atom Closeable>}; nil = uncancellable
+        ;; (headless CLI, /jobs, chron). Bound in this outer scope so the outer
+        ;; catch clause can detect a user-initiated stop.
+        cancel-state (:cancel-state stream-opts)
         trimmed-msgs (trim-messages-to-budget messages (config/max-context-tokens))
         url (str (str/trim (config/llm-url)) "/chat/completions")
         payload (let [base {:model (config/model)
@@ -297,6 +331,8 @@
                                  :content-type "application/json"
                                  :body (json/generate-string payload)
                                  :as :stream
+                                 :conn-timeout (config/llm-conn-timeout-ms)
+                                 :socket-timeout (config/llm-socket-timeout-ms)
                                  :throw-exceptions false})
             status (:status resp)]
         (if-not (= 200 status)
@@ -306,14 +342,21 @@
             {:ok false :error (str "HTTP " status " " (str/trim (or body-str "")))
              :live-thinking-printed? false :live-content-printed? false})
           (with-open [^java.io.Closeable stream (:body resp)]
-            (let [rdr (io/reader stream)
-                  think-buf (StringBuilder.)
+            (let [think-buf (StringBuilder.)
                   content-buf (StringBuilder.)
                   in-thinking (atom false)
                   any-live (atom false)
                   started-answer (atom false)
                   any-content-live (atom false)
-                  streamed-tool-calls (atom nil)]
+                  streamed-tool-calls (atom nil)
+                  streamer (atom (md-stream/empty-state))
+                  cancel-flag (when cancel-state (:flag cancel-state))
+                  cancelled? #(boolean (and cancel-flag @cancel-flag))
+                  line-src (line-source (io/reader stream))
+                  next-line (:next line-src)
+                  src-eof? (:eof line-src)]
+              (when cancel-state
+                (reset! (:stream cancel-state) stream))
               (letfn [(finish! [last-msg last-tc]
                           (when @in-thinking
                             (print ansi-reset)
@@ -321,37 +364,69 @@
                             (reset! in-thinking false))
                           (let [md? (config/format-markdown?)
                                 stream-live? (config/chat-stream-live-content?)
-                                buf-len (.length content-buf)
-                                skip-final-render? (and stream-live? (not md?) @any-content-live)
-                                streamed? (and stream-live? @any-content-live)
-                                dumped-buf? (and (pos? buf-len) (not skip-final-render?))
+                                raw-stream-live? (and stream-live? (not md?))
+                                md-stream-live? (and md? (config/chat-stream-live-markdown?))
                                 ;; Convert OpenAI partial tool_call accumulator to final vec
                                 final-tc (or last-tc
                                              (llm-tool-calls-from-accum @streamed-tool-calls))]
-                            (when (config/llm-debug-response?)
-                              (binding [*out* *err*]
-                                (println "grog: raw response content:")
-                                (println (str content-buf))
-                                (println "grog: end raw response content")))
-                            (when dumped-buf?
-                              (pager/emit-final-reply! {:answer-prefix answer-prefix
-                                                        :raw-content (str content-buf)
-                                                        :ansi-answer ansi-answer
-                                                        :ansi-reset ansi-reset}))
-                            (print ansi-reset)
-                            (println)
-                            (flush)
-                            {:ok true
-                             :body {:message (build-message-from-stream-bufs last-msg think-buf content-buf final-tc)}
-                             :live-thinking-printed? @any-live
-                             :live-content-printed? (boolean (or streamed? dumped-buf?))}))
+                            (when md-stream-live?
+                              (let [[emitted _] (md-stream/finish @streamer)]
+                                (when (seq emitted)
+                                  (when-not @started-answer
+                                    (reset! started-answer true)
+                                    (reset! any-content-live true)
+                                    (print answer-prefix))
+                                  (doseq [s emitted
+                                          :when (seq s)]
+                                    (print s)
+                                    (flush)))))
+                            (let [skip-final-render? (or (and raw-stream-live? @any-content-live)
+                                                         (and md-stream-live? @any-content-live))
+                                  buf-len (.length content-buf)
+                                  dumped-buf? (and (pos? buf-len) (not skip-final-render?))]
+                              (when (config/llm-debug-response?)
+                                (binding [*out* *err*]
+                                  (println "grog: raw response content:")
+                                  (println (str content-buf))
+                                  (println "grog: end raw response content")))
+                              (when dumped-buf?
+                                (pager/emit-final-reply! {:answer-prefix answer-prefix
+                                                          :raw-content (str content-buf)
+                                                          :ansi-answer (appearance/ansi-answer)
+                                                          :ansi-reset ansi-reset}))
+                              (print ansi-reset)
+                              (cond
+                                md-stream-live?
+                                ;; Markdown blocks were already rendered with their own
+                                ;; trailing newlines; don't double the linefeeds.
+                                nil
+
+                                raw-stream-live?
+                                ;; Raw tokens may not end with a newline; keep the
+                                ;; historical one blank line before the next prompt.
+                                (do (println) (println))
+
+                                :else
+                                ;; Buffered markdown was already rendered with trailing
+                                ;; newlines by md-render; don't add another blank line.
+                                (when-not md? (println)))
+                              (flush)
+                              ;; Signal to the caller that the LLM produced its
+                              ;; final output for this response and no more will
+                              ;; come.
+                              (print "<EOL>\n")
+                              (flush)
+                              {:ok true
+                               :body {:message (build-message-from-stream-bufs last-msg think-buf content-buf final-tc)}
+                               :live-thinking-printed? @any-live
+                               :live-content-printed? (boolean (or skip-final-render? dumped-buf?))})))
                       (handle-delta! [delta]
                           (let [{:keys [content thinking tool_calls]} (extract-llm-delta delta)]
                             (when (and (config/chat-show-thinking?) (seq thinking))
                               (when-not @in-thinking
                                 (reset! in-thinking true)
                                 (reset! any-live true)
-                                (print ansi-thinking)
+                                (print (appearance/ansi-thinking))
                                 (print (cond
                                          (and thinking-iter thinking-max)
                                          (str "── thinking " thinking-iter "/" thinking-max " ──\n")
@@ -368,42 +443,69 @@
                                 (println)
                                 (reset! in-thinking false))
                               (.append content-buf content)
-                              (when (and (config/chat-stream-live-content?)
-                                         (not (config/format-markdown?)))
-                                (when-not @started-answer
-                                  (reset! started-answer true)
-                                  (reset! any-content-live true)
-                                  (print answer-prefix)
-                                  (print ansi-answer))
-                                (print content)
-                                (flush)))
+                              (cond
+                                ;; Markdown block streaming: emit completed blocks
+                                ;; as the model produces them.
+                                (and (config/format-markdown?)
+                                     (config/chat-stream-live-markdown?))
+                                (let [[emitted new-state] (md-stream/feed @streamer content)]
+                                  (reset! streamer new-state)
+                                  (when (seq emitted)
+                                    (when-not @started-answer
+                                      (reset! started-answer true)
+                                      (reset! any-content-live true)
+                                      (print answer-prefix))
+                                    (doseq [s emitted
+                                            :when (seq s)]
+                                      (print s)
+                                      (flush))))
+                                ;; Plain raw streaming (existing behavior).
+                                (and (config/chat-stream-live-content?)
+                                     (not (config/format-markdown?)))
+                                (do (when-not @started-answer
+                                      (reset! started-answer true)
+                                      (reset! any-content-live true)
+                                      (print answer-prefix)
+                                      (print (appearance/ansi-answer)))
+                                    (print content)
+                                    (flush))))
                             (when (seq tool_calls)
                               (swap! streamed-tool-calls llm-merge-tool-call-chunks tool_calls))))]
                 (loop []
-                  (let [line (.readLine ^java.io.BufferedReader rdr)]
-                    (cond
-                      (nil? line)
-                      (finish! nil nil)
+                  (if (cancelled?)
+                    (finish! nil nil)
+                    (let [line (next-line)]
+                      (cond
+                        ;; poll timed out with no line yet: keep waiting for the
+                        ;; daemon (this is where cancel! gets to run promptly)
+                        (and (nil? line) (not (src-eof?)))
+                        (recur)
 
-                      (str/blank? line)
-                      (recur)
+                        (nil? line)
+                        (finish! nil nil)
 
-                      (str/starts-with? line ":")
-                      (recur) ; SSE keep-alive
+                        (str/blank? line)
+                        (recur)
 
-                      :else
-                      (if-let [obj (sse-line->json line)]
-                        (let [choices (:choices obj)
-                              delta (some-> choices first :delta)
-                              finish-reason (some-> choices first :finish_reason)]
-                          (when delta (handle-delta! delta))
-                          (if (some? finish-reason)
-                            (finish! nil nil)
-                            (recur)))
-                        (recur))))))))))
+                        (str/starts-with? line ":")
+                        (recur) ; SSE keep-alive
+
+                        :else
+                        (if-let [obj (sse-line->json line)]
+                          (let [choices (:choices obj)
+                                delta (some-> choices first :delta)
+                                finish-reason (some-> choices first :finish_reason)]
+                            (when delta (handle-delta! delta))
+                            (if (some? finish-reason)
+                              (finish! nil nil)
+                              (recur)))
+                          (recur)))))))))))
       (catch Exception e
-        {:ok false :error (.getMessage e)
-         :live-thinking-printed? false :live-content-printed? false}))))
+        (if (and cancel-state @(:flag cancel-state))
+          {:ok false :error "stopped" :stopped true
+           :live-thinking-printed? false :live-content-printed? false}
+          {:ok false :error (.getMessage e)
+           :live-thinking-printed? false :live-content-printed? false})))))
 
 (defn- chat-round!
   "Dispatch chat round to the configured provider."
@@ -626,7 +728,7 @@
   [content answer-prefix]
   (pager/emit-final-reply! {:answer-prefix answer-prefix
                           :raw-content content
-                          :ansi-answer ansi-answer
+                          :ansi-answer (appearance/ansi-answer)
                           :ansi-reset ansi-reset}))
 
 (defn- chat-with-tools!
@@ -647,7 +749,8 @@
           :thinking last-thinking}
          (let [stream-opts (cond-> {:answer-prefix answer-prefix
                                     :thinking-iter (inc n)}
-                            iter-max (assoc :thinking-max iter-max))
+                            iter-max (assoc :thinking-max iter-max)
+                            (:cancel-state opts) (assoc :cancel-state (:cancel-state opts)))
                {:keys [ok body error live-thinking-printed? live-content-printed?]}
                (chat-round! msgs tools stream-opts)]
            (if-not ok
@@ -669,9 +772,51 @@
                   :thinking-max iter-max})))))))))
 
 (defn run-tool-loop-on-messages
-  "Run one full LLM tool loop from initial `messages` (for `/jobs`, chron, etc.). Returns same map as internal chat round."
-  [messages & {:keys [answer-prefix] :or {answer-prefix "\n\n[grog] "}}]
-  (chat-with-tools! messages {:answer-prefix answer-prefix}))
+  "Run one full LLM tool loop from initial `messages` (for `/jobs`, chron, the
+  GUI, etc.). Returns same map as internal chat round. `cancel-state` (optional)
+  is forwarded as the cancellation context (see `grog.ui.cancel`)."
+  [messages & {:keys [answer-prefix cancel-state] :or {answer-prefix "\n\n[grog] "}}]
+  (chat-with-tools! messages (cond-> {:answer-prefix answer-prefix}
+                               cancel-state (assoc :cancel-state cancel-state))))
+
+(declare help-text handle-shell-command! handle-jobs-command! handle-chron-command!
+         handle-mcp-command! handle-project-command! handle-secret-command!
+         handle-soul-command! handle-model-command!)
+
+(defn route-slash-command!
+  "Route a chat line that is a slash command (or quit/exit) to its handler,
+  printing any output to `*out*` (the caller should bind it to the GUI pane).
+  Returns one of:
+    :grog.core/quit    — the app should exit
+    :grog.core/clear   — caller should clear its history
+    :grog.core/handled — a command handler consumed the line
+    :grog.core/llm     — not a command; send it to the LLM"
+  [line]
+  (let [lc (str/lower-case line)]
+    (cond
+      (#{"quit" "exit" "/quit" "/exit"} lc)
+      ::quit
+
+      (= "/paste" lc)
+      (do (binding [*out* *err*]
+            (println "GUI: /paste isn't needed — Ctrl+Enter inserts a new line, then Enter sends."))
+          ::handled)
+
+      (= "/help" lc)
+      (do (println (help-text)) (println) ::handled)
+
+      (handle-tools-command! line)  ::handled
+      (handle-skills-command! line) ::handled
+      (#{"/clear" "/fresh"} lc)     ::clear
+      (handle-shell-command! line)  ::handled
+      (handle-project-command! line) ::handled
+      (handle-jobs-command! line)   ::handled
+      (handle-chron-command! line)  ::handled
+      (handle-mcp-command! line)    ::handled
+      (handle-secret-command! line) ::handled
+      (handle-soul-command! line)   ::handled
+      (handle-model-command! line)  ::handled
+      :else ::llm)))
 
 (defn- brave-status-line []
   (if (brave/brave-search-configured?)
@@ -717,6 +862,7 @@
     "Optional: :llm {:max-context-tokens N} — drop oldest non-system messages before each request; default 200000 (nil to disable); rough estimate (~4 chars/token)"
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"
     "          :llm {:extra-payload {:transforms [\"middle-out\"]} — provider-specific fields merged into every request payload"
+    "          :llm {:profiles {:local {:model \"qwen2.5-coder:7b-instruct\" :url \"http://localhost:11434/v1\"} …}} — named model presets; switch with /model <profile>"
     "Optional: :workspace {:default-root \".\"} — SOUL path resolves here; SOUL file must stay under this root"
     "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under workspace"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
@@ -732,10 +878,11 @@
     "              {:chat-show-thinking true|false} — reasoning/thinking traces"
     "              {:chat-stream-live-thinking false} — buffer thinking; omit/true streams it live"
     "              {:chat-stream-live-content false} — always buffer the answer until the round ends"
-    "              {:format-markdown false} — plain cyan text; omit/true ANSI Markdown (buffered; tables and blocks render correctly)"
+    "              {:chat-stream-live-markdown true} — with :format-markdown true, emit blocks as they close; tables still wait for a blank line"
+    "              {:format-markdown false} — plain cyan text; omit/true ANSI Markdown (buffered unless :chat-stream-live-markdown is enabled)"
     "              {:chat-tool-loop-limit N} — optional positive cap on tool round-trips; omit for no limit"
     ""
-    "Thinking: dark green; assistant reply: cyan. With :format-markdown true, the answer is buffered then ANSI-rendered once (GFM tables, etc.). With :format-markdown false and :chat-stream-live-content true, answer tokens stream in cyan."
+    "Thinking: dark green; assistant reply: cyan. With :format-markdown true, the answer is buffered and ANSI-rendered once by default. Set :chat-stream-live-markdown true to render paragraphs and fenced code blocks as they close; GFM tables still buffer until a blank line. With :format-markdown false and :chat-stream-live-content true, answer tokens stream in cyan."
     "Markdown in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/> is parsed (legacy <text-markdown> still works); GFM pipe tables draw as box tables."
     "<image-png>workspace-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path must be under :workspace :default-root (requires display / non-headless JVM)."
     "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each round opens with a thinking banner `── thinking k/n ──` if :chat-tool-loop-limit is set, else `── thinking k ──`."
@@ -759,6 +906,10 @@
     "  /secret — list known secret keys and set/unset status (never prints values); /secret <KEY> <value> — store in OS keyring (service grog)"
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
+    "  /model — show current LLM model and URL, plus any :llm :profiles"
+    "  /model reset — clear the session model override"
+    "  /model <name> — switch to a model name for this session (e.g. qwen2.5-coder:7b-instruct)"
+    "  /model <profile> — switch to a named profile from :llm :profiles (can override :url, :model, :api-key, etc.)"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
     ""
@@ -1040,6 +1191,44 @@
         (println "SOUL: unknown; try show | path | add … | reload")))
     true))
 
+(defn- handle-model-command!
+  "Switch the active LLM model or profile for this session."
+  [line]
+  (when-let [[_ rest] (re-matches #"(?i)^/model(?:\s+(.*))?$" (str/trim line))]
+    (let [tail (str/trim (or rest ""))
+          profiles (get-in (config/grog) [:llm :profiles])
+          profile-key (when (seq tail)
+                        (or (get (set (keys profiles)) (keyword tail))
+                            (get (set (keys profiles)) tail)
+                            (keyword tail)))]
+      (cond
+        (str/blank? tail)
+        (do (println "Current LLM:" (config/provider-name) "-" (config/llm-model)
+                     "@" (config/llm-url))
+            (when (seq profiles)
+              (println "Profiles:" (str/join ", " (map #(if (keyword? %) (name %) (str %)) (keys profiles))))
+              (doseq [[k v] profiles]
+                (println " " (if (keyword? k) (name k) k) "->"
+                         (or (some-> (:model v) str str/trim not-empty) (config/llm-model))
+                         "@"
+                         (or (some-> (:url v) str str/trim not-empty) (config/llm-url))))))
+
+        (= "reset" (str/lower-case tail))
+        (do (config/clear-llm-override!)
+            (println "Cleared session LLM override; now using" (config/llm-model) "@" (config/llm-url)))
+
+        (contains? profiles profile-key)
+        (let [profile (get profiles profile-key)]
+          (config/set-llm-override! profile)
+          (println "Switched to profile" (pr-str (if (keyword? profile-key) (name profile-key) profile-key))
+                   "-" (config/llm-model) "@" (config/llm-url)))
+
+        :else
+        (do (config/set-llm-override! {:model tail})
+            (println "Switched to model" (pr-str tail)
+                     "-" (config/llm-model) "@" (config/llm-url)))))
+    true))
+
 (defn run-once!
   "Single user message → print assistant reply (stderr on failure)."
   [user-text]
@@ -1140,6 +1329,8 @@
             (recur history)
             (handle-soul-command! line)
             (recur history)
+            (handle-model-command! line)
+            (recur history)
             :else
             (let [prompt (if (str/includes? line "@")
                            (expand-line-at-paths line true)
@@ -1157,8 +1348,6 @@
                             (print-thinking! thinking :iter thinking-iter :max thinking-max))
                           (when-not live-content-printed?
                             (print-buffered-reply! content answer-prefix))
-                          (when live-content-printed?
-                            (println))
                           (try
                             (project-dialog/append-turn! :user prompt)
                             (project-dialog/append-turn! :assistant (str content))
@@ -1186,7 +1375,9 @@
     (empty? args) (println (help-text))
     (#{"help" "-h" "--help"} (first args)) (println (help-text))
     (= "chat" (first args))
-    (do (parse-chat-args (rest args))
-        (run-chat!))
+    (do (binding [*out* *err*]
+          (println "grog: the console chat has been removed — run the GUI instead:")
+          (println "  ./grog-ui   (or: clojure -M:gui)"))
+        (System/exit 1))
     :else
     (run-once! (str/join " " (map expand-at-token args)))))

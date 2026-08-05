@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# grog-ui — launch the grog Swing GUI (chat window + home-spawned terminal).
+#
+# Usage:   ./grog-ui [args]
+# Needs:   the Clojure CLI and a desktop session.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+# Resolve a Clojure CLI explicitly. Desktop launchers (KDE/GNOME .desktop) hand
+# the process a minimal PATH, so don't rely on the ambient PATH alone.
+if [ -x "$HOME/.clojure-cli/bin/clojure" ]; then
+  CLJ="$HOME/.clojure-cli/bin/clojure"
+elif command -v clojure >/dev/null 2>&1; then
+  CLJ="$(command -v clojure)"
+else
+  echo "grog-ui: the 'clojure' command line tool was not found." >&2
+  echo "         Install it via https://clojure.org/guides/install_clojure" >&2
+  exit 1
+fi
+
+export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+
+# The LLM API key is read from the OS keyring (LLM_API_KEY) as a fallback, so
+# desktop launches don't depend on a shell rc exporting it.
+
+LOG="${GROG_LOG:-$HOME/.grog-ui.log}"
+mkdir -p "$(dirname "$LOG")"
+echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ ===" >> "$LOG"
+
+exec 3>&2
+"$CLJ" -M:gui "$@" > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&3)

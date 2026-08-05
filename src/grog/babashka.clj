@@ -65,10 +65,15 @@
                                         (cfg/babashka-max-timeout-sec) ").")}}}}})
 
 (defn tool-log-summary
+  "Echo the script that run_babashka is about to execute. This is called by the
+  tool dispatcher *before* `run-babashka!` runs, so the script is printed to the
+  chat transcript/log ahead of execution."
   [args]
   (let [m (parse-json-args args)
         s (str-trim (or (:script m) (get m "script")))]
-    (str (count s) " chars script")))
+    (if (seq s)
+      (str "running script (" (count s) " chars):\n" s)
+      "running script: (empty)")))
 
 (defn- configure-bb-env!
   [^java.lang.ProcessBuilder pb ^File sandbox]

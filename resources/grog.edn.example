@@ -1,6 +1,4 @@
-{:workspace {:default-root "/absolute/path/to/project"
-             ;; Reads, docx :write-to, and workspace-write: paths must fall under one of these roots (or under default-root).
-             :allowed-roots ["/absolute/path/to/project" "/tmp"]}
+{:workspace {:default-root "/absolute/path/to/project"}
  ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
  ;; For local Ollama use: :url "http://localhost:11434/v1"
  :llm {:url "http://localhost:11434/v1"
@@ -15,9 +13,21 @@
        ;; :max-context-tokens 200000
        ;; Optional: cap individual tool result length. Default 50000; set to nil to disable.
        ;; :max-tool-result-chars 50000
+       ;; Optional: temperature (provider default when omitted).
+       ;; :temperature 0.7
+       ;; Optional: max output tokens (provider default when omitted).
+       ;; :max-tokens 4096
+       ;; Optional: connection/read timeouts in seconds (defaults: conn 60, socket 300).
+       ;; :conn-timeout-sec 60
+       ;; :socket-timeout-sec 300
+       ;; Optional: human-readable label for status lines.
+       ;; :provider-name "Ollama Local"
        ;; Optional: provider-specific fields merged into every request payload.
        ;; E.g. OpenRouter context compression: :extra-payload {:transforms ["middle-out"]}
        ;; :extra-payload {:transforms ["middle-out"]}
+       ;; Optional: named presets for /model. Each profile overrides base :llm keys for the session.
+       ;; :profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
+       ;;            :remote {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k2.7-code"}}
        }
  :soul {:path "SOUL.md"}
  ;; Skills: each subdir of these roots under workspace must contain skill.edn + SKILL.md
@@ -25,19 +35,23 @@
           ;; :max-body-chars 65536
           ;; :prompt-skill-lines 16
           }
- ;; Optional: Babashka binary for :babashka-run (default bb on PATH).
- :babashka {:executable "bb"}
- ;; Optional: Grog-owned SQLite (:path relative to workspace or absolute).
- ;; Todos (`/todo`, tool :todo) use `grog_todos`; project memory uses `grog_project_memory`.
- :sqlite {:path ".grog/grog.db"
-          :max-rows 500}
- ;; Optional: project memory — optional git-friendly markdown mirror (rewritten on add/rm).
- ;; :max-chars caps text injected into every :grog prompt (default 24000).
- :project {:export-path "PROJECT_MEMORY.md"
-           :max-chars 24000}
+ ;; Optional: Babashka — enable the run_babashka tool (bb must be on PATH; override command with :command).
+ :babashka {:enabled true}
+ ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (path under workspace).
+ ;; :edn-store {:root "edn-store"}
+ ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.
+ ;; :appearance {:chat {:font-family "Monospaced" :font-size 18
+ ;;                     :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
+ ;;                     :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
+ ;;              :terminal {:font-family "Monospaced" :font-size 18}}
  :cli {:verbose-steps false
        ;; Prior user/assistant pairs prepended to each chat message. `0` = stateless (no old replies).
        ;; Omit key = unlimited (grows forever; use /clear or /fresh in chat to reset).
        :chat-history-turns 12
        ;; When true/false: always/never print model `:thinking` in chat (pale green). Omit: only if JVM has a console.
-       :chat-show-thinking true}}
+       :chat-show-thinking true
+       ;; Streaming options.
+       :chat-stream-live-thinking true
+       :chat-stream-live-content true
+       :chat-stream-live-markdown false
+       :format-markdown true}}

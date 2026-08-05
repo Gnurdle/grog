@@ -10,7 +10,7 @@
             TableHead TableRow TablesExtension]
            [org.commonmark.node BlockQuote BulletList Code Document Emphasis
             FencedCodeBlock HardLineBreak Heading HtmlBlock HtmlInline IndentedCodeBlock
-            Link ListItem Node OrderedList Paragraph SoftLineBreak StrongEmphasis Text
+            Link ListBlock ListItem Node OrderedList Paragraph SoftLineBreak StrongEmphasis Text
             ThematicBreak]
            [org.commonmark.parser Parser]))
 
@@ -222,12 +222,11 @@
                                                (dim-seg "│")))
                                         widths parts))
                          "\n")))]
-    (str "\n"
-         htop "\n"
+    (str htop "\n"
          (str/join "" (map fmt-row hdr-rows))
          (when (seq hdr-rows) (str hmid "\n"))
          (str/join "" (map fmt-row data-rows))
-         hbot "\n")))
+         hbot "\n\n")))
 
 (defn- walk [^Node n ^StringBuilder sb]
   (condp instance? n
@@ -236,7 +235,6 @@
 
     Heading
     (do (.append sb body)
-        (.append sb "\n")
         (.append sb head)
         (.append sb bold)
         (iter-children n #(walk % sb))
@@ -245,9 +243,12 @@
         (.append sb "\n\n"))
 
     Paragraph
-    (do (.append sb body)
-        (iter-children n #(walk % sb))
-        (.append sb "\n\n"))
+    (let [parent (.getParent n)
+          tight-list? (when (instance? ListItem parent)
+                        (.isTight ^ListBlock (.getParent ^ListItem parent)))]
+      (.append sb body)
+      (iter-children n #(walk % sb))
+      (.append sb (if tight-list? "\n" "\n\n")))
 
     Text
     (.append sb (.getLiteral ^Text n))
@@ -273,32 +274,36 @@
         (.append sb body))
 
     FencedCodeBlock
-    (do (.append sb "\n")
-        (.append sb dim)
+    (do (.append sb dim)
         (.append sb (.getLiteral ^FencedCodeBlock n))
         (.append sb reset)
         (.append sb body)
         (.append sb "\n\n"))
 
     IndentedCodeBlock
-    (do (.append sb "\n")
-        (.append sb dim)
+    (do (.append sb dim)
         (.append sb (.getLiteral ^IndentedCodeBlock n))
         (.append sb reset)
         (.append sb body)
         (.append sb "\n\n"))
 
     BulletList
-    (iter-children n #(walk % sb))
+    (do (iter-children n #(walk % sb))
+        ;; Tight lists need a trailing blank line; loose items already end with one.
+        (when (.isTight ^ListBlock n)
+          (.append sb "\n")))
 
     OrderedList
-    (iter-children n #(walk % sb))
+    (do (iter-children n #(walk % sb))
+        (when (.isTight ^ListBlock n)
+          (.append sb "\n")))
 
     ListItem
     (do (.append sb body)
         (.append sb "  • ")
-        (iter-children n #(walk % sb))
-        (.append sb "\n"))
+        ;; Paragraph children supply their own trailing newline(s) based on the
+        ;; parent list's tightness, so ListItem adds no suffix of its own.
+        (iter-children n #(walk % sb)))
 
     Link
     (do (iter-children n #(walk % sb))
@@ -310,21 +315,27 @@
         (.append sb body))
 
     BlockQuote
-    (do (.append sb quote-style)
-        (.append sb "│ ")
-        (iter-children n #(walk % sb))
+    (let [start (.length sb)]
+      (.append sb quote-style)
+      (.append sb "│ ")
+      (iter-children n #(walk % sb))
+      ;; If the children already ended with a blank line (e.g. Paragraph),
+      ;; don't add another one.
+      (let [children-end-nn? (str/ends-with? (subs (str sb) start) "\n\n")]
         (.append sb reset)
         (.append sb body)
-        (.append sb "\n"))
+        (when-not children-end-nn?
+          (.append sb "\n\n"))))
 
     ThematicBreak
     (do (.append sb dim)
         (.append sb "────────────────────────────────────────\n")
         (.append sb reset)
-        (.append sb body))
+        (.append sb body)
+        (.append sb "\n"))
 
     SoftLineBreak
-    (.append sb "\n")
+    (.append sb " ")
 
     HardLineBreak
     (.append sb "\n")

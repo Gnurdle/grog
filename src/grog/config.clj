@@ -51,10 +51,23 @@
   []
   (swap! !cfg (fn [cur] (or cur (load-merge!)))))
 
-(defn- req-str [path label]
-  (or (some-> (get-in (grog) path) str str/trim not-empty)
-      (throw (ex-info (str "grog.edn missing required " label)
-                      {:path path}))))
+(defonce ^:private !llm-override (atom nil))
+
+(defn set-llm-override!
+  "Apply a session-scoped override map on top of the file-based `:llm` config.
+   Use `(clear-llm-override!)` to revert to the on-disk config."
+  [m]
+  (reset! !llm-override m))
+
+(defn clear-llm-override!
+  "Remove any session-scoped `:llm` override set by `/model`."
+  []
+  (reset! !llm-override nil))
+
+(defn effective-llm-cfg
+  "File-based `:llm` config deep-merged with any session override."
+  []
+  (deep-merge (get-in (grog) [:llm] {}) (or @!llm-override {})))
 
 (defn workspace-root
   "`:workspace :default-root` from grog.edn, default `\".\"` (used to resolve relative SOUL.md)."
@@ -73,25 +86,44 @@
                    (let [[var-name default-val] (str/split var-spec #":-" 2)]
                      (or (System/getenv var-name) default-val ""))))))
 
-(defn- cfg-str [path]
-  (some-> (get-in (grog) path) str str/trim not-empty))
-
 (defn llm-url
   "Chat completions POST URL. Use :llm :url."
   []
-  (req-str [:llm :url] ":llm :url"))
+  (let [v (get-in (effective-llm-cfg) [:url])]
+    (or (some-> v str str/trim not-empty)
+        (throw (ex-info "grog.edn missing required :llm :url"
+                        {:path [:llm :url]})))))
 
 (defn llm-model
   "Model id. Use :llm :model."
   []
-  (req-str [:llm :model] ":llm :model"))
+  (let [v (get-in (effective-llm-cfg) [:model])]
+    (or (some-> v str str/trim not-empty)
+        (throw (ex-info "grog.edn missing required :llm :model"
+                        {:path [:llm :model]})))))
 
 (defn llm-api-key
   "API key for OpenAI-compatible providers. Supports `${ENV}` and `${ENV:-default}` interpolation.
-   Reads :llm :api-key (inline, not recommended) or OS keyring LLM_API_KEY."
+   Reads :llm :api-key (inline, not recommended) or OS keyring LLM_API_KEY.
+
+   A session override can explicitly set `:api-key nil` or `:api-key false` to disable
+   the key for backends that do not need one (e.g. local Ollama)."
   []
-  (or (some-> (cfg-str [:llm :api-key]) interpolate-env-var not-empty)
-      (some-> (secrets/get-secret "LLM_API_KEY") not-empty)))
+  (let [override @!llm-override
+        explicit? (contains? override :api-key)
+        key-src (if explicit?
+                  (:api-key override)
+                  (:api-key (get-in (grog) [:llm] {})))]
+    (cond
+      (or (nil? key-src) (false? key-src))
+      nil
+
+      :else
+      (or (some-> (some-> key-src str str/trim not-empty)
+                  interpolate-env-var
+                  not-empty)
+          (when-not explicit?
+            (some-> (secrets/get-secret "LLM_API_KEY") not-empty))))))
 
 (defn llm-auth-headers
   "Authorization headers. Bearer token when an API key is configured."
@@ -102,32 +134,44 @@
 (defn llm-max-tokens
   "Max tokens for LLM requests. Default nil (provider default)."
   []
-  (let [v (get-in (grog) [:llm :max-tokens])]
+  (let [v (get-in (effective-llm-cfg) [:max-tokens])]
     (when (and (number? v) (pos? (long v)))
       (long v))))
+
+(defn llm-conn-timeout-ms
+  "Connection timeout (ms) for LLM HTTP requests; :llm :conn-timeout-sec, default 60s."
+  []
+  (* 1000 (long (get-in (effective-llm-cfg) [:conn-timeout-sec] 60))))
+
+(defn llm-socket-timeout-ms
+  "Read timeout (ms) for LLM streaming reads — a safety net so a stalled HTTP
+  body / pre-stream response can never block forever. :llm :socket-timeout-sec,
+  default 300s."
+  []
+  (* 1000 (long (get-in (effective-llm-cfg) [:socket-timeout-sec] 300))))
 
 (defn llm-temperature
   "Temperature for LLM requests. Default nil (provider default)."
   []
-  (let [v (get-in (grog) [:llm :temperature])]
+  (let [v (get-in (effective-llm-cfg) [:temperature])]
     (when (number? v) (double v))))
 
 (defn llm-debug-payload?
   "When true, prints full request payload to stderr."
   []
-  (true? (get-in (grog) [:llm :debug-payload])))
+  (true? (get-in (effective-llm-cfg) [:debug-payload])))
 
 (defn llm-debug-response?
   "When true, prints the raw accumulated response content to stderr before rendering."
   []
-  (true? (get-in (grog) [:llm :debug-response])))
+  (true? (get-in (effective-llm-cfg) [:debug-response])))
 
 (defn max-context-tokens
   "Context token budget. When set, oldest non-system messages are dropped before each
    request so the total stays under this limit. Rough estimate (~4 chars/token).
    Default 200000 to stay safely under common 256K–262K provider limits."
   []
-  (let [v (get-in (grog) [:llm :max-context-tokens])]
+  (let [v (get-in (effective-llm-cfg) [:max-context-tokens])]
     (cond
       (nil? v) 200000
       (and (number? v) (pos? (long v))) (long v)
@@ -137,7 +181,7 @@
   "Max characters for individual tool results. Results longer than this are truncated
    with a note. Default 50000 (~10–15K tokens). Set to nil in grog.edn to disable."
   []
-  (let [v (get-in (grog) [:llm :max-tool-result-chars])]
+  (let [v (get-in (effective-llm-cfg) [:max-tool-result-chars])]
     (cond
       (nil? v) 50000
       (and (number? v) (pos? (long v))) (long v)
@@ -148,7 +192,7 @@
    E.g. OpenRouter {:transforms [\"middle-out\"]} or {:plugins {…}}.
    Deep-merged after the standard payload fields so it can override them."
   []
-  (get-in (grog) [:llm :extra-payload]))
+  (get-in (effective-llm-cfg) [:extra-payload]))
 
 ;; Backward-compat alias — old code calls config/model
 (defn model
@@ -159,7 +203,7 @@
 (defn provider-name
   "Human-readable provider name for status lines."
   []
-  (or (some-> (cfg-str [:llm :provider-name]) not-empty)
+  (or (some-> (get-in (effective-llm-cfg) [:provider-name]) str str/trim not-empty)
       "OpenAI-compatible"))
 
 (defn oracle-url
@@ -247,6 +291,15 @@
   `:cli :chat-stream-live-content false` to always buffer until the round completes."
   []
   (not (false? (:chat-stream-live-content (cli-cfg)))))
+
+(defn chat-stream-live-markdown?
+  "When true (default false) and `:format-markdown` is true, stream assistant answer
+  tokens block-by-block through the Markdown renderer. Paragraphs and fenced code blocks
+  emit as soon their boundary is recognized; tables, list continuations, and other
+  blocks may remain buffered until a terminator (blank line, closing fence) arrives.
+  Set `:cli :chat-stream-live-markdown true` to enable."
+  []
+  (true? (:chat-stream-live-markdown (cli-cfg))))
 
 (defn format-markdown?
   "When true (default), assistant replies are rendered as CommonMark with ANSI styles.

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=grog
+GenericName=AI Chat Assistant
+Comment=Grog AI chat with an integrated shell window
+# Paths below use the repo's current location. If you move the repo, run
+# ./install-desktop.sh to regenerate this file with the new path, or edit.
+Exec=/d/gni/grog/grog-ui
+Icon=/d/gni/grog/icon.png
+Terminal=false
+StartupNotify=true
+Categories=Development;
+Keywords=grog;ai;chat;llm;assistant;

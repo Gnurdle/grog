@@ -14,17 +14,28 @@
         org.boofcv/boofcv-feature {:mvn/version "1.2.2"}
         ;; macOS Keychain / Windows Credential Manager / Linux Secret Service (GNOME/KDE)
         com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
-        org.slf4j/slf4j-nop {:mvn/version "2.0.9"}}
+        org.slf4j/slf4j-nop {:mvn/version "2.0.9"}
+        ;; modern flat Look & Feel so the chat + shell windows share a theme
+        com.formdev/flatlaf {:mvn/version "3.7.2"}
+        ;; real terminal (JediTerm widget) + PTY for the GUI shell window.
+        org.jetbrains.pty4j/pty4j {:mvn/version "0.13.12"}
+        com.github.JetBrains.JediTerm/jediterm-core {:mvn/version "master-86b5bea5f6-1"}
+        com.github.JetBrains.JediTerm/jediterm-ui {:mvn/version "master-86b5bea5f6-1"}}
+  :mvn/repos {"jitpack" {:url "https://jitpack.io"}}
 
  :aliases
  {:run {:main-opts ["-m" "grog.core"]
        ;; JDK 21+: native / reflective access for some transitive deps (e.g. JLine, OCR)
        :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                   "--enable-native-access=ALL-UNNAMED"]}
-  ;; Shorthand: `clojure -M:chat` → interactive chat (no extra `chat` token after :run)
-  :chat {:main-opts ["-m" "grog.core" "chat"]
-         :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
-                    "--enable-native-access=ALL-UNNAMED"]}
+  ;; Shorthand: `clojure -M:gui` → GUI (or `./grog-ui`); headless one-shot via `-m grog.core <text>`
+  :gui {:main-opts ["-m" "grog.ui"]
+        :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                   "--enable-native-access=ALL-UNNAMED"
+                   "-Dlog4j2.statusLoggerLevel=OFF"
+                   "-Dlog4j2.disableJmx=true"
+                   ;; faster cold start from a desktop launcher: stop deep JIT
+                   "-XX:TieredStopAtLevel=1"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :ns-default build}
   :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}

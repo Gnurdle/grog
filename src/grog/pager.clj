@@ -11,9 +11,12 @@
   [{:keys [^String answer-prefix ^String raw-content ^String ansi-answer ^String ansi-reset]}]
   (when-not (str/blank? raw-content)
     (let [expanded (image-png/process-tags! raw-content)
-          body (if (config/format-markdown?)
+          md? (config/format-markdown?)
+          body (if md?
                  (md-render/render-to-ansi expanded)
                  (str ansi-answer expanded))
-          full (str (or answer-prefix "\n") body "\n" ansi-reset)]
+          ;; Markdown renderer already ends blocks with their own trailing newlines;
+          ;; adding another one here would create extra blank lines.
+          full (str (or answer-prefix "\n") body (when-not md? "\n") ansi-reset)]
       (print full)
       (flush))))
