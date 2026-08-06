@@ -19,7 +19,7 @@
            [org.apache.pdfbox.rendering ImageType PDFRenderer]
            [org.apache.pdfbox.text PDFTextStripper]
            [org.apache.poi.ss.usermodel DataFormatter WorkbookFactory]
-           [org.apache.poi.xwpf.usermodel IBodyElement XWPFDocument XWPFParagraph
+           [org.apache.poi.xwpf.usermodel XWPFDocument XWPFParagraph
             XWPFTable XWPFTableCell XWPFTableRow]
            (java.nio.file StandardOpenOption)))
 
@@ -147,18 +147,42 @@
                               :pad_px {:type "integer"
                                        :description "Optional uniform margin added around the box before clamping to image bounds (0–256)."}}}}})
 
+(def ^:private default-office-max-chars (* 512 1024))         ; 512 KiB default text cap per call
+(def ^:private office-max-chars-cap (* 4 1024 1024))          ; 4 MiB upper limit
+(def ^:private office-max-elements-cap 10000)
+(def ^:private default-office-max-rows 500)                   ; Excel rows per sheet per call
+(def ^:private office-max-rows-cap 100000)
+
 (defn read-office-document-tool-spec []
   {:type "function"
    :function
    {:name "read_office_document"
     :description (str "Extract plain text and tables from a Word or Excel file under the workspace (any relative or absolute path under the workspace root). "
-                         "Supports .docx, .xlsx, .xls; other extensions are probed as spreadsheet then document. "
-                         "Returns JSON: format, path, text (paragraphs), tables (rows as string arrays). "
-                         "Each Word table is one entry; each Excel sheet is one table.")
+                      "Supports .docx, .xlsx, .xls; other extensions are probed as spreadsheet then document. "
+                      "Returns JSON: format, path, text (paragraphs), tables (rows as string arrays), plus paging metadata. "
+                      "Each Word table is one entry; each Excel sheet is one table. "
+                      "Large documents should be read in chunks: for Word use offset/limit on body elements "
+                      "(paragraphs+tables) and follow next_offset; for Excel use sheet_index/start_row/row_limit. "
+                      "text can be capped with max_chars; if text_truncated is true, raise the cap or narrow the window.")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path under workspace root (any extension; file must be readable as Office)."}}}}})
+                                     :description "Path under workspace root (any extension; file must be readable as Office)."}
+                              :offset {:type "integer"
+                                       :description "Word only: number of body elements (paragraphs+tables) to skip before reading. Default 0."}
+                              :limit {:type "integer"
+                                      :description (str "Word only: max body elements to read in this call. Default all remaining (up to "
+                                                        office-max-elements-cap "). Use with offset to page forward.")}
+                              :max_chars {:type "integer"
+                                          :description (str "Cap on characters of extracted text returned (default " default-office-max-chars
+                                                            ", max " office-max-chars-cap "). Not needed if paging by offset/limit.")}
+                              :sheet_index {:type "integer"
+                                            :description "Excel only: 0-based sheet to read. Omit to read all sheets."}
+                              :start_row {:type "integer"
+                                          :description "Excel only: 0-based first data row to read within each sheet. Default 0."}
+                              :row_limit {:type "integer"
+                                          :description (str "Excel only: max rows to read per sheet (default " default-office-max-rows
+                                                            ", max " office-max-rows-cap ").")}}}}})
 
 (defn read-pdf-document-tool-spec []
   {:type "function"
@@ -908,73 +932,110 @@
       (json/generate-string {:error (or (.getMessage e) "image crop failed")
                              :detail (str e)}))))
 
-(defn- extract-docx [^File f]
+(defn- extract-docx
+  "Extract text/tables from a .docx, reading only `limit` body elements starting at element `offset`.
+  Returns text, tables (each tagged with its element index), total element count, and count actually read."
+  [^File f offset limit]
   (with-open [in (FileInputStream. f)
               doc (XWPFDocument. in)]
-    (let [text-buf (StringBuilder.)
-          tables (volatile! [])]
-      (doseq [^IBodyElement el (.getBodyElements doc)]
-        (cond
-          (instance? XWPFParagraph el)
-          (let [t (.getText ^XWPFParagraph el)]
-            (when-not (str/blank? t)
-              (.append text-buf t)
-              (.append text-buf "\n")))
-          (instance? XWPFTable el)
-          (let [^XWPFTable tbl el
-                rows (for [^XWPFTableRow row (.getRows tbl)]
-                       (vec (for [^XWPFTableCell cell (.getTableCells row)]
-                              (str/trim (.getText cell)))))]
-            (vswap! tables conj {:source "word_table" :rows (vec rows)}))
-          :else nil))
+    (let [els (vec (.getBodyElements doc))
+          total (count els)
+          text-buf (StringBuilder.)
+          tables (volatile! [])
+          read-count (volatile! 0)
+          limit* (when limit (min (long limit) office-max-elements-cap))
+          stop-at (if limit* (+ (long offset) (long limit*)) total)]
+      (doseq [idx (range (long offset) (min total stop-at))]
+        (let [el (nth els idx)]
+          (cond
+            (instance? XWPFParagraph el)
+            (let [t (.getText ^XWPFParagraph el)]
+              (when-not (str/blank? t)
+                (.append text-buf t)
+                (.append text-buf "\n")))
+            (instance? XWPFTable el)
+            (let [^XWPFTable tbl el
+                  rows (for [^XWPFTableRow row (.getRows tbl)]
+                         (vec (for [^XWPFTableCell cell (.getTableCells row)]
+                                (str/trim (.getText cell)))))]
+              (vswap! tables conj {:source "word_table"
+                                   :element_index idx
+                                   :rows (vec rows)}))
+            :else nil))
+        (vswap! read-count inc))
       {:text (str text-buf)
-       :tables @tables})))
+       :tables @tables
+       :total_elements (long total)
+       :elements_read (long @read-count)})))
 
-(defn- extract-xlsx [^File f]
+(defn- extract-xlsx
+  "Extract text/tables from an .xlsx/.xls. When `sheet-index` is set, reads only that sheet; otherwise all sheets.
+  Reads rows from `start-row` up to `row-limit` per sheet. Returns text, tables, and sheet metadata."
+  [^File f sheet-index start-row row-limit]
   (with-open [wb (WorkbookFactory/create f)]
     (let [fmt (DataFormatter.)
+          total-sheets (.getNumberOfSheets wb)
+          _ (when (and (some? sheet-index) (or (neg? sheet-index) (>= sheet-index total-sheets)))
+              (throw (ex-info (str "sheet_index " sheet-index " out of range (0.." (dec total-sheets) ")")
+                              {:total_sheets total-sheets})))
+          idxs (if (nil? sheet-index) (range total-sheets) [(long sheet-index)])
+          row-limit* (when row-limit (min (long row-limit) office-max-rows-cap))
           sheets
           (mapv
            (fn [si]
-             (let [sh (.getSheetAt wb si)
+             (let [sh (.getSheetAt wb (int si))
                    name (.getSheetName sh)
                    last-row (.getLastRowNum sh)
+                   start (long (or start-row 0))
+                   end-row (cond (nil? row-limit*) last-row
+                                 :else (min last-row (dec (+ start (long row-limit*)))))
                    rows
                    (vec
-                    (for [r (range (inc (max -1 last-row)))
+                    (for [r (range start (inc (max -1 end-row)))
                           :let [row (.getRow sh r)]
                           :when row]
                       (vec
                        (for [c (range (max 1 (long (.getLastCellNum row))))
                              :let [cell (.getCell row c)]]
                          (if cell (.formatCellValue fmt cell) "")))))]
-               {:source "excel_sheet" :sheet name :rows rows}))
-           (range (.getNumberOfSheets wb)))]
+               {:source "excel_sheet"
+                :sheet name
+                :sheet_index (long si)
+                :first_row start
+                :last_data_row (long last-row)
+                :next_start_row (if (and end-row (< (inc end-row) (inc last-row)))
+                                  (inc end-row)
+                                  nil)
+                :rows_read (count rows)
+                :rows rows}))
+           idxs)]
       {:text (str/join "\n\n"
                        (map (fn [{:keys [sheet rows]}]
                               (str "## " sheet "\n"
                                    (str/join "\n"
                                              (map #(str/join "\t" %) rows))))
                             sheets))
-       :tables sheets})))
+       :tables sheets
+       :total_sheets (long total-sheets)})))
 
-(defn- read-office-as-json! [^File f path-str]
+(defn- extract-office-sliced
+  "Dispatch to the right extractor based on extension, passing Word/Excel slicing params.
+  Returns a data map (not JSON): format, path, text, tables, plus counts."
+  [^File f path-str offset limit sheet-index start-row row-limit]
   (let [lower (str/lower-case path-str)
         ext (some-> (re-find #"\.([^.]+)$" lower) second)]
     (cond
       (= ext "docx")
-      (let [{:keys [text tables]} (extract-docx f)]
-        (json/generate-string {:format "docx" :path path-str :text text :tables tables}))
+      (assoc (extract-docx f offset limit) :format "docx" :path path-str)
+
       (or (= ext "xlsx") (= ext "xls"))
-      (let [{:keys [text tables]} (extract-xlsx f)]
-        (json/generate-string {:format "xlsx" :path path-str :text text :tables tables}))
+      (assoc (extract-xlsx f sheet-index start-row row-limit) :format "xlsx" :path path-str)
+
       :else
       (try
-        (let [{:keys [text tables]} (extract-xlsx f)]
-          (json/generate-string {:format "xlsx" :path path-str :text text :tables tables}))
+        (assoc (extract-xlsx f sheet-index start-row row-limit) :format "xlsx" :path path-str)
         (catch Exception _
-          (let [{:keys [text tables]} (extract-docx f)]
-            (json/generate-string {:format "docx" :path path-str :text text :tables tables})))))))
+          (assoc (extract-docx f offset limit) :format "docx" :path path-str))))))
 
 (defn- extract-pdf [^File f ^long max-pages]
   (with-open [^PDDocument doc (Loader/loadPDF f)]
@@ -999,6 +1060,21 @@
     (let [m (parse-args-map arguments)
           path-str (or (some-> (:path m) str str/trim not-empty)
                        (some-> (get m "path") str str/trim not-empty))
+          offset (let [x (or (:offset m) (get m "offset"))]
+                   (cond (number? x) (max 0 (long x)) :else 0))
+          limit (let [x (or (:limit m) (get m "limit"))]
+                  (cond (number? x) (min office-max-elements-cap (max 1 (long x)))
+                        :else nil))
+          max-chars (let [x (or (:max_chars m) (get m "max_chars"))]
+                      (cond (number? x) (min office-max-chars-cap (max 1 (long x)))
+                            :else default-office-max-chars))
+          sheet-index (let [x (or (:sheet_index m) (get m "sheet_index"))]
+                        (cond (number? x) (long x) :else nil))
+          start-row (let [x (or (:start_row m) (get m "start_row"))]
+                      (cond (number? x) (max 0 (long x)) :else nil))
+          row-limit (let [x (or (:row_limit m) (get m "row_limit"))]
+                      (cond (number? x) (min office-max-rows-cap (max 1 (long x)))
+                            :else nil))
           ^File f (resolve-file-under-workspace! path-str)]
       (cond
         (not (.exists f))
@@ -1008,11 +1084,27 @@
         (json/generate-string {:error "not a regular file" :path path-str})
 
         :else
-        (try (read-office-as-json! f path-str)
-             (catch Exception e
-               (json/generate-string {:error "not a readable Office document (.docx / .xlsx / .xls)"
-                                      :path path-str
-                                      :detail (.getMessage e)})))))
+        (try
+          (let [{:keys [text elements_read] :as extracted}
+                (extract-office-sliced f path-str offset limit sheet-index start-row row-limit)
+                ^String t (or text "")
+                total-chars (count t)
+                text-truncated (> total-chars max-chars)
+                t-out (if text-truncated (subs t 0 (min total-chars max-chars)) t)
+                docx? (= (:format extracted) "docx")
+                result (cond-> (assoc extracted
+                                      :text t-out
+                                      :text_truncated text-truncated
+                                      :text_char_limit (when text-truncated max-chars)
+                                      :total_chars total-chars)
+                         docx? (assoc :offset offset
+                                      :limit limit
+                                      :next_offset (+ offset (long (or elements_read 0)))))]
+            (json/generate-string result))
+          (catch Exception e
+            (json/generate-string {:error "not a readable Office document (.docx / .xlsx / .xls)"
+                                   :path path-str
+                                   :detail (.getMessage e)})))))
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "office extract failed")
                              :detail (str e)}))))

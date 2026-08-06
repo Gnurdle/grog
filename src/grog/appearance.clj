@@ -99,6 +99,14 @@
   (save!)
   (current))
 
+(defn set-terminal-defaults!
+  "Reset only the terminal subtree (font + foreground/background) to the built-in
+  defaults, persist, and return the new current map."
+  []
+  (reset! state (assoc (deep-merge defaults @state) :terminal (get-in defaults [:terminal])))
+  (save!)
+  (current))
+
 (defn rgb [ks] (or (get-of (conj ks :rgb) nil) [255 255 255]))
 
 (defn set-rgb!
@@ -121,8 +129,10 @@
 (defn chat-font-family     [] (get-of [:chat :font-family] "Monospaced"))
 (defn chat-bg              [] (rgb [:chat :background]))
 (defn terminal-font-size   [] (get-of [:terminal :font-size] 18))
+(defn terminal-font-family [] (get-of [:terminal :font-family] "Monospaced"))
 (defn terminal-fg          [] (rgb [:terminal :foreground]))
 (defn terminal-bg          [] (rgb [:terminal :background]))
+(defn terminal-defaults    [] (get-in defaults [:terminal]))
 
 (defn ansi-user     [] (ansi-fg [:chat :user]))
 (defn ansi-thinking [] (ansi-fg [:chat :thinking]))

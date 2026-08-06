@@ -374,9 +374,10 @@
     ;; Send: button + Ctrl+Enter
     (.addActionListener send (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (submit!))))
-    ;; Enter submits the prompt; Ctrl+Enter inserts a literal newline (default).
+    ;; Enter inserts a literal newline (JTextArea default, so the prompt is
+    ;; freely editable/multiline); Shift+Enter submits the prompt.
     (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
-          (KeyStroke/getKeyStroke KeyEvent/VK_ENTER 0)
+          (KeyStroke/getKeyStroke KeyEvent/VK_ENTER (java.awt.event.InputEvent/SHIFT_DOWN_MASK))
           "grog-submit")
     (.put (.getActionMap prompt) "grog-submit"
           (proxy [AbstractAction] []

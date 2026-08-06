@@ -98,40 +98,40 @@
 (declare populate-appearance!)
 
 (defn- defaults-button
-  "A button that resets appearance to the built-in defaults and rebuilds the tab."
-  ^JButton [^JPanel panel families]
+  "A button that resets appearance — if `section` is given, only that subtree
+  (e.g. :terminal) — to the built-in defaults, then rebuilds the tab.
+  `repopulate` is a zero-arg fn that refreshes the panel's controls."
+  ^JButton [section repopulate]
   (let [b (widgets/styled-button "Defaults")]
     (.addActionListener b
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
-          (appearance/set-values! appearance/defaults)
+          (if section
+            (appearance/set-terminal-defaults!)
+            (appearance/set-values! appearance/defaults))
           (uifonts/apply-all!)
-          (populate-appearance! panel families))))
+          (repopulate))))
     b))
 
 (defn- populate-appearance!
-  "Fill the appearance tab panel (a vertical box) with the current controls."
+  "Fill the appearance tab panel (a vertical box) with the current chat controls."
   [^JPanel panel families]
   (.removeAll panel)
   (doseq [r [(font-size-row     "Chat font size"   [:chat :font-size])
              (font-family-row   "Chat font"        [:chat :font-family] families)
-             (font-size-row     "Terminal font size" [:terminal :font-size])
-             (font-family-row   "Terminal font"    [:terminal :font-family] families)
              (color-row "User text"          [:chat :user])
              (color-row "Thinking"           [:chat :thinking])
              (color-row "Answer"             [:chat :answer])
              (color-row "Tool call"          [:chat :tool-call])
-             (color-row "Chat background"    [:chat :background])
-             (color-row "Terminal text"      [:terminal :foreground])
-             (color-row "Terminal background" [:terminal :background])]]
+             (color-row "Chat background"    [:chat :background])]]
     (.add panel r)
     (.add panel (Box/createVerticalStrut 6)))
-  (.add panel (defaults-button panel families))
+  (.add panel (defaults-button nil #(populate-appearance! panel families)))
   (.revalidate panel)
   (.repaint panel))
 
 (defn- build-appearance-tab
-  "Chat/terminal fonts + colours, in a scrollable vertical panel."
+  "Chat fonts + colours, in a scrollable vertical panel."
   ^JPanel []
   (let [families (vec (.getAvailableFontFamilyNames
                        (GraphicsEnvironment/getLocalGraphicsEnvironment)))
@@ -139,6 +139,36 @@
         _ (.setLayout vbox (BoxLayout. vbox BoxLayout/Y_AXIS))
         _ (.setBorder vbox (javax.swing.BorderFactory/createEmptyBorder 12 12 12 12))
         _ (populate-appearance! vbox families)
+        outer (doto (JPanel. (BorderLayout.))
+                (.setOpaque false)
+                (.add (JScrollPane. vbox) BorderLayout/CENTER))]
+    outer))
+
+;; --- Terminal tab ----------------------------------------------------------
+
+(defn- populate-terminal!
+  "Fill the terminal tab panel (a vertical box) with font/colour controls."
+  [^JPanel panel families]
+  (.removeAll panel)
+  (doseq [r [(font-family-row   "Terminal font"    [:terminal :font-family] families)
+             (font-size-row     "Font size"        [:terminal :font-size])
+             (color-row "Terminal text"    [:terminal :foreground])
+             (color-row "Background"       [:terminal :background])]]
+    (.add panel r)
+    (.add panel (Box/createVerticalStrut 6)))
+  (.add panel (defaults-button :terminal #(populate-terminal! panel families)))
+  (.revalidate panel)
+  (.repaint panel))
+
+(defn- build-terminal-tab
+  "Terminal font, text colour and background, in a scrollable vertical panel."
+  ^JPanel []
+  (let [families (vec (.getAvailableFontFamilyNames
+                       (GraphicsEnvironment/getLocalGraphicsEnvironment)))
+        vbox (JPanel.)
+        _ (.setLayout vbox (BoxLayout. vbox BoxLayout/Y_AXIS))
+        _ (.setBorder vbox (javax.swing.BorderFactory/createEmptyBorder 12 12 12 12))
+        _ (populate-terminal! vbox families)
         outer (doto (JPanel. (BorderLayout.))
                 (.setOpaque false)
                 (.add (JScrollPane. vbox) BorderLayout/CENTER))]
@@ -359,7 +389,7 @@
     (.addTab tabs "General" (stub-tab "General settings — coming soon."))
     (.addTab tabs "Appearance" (build-appearance-tab))
     (.addTab tabs "Models" (build-models-tab))
-    (.addTab tabs "Terminal" (stub-tab "Shell and keybindings — coming soon."))
+    (.addTab tabs "Terminal" (build-terminal-tab))
     (.addTab tabs "About" (stub-tab "grog — an AI chat plus terminal."))
     (.addActionListener close-btn
       (reify java.awt.event.ActionListener

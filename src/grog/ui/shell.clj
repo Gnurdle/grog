@@ -8,7 +8,7 @@
             [clojure.string :as str])
   (:require [grog.appearance :as appearance]
             [grog.ui.fonts :as uifonts])
-  (:import (java.awt BorderLayout)
+  (:import (java.awt BorderLayout Font)
            (java.awt.event WindowAdapter)
            (java.nio.charset Charset)
            (java.util HashMap)
@@ -60,16 +60,19 @@
   "A SettingsProvider that themes the JediTerm terminal from global appearance."
   []
   (let [fg #(rgb->jcolor (appearance/terminal-fg))
-        bg #(rgb->jcolor (appearance/terminal-bg))]
-    (let [palette
-          (proxy [ColorPalette] []
-            (getForegroundByColorIndex [_] (fg))
-            (getBackgroundByColorIndex [_] (bg))
-            (getForeground [tc] (fg))
-            (getBackground [tc] (bg)))]
-      (proxy [DefaultSettingsProvider] []
-        (getTerminalColorPalette [] palette)
-        (getTerminalFontSize [] (uifonts/terminal-font-size))))))
+        bg #(rgb->jcolor (appearance/terminal-bg))
+        size (uifonts/terminal-font-size)
+        fam (appearance/terminal-font-family)
+        palette
+        (proxy [ColorPalette] []
+          (getForegroundByColorIndex [_] (fg))
+          (getBackgroundByColorIndex [_] (bg))
+          (getForeground [tc] (fg))
+          (getBackground [tc] (bg)))]
+    (proxy [DefaultSettingsProvider] []
+      (getTerminalColorPalette [] palette)
+      (getTerminalFont [] (Font. fam Font/PLAIN size))
+      (getTerminalFontSize [] size))))
 
 (defn make-shell-frame
   "Build and return the real terminal `JFrame` (JediTerm widget over a PTY).

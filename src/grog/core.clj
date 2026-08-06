@@ -26,7 +26,8 @@
             [grog.skills :as skills]
             [grog.soul :as soul]
             [grog.with-api-key :as wkey]
-            [grog.appearance :as appearance]))
+            [grog.appearance :as appearance]
+            [grog.assoc-memory :as assoc-memory]))
 
 (def ^:private ansi-reset "\u001B[0m")
 (def ^:private ansi-hot-pink "\u001B[38;2;255;105;180m")
@@ -43,6 +44,48 @@
     (apply println args)
     (print ansi-reset)
     (flush)))
+
+(defn- debug-tool-names
+  "Names of the tool definitions offered in a request `payload`."
+  [payload]
+  (->> (or (:tools payload) (get payload "tools") [])
+       (keep (fn [spec]
+               (let [n (get-in spec [:function :name])
+                     n (or n (get-in spec ["function" "name"]))]
+                 (when (seq (str n)) (str n)))))
+       vec))
+
+(defn- debug-tool-calls
+  "Sequence of [tool-name args] for every tool_call embedded in the `messages` of a request `payload`."
+  [payload]
+  (let [msgs (or (:messages payload) (get payload "messages") [])]
+    (mapcat (fn [msg]
+              (if (map? msg)
+                (let [sub (if (map? (:message msg)) (:message msg) msg)
+                      tcs (or (:tool_calls sub) (get sub "tool_calls") [])]
+                  (keep (fn [tc]
+                          (when (map? tc)
+                            (let [f (or (:function tc) (get tc "function"))
+                                  nm (or (:name f) (get f "name"))
+                                  args (or (:arguments f) (get f "arguments"))]
+                              (when (seq (str nm)) [(str nm) args]))))
+                        (vec tcs)))
+                []))
+            msgs)))
+
+(defn- debug-log-tool-calls!
+  "Explicit, easy-to-spot tool-call debug log to stderr, emitted when :debug-payload is on.
+  Prints the tool definitions offered and any tool_calls the model made in this request."
+  [payload]
+  (binding [*out* *err*]
+    (let [names (debug-tool-names payload)
+          calls (vec (debug-tool-calls payload))]
+      (println (str "grog: debug: tools offered (" (count names) "): "
+                    (if (seq names) (str/join ", " names) "(none)")))
+      (if (seq calls)
+        (doseq [[i [nm args]] (map-indexed vector calls)]
+          (println (str "grog: debug: tool_call[" i "] " nm " " (pr-str args))))
+        (println "grog: debug: no tool_calls in this request's messages")))))
 
 (def ^:private chat-initial-heading "I am Grog -- Trifle with me at your own peril.")
 
@@ -325,7 +368,8 @@
     (when (config/llm-debug-payload?)
       (binding [*out* *err*]
         (println "grog: LLM request ->" url)
-        (println (json/generate-string payload {:pretty true}))))
+        (println (json/generate-string payload {:pretty true})))
+      (debug-log-tool-calls! payload))
     (try
       (let [resp (http/post url {:headers headers
                                  :content-type "application/json"
@@ -565,6 +609,8 @@
           (#{"memory_save" "memory_load" "memory_list_keys" "memory_namespaces"
              "memory_create_namespace" "memory_delete"} nm)
           (tool-call-println! "grog: tool" nm (pr-str (memory-tools/tool-log-summary nm args)))
+          (#{"assoc_store" "assoc_get" "assoc_keys" "assoc_search"} nm)
+          (tool-call-println! "grog: tool" nm (pr-str (assoc-memory/tool-log-summary nm args)))
           (#{"list_skills" "read_skill" "save_skill" "delete_skill"} nm)
           (tool-call-println! "grog: tool" nm
                               (when (#{"read_skill" "save_skill" "delete_skill"} nm)
@@ -604,6 +650,10 @@
           (= nm "memory_namespaces") (memory-tools/run-memory-namespaces! args)
           (= nm "memory_create_namespace") (memory-tools/run-memory-create-namespace! args)
           (= nm "memory_delete") (memory-tools/run-memory-delete! args)
+          (= nm "assoc_store") (assoc-memory/run-assoc-store! args)
+          (= nm "assoc_get") (assoc-memory/run-assoc-get! args)
+          (= nm "assoc_keys") (assoc-memory/run-assoc-keys! args)
+          (= nm "assoc_search") (assoc-memory/run-assoc-search! args)
           (= nm "list_skills") (skills/run-list-skills! args)
           (= nm "read_skill") (skills/run-read-skill! args)
           (= nm "save_skill") (skills/run-save-skill! args)
@@ -614,7 +664,7 @@
           (mcp/mcp-admin-tool-name? nm) (mcp/run-mcp-admin-tool! nm args)
           (mcp/tool-name-mcp? nm) (mcp/run-tool! nm args)
           :else
-          (str "Unknown tool \"" nm "\". Available: read_workspace_file, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image, read_office_document, read_pdf_document, ocr_pdf_document, grep_workspace_file, stat_workspace_file, read_workspace_file_lines, analyze_pdf_line_drawings"
+          (str "Unknown tool \"" nm "\". Available: read_workspace_file, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image, read_office_document, read_pdf_document, ocr_pdf_document, grep_workspace_file, stat_workspace_file, read_workspace_file_lines, analyze_pdf_line_drawings, assoc_store, assoc_get, assoc_keys, assoc_search"
                (when (config/skills-configured?) ", list_skills, read_skill, save_skill, delete_skill")
                (when (brave/brave-search-configured?) ", brave_web_search")
                (when (oracle/oracle-configured?) ", oracle")
@@ -657,6 +707,7 @@
                 (fs/stat-workspace-file-tool-spec)
                 (fs/read-workspace-file-lines-tool-spec)
                 (boofcv-pdf/analyze-pdf-line-drawings-tool-spec)]
+               (assoc-memory/tool-specs)
                (when (brave/brave-search-configured?)
                  [(brave/tool-spec)])
                (when (oracle/oracle-configured?)
