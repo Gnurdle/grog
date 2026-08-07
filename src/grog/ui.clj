@@ -18,13 +18,14 @@
 
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.chat-context :as chat-ctx]
             [grog.config :as config]
             [grog.core :as core]
+            [grog.eca :as eca]
+            [grog.eca-config :as ecacfg]
             [grog.appearance :as appearance]
-            [grog.pager :as pager]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
+            [grog.ui.eca-stream :as ecastream]
             [grog.ui.export :as uiexport]
             [grog.ui.fonts :as uifonts]
             [grog.ui.footer :as uifooter]
@@ -33,16 +34,15 @@
             [grog.ui.transcript :as transcript]
             [grog.ui.widgets :as widgets]
             [grog.soul :as soul])
-  (:import (java.awt Color Component Dimension Font Graphics Image Toolkit BorderLayout FlowLayout Point)
+  (:import (java.awt Color Component Font Graphics Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
-           (javax.swing AbstractAction JButton JComponent JFrame JLabel JMenuItem JPanel
-                        JPopupMenu JScrollPane JTextArea JTextPane KeyStroke SwingUtilities)
+           (javax.swing AbstractAction JComponent JFrame JLabel JMenuItem JOptionPane
+                        JPanel JPopupMenu JScrollPane JTextArea JTextPane KeyStroke SwingUtilities)
            (java.util.concurrent LinkedBlockingQueue)
            (java.awt.datatransfer StringSelection)
            (java.awt.event KeyEvent MouseAdapter)))
 
 ;; ANSI styling mirrors grog.core for plain mode (parsed by transcript writer).
-(def ^:private ansi-answer "\u001B[38;2;100;220;255m")
 (def ^:private ansi-reset  "\u001B[0m")
 
 ;; echoed user prompt colour (dark yellow)
@@ -163,84 +163,87 @@
 ;; Chat
 ;; ---------------------------------------------------------------------------
 
-(defn- do-llm-turn!
-  "Run one user turn through the LLM+tool loop, streaming into `pane`, and
-  return the updated history. Runs on the worker thread."
-  [^JTextPane pane history text]
-  (dbg! "handle-turn start text=" text)
-  (dbg! "llm url=" (config/llm-url) " model=" (config/model)
-        " has-key=" (boolean (config/llm-api-key)))
-  (try
-    (let [recent (chat-ctx/recent-history-for-cap history (config/chat-history-turns))
-          msgs (conj (chat-ctx/history->messages (chat-ctx/system-messages) recent)
-                     {:role "user" :content text})]
-      (dbg! "messages built, count=" (count msgs))
-      (dbg! "calling chat round...")
-        (let [result (core/run-tool-loop-on-messages msgs
-                       :answer-prefix "\n"
-                       :cancel-state (cancel/cancel-state))]
-          (dbg! "chat round returned ok=" (:ok result)
-                " err=" (str/trim (str (:error result)))
-                " thinking?=" (boolean (str/trim (str (:thinking result))))
-                " content=" (when-let [c (:content result)] (subs (str c) 0 (min 80 (count (str c))))))
-          (if (:ok result)
-            (let [content (str (:content result) "")
-                  thinking (str (:thinking result) "")]
-              (when (and (config/chat-show-thinking?) (seq thinking)
-                         (not (:live-thinking-printed? result)))
-                (println (str "── thinking ──\n" thinking "\n")))
-              (when-not (:live-content-printed? result)
-                (when (seq (str/trim content))
-                  (pager/emit-final-reply!
-                    {:answer-prefix "\n"
-                     :raw-content content
-                     :ansi-answer (appearance/ansi-answer)
-                     :ansi-reset ansi-reset})))
-              (conj history {:user text :assistant content}))
-            (do (binding [*out* *err*]
-                  (println (str "[grog] " (:error result))))
-                history))))
-      (catch Exception e
-        (dbg! "exception in handle-turn:" (.getMessage e))
-        (binding [*out* *err*]
-          (println (str "[grog] error: " (.getMessage e))))
-        history)))
+(defn- file-uri
+  "A `file://` URI for a local path, for ECA `workspaceFolders`."
+  [^String path]
+  (let [abs (.toAbsolutePath (.normalize (.toPath (java.io.File. path))))]
+    (str "file://" abs)))
+
+(defn- make-event-handler
+  "Build the ECA event handler for the transcript: renders `chat/contentReceived`,
+  flips `running?` when a prompt finishes, and prompts the user to approve/reject
+  manual-approval tool calls. Runs on the ECA reader thread."
+  [^JTextPane pane running? chat-id]
+  (fn [method params]
+    (case method
+      "chat/contentReceived"
+      (let [content (:content params)]
+        (binding [*out* (transcript/styled-writer pane)]
+          (ecastream/render-content! pane content))
+        (when (= "finished" (:state content))
+          (reset! running? false))
+        ;; manual-approval tool call -> ask the user, then approve/reject
+        (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
+          (let [id (:id content)
+                name (str (:name content))
+                summary (:summary content)
+                approve? (= JOptionPane/YES_OPTION
+                            (JOptionPane/showConfirmDialog
+                              pane
+                              (str "Approve tool call:\n\n  " name
+                                   (when (seq summary) (str "\n\n" summary))
+                                   "\n\nApprove?" )
+                              "grog — tool approval"
+                              JOptionPane/YES_NO_OPTION))]
+            (if approve?
+              (eca/approve! @chat-id id)
+              (eca/reject! @chat-id id)))))
+
+      "chat/statusChanged"
+      (when (= "idle" (:status params))
+        (reset! running? false))
+
+      nil)))
 
 (defn- handle-turn!
-  "Route slash commands, or run an LLM turn. Returns the updated history."
-  [^JTextPane pane history text]
+  "Echo user input, route slash commands, or hand an LLM turn to `send-fn`
+  (a closure `(fn [history text] -> history)` owned by the frame). Also handles
+  `/eca-model <name>` via `set-model-fn`. Returns the updated history."
+  [^JTextPane pane history text send-fn set-model-fn]
   (binding [*out* (transcript/styled-writer pane)
             *err* (transcript/styled-writer pane)]
     (cancel/clear!)
     ;; echo the user's input (prompt or command) into the transcript in dark yellow
     (when (seq (str/trim text))
       (println (str "\n" (appearance/ansi-user) text ansi-reset)))
-    (case (core/route-slash-command! text)
-      :grog.core/quit
-      (do (System/exit 0) history)
-      :grog.core/clear
-      (do
-        ;; empty the visible transcript as well as the chat history
-        (let [^javax.swing.text.StyledDocument doc (.getStyledDocument pane)
-              len (.getLength doc)]
-          (when (pos? len) (.remove doc 0 len)))
-        (println "History cleared.")
-        [])
-      :grog.core/handled
-      history
-      :grog.core/llm
-      (do-llm-turn! pane history text))))
+    (if-let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
+      (do (set-model-fn (str/trim (second m)))
+          history)
+      (case (core/route-slash-command! text)
+        :grog.core/quit
+        (do (System/exit 0) history)
+        :grog.core/clear
+        (do
+          ;; empty the visible transcript as well as the chat history
+          (let [^javax.swing.text.StyledDocument doc (.getStyledDocument pane)
+                len (.getLength doc)]
+            (when (pos? len) (.remove doc 0 len)))
+          (println "History cleared.")
+          [])
+        :grog.core/handled
+        history
+        :grog.core/llm
+        (send-fn history text)))))
 
 (defn- chat-worker!
-  "Process the input queue on a background thread."
-  [^JTextPane pane ^LinkedBlockingQueue queue running? history-ref]
+  "Process the input queue on a background thread. `send-fn` is the ECA turn
+  closure; `running?` is managed by the ECA event lifecycle."
+  [^JTextPane pane ^LinkedBlockingQueue queue history-ref send-fn set-model-fn]
   (Thread.
     (fn []
       (loop []
         (when-let [text (.take queue)]
-          (reset! running? true)
-          (reset! history-ref (handle-turn! pane @history-ref text))
-          (reset! running? false)
+          (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn))
           (recur))))))
 
 (def ^:private shell-frame-ref (atom nil))
@@ -342,6 +345,52 @@
         queue (LinkedBlockingQueue.)
         running? (atom false)
         history-ref (atom [])
+        chat-id (atom (str (java.util.UUID/randomUUID)))
+        model-ref (atom (or (config/eca-model) nil))
+        connected (atom false)
+        event-handler (make-event-handler pane running? chat-id)
+        connect-eca! (fn []
+                       (when-not @connected
+                         (try
+                           (let [cfg (ecacfg/generate-config!)]
+                             (eca/connect! [{:uri (file-uri (config/workspace-root)) :name "grog"}]
+                                           :event-handler event-handler
+                                           :args ["--config-file" cfg]
+                                           :log-fn (fn [line] (dbg! "eca:" line))))
+                           (reset! connected true)
+                           (catch Throwable e
+                             (binding [*out* (transcript/styled-writer pane)]
+                               (println (str "[grog] ECA connect failed: " (.getMessage e))))
+                             (reset! running? false)))))
+        send-fn (fn [history text]
+                  (connect-eca!)
+                  (if-not @connected
+                    (do (reset! running? false) history)
+                    (do
+                      (reset! running? true)
+                      (cancel/clear!)
+                      (try
+                        (let [resp (eca/prompt! text {:chatId @chat-id :model (or @model-ref nil)})]
+                          (when-let [e (:error resp)]
+                            (binding [*out* (transcript/styled-writer pane)]
+                              (println (str "[grog] " (or (:message e) (pr-str e))))))
+                          (conj history {:user text}))
+                        (catch Throwable e
+                          (dbg! "eca prompt error:" (.getMessage e))
+                          (reset! running? false)
+                          (binding [*out* (transcript/styled-writer pane)]
+                            (println (str "[grog] " (.getMessage e))))
+                          history)))))
+        stop-action! (fn []
+                       (when @connected (eca/stop! @chat-id))
+                       (cancel/cancel!)
+                       (reset! running? false))
+        set-model-fn (fn [name]
+                       (when @connected
+                         (eca/selected-model! name {:chatId @chat-id}))
+                       (reset! model-ref name)
+                       (binding [*out* (transcript/styled-writer pane)]
+                         (println (str "model: " name))))
         bg (background-panel)
         sent? (atom false)   ; first real message flips the logo to subdued
         submit! (fn []
@@ -382,9 +431,9 @@
     (.put (.getActionMap prompt) "grog-submit"
           (proxy [AbstractAction] []
             (actionPerformed [e] (submit!))))
-    ;; Stop -> cancellation registry; Terminal -> open the shell window
+    ;; Stop -> stop the ECA prompt (and cancel registry); Terminal -> shell window
     (.addActionListener stop (reify java.awt.event.ActionListener
-                               (actionPerformed [_ _] (cancel/cancel!))))
+                               (actionPerformed [_ _] (stop-action!))))
     (.addActionListener term (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (show-shell!))))
     (.addActionListener settings (reify java.awt.event.ActionListener
@@ -394,7 +443,7 @@
                                  (actionPerformed [_ _]
                                    (uiexport/save-transcript! frame pane))))
     ;; start worker
-    (.start (chat-worker! pane queue running? history-ref))
+    (.start (chat-worker! pane queue history-ref send-fn set-model-fn))
     ;; layout over the logo background
     (let [root (:panel bg)
           button-row (JPanel. (FlowLayout. FlowLayout/LEFT))]
@@ -405,7 +454,7 @@
       (.add button-row export)
       ;; active-model indicator in the lower corner
       (.add button-row (uifooter/register-label!
-                          (JLabel. (str "model: " (config/model)))))
+                          (JLabel. (str "model: " (or @model-ref (config/model))))))
       ;; readable prompt box: dark + light text; surrounding panes transparent
       (doto prompt
         (.setOpaque true)
@@ -453,6 +502,9 @@
 (defn -main
   "Entry point: `clojure -M -m grog.ui`, `./grog-ui`, or `grog-ui.bat`."
   [& _]
+  ;; cleanly shut down the ECA subprocess (if any) on JVM exit
+  (.addShutdownHook (Runtime/getRuntime)
+                    (Thread. (fn [] (eca/disconnect!))))
   (SwingUtilities/invokeLater
     (fn []
       (try

@@ -77,6 +77,13 @@
       "."
       (str/trim (str r)))))
 
+(defn eca-model
+  "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
+  `chat/prompt`. nil when unset (ECA falls back to its own default)."
+  []
+  (let [m (get-in (grog) [:eca :model])]
+    (when (seq (str/trim (str m))) (str/trim (str m)))))
+
 (defn- interpolate-env-var
   "Replace `${ENV}` and `${ENV:-default}` in a string with environment variable values."
   [^String s]

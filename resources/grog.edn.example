@@ -1,4 +1,5 @@
 {:workspace {:default-root "/absolute/path/to/project"}
+ :eca {:model "openrouter/moonshotai/kimi-k2.6"}
  ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
  ;; For local Ollama use: :url "http://localhost:11434/v1"
  :llm {:url "http://localhost:11434/v1"
