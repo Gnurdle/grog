@@ -172,14 +172,18 @@
 (defn- make-event-handler
   "Build the ECA event handler for the transcript: renders `chat/contentReceived`
   (streaming inline), flips `running?` when a prompt finishes, and prompts the
-  user to approve/reject manual-approval tool calls. Runs on the ECA reader thread."
+  user to approve/reject manual-approval tool calls. Runs on the ECA reader thread.
+  NOTE: a single `styled-writer` is shared across all events so its active ANSI
+  color persists between contiguous streamed chunks (a fresh writer per event
+  would reset the color to black mid-stream)."
   [^JTextPane pane running? chat-id]
-  (let [streamer (ecastream/make-streamer)]
+  (let [streamer (ecastream/make-streamer)
+        writer (transcript/styled-writer pane)]
     (fn [method params]
       (case method
         "chat/contentReceived"
         (let [content (:content params)]
-          (binding [*out* (transcript/styled-writer pane)]
+          (binding [*out* writer]
             (streamer content))
           (when (= "finished" (:state content))
             (reset! running? false))
