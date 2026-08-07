@@ -2,9 +2,14 @@
   "Renders ECA `chat/contentReceived` content events onto the grog transcript pane.
 
   The caller binds `*out*` to `grog.ui.transcript/styled-writer` (which parses
-  ANSI SGR into styled runs on the EDT), then calls `render-content!` for each
-  `:content` object in a `chat/contentReceived` notification. Runs on the ECA
-  reader thread; the styled-writer marshals to the EDT."
+  ANSI SGR into styled runs on the EDT), then feeds each `:content` object to a
+  stateful renderer returned by `make-streamer`. Runs on the ECA reader thread;
+  the styled-writer marshals to the EDT.
+
+  Streamed text (`text`, `reasonText`) is printed *inline* (no newline between
+  chunks) so the reply/the reasoning flows continuously instead of one piece per
+  line; block boundaries (thinking start/finish, tool calls, metadata) close the
+  current line."
   (:require [clojure.string :as str]
             [grog.appearance :as appearance]))
 
@@ -25,57 +30,87 @@
          (when (seq summary) (str " — " (str/trim summary)))
          " ──")))
 
-(defn render-content!
-  "Append one ECA `:content` object to the pane (via the bound `*out*` writer)."
-  [^javax.swing.JTextPane _pane content]
-  (when (map? content)
-    (case (:type content)
-      "text"
-      (let [t (str (:text content))]
-        (when (seq t)
-          (say! (appearance/ansi-answer) t ansi-reset)))
+(defn make-streamer
+  "A stateful renderer `(fn [content])` that streams `text`/`reasonText` inline
+  rather than line-per-chunk. Blocks (tool calls, metadata, flags, thinking
+  start/finish, stream end) close any in-progress line first."
+  []
+  (let [open? (atom false)]          ; an inline streamed block is being printed
+    (fn [content]
+      (when (map? content)
+        (let [close-line! (fn []
+                            (when @open?
+                              (print ansi-reset)
+                              (println)
+                              (flush)
+                              (reset! open? false)))
+              open-line! (fn [^String color]
+                           (when @open? (println) (flush))
+                           (reset! open? true)
+                           (print color)
+                           (flush))]
+          (case (:type content)
+            "text"
+            (let [txt (str (:text content))]
+              (when (seq txt)
+                (when-not @open? (open-line! (appearance/ansi-answer)))
+                (print txt)
+                (flush)))
 
-      "reasonStarted"
-      (say! (appearance/ansi-thinking) "── thinking ──" ansi-reset)
+            "reasonText"
+            (let [txt (str (:text content))]
+              (when (seq txt)
+                (when-not @open? (open-line! (appearance/ansi-thinking)))
+                (print txt)
+                (flush)))
 
-      "reasonText"
-      (let [t (str (:text content))]
-        (when (seq t)
-          (say! (appearance/ansi-thinking) t ansi-reset)))
+            "reasonStarted"
+            (do (close-line!)
+                (say! (appearance/ansi-thinking) "── thinking ──" ansi-reset))
 
-      "reasonFinished"
-      (say! (appearance/ansi-thinking) ansi-reset)
+            "reasonFinished"
+            (close-line!)
 
-      "toolCallPrepare" nil
+            "toolCallPrepare" nil
 
-      "toolCallRun"
-      (say! (appearance/ansi-tool-call) (tool-banner content)
-            (when (true? (:manualApproval content)) "  ⚠ approval required")
-            ansi-reset)
+            "toolCallRun"
+            (do (close-line!)
+                (say! (appearance/ansi-tool-call) (tool-banner content)
+                      (when (true? (:manualApproval content)) "  ⚠ approval required")
+                      ansi-reset))
 
-      "toolCallRunning"
-      (say! (appearance/ansi-tool-call) (str "   running " (:name content) "…")
-            ansi-reset)
+            "toolCallRunning"
+            (do (close-line!)
+                (say! (appearance/ansi-tool-call) (str "   running " (:name content) "…")
+                      ansi-reset))
 
-      "toolCalled"
-      (let [err (:error content)]
-        (say! (appearance/ansi-tool-call)
-              (str "   " (if err "✗" "✓") " " (:name content)
-                   (when-let [ms (:totalTimeMs content)] (str " (" ms "ms)")))
-              ansi-reset))
+            "toolCalled"
+            (do (close-line!)
+                (let [err (:error content)]
+                  (say! (appearance/ansi-tool-call)
+                        (str "   " (if err "✗" "✓") " " (:name content)
+                             (when-let [ms (:totalTimeMs content)] (str " (" ms "ms)")))
+                        ansi-reset)))
 
-      "toolCallRejected"
-      (say! (appearance/ansi-tool-call) (str "   ✗ " (:name content) " rejected")
-            ansi-reset)
+            "toolCallRejected"
+            (do (close-line!)
+                (say! (appearance/ansi-tool-call) (str "   ✗ " (:name content) " rejected")
+                      ansi-reset))
 
-      "metadata"
-      (let [t (:title content)]
-        (when (seq t) (say! (str "[" t "]"))))
+            "metadata"
+            (do (close-line!)
+                (let [t (:title content)]
+                  (when (seq t) (say! (str "[" t "]")))))
 
-      "flag"
-      (let [t (:text content)]
-        (when (seq t) (say! (str "[" t "]"))))
+            "flag"
+            (do (close-line!)
+                (let [t (:text content)]
+                  (when (seq t) (say! (str "[" t "]")))))
 
-      "usage" nil
-      "progress" nil
-      nil)))
+            "usage" nil
+
+            "progress"
+            (when (= "finished" (:state content))
+              (close-line!))
+
+            nil))))))

@@ -170,40 +170,41 @@
     (str "file://" abs)))
 
 (defn- make-event-handler
-  "Build the ECA event handler for the transcript: renders `chat/contentReceived`,
-  flips `running?` when a prompt finishes, and prompts the user to approve/reject
-  manual-approval tool calls. Runs on the ECA reader thread."
+  "Build the ECA event handler for the transcript: renders `chat/contentReceived`
+  (streaming inline), flips `running?` when a prompt finishes, and prompts the
+  user to approve/reject manual-approval tool calls. Runs on the ECA reader thread."
   [^JTextPane pane running? chat-id]
-  (fn [method params]
-    (case method
-      "chat/contentReceived"
-      (let [content (:content params)]
-        (binding [*out* (transcript/styled-writer pane)]
-          (ecastream/render-content! pane content))
-        (when (= "finished" (:state content))
+  (let [streamer (ecastream/make-streamer)]
+    (fn [method params]
+      (case method
+        "chat/contentReceived"
+        (let [content (:content params)]
+          (binding [*out* (transcript/styled-writer pane)]
+            (streamer content))
+          (when (= "finished" (:state content))
+            (reset! running? false))
+          ;; manual-approval tool call -> ask the user, then approve/reject
+          (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
+            (let [id (:id content)
+                  name (str (:name content))
+                  summary (:summary content)
+                  approve? (= JOptionPane/YES_OPTION
+                              (JOptionPane/showConfirmDialog
+                                pane
+                                (str "Approve tool call:\n\n  " name
+                                     (when (seq summary) (str "\n\n" summary))
+                                     "\n\nApprove?" )
+                                "grog — tool approval"
+                                JOptionPane/YES_NO_OPTION))]
+              (if approve?
+                (eca/approve! @chat-id id)
+                (eca/reject! @chat-id id)))))
+
+        "chat/statusChanged"
+        (when (= "idle" (:status params))
           (reset! running? false))
-        ;; manual-approval tool call -> ask the user, then approve/reject
-        (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
-          (let [id (:id content)
-                name (str (:name content))
-                summary (:summary content)
-                approve? (= JOptionPane/YES_OPTION
-                            (JOptionPane/showConfirmDialog
-                              pane
-                              (str "Approve tool call:\n\n  " name
-                                   (when (seq summary) (str "\n\n" summary))
-                                   "\n\nApprove?" )
-                              "grog — tool approval"
-                              JOptionPane/YES_NO_OPTION))]
-            (if approve?
-              (eca/approve! @chat-id id)
-              (eca/reject! @chat-id id)))))
 
-      "chat/statusChanged"
-      (when (= "idle" (:status params))
-        (reset! running? false))
-
-      nil)))
+        nil))))
 
 (defn- handle-turn!
   "Echo user input, route slash commands, or hand an LLM turn to `send-fn`
