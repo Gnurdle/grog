@@ -40,4 +40,5 @@
                    "-XX:TieredStopAtLevel=1"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :ns-default build}
+  :eca-test {:main-opts ["-m" "grog.eca-test"]}
   :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
