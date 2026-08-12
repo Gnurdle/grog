@@ -33,7 +33,7 @@ Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the mode
 | **Skills** | Packaged `skill.edn` + `SKILL.md` directories; the model can list, read, create, and update skills. |
 | **Babashka** | Optional **`run_babashka`** for short scripted side effects (`bb` on `PATH`). |
 
-Symlinks **inside** the workspace are allowed: containment checks use the logical path (symlinks not resolved), but I/O follows symlinks as usual. `..` cannot escape the configured root.
+Tool paths are taken as given — absolute, or relative to the repo/conversation root. There is no workspace-root containment check.
 
 ---
 
@@ -50,9 +50,9 @@ Symlinks **inside** the workspace are allowed: containment checks use the logica
 - **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits.
 - **GUI** — `clojure -M:gui` (or `./grog-ui`) opens a Swing desktop app with streaming transcript, Settings, export, and an integrated terminal.
 
-### Workspace
+### Repo root
 
-**`:workspace {:default-root "…"}`** — root for relative tool paths and SOUL resolution.
+Paths in tool calls are absolute or relative to the repo root. ECA's `workspaceFolders` (declared at connect) points at the repo root, so ECA's own file tools operate there too. The old `:workspace {:default-root …}` containment layer has been removed.
 
 ---
 
@@ -65,8 +65,7 @@ Active set depends on `grog.edn`. Use **`/tools`** in chat for the live list and
 
 | Area | Tools |
 | --- | --- |
-| **Files** | `read_workspace_file`, `write_workspace_file`, `read_workspace_dir`, `write_workspace_png`, `crop_workspace_image`, `grep_workspace_file`, `stat_workspace_file`, `read_workspace_file_lines` |
-| **Documents** | `read_office_document`, `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings` |
+| **Files** | `read_office_document`, `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings` |
 | **Web** | `brave_web_search` — Brave Search API key in OS keyring |
 | **Stronger model** | `oracle` — OpenAI-style chat completions; `:oracle` + **`ORACLE_API_KEY`** |
 | **HTTP + secrets** | `with_api_key` — allowlisted keyring names + optional URL prefixes |
@@ -93,7 +92,7 @@ These are **user** commands, not model tools.
 | `/jobs` | **`add` \| `list` \| `next` \| `status`** — project job queue in edn-store (`grog-jobs/`); needs **active project** + **`:edn-store`** |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
 | `/secret` | Keyring **`grog`** — list/set keys (values never printed) |
-| `/shell` | `sh -lc` under workspace cwd, or interactive subshell |
+| `/shell` | `sh -lc` under the repo root cwd, or interactive subshell |
 | `/mcp` | MCP server list in edn-store: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
 | `/soul` | **show** \| **path** \| **add** *text* \| **reload** — SOUL.md management |
 | `@path` | Inline files into the prompt (whitespace-separated tokens) |
@@ -112,7 +111,7 @@ Config merges in order:
 
 **Optional:** `:llm` also accepts `:max-context-tokens` (drop oldest non-system messages before each request; default 200000, set `nil` to disable), `:max-tool-result-chars` (truncate oversized tool outputs; default 50000, set `nil` to disable), `:temperature`, `:max-tokens`, `:api-key` (inline or `${LLM_API_KEY}` env-var interpolation; prefer OS keyring `LLM_API_KEY`), `:conn-timeout-sec` (default 60), `:socket-timeout-sec` (default 300), `:debug-payload` / `:debug-response` (print to stderr), `:provider-name` (human-readable label), and `:extra-payload` (provider-specific fields merged into every request — e.g. OpenRouter `{:transforms ["middle-out"]}` for context compression).
 
-**Optional:** workspace, `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
+**Optional:** `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
 
 ### MCP servers
 
@@ -147,7 +146,7 @@ The GUI also supports zoom (Ctrl+Shift+Plus/Minus) and transcript export (Ctrl+E
 
 ## Jobs and chron
 
-Both use the **same agent stack** as normal chat (`run-tool-loop-on-messages`) and the **edn-store** tree under your workspace.
+Both use the **same agent stack** as normal chat (`run-tool-loop-on-messages`) and the **edn-store** tree in your repo.
 
 ### Jobs (`/jobs`)
 
@@ -178,7 +177,7 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 **Secrets** (Brave, oracle, `with_api_key`) live in the OS keyring — set with **`/secret <ACCOUNT> <value>`** in chat, never in this file.
 
 ```clojure
-{:workspace {:default-root "."}
+{:soul {:path "SOUL.md"}
 
  ;; Required: OpenAI-compatible chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
  :llm {:url "http://localhost:11434/v1"
@@ -208,10 +207,9 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
        ;;            :openai   {:url "https://api.openai.com/v1" :model "gpt-4o" :api-key "${OPENAI_API_KEY}"}}
        }
 
- :soul {:path "SOUL.md"}
  :skills {:roots ["skills"]}
 
- ;; Optional: structured memory + project dialog trees (path under workspace)
+ ;; Optional: structured memory + project dialog trees (absolute or repo-root-relative path)
  :edn-store {:root "edn-store"}
 
  ;; Optional: periodic checks while chat is running (stderr banner + LLM + tools)

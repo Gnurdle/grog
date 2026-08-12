@@ -48,7 +48,7 @@
     (str "Run **Babashka** (`bb`) on a short Clojure script in an **isolated empty directory** with a **reduced environment** "
          "(PATH, JAVA_HOME, temp vars; HOME set to that directory). **Contract:** read problem input from **stdin** "
          "(Grog passes `stdin` as the pipe contents; in code use `(slurp *in*)` or `*in*`), write the answer to **stdout** only; "
-         "use stderr sparingly for errors. **Do not** rely on workspace files, network, or mutating the host — SOUL forbids "
+         "use stderr sparingly for errors. **Do not** rely on repo files, network, or mutating the host — SOUL forbids "
          "\"mutating the universe\"; prefer pure data transforms. **Python is off-limits** — Babashka/Clojure only. "
          "Enable in grog.edn: `:babashka {:enabled true}`.")
     :parameters

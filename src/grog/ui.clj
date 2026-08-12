@@ -22,6 +22,7 @@
             [grog.core :as core]
             [grog.eca :as eca]
             [grog.eca-config :as ecacfg]
+            [grog.models :as models]
             [grog.appearance :as appearance]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
@@ -36,8 +37,9 @@
             [grog.soul :as soul])
   (:import (java.awt Color Component Font Graphics Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
-           (javax.swing AbstractAction JComponent JFrame JLabel JMenuItem JOptionPane
-                        JPanel JPopupMenu JScrollPane JTextArea JTextPane KeyStroke SwingUtilities)
+           (javax.swing AbstractAction Box BoxLayout JComponent JDialog JFrame JLabel JList
+                        JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
+                        JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities)
            (java.util.concurrent LinkedBlockingQueue)
            (java.awt.datatransfer StringSelection)
            (java.awt.event KeyEvent MouseAdapter)))
@@ -58,25 +60,119 @@
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
 
-;; Larger fonts (user preference).
-(def ^:private ui-monospace-font (Font. "Monospaced" Font/PLAIN 18))
-(def ^:private ui-ui-font (Font. "SansSerif" Font/PLAIN 17))
+;; --- ECA<->grog protocol tracing into the debug log ------------------------
+;; Every JSON-RPC frame that crosses the stdio pipe to the `eca server` child is
+;; summarized here (via eca.clj's :trace-fn) so ~/.grog-ui.log shows what is
+;; actually flowing between grog and ECA.
+
+(defn- trunc
+  "Clip a string to `n` chars with an ellipsis; used to keep streamed text lines
+  bounded in the trace."
+  [s n]
+  (let [s (str s)]
+    (if (> (count s) n) (str (subs s 0 n) "…") s)))
+
+(defn- summarize-content
+  "A compact one-line summary of a `chat/contentReceived` content object."
+  [c]
+  (let [t (:type c)]
+    (case t
+      "text"            (str "type=" t " text=" (pr-str (trunc (:text c) 120)))
+      "reasonText"      (str "type=" t " text=" (pr-str (trunc (:text c) 120)))
+      "reasonStarted"   (str "type=" t " (thinking start)")
+      "reasonFinished"  (str "type=" t " (thinking end)")
+      "toolCallPrepare" (str "type=" t " tool=" (:name c) (when-let [s (:summary c)] (str " — " (trunc s 80))))
+      "toolCallRun"     (str "type=" t " tool=" (:name c)
+                             (when (true? (:manualApproval c)) " [manual approval]")
+                             (when-let [s (:summary c)] (str " — " (trunc s 80))))
+      "toolCallRunning" (str "type=" t " tool=" (:name c))
+      "toolCalled"      (str "type=" t " tool=" (:name c)
+                             (if (:error c) " ERR" "")
+                             (when-let [ms (:totalTimeMs c)] (str " " ms "ms"))
+                             (when-let [s (:summary c)] (str " — " (trunc s 80))))
+      "toolCallRejected" (str "type=" t " tool=" (:name c))
+      "metadata"        (str "type=" t (when-let [ti (:title c)] (str " title=" (pr-str ti))))
+      "flag"            (str "type=" t (when-let [tx (:text c)] (str " text=" (pr-str tx))))
+      "usage"           (str "type=" t " usage=" (pr-str (dissoc c :type)))
+      "progress"        (str "type=" t " state=" (:state c))
+      (str "type=" t " content=" (pr-str (trunc c 200))))))
+
+(defn- summarize-frame
+  "A one-line, direction-tagged summary of a raw ECA JSON-RPC frame."
+  [dir frame]
+  (let [{:keys [id method result error]} frame
+        params (:params frame)
+        arrow (if (= dir :out) "→" "←")]
+    (str arrow
+         (cond
+           ;; a response to one of our requests
+           (and (some? id) (not method))
+           (str "  resp id=" id " -> "
+                (if error (str "ERR " (pr-str (:message error))) (pr-str result)))
+
+           ;; a server->client request
+           (and (some? id) method)
+           (str "  req  id=" id " " method " " (pr-str params))
+
+           ;; a notification
+           method
+           (str "  notify " method " "
+                (if (= method "chat/contentReceived")
+                  (str "{content " (summarize-content (:content params)) "}")
+                  (pr-str params)))
+
+           :else
+           (str "  " (pr-str frame))))))
+
+(defn make-eca-tracer
+  "Build an ECA `:trace-fn` that logs every JSON-RPC frame to the grog debug log,
+  except `chat/contentReceived` notifications — those arrive in a high-frequency
+  stream of tiny content chunks and would swamp the log, so they're elided."
+  []
+  (fn [dir frame]
+    ;; skip the noisy token/event stream; log everything else (handshake,
+    ;; prompt requests/responses, statusChanged, tool events, errors, etc.)
+    (when-not (and (nil? (:id frame))
+                   (= "chat/contentReceived" (:method frame)))
+      (dbg! (summarize-frame dir frame)))))
+
+;; Dialog / status fonts follow the active Look & Feel's system font at a larger
+;; size (see grog.ui.widgets/ui-font + mono-font). These are functions, not
+;; constants, because the L&F font is only known after FlatLaf/setup runs.
+(defn- ui-monospace-font ^Font [] (widgets/mono-font))
 
 ;; ---------------------------------------------------------------------------
 ;; Background logo
 ;; ---------------------------------------------------------------------------
 
-(defonce ^:private logo-image
-  (delay (try (ImageIO/read (io/file "logo.jpg"))
-              (catch Throwable _ nil))))
+;; ---------------------------------------------------------------------------
+;; Asset (icon/logo) resolution. grog-ui exports GROG_HOME (the repo dir) so
+;; these are found regardless of the process's current working directory — a
+;; relative "icon.png"/"logo.jpg" would silently fail when grog is started from
+;; anywhere but the repo (e.g. a desktop launcher whose CWD isn't the repo).
 
-(def ^:private jar-path (io/file "icon.png"))
+(defn- asset-file
+  "Resolve a repo-relative asset name (icon.png, logo.jpg) to a File, trying in
+  order: the `grog.home` system property, the `GROG_HOME` env var (set by
+  grog-ui), then the current working directory."
+  [name]
+  (or (some-> (System/getProperty "grog.home") (io/file name))
+      (some-> (System/getenv "GROG_HOME") (io/file name))
+      (io/file name)))
+
+(defonce ^:private logo-image
+  (delay (try (ImageIO/read (asset-file "logo.jpg"))
+              (catch Throwable _ nil))))
 
 ;; Window / menu icon: prefers `icon.png` (repo root), falls back to the logo
 ;; so the window decoration never shows the default Java icon.
 (defonce ^:private frame-icon-image
-  (delay (or (try (ImageIO/read jar-path) (catch Throwable _ nil))
-             @logo-image)))
+  (delay
+    (let [icon (try (ImageIO/read (asset-file "icon.png")) (catch Throwable _ nil))]
+      (if icon
+        icon
+        (do (dbg! "icon.png not found; falling back to logo.jpg for window icon")
+            @logo-image)))))
 
 (defn- set-frame-icon!
   "Apply the app icon to a frame's window decoration (instead of the Java
@@ -137,26 +233,29 @@
   (transparent! (.getViewport sp))
   sp)
 
-(defn- with-copy-popup!
-  "Add a right-click 'Copy' menu to a text component (copies the selection)."
-  [^javax.swing.text.JTextComponent c]
-  (let [item (JMenuItem. "Copy")]
-    (.addActionListener item
-      (reify java.awt.event.ActionListener
-        (actionPerformed [_ _]
-          (let [sel (.getSelectedText c)]
-            (when (seq sel)
-              (.setContents (.getSystemClipboard (Toolkit/getDefaultToolkit))
-                            (StringSelection. sel)
-                            nil))))))
-    (let [menu (JPopupMenu.)]
-      (.add menu item)
-      (.addMouseListener c
-        (proxy [MouseAdapter] []
-          (mousePressed [e]
-            (when (.isPopupTrigger e) (.show menu c (.getX e) (.getY e))))
-          (mouseReleased [e]
-            (when (.isPopupTrigger e) (.show menu c (.getX e) (.getY e))))))))
+(defn- with-copy-menu!
+  "Add a right-click copy menu to `c`. `items` is a seq of [label text-fn];
+  selecting an item copies `(text-fn)` to the clipboard (e.g. the transcript's
+  \"Copy selection\" / \"Copy all\" and the prompt's \"Copy\")."
+  [^java.awt.Component c items]
+  (let [menu (JPopupMenu.)]
+    (doseq [[label text-fn] items]
+      (let [item (JMenuItem. label)]
+        (.addActionListener item
+          (reify java.awt.event.ActionListener
+            (actionPerformed [_ _]
+              (let [sel (try (text-fn) (catch Throwable _ nil))]
+                (when (seq sel)
+                  (.setContents (.getSystemClipboard (Toolkit/getDefaultToolkit))
+                                (StringSelection. sel)
+                                nil))))))
+        (.add menu item)))
+    (.addMouseListener c
+      (proxy [MouseAdapter] []
+        (mousePressed [e]
+          (when (.isPopupTrigger e) (.show menu c (.getX e) (.getY e))))
+        (mouseReleased [e]
+          (when (.isPopupTrigger e) (.show menu c (.getX e) (.getY e)))))))
   c)
 
 ;; ---------------------------------------------------------------------------
@@ -175,64 +274,255 @@
   user to approve/reject manual-approval tool calls. Runs on the ECA reader thread.
   NOTE: a single `styled-writer` is shared across all events so its active ANSI
   color persists between contiguous streamed chunks (a fresh writer per event
-  would reset the color to black mid-stream)."
-  [^JTextPane pane running? chat-id]
+  would reset the color to black mid-stream).
+
+  `yolo-ref` is the trust (YOLO) atom: when it's truthy, manual-approval tool
+  calls are auto-approved and the dialog is skipped — \"check it and everything
+  goes\". `last-sent` holds the most recently sent user message, so the ECA echo
+  of that message (a `text` content event mirroring the prompt) can be suppressed
+  instead of duplicating the local user echo. `pending-steer*` tracks a steer
+  that has been sent but not yet confirmed consumed by ECA; `resend-steer!` is
+  called with the steer text to re-issue it as a normal prompt if the run ends
+  before ECA consumes it (the protocol's documented fallback)."
+  [^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!]
   (let [streamer (ecastream/make-streamer)
-        writer (transcript/styled-writer pane)]
+        writer (transcript/styled-writer pane)
+        ;; a steer is consumed when ECA echoes it back; resend undelivered steers
+        ;; on any idle/finished transition (protocol fallback).
+        finish! (fn []
+                  (when-let [s @pending-steer*]
+                    (reset! pending-steer* nil)
+                    (resend-steer! s))
+                  (reset! running? false))]
     (fn [method params]
       (case method
         "chat/contentReceived"
-        (let [content (:content params)]
-          (binding [*out* writer]
-            (streamer content))
-          (when (= "finished" (:state content))
-            (reset! running? false))
-          ;; manual-approval tool call -> ask the user, then approve/reject
-          (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
-            (let [id (:id content)
-                  name (str (:name content))
-                  summary (:summary content)
-                  approve? (= JOptionPane/YES_OPTION
-                              (JOptionPane/showConfirmDialog
-                                pane
-                                (str "Approve tool call:\n\n  " name
-                                     (when (seq summary) (str "\n\n" summary))
-                                     "\n\nApprove?" )
-                                "grog — tool approval"
-                                JOptionPane/YES_NO_OPTION))]
-              (if approve?
-                (eca/approve! @chat-id id)
-                (eca/reject! @chat-id id)))))
+        (let [content (:content params)
+              echo? (and (= "text" (:type content))
+                         @last-sent
+                         (= (str/trim (str (:text content)))
+                            (str/trim (str @last-sent))))]
+          ;; the steer echo (from ECA consuming the steer) confirms it was
+          ;; accepted — mark it consumed so the finish-path doesn't resend it.
+          (when (and echo? @pending-steer*
+                     (= (str/trim (str (:text content)))
+                        (str/trim (str @pending-steer*))))
+            (reset! pending-steer* nil))
+          (when-not echo?
+            (binding [*out* writer]
+              (streamer content))
+            (when (= "finished" (:state content))
+              (finish!))
+            ;; manual-approval tool call -> in YOLO mode auto-approve (everything
+            ;; goes, no permission dialog); otherwise ask the user in a dialog
+            ;; with a readable font and a check-box to switch into YOLO mode.
+            (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
+              (if @yolo-ref
+                (eca/approve! @chat-id (:id content))
+                (let [id (:id content)
+                      name (str (:name content))
+                      summary (:summary content)
+                      msg (doto (JTextArea.
+                                 (str "Approve tool call?\n\n  " name "\n"
+                                      (when (seq summary) (str "\n" summary "\n"))
+                                      "\n• Approve — just this once\n"
+                                      "• Reject — don't run it\n"
+                                      "• YOLO — this call and everything after, no more dialogs"))
+                             (.setEditable false)
+                             (.setLineWrap true)
+                             (.setWrapStyleWord true)
+                             (.setFont (ui-monospace-font))
+                             (.setOpaque true)
+                             (.setBorder (javax.swing.BorderFactory/createEmptyBorder
+                                          8 8 8 8)))
+                      panel (doto (JPanel. (BorderLayout.))
+                              (.setBorder (javax.swing.BorderFactory/createEmptyBorder
+                                           8 8 8 8))
+                              (.add msg BorderLayout/CENTER))
+                      opts (into-array ["Approve" "Reject" "YOLO"])
+                      dismiss (JOptionPane/DEFAULT_OPTION)
+                      choice (JOptionPane/showOptionDialog
+                               pane panel
+                               "grog — tool approval"
+                               dismiss
+                               JOptionPane/QUESTION_MESSAGE
+                               nil opts opts)]
+                  (case (int choice)
+                    0 (eca/approve! @chat-id id)
+                    1 (eca/reject! @chat-id id)
+                    ;; "YOLO" — approve this call and switch into trust mode so
+                    ;; all future tool calls auto-approve
+                    (do (reset! yolo-ref true)
+                        (uifooter/set-trust-indicator! true)
+                        (eca/set-trust! @chat-id true)
+                        (eca/approve! @chat-id id))))))))
 
         "chat/statusChanged"
-        (when (= "idle" (:status params))
-          (reset! running? false))
+        (let [st (str (:status params))]
+          (when (= "idle" st)
+            (finish!))
+          (uifooter/set-status! st))
+
+        ;; ECA re-syncs its model catalog on startup/login: remember the full set
+        ;; of provider-qualified ids so model qualification is exact — this is what
+        ;; disambiguates OpenRouter catalog orgs that collide with native provider
+        ;; names (deepseek/…, openai/…, google/…, …).
+        "config/updated"
+        (when-let [ms (get-in params [:chat :models])]
+          (models/register-eca-catalog! ms))
 
         nil))))
+
+(defn- show-question-dialog!
+  "Modal 'Question from the LLM' dialog.
+
+  `options` (optional) is a seq of `{:label .. :description ..}` maps (or plain
+  strings) from ECA's `chat/askQuestion`. Labels are shown as a selectable list
+  (descriptions shown dimmed underneath); when `allow-freeform?` is true a text
+  field lets the user type a custom answer instead. Returns
+  `{:cancelled bool :answer str|nil}`."
+  [^JComponent owner prompt options allow-freeform?]
+  (let [frame (JOptionPane/getFrameForComponent owner)
+        dlg (JDialog. frame "Question from the LLM" true)
+        labels (vec (keep (fn [o]
+                            (when-let [l (if (map? o) (:label o) o)]
+                              (str/trim (str l))))
+                          (or options [])))
+        list (when (seq labels)
+               (let [l (JList. (into-array String labels))]
+                 (.setSelectionMode l ListSelectionModel/SINGLE_SELECTION)
+                 (.setSelectionInterval l 0 0)
+                 l))
+        custom (JTextField. 32)
+        custom-row (when allow-freeform?
+                     (let [p (JPanel. (BorderLayout.))]
+                       (.add p (JLabel. "Or type a custom answer:") BorderLayout/WEST)
+                       (.add p custom BorderLayout/CENTER)
+                       p))
+        q (doto (JTextArea. (str (or prompt "")))
+            (.setEditable false)
+            (.setLineWrap true)
+            (.setWrapStyleWord true)
+            (.setFont (ui-monospace-font))
+            (.setOpaque false))
+        ok (widgets/styled-button "OK")
+        cancel (widgets/styled-button "Cancel")
+        result (atom {:cancelled true :answer nil})
+        choose! (fn []
+                  (let [custom-ans (str/trim (.getText custom))
+                        selected (when list (str/trim (str (.getSelectedValue list))))
+                        ans (cond
+                              (seq custom-ans) custom-ans
+                              (seq selected) selected
+                              :else nil)]
+                    (reset! result (if (seq ans)
+                                     {:cancelled false :answer ans}
+                                     {:cancelled true :answer nil}))
+                    (.dispose dlg)))]
+    ;; layout
+    (let [center (JPanel.)
+          _ (.setLayout center (BoxLayout. center BoxLayout/Y_AXIS))
+          south (JPanel. (FlowLayout. FlowLayout/RIGHT))]
+      (.add center q)
+      (when list
+        (.add center (JScrollPane. list)))
+      (when custom-row
+        (.add center custom-row))
+      (.add south cancel)
+      (.add south ok)
+      (.add dlg south BorderLayout/SOUTH)
+      (.setLayout dlg (BorderLayout.))
+      (.add dlg center BorderLayout/CENTER)
+      (doto dlg (.setSize 600 360)
+            (.setLocationRelativeTo frame)))
+    ;; actions
+    (.addActionListener ok
+      (reify java.awt.event.ActionListener
+        (actionPerformed [_ _] (choose!))))
+    (.addActionListener cancel
+      (reify java.awt.event.ActionListener
+        (actionPerformed [_ _] (.dispose dlg))))
+    (let [listener (proxy [MouseAdapter] []
+                     (mouseClicked [e]
+                       (when (and (= 2 (.getClickCount e)) list)
+                         (choose!))))]
+      (.addMouseListener q listener)
+      (when list (.addMouseListener list listener)))
+    (when custom
+      (.put (.getInputMap custom JComponent/WHEN_FOCUSED)
+            (KeyStroke/getKeyStroke KeyEvent/VK_ENTER 0) "question-ok")
+      (.put (.getActionMap custom) "question-ok"
+            (proxy [AbstractAction] []
+              (actionPerformed [_ _] (choose!)))))
+    (.setVisible dlg true)
+    @result))
+
+(defn- make-request-handler
+  "Handle ECA server→client requests. The one that matters for the user is
+  `chat/askQuestion` — the LLM asking a question — which surfaces a dialog on
+  the EDT and answers with the user's input (or cancels). Everything else gets
+  safe defaults (empty diagnostics / empty result). Runs on the ECA reader
+  thread; the dialog is marshalled to the EDT with `invokeAndWait` and the
+  reader thread blocks until the user answers (which is what we want: ECA is
+  waiting for the response)."
+  [^JComponent pane]
+  (fn [method params]
+    (case method
+      "chat/askQuestion"
+      (let [prompt (or (some-> (:prompt params) str str/trim not-empty)
+                       (some-> (:message params) str str/trim not-empty)
+                       (some-> (:question params) str str/trim not-empty)
+                       (pr-str params))
+            options (when (sequential? (:options params)) (vec (:options params)))
+            allow-freeform? (not (false? (:allowFreeform params)))
+            res (atom {:cancelled true :answer nil})]
+        (binding [*out* (transcript/styled-writer pane)]
+          (println (str "\n[" (appearance/ansi-tool-call) "LLM question" ansi-reset "] "
+                        prompt)))
+        (SwingUtilities/invokeAndWait
+          (fn []
+            (reset! res (show-question-dialog! pane prompt options allow-freeform?))))
+        {:result @res})
+
+      "editor/getDiagnostics"
+      {:result {:diagnostics []}}
+
+      {:result {}})))
 
 (defn- handle-turn!
   "Echo user input, route slash commands, or hand an LLM turn to `send-fn`
   (a closure `(fn [history text] -> history)` owned by the frame). Also handles
-  `/eca-model <name>` via `set-model-fn`. Returns the updated history."
-  [^JTextPane pane history text send-fn set-model-fn]
+  `/eca-model <name>` via `set-model-fn` and `/yolo [on|off]` via `set-yolo-fn`.
+  Returns the updated history."
+  [^JComponent pane history text send-fn set-model-fn set-yolo-fn]
   (binding [*out* (transcript/styled-writer pane)
             *err* (transcript/styled-writer pane)]
     (cancel/clear!)
     ;; echo the user's input (prompt or command) into the transcript in dark yellow
     (when (seq (str/trim text))
       (println (str "\n" (appearance/ansi-user) text ansi-reset)))
-    (if-let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
-      (do (set-model-fn (str/trim (second m)))
-          history)
+    (cond
+      (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))
+      (let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
+        (set-model-fn (str/trim (second m)))
+        history)
+
+      (re-matches #"(?i)^/yolo(?:\s+(on|off))?$" (str/trim text))
+      (let [m (re-matches #"(?i)^/yolo(?:\s+(on|off))?$" (str/trim text))
+            on? (when (second m) (= "on" (str/lower-case (second m))))]
+        (set-yolo-fn on?)
+        history)
+
+      :else
       (case (core/route-slash-command! text)
         :grog.core/quit
         (do (System/exit 0) history)
         :grog.core/clear
         (do
-          ;; empty the visible transcript as well as the chat history
-          (let [^javax.swing.text.StyledDocument doc (.getStyledDocument pane)
-                len (.getLength doc)]
-            (when (pos? len) (.remove doc 0 len)))
+          ;; clear the virtualized transcript log, and drop any trust (yolo)
+          ;; auto-approve so a fresh transcript starts from a clean slate
+          (transcript/clear! pane)
+          (set-yolo-fn false)
           (println "History cleared.")
           [])
         :grog.core/handled
@@ -243,12 +533,12 @@
 (defn- chat-worker!
   "Process the input queue on a background thread. `send-fn` is the ECA turn
   closure; `running?` is managed by the ECA event lifecycle."
-  [^JTextPane pane ^LinkedBlockingQueue queue history-ref send-fn set-model-fn]
+  [^JComponent pane ^LinkedBlockingQueue queue history-ref send-fn set-model-fn set-yolo-fn]
   (Thread.
     (fn []
       (loop []
         (when-let [text (.take queue)]
-          (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn))
+          (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn set-yolo-fn))
           (recur))))))
 
 (def ^:private shell-frame-ref (atom nil))
@@ -269,7 +559,7 @@
    - j/k (vim-style) scroll one line when pane is focused
    - Ctrl+Up/Ctrl+Down window-wide scroll the transcript
    Also sets the scrollbar unit increment to match the pane's font line height."
-  [^JTextPane pane ^JScrollPane scroll-pane frame]
+  [^JComponent pane ^JScrollPane scroll-pane frame]
   (let [line-h (atom 20)  ;; updated below from font metrics
         scroll-unit! (fn []
                        (let [sb (.getVerticalScrollBar scroll-pane)]
@@ -280,11 +570,6 @@
                          (.setViewPosition vp (Point. (.x pos)
                                                       (max 0 (+ (.y pos)
                                                                 (* delta (int @line-h))))))))
-        scroll-to-bottom! (fn []
-                            (let [vp (.getViewport scroll-pane)
-                                  h (.getHeight (.getView vp))
-                                  vh (.getHeight vp)]
-                              (.setViewPosition vp (Point. 0 (max 0 (- h vh))))))
         scroll-to-top! (fn []
                          (.setViewPosition (.getViewport scroll-pane)
                                            (Point. 0 0)))]
@@ -309,7 +594,7 @@
               (actionPerformed [_] (scroll-line! 1))))
       (.put am "grog-scroll-bottom"
             (proxy [AbstractAction] []
-              (actionPerformed [_] (scroll-to-bottom!))))
+              (actionPerformed [_] (transcript/follow! pane true))))
       (.put am "grog-scroll-top"
             (proxy [AbstractAction] []
               (actionPerformed [_] (scroll-to-top!)))))
@@ -329,7 +614,7 @@
               (actionPerformed [_] (scroll-line! 1))))
       (.put am "grog-cscroll-bottom"
             (proxy [AbstractAction] []
-              (actionPerformed [_] (scroll-to-bottom!))))
+              (actionPerformed [_] (transcript/follow! pane true))))
       (.put am "grog-cscroll-top"
             (proxy [AbstractAction] []
               (actionPerformed [_] (scroll-to-top!)))))))
@@ -337,31 +622,53 @@
 (defn- build-chat-frame
   "Build the chat frame (not yet shown). Returns the JFrame."
   ^JFrame []
-  (let [pane (doto (JTextPane.) (.setEditable false))
-        transcript-scroll (JScrollPane. pane)
+  (let [transcript-scroll (transcript/make-chat-pane)
+        pane (transcript/chat-pane transcript-scroll)
         prompt (JTextArea. 4 84)
         prompt-scroll (JScrollPane. prompt)
-        send (widgets/styled-button "Send")
-        stop (widgets/styled-button "Stop")
-        term (widgets/styled-button "Terminal")
-        settings (widgets/styled-button "Settings")
-        export (widgets/styled-button "Export")
+        send (widgets/toolbar-button :send "Send (Ctrl+Enter)")
+        stop (widgets/toolbar-button :stop "Stop")
+        term (widgets/toolbar-button :terminal "Terminal")
+        settings (widgets/toolbar-button :settings "Settings")
+        export (widgets/toolbar-button :export "Export transcript")
+        clear (widgets/toolbar-button :clear "Clear")
         frame (JFrame. "grog")
         queue (LinkedBlockingQueue.)
         running? (atom false)
         history-ref (atom [])
         chat-id (atom (str (java.util.UUID/randomUUID)))
-        model-ref (atom (or (config/eca-model) nil))
+        _ (uifooter/init-model! (models/qualify-eca-model (config/eca-model)
+                                                          nil
+                                                          (try (config/llm-url) (catch Exception _ nil))))
+        yolo-ref (atom false)   ; trust (yolo) mode: auto-approve all tool calls
+        last-sent (atom nil)    ; last user message sent, to suppress ECA's echo
+        pending-steer* (atom nil) ; steer text sent but not yet confirmed consumed by ECA
         connected (atom false)
-        event-handler (make-event-handler pane running? chat-id)
+        event-handler (make-event-handler pane running? chat-id yolo-ref last-sent
+                                          pending-steer*
+                                          (fn [s]
+                                            ;; steer was dropped (run finished before
+                                            ;; ECA consumed it): re-issue as a normal prompt
+                                            (binding [*out* (transcript/styled-writer pane)
+                                                      *err* (transcript/styled-writer pane)]
+                                              (println (str "[grog] resending as a prompt: " s)))
+                                            (reset! last-sent (str s))
+                                            (.put ^LinkedBlockingQueue queue (str s))))
         connect-eca! (fn []
                        (when-not @connected
                          (try
-                           (let [cfg (ecacfg/generate-config!)]
-                             (eca/connect! [{:uri (file-uri (config/workspace-root)) :name "grog"}]
-                                           :event-handler event-handler
-                                           :args ["--config-file" cfg]
-                                           :log-fn (fn [line] (dbg! "eca:" line))))
+                           (let [cfg (ecacfg/generate-config!)
+                                 _ (dbg! "ECA starting: config=" cfg
+                                         " model=" (or (uifooter/current-model) "(none)")
+                                         " chatId=" @chat-id
+                                         " root=" (config/repo-root))
+                                 init (eca/connect! [{:uri (file-uri (config/repo-root)) :name "grog"}]
+                                                    :event-handler event-handler
+                                                    :request-handler (make-request-handler pane)
+                                                    :args ["--config-file" cfg]
+                                                    :log-fn (fn [line] (dbg! "eca:" line))
+                                                    :trace-fn (make-eca-tracer))]
+                             (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
                            (reset! connected true)
                            (catch Throwable e
                              (binding [*out* (transcript/styled-writer pane)]
@@ -374,8 +681,14 @@
                     (do
                       (reset! running? true)
                       (cancel/clear!)
+                      (reset! last-sent (str text))
                       (try
-                        (let [resp (eca/prompt! text {:chatId @chat-id :model (or @model-ref nil)})]
+                        (let [resp (eca/prompt! text {:chatId @chat-id
+                                                      :model (some-> (uifooter/current-model)
+                                                                     (models/qualify-eca-model
+                                                                      nil
+                                                                      (try (config/llm-url) (catch Exception _ nil))))
+                                                      :trust @yolo-ref})]
                           (when-let [e (:error resp)]
                             (binding [*out* (transcript/styled-writer pane)]
                               (println (str "[grog] " (or (:message e) (pr-str e))))))
@@ -391,48 +704,82 @@
                        (cancel/cancel!)
                        (reset! running? false))
         set-model-fn (fn [name]
-                       (when @connected
-                         (eca/selected-model! name {:chatId @chat-id}))
-                       (reset! model-ref name)
-                       (binding [*out* (transcript/styled-writer pane)]
-                         (println (str "model: " name))))
+                       (let [id (models/qualify-eca-model name
+                                                          nil
+                                                          (try (config/llm-url) (catch Exception _ nil)))]
+                         (when (and @connected id)
+                           (eca/selected-model! id {:chatId @chat-id}))
+                         (uifooter/set-model-ref! id)
+                         (when id (models/save-eca-model! id))
+                         (config/reload!)
+                         (uifooter/set-model! id)
+                         (binding [*out* (transcript/styled-writer pane)]
+                           (println (str "model: " id)))))
+        set-yolo-fn (fn [on?]
+                      (let [next (if (nil? on?) (not @yolo-ref) on?)]
+                        (reset! yolo-ref next)
+                        (uifooter/set-trust-indicator! next)
+                        (when @connected
+                          (eca/set-trust! @chat-id next))
+                        (binding [*out* (transcript/styled-writer pane)]
+                          (println (str "trust (yolo) mode: "
+                                        (if next "ON — tool calls auto-approved" "off"))))))
         bg (background-panel)
         sent? (atom false)   ; first real message flips the logo to subdued
         submit! (fn []
-                  (when-not @running?
-                    (let [t (.getText ^JTextArea prompt)]
-                      (when (seq (str/trim t))
-                        (.setText ^JTextArea prompt "")
-                        (when (compare-and-set! sent? false true)
-                          ((:subdue! bg) true))
+                  (let [t (.getText ^JTextArea prompt)
+                        t (str/trim (str t))]
+                    (when (seq t)
+                      (transcript/follow! pane true)
+                      (.setText ^JTextArea prompt "")
+                      ;; first real message flips the logo to subdued
+                      (when (compare-and-set! sent? false true)
+                        ((:subdue! bg) true))
+                      (if @running?
+                        ;; model is mid-turn: echo the prompt locally and steer
+                        ;; the running response (chat/promptSteer). Set last-sent
+                        ;; so ECA's own echo of the steer is suppressed (no dup).
+                        ;; Track it as pending: if the prompt finishes before ECA
+                        ;; consumes the steer (dropped), we resend it as a regular
+                        ;; prompt (see make-event-handler's finish handling).
+                        (do (reset! pending-steer* t)
+                            (reset! last-sent t)
+                            (binding [*out* (transcript/styled-writer pane)
+                                      *err* (transcript/styled-writer pane)]
+                              (println (str "\n" (appearance/ansi-user) t ansi-reset)))
+                            (when @connected
+                              (eca/steer! @chat-id t)))
+                        ;; idle: queue a normal prompt as before
                         (.put ^LinkedBlockingQueue queue t)))))]
     ;; larger fonts
     (doto pane
-      (.setFont ui-monospace-font)
-      ;; visible selection (over the dark/logo background) + white selected text
-      (.setSelectionColor (Color. 55 90 150))
-      (.setSelectedTextColor Color/WHITE)
-      (.setCaretColor (Color. 210 220 210)))
-    (doto prompt (.setFont ui-monospace-font))
-    (doseq [b [send stop term]] (.setFont b ui-ui-font))    ;; register chat panes for shared Ctrl+Shift+Plus/Minus zoom
+      (.setFont (ui-monospace-font))
+      ;; keep the transcript transparent over the logo background
+      (.setOpaque false))
+    (doto prompt (.setFont (ui-monospace-font)))
+    ;; all footer buttons are widgets/styled-button and already get the compact
+    ;; system-derived button font via style!; no per-button setFont needed here.
     (uifonts/register-chat! pane :transcript)
     (uifonts/register-chat! prompt :prompt)
-    ;; drag-and-drop on every text pane
-    (dnd/install! pane)
+    ;; drag-and-drop on the prompt only (the transcript is a virtualized JList)
     (dnd/install! prompt)
     ;; right-click Copy on the transcript and prompt
-    (with-copy-popup! pane)
-    (with-copy-popup! prompt)
+    (with-copy-menu! pane [["Copy selection" #(transcript/copy-selection! pane)]
+                           ["Copy all" #(transcript/text pane)]])
+    (with-copy-menu! prompt [["Copy" #(.getSelectedText prompt)]])
     ;; single-line scroll keys on the transcript
     (install-transcript-scroll-keys! pane transcript-scroll frame)
     ;; Send: button + Ctrl+Enter
     (.addActionListener send (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (submit!))))
-    ;; Enter inserts a literal newline (JTextArea default, so the prompt is
-    ;; freely editable/multiline); Shift+Enter submits the prompt.
+    ;; Enter submits the prompt; Shift+Enter inserts a literal newline
+    ;; (reversed from before) so the prompt stays multiline but sending is one key.
+    (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
+          (KeyStroke/getKeyStroke KeyEvent/VK_ENTER 0)
+          "grog-submit")
     (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
           (KeyStroke/getKeyStroke KeyEvent/VK_ENTER (java.awt.event.InputEvent/SHIFT_DOWN_MASK))
-          "grog-submit")
+          "insert-break")
     (.put (.getActionMap prompt) "grog-submit"
           (proxy [AbstractAction] []
             (actionPerformed [e] (submit!))))
@@ -447,19 +794,50 @@
     (.addActionListener export (reify java.awt.event.ActionListener
                                  (actionPerformed [_ _]
                                    (uiexport/save-transcript! frame pane))))
+    ;; Clear button routes through the same behavior as /clear: wipe the
+    ;; transcript and drop trust (yolo) auto-approve, without echoing "/clear".
+    (let [do-clear! (fn []
+                      (transcript/clear! pane)
+                      (set-yolo-fn false)
+                      (reset! history-ref []))]
+      (.addActionListener clear (reify java.awt.event.ActionListener
+                                  (actionPerformed [_ _]
+                                    (do-clear!)))))
     ;; start worker
-    (.start (chat-worker! pane queue history-ref send-fn set-model-fn))
+    (.start (chat-worker! pane queue history-ref send-fn set-model-fn set-yolo-fn))
     ;; layout over the logo background
     (let [root (:panel bg)
-          button-row (JPanel. (FlowLayout. FlowLayout/LEFT))]
-      (.add button-row send)
-      (.add button-row stop)
-      (.add button-row term)
-      (.add button-row settings)
-      (.add button-row export)
-      ;; active-model indicator in the lower corner
-      (.add button-row (uifooter/register-label!
-                          (JLabel. (str "model: " (or @model-ref (config/model))))))
+          toolbar (doto (JToolBar.)
+                    (.setFloatable false)
+                    (.setRollover true)
+                    (.setOpaque false)
+                    (.setBorder nil))]
+      ;; left: operation buttons (icons + hover tooltips set by `toolbar-button`)
+      (doseq [b [send stop term settings export clear]]
+        (.add toolbar b)
+        (.add toolbar (Box/createHorizontalStrut 4)))
+      ;; right: model / status / trust indicators
+      (.add toolbar (Box/createHorizontalGlue))
+      (.add toolbar (Box/createHorizontalStrut 14))
+      ;; model — dainty, dim, small
+      (let [model-label (JLabel. (str " " (or (uifooter/current-model) (config/model))))
+            base (widgets/ui-font)
+            dainty (Font. (.getFamily base) Font/PLAIN (max 12 (int (/ (.getSize base) 1.4))))]
+        (.setFont model-label dainty)
+        (.setForeground model-label (Color. 140 142 152))
+        (.add toolbar (uifooter/register-label! model-label))
+        (.add toolbar (Box/createHorizontalStrut 16)))
+      ;; status — dot icon (running / idle / question), no text
+      (let [status-label (JLabel.)]
+        (.setOpaque status-label false)
+        (.add toolbar (uifooter/register-status-label! status-label))
+        (uifooter/set-status! "idle")
+        (.add toolbar (Box/createHorizontalStrut 10)))
+      ;; trust — dot icon (on / off), no text
+      (let [trust-label (JLabel.)]
+        (.setOpaque trust-label false)
+        (.add toolbar (uifooter/register-trust-label! trust-label))
+        (uifooter/set-trust-indicator! @yolo-ref))
       ;; readable prompt box: dark + light text; surrounding panes transparent
       (doto prompt
         (.setOpaque true)
@@ -471,13 +849,13 @@
       ;; transcript transparent so the logo shows behind the conversation
       (make-viewport-transparent! transcript-scroll)
       (transparent! pane)
-      (transparent! button-row)
+      (transparent! toolbar)
       (.setLayout root (BorderLayout.))
       (.add root transcript-scroll BorderLayout/CENTER)
       (let [south (JPanel. (BorderLayout.))]
         (transparent! south)
         (.add south prompt-scroll BorderLayout/CENTER)
-        (.add south button-row BorderLayout/SOUTH)
+        (.add south toolbar BorderLayout/SOUTH)
         (.add root south BorderLayout/SOUTH))
       ;; explicit black on frame + content so nothing light can peek through
       (.setBackground root (Color. 0 0 0))
@@ -500,7 +878,7 @@
       (binding [*out* (transcript/styled-writer pane)]
         (println (str ansi-snark snark ansi-reset "\n"))))
     (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
-    (.setSize frame 900 680)
+    (.setSize frame 1350 1020)
     (.setLocationRelativeTo frame nil)
     (set-frame-icon! frame)))
 
@@ -515,6 +893,9 @@
       (try
         ;; apply the modern dark Look & Feel across both windows
         (com.formdev.flatlaf.FlatDarkLaf/setup)
+        ;; enlarge the L&F's base UI fonts from the desktop's system font so
+        ;; dialogs (settings, model picker, approvals) and labels read larger
+        (widgets/scale-ui-fonts!)
         ;; load persisted appearance (fonts/colours) from grog.edn
         (appearance/load!)
         (.setVisible (build-chat-frame) true)

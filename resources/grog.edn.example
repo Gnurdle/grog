@@ -1,5 +1,4 @@
-{:workspace {:default-root "/absolute/path/to/project"}
- :eca {:model "openrouter/moonshotai/kimi-k2.6"}
+{:eca {:model "openrouter/moonshotai/kimi-k2.6"}
  ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
  ;; For local Ollama use: :url "http://localhost:11434/v1"
  :llm {:url "http://localhost:11434/v1"
@@ -31,14 +30,14 @@
        ;;            :remote {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k2.7-code"}}
        }
  :soul {:path "SOUL.md"}
- ;; Skills: each subdir of these roots under workspace must contain skill.edn + SKILL.md
+ ;; Skills: each subdir of these roots must contain skill.edn + SKILL.md
  :skills {:roots ["skills"]
           ;; :max-body-chars 65536
           ;; :prompt-skill-lines 16
           }
  ;; Optional: Babashka — enable the run_babashka tool (bb must be on PATH; override command with :command).
  :babashka {:enabled true}
- ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (path under workspace).
+ ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (relative path).
  ;; :edn-store {:root "edn-store"}
  ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.
  ;; :appearance {:chat {:font-family "Monospaced" :font-size 18

@@ -46,7 +46,7 @@
     :segments_returned "How many entries appear in segments (after cap; longest kept first)."
     :segments_truncated "true if segment_count exceeded the cap and shorter segments were dropped."}
    :suggested_use
-   "Infer structure by grouping parallel/collinear segments and corner junctions; cross-reference endpoint clusters with OCR word boxes; for a visual check, crop_workspace_image the same PDF page at the same dpi."})
+   "Infer structure by grouping parallel/collinear segments and corner junctions; cross-reference endpoint clusters with OCR word boxes."})
 
 (defn analyze-pdf-line-drawings-tool-spec []
   {:type "function"
@@ -57,11 +57,11 @@
                       "origin **top-left**, y **down**. It is **not** OCR, not labeled objects, and not word bounding boxes — use ocr_pdf_document "
                       "for text on the same path/dpi. Long diagrams may return many short segments (noise, curves, hatching). "
                       "The JSON includes a reading_guide object: read it before inferring schematics. "
-                      "Workspace path to a PDF; pair with crop_workspace_image (same dpi) to snapshot a region as PNG.")
+                      "A path to a PDF (absolute or repo-root-relative).")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path to PDF under workspace root (any extension if file is PDF)."}
+                                     :description "Path to the PDF (any extension if file is PDF)."}
                               :max_pages {:type "integer"
                                           :description "Max pages to analyze (default 15, cap 40)."}
                               :dpi {:type "integer"
@@ -128,7 +128,7 @@
                     (cond (number? x) (min max-segments-per-page-cap (max 10 (long x)))
                           :else default-max-segments-per-page))
           region-opt (or (:region_size m) (get m "region_size"))
-          ^File f (fs/resolve-workspace-path! path-str)]
+          ^File f (fs/resolve-repo-path! path-str)]
       (cond
         (str/blank? path-str)
         (json/generate-string {:error "path is required"})
@@ -170,8 +170,7 @@
               :pages pages
               :reading_guide reading-guide-for-model
               :hint (str "Read reading_guide first. Each segments[] element: straight line in pixel space at this dpi; "
-                         "not text. To save a region as PNG, bbox segment endpoints (optional pad_px) and crop_workspace_image "
-                         "same path, page, dpi. Pair with ocr_pdf_document for labels.")})))))
+                         "not text. Pair with ocr_pdf_document for labels.")})))))
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "line drawing analysis failed")
                              :detail (str e)}))))

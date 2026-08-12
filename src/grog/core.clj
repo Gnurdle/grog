@@ -596,12 +596,7 @@
             (if (str/blank? q)
               (tool-call-println! "grog: tool" nm "(query missing or empty)")
               (tool-call-println! "grog: tool" nm (pr-str (if (> (count q) 120) (str (subs q 0 120) "…") q)))))
-          (= nm "crop_workspace_image")
-          (if-let [ln (some-> (fs/tool-log-crop-line args) not-empty)]
-            (tool-call-println! "grog: tool" nm ln)
-            (tool-call-println! "grog: tool" nm "(source_path or out_path missing)"))
-          (#{"read_workspace_file" "read_workspace_dir" "write_workspace_file" "write_workspace_png" "read_office_document"
-             "read_pdf_document" "ocr_pdf_document" "grep_workspace_file" "stat_workspace_file" "read_workspace_file_lines"
+          (#{"read_office_document" "read_pdf_document" "ocr_pdf_document"
              "analyze_pdf_line_drawings"} nm)
           (if-let [p (some-> (fs/tool-log-path args) not-empty)]
             (tool-call-println! "grog: tool" nm (pr-str p))
@@ -632,17 +627,9 @@
           :else (tool-call-println! "grog: tool" nm))
         (cond
           (= nm "brave_web_search") (brave/run-web-search! args)
-          (= nm "read_workspace_file") (fs/run-read-workspace-file! args)
-          (= nm "read_workspace_dir") (fs/run-read-workspace-dir! args)
-          (= nm "write_workspace_file") (fs/run-write-workspace-file! args)
-          (= nm "write_workspace_png") (fs/run-write-workspace-png! args)
-          (= nm "crop_workspace_image") (fs/run-crop-workspace-image! args)
           (= nm "read_office_document") (fs/run-read-office-document! args)
           (= nm "read_pdf_document") (fs/run-read-pdf-document! args)
           (= nm "ocr_pdf_document") (fs/run-ocr-pdf-document! args)
-          (= nm "grep_workspace_file") (fs/run-grep-workspace-file! args)
-          (= nm "stat_workspace_file") (fs/run-stat-workspace-file! args)
-          (= nm "read_workspace_file_lines") (fs/run-read-workspace-file-lines! args)
           (= nm "analyze_pdf_line_drawings") (boofcv-pdf/run-analyze-pdf-line-drawings! args)
           (= nm "memory_save") (memory-tools/run-memory-save! args)
           (= nm "memory_load") (memory-tools/run-memory-load! args)
@@ -664,7 +651,7 @@
           (mcp/mcp-admin-tool-name? nm) (mcp/run-mcp-admin-tool! nm args)
           (mcp/tool-name-mcp? nm) (mcp/run-tool! nm args)
           :else
-          (str "Unknown tool \"" nm "\". Available: read_workspace_file, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image, read_office_document, read_pdf_document, ocr_pdf_document, grep_workspace_file, stat_workspace_file, read_workspace_file_lines, analyze_pdf_line_drawings, assoc_store, assoc_get, assoc_keys, assoc_search"
+          (str "Unknown tool \"" nm "\". Available: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings, assoc_store, assoc_get, assoc_keys, assoc_search"
                (when (config/skills-configured?) ", list_skills, read_skill, save_skill, delete_skill")
                (when (brave/brave-search-configured?) ", brave_web_search")
                (when (oracle/oracle-configured?) ", oracle")
@@ -695,17 +682,9 @@
         tool-calls))
 
 (defn- chat-tools-payload []
-  (vec (concat [(fs/read-workspace-file-tool-spec)
-                (fs/read-workspace-dir-tool-spec)
-                (fs/write-workspace-file-tool-spec)
-                (fs/write-workspace-png-tool-spec)
-                (fs/crop-workspace-image-tool-spec)
-                (fs/read-office-document-tool-spec)
+  (vec (concat [(fs/read-office-document-tool-spec)
                 (fs/read-pdf-document-tool-spec)
                 (fs/ocr-pdf-document-tool-spec)
-                (fs/grep-workspace-file-tool-spec)
-                (fs/stat-workspace-file-tool-spec)
-                (fs/read-workspace-file-lines-tool-spec)
                 (boofcv-pdf/analyze-pdf-line-drawings-tool-spec)]
                (assoc-memory/tool-specs)
                (when (brave/brave-search-configured?)
@@ -775,7 +754,7 @@
 
 (defn- print-buffered-reply!
   "Show full answer (markdown vs plain per config) via `grog.pager/emit-final-reply!`.
-  `<image-png>path</image-png>` opens a PNG from the workspace in a Swing viewer (see `grog.image-png`)."
+  `<image-png>path</image-png>` opens a PNG file in a Swing viewer (see `grog.image-png`)."
   [content answer-prefix]
   (pager/emit-final-reply! {:answer-prefix answer-prefix
                           :raw-content content
@@ -783,7 +762,7 @@
                           :ansi-reset ansi-reset}))
 
 (defn- chat-with-tools!
-  "Run /v1/chat/completions, executing `tool_calls` (workspace file/dir read/write/PNG, Office/PDF, OCR, BoofCV lines, optional Brave,
+  "Run /v1/chat/completions, executing `tool_calls` (Office/PDF, OCR, BoofCV lines, optional Brave,
   optional oracle tool, optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
   ([messages] (chat-with-tools! messages {}))
   ([messages opts]
@@ -914,14 +893,14 @@
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"
     "          :llm {:extra-payload {:transforms [\"middle-out\"]} — provider-specific fields merged into every request payload"
     "          :llm {:profiles {:local {:model \"qwen2.5-coder:7b-instruct\" :url \"http://localhost:11434/v1\"} …}} — named model presets; switch with /model <profile>"
-    "Optional: :workspace {:default-root \".\"} — SOUL path resolves here; SOUL file must stay under this root"
-    "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under workspace"
+    "Optional: paths resolve against the repo root — grog.home property, GROG_HOME env, or cwd (exported by grog-ui); SOUL path resolves here"
+    "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under repo root"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
     "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
     "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY; set via /secret in chat"
     "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle; :max-tokens, :temperature"
     "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
-    "Tools: workspace read_workspace_file (offset chunks), grep_workspace_file, stat_workspace_file, read_workspace_file_lines, read_workspace_dir, write_workspace_file, write_workspace_png, crop_workspace_image; Office/PDF/OCR/BoofCV; list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
+    "Tools: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings (Office/PDF/OCR/BoofCV); list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
     "          MCP: servers.edn + tools-cache.edn under grog-memory/grog-mcp/ (or Projects/<project>/…) — /mcp or mcp_* tools; mcp_reload (or set/servers_set) re-probes servers and refreshes the cache without leaving subprocesses running."
     "          :chron {:enabled true :tasks [{:id \"…\" :every-minutes 30 :instruction \"…\"}]} — periodic LLM+tools while chat runs (stderr banner); optional :interval-seconds"
     "          :jobs {:max-thread-turns 40} — project dialog turns injected for /jobs and chron (default 40)"
@@ -935,7 +914,7 @@
     ""
     "Thinking: dark green; assistant reply: cyan. With :format-markdown true, the answer is buffered and ANSI-rendered once by default. Set :chat-stream-live-markdown true to render paragraphs and fenced code blocks as they close; GFM tables still buffer until a blank line. With :format-markdown false and :chat-stream-live-content true, answer tokens stream in cyan."
     "Markdown in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/> is parsed (legacy <text-markdown> still works); GFM pipe tables draw as box tables."
-    "<image-png>workspace-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path must be under :workspace :default-root (requires display / non-headless JVM)."
+    "<image-png>repo-root-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path is absolute or repo-root relative (requires display / non-headless JVM)."
     "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each round opens with a thinking banner `── thinking k/n ──` if :chat-tool-loop-limit is set, else `── thinking k ──`."
     "Models must support tool calling for these tools (many recent instruct models)."
     ""
@@ -953,7 +932,7 @@
     "  /project — list project dirs, or leave project mode if inside one; /project <name> — enter or switch project"
     "  /jobs — add|list|next|status (needs :edn-store + active project); queue in memory namespace grog-jobs under the project"
     "  /chron — show chron scheduler status"
-    "  /shell [command] — run one line via sh -lc under workspace cwd, or /shell alone for interactive subshell (exit to return)"
+    "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
     "  /secret — list known secret keys and set/unset status (never prints values); /secret <KEY> <value> — store in OS keyring (service grog)"
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
@@ -975,7 +954,7 @@
 
 (defn- shell-cwd-file
   ^java.io.File []
-  (.getCanonicalFile (io/file (config/workspace-root))))
+  (.getCanonicalFile (io/file (config/repo-root))))
 
 (defn- run-shell-one-liner! [^String cmd]
   (try

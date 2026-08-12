@@ -69,13 +69,16 @@
   []
   (deep-merge (get-in (grog) [:llm] {}) (or @!llm-override {})))
 
-(defn workspace-root
-  "`:workspace :default-root` from grog.edn, default `\".\"` (used to resolve relative SOUL.md)."
+(defn repo-root
+  "The grog project/repo root (where deps.edn, SOUL.md, skills/ etc. live).
+  Resolution order: the `grog.home` system property, then the `GROG_HOME` env
+  var (exported by grog-ui), then the process working directory. Used as ECA's
+  `workspaceFolders` root and as the `/shell` working directory, so the tool
+  model can address files by plain paths in the repo (no workspace containment)."
   []
-  (let [r (get-in (grog) [:workspace :default-root])]
-    (if (str/blank? (str r))
-      "."
-      (str/trim (str r)))))
+  (or (some-> (System/getProperty "grog.home") str str/trim not-empty)
+      (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
+      "."))
 
 (defn eca-model
   "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
@@ -353,7 +356,7 @@
   (:skills (grog) {}))
 
 (defn skills-configured?
-  "True when `:skills :roots` is a non-empty sequence of paths (under workspace when relative)."
+  "True when `:skills :roots` is a non-empty sequence of paths (absolute or repo-root-relative)."
   []
   (let [roots (:roots (skills-cfg))]
     (boolean (and (sequential? roots) (seq roots)))))

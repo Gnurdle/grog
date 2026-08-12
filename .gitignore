@@ -1,3 +1,5 @@
 grog.edn
 target/
 .*
+workspace/
+grog-memory/err.log

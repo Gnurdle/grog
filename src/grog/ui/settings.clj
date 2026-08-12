@@ -4,6 +4,7 @@
   (:require [clojure.string :as str]
             [grog.appearance :as appearance]
             [grog.config :as config]
+            [grog.eca :as eca]
             [grog.models :as models]
             [grog.secrets :as secrets]
             [grog.ui.fonts :as uifonts]
@@ -176,6 +177,34 @@
 
 ;; --- Models tab ------------------------------------------------------------
 
+(defn- apply-eca-model!
+  "Apply a newly chosen model to the whole GUI: update the session model (so
+  future `chat/prompt` calls use it), persist it as `:eca :model`, refresh the
+  config and footer, and notify the running ECA child to switch — so the change
+  shows up as `chat/selectedModelChanged` traffic in the debug log."
+  [m]
+  (let [id (models/qualify-eca-model m
+                                     nil
+                                     (try (config/llm-url) (catch Exception _ nil)))]
+    (when id
+      (uifooter/set-model-ref! id)
+      (models/save-eca-model! id)
+      (config/reload!)
+      (uifooter/set-model! id)
+      (when (eca/connected?)
+        (eca/selected-model! id)))
+    id))
+
+(defn- to-eca-id
+  "Translate a picked model (from the picker: {:model … :source …}) into the
+  provider-qualified id ECA understands (e.g. `openrouter/…`, `ollama/…`). The
+  picker returns raw transport ids (no prefix), and ECA resolves models by
+  `provider/name` — so we map the source onto the prefix here."
+  [{:keys [model source]}]
+  (models/qualify-eca-model model
+                            source
+                            (try (config/llm-url) (catch Exception _ nil))))
+
 (defn- field-row
   "A labeled text field row."
   ^JPanel [label ^JTextField tf]
@@ -328,25 +357,27 @@
     (.addActionListener apply-btn
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
+          ;; "Apply defaults" edits the CLI :llm default provider only — the
+          ;; value may be a bare local id that ECA cannot resolve, so it must
+          ;; NOT be pushed into the ECA model.
           (models/save-fields! {:model (.getText model-tf)
                                 :url (.getText url-tf)
                                 :max-tokens (int (.getValue max-sp))
                                 :temperature (double (.getValue temp-sp))})
           (config/clear-llm-override!)
-          (config/reload!)
-          (uifooter/set-model! (.getText model-tf)))))
+          (config/reload!))))
     (.addActionListener pick-btn
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
           (let [owner (SwingUtilities/getWindowAncestor pick-btn)
                 r (modelpicker/show-picker! owner (.getText model-tf))]
             (when r
-              (.setText model-tf (:model r))
-              (.setText url-tf (:url r))
-              (models/save-fields! (merge {:model (:model r)} (when (:url r) {:url (:url r)})))
-              (config/clear-llm-override!)
-              (config/reload!)
-              (uifooter/set-model! (:model r)))))))
+              (let [eca-id (to-eca-id r)]
+                (.setText model-tf (:model r))
+                (.setText url-tf (:url r))
+                (models/save-fields! (merge {:model (:model r)} (when (:url r) {:url (:url r)})))
+                (config/clear-llm-override!)
+                (apply-eca-model! eca-id)))))))
     (.addActionListener save-prof
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]

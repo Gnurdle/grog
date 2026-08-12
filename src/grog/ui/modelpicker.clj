@@ -67,7 +67,11 @@
                 (.start (Thread.
                           (fn []
                             (let [raw (try ((:fetch t)) (catch Throwable _ []))
-                                  ms  (mapv (fn [x] (if (map? x) x {:model (str x)})) raw)]
+                                  src (some-> t :id name)
+                                  ms  (mapv (fn [x] (if (map? x)
+                                                       (assoc x :source src)
+                                                       {:model (str x) :source src}))
+                                            raw)]
                               (SwingUtilities/invokeLater
                                 (fn []
                                   (reset! current-models ms)
@@ -102,7 +106,9 @@
                         (let [t2 (str/trim (.getText search))]
                           (when (seq t2) t2)))]
               (when (seq (str m))
-                (reset! result {:model (str m) :url (:url t)}))
+                (reset! result {:model (str m)
+                                :url (:url t)
+                                :source (when (map? sel) (:source sel))}))
               (.dispose dlg)))))
       (.addActionListener cancel
         (proxy [java.awt.event.ActionListener] []

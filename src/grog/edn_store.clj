@@ -2,7 +2,7 @@
   "Filesystem tree of **.edn** files → nested Clojure maps (no third-party DB).
 
   Config: `:edn-store {:root \"…\"}` under `grog.edn` — path relative to
-  `:workspace :default-root` unless absolute; must stay inside the workspace.
+  the repo root unless absolute.
 
   **Key hierarchy (path → nested keywords):**
   - Only `*.edn` files under the root (recursive) participate.
@@ -18,8 +18,7 @@
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [grog.config :as cfg]
-            [grog.workspace-paths :as wsp])
+            [grog.config :as cfg])
   (:import [java.io File]
            [java.net URLDecoder]))
 
@@ -27,7 +26,10 @@
   (^File []
    (let [raw (some-> (get-in (cfg/grog) [:edn-store :root]) str str/trim not-empty)]
      (when raw
-       (wsp/resolve-under-workspace! raw)))))
+       (let [f (io/file raw)]
+         (if (.isAbsolute f)
+           f
+           (.getCanonicalFile (io/file (cfg/repo-root) raw))))))))
 
 (defn configured?
   []
@@ -36,6 +38,15 @@
 (defn root-directory
   []
   (try (resolve-root!) (catch Exception _ nil)))
+
+(defn- under-root?
+  "True iff `file`'s absolute canonical path is `root` or a descendant (guards against
+  path-traversal through `..`-style segments when building file paths from model input)."
+  [^File root ^File file]
+  (let [rp (.getPath (.getCanonicalFile ^File (or (.getCanonicalFile root) root)))
+        fp (.getPath (.getCanonicalFile ^File (or (.getCanonicalFile file) file)))]
+    (and (or (= fp rp) (str/starts-with? fp (str rp java.io.File/separator)))
+         (str/starts-with? fp rp))))
 
 (defn- rel-path ^String [^File root ^File file]
   (-> (.relativize (.toPath root) (.toPath (.getCanonicalFile file)))
@@ -91,7 +102,7 @@
   (when-let [^File root (resolve-root!)]
     (when-let [rel (keypath->relative-edn-path keypath)]
       (let [^File f (io/file root rel)]
-        (when (wsp/path-under-base? root f)
+        (when (under-root? root f)
           f)))))
 
 (defn read-leaf
@@ -110,7 +121,7 @@
         rel (or (keypath->relative-edn-path keypath)
                 (throw (ex-info "keypath must be non-empty" {})))
         ^File f (io/file root rel)]
-    (when-not (wsp/path-under-base? root f)
+    (when-not (under-root? root f)
       (throw (ex-info "keypath escapes edn-store root" {:keypath keypath})))
     (.mkdirs (.getParentFile f))
     (spit f (with-out-str (pprint/pprint value)) :encoding "UTF-8")
@@ -130,7 +141,7 @@
   (if (and (seq rel-segments) (resolve-root!))
     (let [^File root (resolve-root!)
           ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)]
-      (if (and (.exists dir) (.isDirectory dir) (wsp/path-under-base? root dir))
+      (if (and (.exists dir) (.isDirectory dir) (under-root? root dir))
         (do (doseq [^File f (reverse (file-seq dir))]
               (.delete f))
             true)
@@ -145,7 +156,7 @@
     []
     (let [^File root (resolve-root!)
           ^File dir (reduce (fn [^File acc ^String seg] (io/file acc (str seg))) root rel-segments)]
-      (if (and (.isDirectory dir) (wsp/path-under-base? root dir))
+      (if (and (.isDirectory dir) (under-root? root dir))
         (->> (.listFiles dir)
              (filter some?)
              (filter #(.isFile ^File %))
@@ -160,7 +171,7 @@
   []
   (if-let [^File root (root-directory)]
     (let [^File p (io/file root "grog-memory" "Projects")]
-      (if (and (.isDirectory p) (wsp/path-under-base? root p))
+      (if (and (.isDirectory p) (under-root? root p))
         (->> (.listFiles p)
              (filter some?)
              (filter #(.isDirectory ^File %))
@@ -176,7 +187,7 @@
 (defn startup-status-line []
   (try
     (if-not (configured?)
-      "edn-store: off — set :edn-store {:root \"…\"} under workspace"
+      "edn-store: off — set :edn-store {:root \"…\"} (absolute or repo-root-relative)"
       (str "edn-store: " (.getPath ^File (resolve-root!))))
     (catch Exception e
       (str "edn-store: error — " (.getMessage e)))))

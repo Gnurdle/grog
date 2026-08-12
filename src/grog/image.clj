@@ -18,8 +18,8 @@
 (def crop-default-pdf-dpi 220)
 
 (def max-pdf-raster-dpi
-  "Upper bound on PDF rasterization DPI for `ocr_pdf_document`, PDF `crop_workspace_image`, and
-  `analyze_pdf_line_drawings`. Use the same dpi when pairing OCR with line geometry or crops."
+  "Upper bound on PDF rasterization DPI for `ocr_pdf_document` and
+  `analyze_pdf_line_drawings`. Use the same dpi when pairing OCR with line geometry."
   1200)
 
 (def default-ocr-dpi 300)

@@ -1,25 +1,27 @@
 (ns grog.skills
-  "Skills live under workspace-relative `:skills :roots` (default `skills/`). Each skill is one directory:
+  "Skills for the LLM. Each skill is one directory:
 
     <root>/<skill-dir>/skill.edn   — metadata only
     <root>/<skill-dir>/SKILL.md    — full instructions (body for read_skill)
 
-  Paths in grog.edn are relative to `:workspace :default-root` unless absolute (still must stay under root).
+  Paths in grog.edn are relative to the repo root unless absolute.
 
   New skills are written under the **first** entry of `:skills :roots` (see `primary-write-root-file!`)."
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg]
-            [grog.workspace-paths :as wsp])
+            [grog.config :as cfg])
   (:import (java.io File)
            (java.nio.file Path)))
 
-(defn- resolve-under-workspace!
-  "File for path relative to workspace or absolute under workspace (symlinks in path allowed)."
+(defn- resolve-skill-path!
+  "File for `path` as given: absolute, or relative to the repo root."
   ^File [^String path]
-  (wsp/resolve-under-workspace! path))
+  (let [f (io/file path)]
+    (if (.isAbsolute f)
+      f
+      (.getCanonicalFile (io/file (cfg/repo-root) path)))))
 
 (def ^:private skill-md-filename "SKILL.md")
 (def ^:private skill-edn-filename "skill.edn")
@@ -36,12 +38,12 @@
                 (re-matches #"[a-zA-Z0-9][a-zA-Z0-9_-]*" s))))
 
 (defn- primary-write-root-file!
-  "First `:skills :root` resolved under workspace; created if missing."
+  "First configured `:skills :root` (relative to repo root); created if missing."
   ^File []
   (let [roots (cfg/skills-roots)]
     (when (empty? roots)
       (throw (ex-info "no skills roots configured" {})))
-    (let [^File root (resolve-under-workspace! (first roots))]
+    (let [^File root (resolve-skill-path! (first roots))]
       (.mkdirs root)
       root)))
 
@@ -137,7 +139,7 @@
       (vec out))))
 
 (defn- root-relative-path [^File abs-file]
-  (let [root (wsp/workspace-base-path)
+  (let [root (-> (io/file (cfg/repo-root)) .toPath .toAbsolutePath .normalize)
         ap (-> abs-file .toPath .toAbsolutePath .normalize)]
     (if (= ap root)
       "."
@@ -153,7 +155,7 @@
         by-id (volatile! {})]
     (doseq [root-str (cfg/skills-roots)]
       (try
-        (let [root (resolve-under-workspace! root-str)]
+        (let [root (resolve-skill-path! root-str)]
           (doseq [item (discover-in-root! root)]
             (if (:ok item)
               (let [rec (:rec item)
@@ -189,7 +191,7 @@
    :function
    {:name "list_skills"
     :description (str "List discoverable skills under :skills :roots (each directory has skill.edn + SKILL.md). "
-                      "Returns id, title, description, tags, workspace-relative path. "
+                      "Returns id, title, description, tags, and the skill's relative path. "
                       "Call read_skill for full SKILL.md; after save_skill, call list_skills to confirm.")
     :parameters {:type "object"
                  :properties {}}}})
@@ -243,7 +245,7 @@
   (try
     (if-not (cfg/skills-configured?)
       (json/generate-string {:error "skills not configured"
-                             :hint "Set :skills {:roots [\"skills\"]} in grog.edn (under :workspace :default-root)."})
+                             :hint "Set :skills {:roots [\"skills\"]} in grog.edn (relative to the repo root)."})
       (let [{:keys [by-id errors roots]} (discover-skill-records!)
             skills (->> (vals by-id)
                         (sort-by (comp str/lower-case :id))
@@ -296,7 +298,7 @@
   (try
     (if-not (cfg/skills-configured?)
       (json/generate-string {:error "skills not configured"
-                             :hint "Set :skills {:roots [\"skills\"]} in grog.edn (under :workspace :default-root)."})
+                             :hint "Set :skills {:roots [\"skills\"]} in grog.edn (relative to the repo root)."})
       (let [m (parse-skill-tool-args arguments)
             id (id-str (or (:id m) (get m "id")))
             desc (desc-str (or (:description m) (get m "description")))
@@ -405,7 +407,7 @@
              "Each skill is a directory with `skill.edn` (metadata) and `SKILL.md` (instructions), under `:skills :roots` in grog.edn. "
              "**New and updated skills are written only under the first root:** `" write-rel "/<id>/`.\n\n"
              "### Tools\n\n"
-             "- **list_skills** — ids, descriptions, workspace-relative paths.\n"
+             "- **list_skills** — ids, descriptions, repo-relative paths.\n"
              "- **read_skill** — full SKILL.md; **call this before save_skill** when editing an existing skill.\n"
              "- **save_skill** — create or replace `skill.edn` + `SKILL.md` (`id`, `description`, `skill_md`; optional `title`, `tags`).\n"
              "- **delete_skill** — remove a skill directory (only if it contains skill.edn and/or SKILL.md).\n\n"
@@ -421,7 +423,7 @@
   []
   (if-not (cfg/skills-configured?)
     (do (println "Skills are not configured.")
-        (println "Add :skills {:roots [\"skills\"]} to grog.edn (under :workspace :default-root)."))
+        (println "Add :skills {:roots [\"skills\"]} to grog.edn (relative to the repo root)."))
     (try
       (let [{:keys [by-id errors roots]} (discover-skill-records!)
             rows (->> (vals by-id) (sort-by (comp str/lower-case :id)) vec)]
@@ -473,7 +475,7 @@
 
 (defn startup-status-line []
   (if-not (cfg/skills-configured?)
-    "Skills: off — set :skills {:roots [\"skills\"]} (under workspace); each skill dir needs skill.edn + SKILL.md"
+    "Skills: off — set :skills {:roots [\"skills\"]}; each skill dir needs skill.edn + SKILL.md"
     (try
       (let [{:keys [by-id errors]} (discover-skill-records!)]
         (str "Skills: " (count by-id) " in " (count (cfg/skills-roots)) " root(s)"

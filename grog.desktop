@@ -8,6 +8,7 @@ Comment=Grog AI chat with an integrated shell window
 # ./install-desktop.sh to regenerate this file with the new path, or edit.
 Exec=/d/gni/grog/grog-ui
 Icon=/d/gni/grog/icon.png
+StartupWMClass=clojure-main
 Terminal=false
 StartupNotify=true
 Categories=Development;

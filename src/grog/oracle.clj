@@ -54,7 +54,7 @@
          "or similar).\n"
          "- The task is **high-stakes** for the user and you remain **materially uncertain** after checking what you can.\n\n"
          "### Do **not** call `oracle` when\n\n"
-         "- **Small talk**, simple lookups, or work solvable with workspace files, **brave_web_search**, **memory_***, "
+         "- **Small talk**, simple lookups, or work solvable with local files, **brave_web_search**, **memory_***, "
          "or **skills** alone.\n"
          "- You would only be **avoiding** doing the work yourself.\n"
          "- **Cost / latency:** each call uses the remote API — do **not** send multiple `oracle` calls for one question.\n\n"
@@ -63,7 +63,7 @@
          "see the rest of the chat unless you paste it into `query`).\n"
          "- In your reply to the user, **integrate** the oracle text honestly: quote, summarize, or disagree — do not "
          "pretend you authored it alone.\n"
-         "- The oracle’s answer text may include **`<image-png>workspace/path.png</image-png>`** (or **`<image-png/>`** close); "
+         "- The oracle’s answer text may include **`<image-png>path.png</image-png>`** (or **`<image-png/>`** close); "
          "Grog opens those PNGs in a viewer when the **oracle** tool returns (same rules as normal assistant text).\n")))
 
 (defn parse-oracle-args

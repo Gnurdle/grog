@@ -1,21 +1,27 @@
 (ns grog.soul
   "SOUL.md — persistent instructions merged into every chat as the model `system` message.
 
-  Relative `:soul :path` resolves under `:workspace :default-root`. Absolute paths must still
-  lie under that directory (same rule as before the simple-chat reset)."
+  `:soul :path` is resolved as given — absolute, or relative to the repo root
+  (`grog.home` / `GROG_HOME` / process cwd)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg]
-            [grog.workspace-paths :as wsp])
+            [grog.config :as cfg])
   (:import (java.io File)))
 
+(defn- resolve-path!
+  "Absolute `File` for a soul path: absolute as given, relative against the repo root."
+  ^File [^String path]
+  (let [f (io/file path)]
+    (if (.isAbsolute f)
+      f
+      (.getCanonicalFile (io/file (cfg/repo-root) path)))))
+
 (defn- resolved-file
-  "SOUL file under workspace (logical path; symlinks in the path are allowed)."
+  "SOUL file (absolute; symlinks in the path are allowed)."
   ^File []
   (let [rel (or (some-> (get-in (cfg/grog) [:soul :path]) str str/trim not-empty)
-                "SOUL.md")
-        f (io/file rel)]
-    (wsp/resolve-under-workspace! (if (.isAbsolute f) (.getPath f) rel))))
+                "SOUL.md")]
+    (resolve-path! rel)))
 
 (defn resolved-path
   "Absolute path to the soul file."

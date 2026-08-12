@@ -34,7 +34,7 @@
     (str method " :: " text)))
 
 (defn -main
-  "Args: [workspace-root] [message] [model]. Defaults: /d/gni/grog, \"Reply with
+  "Args: [repo-root] [message] [model]. Defaults: /d/gni/grog, \"Reply with
   exactly the word OK.\", and openrouter/moonshotai/kimi-k2.6 (must be an
   actually-configured provider/model for the running eca)."
   [& args]

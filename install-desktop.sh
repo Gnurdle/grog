@@ -56,6 +56,9 @@ else
 fi
 
 # --- 2. grog.desktop ----------------------------------------------------------
+# Icon uses an ABSOLUTE path to the repo's icon.png (not a theme name). KDE/GNOME
+# both honor this directly and it never depends on the icon theme / cache, so a
+# hand-installed app can't fall back to the generic icon.
 cat > "$desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -64,7 +67,7 @@ Name=grog
 GenericName=AI Chat Assistant
 Comment=Grog AI chat with an integrated shell window
 Exec=$repo/grog-ui
-Icon=grog
+Icon=$repo/icon.png
 StartupWMClass=clojure-main
 Terminal=false
 StartupNotify=false

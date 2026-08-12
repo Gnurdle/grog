@@ -1,17 +1,12 @@
 (ns grog.fs
-  "Workspace-scoped file tools: read/write text, Office, PDF, OCR."
+  "Repo-root file tools: read/write text, Office, PDF, OCR."
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg]
-            [grog.workspace-paths :as wsp])
+            [grog.config :as cfg])
   (:import [java.awt Graphics2D RenderingHints]
            [java.awt.image BufferedImage RescaleOp]
            [java.io File FileInputStream]
-           [javax.imageio ImageIO]
-           [java.nio.charset CodingErrorAction StandardCharsets]
-           [java.nio.file Files]
-           [java.util Base64]
            [net.sourceforge.tess4j ITessAPI$TessOcrEngineMode ITessAPI$TessPageSegMode
             Tesseract TesseractException]
            [org.apache.pdfbox Loader]
@@ -20,19 +15,20 @@
            [org.apache.pdfbox.text PDFTextStripper]
            [org.apache.poi.ss.usermodel DataFormatter WorkbookFactory]
            [org.apache.poi.xwpf.usermodel XWPFDocument XWPFParagraph
-            XWPFTable XWPFTableCell XWPFTableRow]
-           (java.nio.file StandardOpenOption)))
+            XWPFTable XWPFTableCell XWPFTableRow]))
 
-(defn- resolve-file-under-workspace!
-  "Returns `File` for `path` under workspace (symlinks allowed in `path`; I/O follows them).
-  Throws on `..` escape or absolute path outside the workspace."
+(defn- resolve-file!
+  "Returns `File` for `path` as given: absolute as-is, or relative to the repo root."
   ^File [^String path]
-  (wsp/resolve-under-workspace! path))
+  (let [f (io/file path)]
+    (if (.isAbsolute f)
+      (.getCanonicalFile f)
+      (.getCanonicalFile (io/file (cfg/repo-root) path)))))
 
-(defn resolve-workspace-path!
-  "Canonical `java.io.File` for `path` under :workspace :default-root (same rules as file tools)."
+(defn resolve-repo-path!
+  "Canonical `java.io.File` for `path` (absolute or repo-root-relative)."
   ^File [path]
-  (resolve-file-under-workspace! (str path)))
+  (resolve-file! (str path)))
 
 (defn- parse-args-map [arguments]
   (cond (map? arguments) arguments
@@ -40,112 +36,13 @@
                                   (catch Exception _ {}))
         :else {}))
 
-(defn read-workspace-file-tool-spec []
-  {:type "function"
-   :function
-   {:name "read_workspace_file"
-    :description (str "Read any regular file under the workspace (any path at or below :workspace :default-root). "
-                      "Valid UTF-8 is returned as text; otherwise bytes are returned as Base64 (`:type` binary). "
-                      "For structured PDF/Office extraction prefer read_pdf_document / read_office_document / ocr_pdf_document. "
-                      "To write text use write_workspace_file; PNG binary use write_workspace_png. "
-                      "Use `offset` to read a file in chunks when it exceeds `max_bytes`.")
-    :parameters {:type "object"
-                 :required ["path"]
-                 :properties {:path {:type "string"
-                                    :description "Path relative to workspace root, or absolute if still under that root."}
-                              :offset {:type "integer"
-                                       :description "Byte offset to start reading from (default 0)."}
-                              :max_bytes {:type "integer"
-                                          :description "Max bytes to read (default 524288). Capped at 2097152."}}}}})
-
-(def ^:private default-dir-max-entries 2000)
-(def ^:private dir-max-entries-cap 10000)
-
-(defn read-workspace-dir-tool-spec []
-  {:type "function"
-   :function
-   {:name "read_workspace_dir"
-    :description (str "List files and immediate subdirectories under a path inside the workspace (non-recursive, like ls). "
-                      "Use path \".\" or the workspace root name to list the project root. "
-                      "Returns JSON with :entries [{:name :type \"file\"|\"directory\" :size_bytes …}]; optional :max_entries caps count (default 2000, max 10000).")
-    :parameters {:type "object"
-                 :required ["path"]
-                 :properties {:path {:type "string"
-                                    :description "Directory relative to workspace root, or absolute under root; use \".\" for root."}
-                              :max_entries {:type "integer"
-                                            :description "Max entries to return (default 2000, cap 10000)."}}}}})
-
-(defn write-workspace-file-tool-spec []
-  {:type "function"
-   :function
-   {:name "write_workspace_file"
-    :description (str "Write UTF-8 text to a path under the workspace. Creates parent directories. "
-                      "Overwrites existing files unless append is true. "
-                      "For PNG images use write_workspace_png (base64), not this tool. "
-                      "For .docx/.xlsx/.pdf use appropriate tools, not raw writes. Max ~2 MiB per call.")
-    :parameters {:type "object"
-                 :required ["path" "content"]
-                 :properties {:path {:type "string"
-                                     :description "Relative to workspace root or absolute under that root."}
-                              :content {:type "string"
-                                        :description "Full file body as UTF-8 text (use \\n newlines)."}
-                              :append {:type "boolean"
-                                       :description "If true, append to existing file (creates file if missing). Default false (replace)."}}}}})
-
-(defn write-workspace-png-tool-spec []
-  {:type "function"
-   :function
-   {:name "write_workspace_png"
-    :description (str "Write a binary PNG image under the workspace. "
-                       "Pass `png_base64`: standard Base64 (RFC 4648) or a data URL `data:image/png;base64,...`. "
-                       "Decoded file must begin with a valid PNG signature. "
-                       "Path must end in .png (case-insensitive). Max ~15 MiB decoded.")
-    :parameters {:type "object"
-                 :required ["path" "png_base64"]
-                 :properties {:path {:type "string"
-                                    :description "Relative to workspace root or absolute under root; must end with .png"}
-                              :png_base64 {:type "string"
-                                           :description (str "PNG bytes as standard Base64 or data:image/png;base64,.... "
-                                                               "Some models emit camelCase pngBase64 — same value.")}}}}})
-
-(def ^:private crop-max-edge 4096)
-(def ^:private crop-max-pad 256)
-(def ^:private crop-default-pdf-dpi 220)
-
 (def max-pdf-raster-dpi
-  "Upper bound on PDF rasterization DPI for `ocr_pdf_document`, PDF `crop_workspace_image`, and
+  "Upper bound on PDF rasterization DPI for `ocr_pdf_document` and
   `analyze_pdf_line_drawings`. Use the same dpi when pairing OCR with line geometry or crops."
   1200)
 
 (def ^:private default-ocr-dpi 300)
 (def ^:private min-ocr-dpi 120)
-
-(defn crop-workspace-image-tool-spec []
-  {:type "function"
-   :function
-   {:name "crop_workspace_image"
-    :description (str "Crop a rectangular region from an image or a single PDF page and save as PNG under the workspace. "
-                      "Pixel coordinates are top-left origin (same convention as analyze_pdf_line_drawings segment endpoints). "
-                      "For PDF sources use the same :dpi as line analysis so crops align with detected segments. "
-                      "Use after BoofCV line discovery to extract diagram/schematic regions, then reference the saved PNG or embed via write_workspace_png elsewhere.")
-    :parameters {:type "object"
-                 :required ["source_path" "out_path" "x" "y" "width" "height"]
-                 :properties {:source_path {:type "string"
-                                            :description "Workspace path to .png, .jpg, .jpeg, or .pdf"}
-                              :out_path {:type "string"
-                                         :description "Destination path; must end with .png (created under workspace)."}
-                              :x {:type "integer" :description "Left edge of crop in pixels (≥ 0)."}
-                              :y {:type "integer" :description "Top edge of crop in pixels (≥ 0)."}
-                              :width {:type "integer" :description "Crop width in pixels (1–4096)."}
-                              :height {:type "integer" :description "Crop height in pixels (1–4096)."}
-                              :page {:type "integer"
-                                     :description "1-based page index when source is PDF (required for .pdf)."}
-                              :dpi {:type "integer"
-                                    :description (str "Render DPI for PDF only (default " crop-default-pdf-dpi
-                                                      "; max " max-pdf-raster-dpi
-                                                      "; use same dpi as analyze_pdf_line_drawings / ocr_pdf_document).")}
-                              :pad_px {:type "integer"
-                                       :description "Optional uniform margin added around the box before clamping to image bounds (0–256)."}}}}})
 
 (def ^:private default-office-max-chars (* 512 1024))         ; 512 KiB default text cap per call
 (def ^:private office-max-chars-cap (* 4 1024 1024))          ; 4 MiB upper limit
@@ -157,7 +54,7 @@
   {:type "function"
    :function
    {:name "read_office_document"
-    :description (str "Extract plain text and tables from a Word or Excel file under the workspace (any relative or absolute path under the workspace root). "
+    :description (str "Extract plain text and tables from a Word or Excel file (absolute or relative path to the file). "
                       "Supports .docx, .xlsx, .xls; other extensions are probed as spreadsheet then document. "
                       "Returns JSON: format, path, text (paragraphs), tables (rows as string arrays), plus paging metadata. "
                       "Each Word table is one entry; each Excel sheet is one table. "
@@ -167,7 +64,7 @@
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path under workspace root (any extension; file must be readable as Office)."}
+                                     :description "Path to the file (absolute or relative; any extension; file must be readable as Office)."}
                               :offset {:type "integer"
                                        :description "Word only: number of body elements (paragraphs+tables) to skip before reading. Default 0."}
                               :limit {:type "integer"
@@ -188,13 +85,13 @@
   {:type "function"
    :function
    {:name "read_pdf_document"
-    :description (str "Extract plain text from a PDF file under the workspace (any path under root; file must be a valid PDF). "
+    :description (str "Extract plain text from a PDF file (absolute or relative path to the file; must be a valid PDF). "
                       "Returns JSON: format, path, page_count, pages_read, text, truncated flags. "
                       "Does not run OCR — for scanned/image-only PDFs use ocr_pdf_document after this returns little text.")
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path under workspace root (any extension if file is a valid PDF)."}
+                                     :description "Path to the file (absolute or relative; any extension if file is a valid PDF)."}
                               :max_pages {:type "integer"
                                           :description "Max pages to extract (default 100, cap 500)."}}}}})
 
@@ -202,7 +99,7 @@
   {:type "function"
    :function
    {:name "ocr_pdf_document"
-    :description (str "OCR for PDF files under the workspace that are scanned or image-only (any path under root; must be a valid PDF). "
+    :description (str "OCR for scanned or image-only PDF files (absolute or relative path to the file; must be a valid PDF). "
                       "Uses high-DPI render, LSTM engine, grayscale+contrast preprocessing, and text cleanup for LLM parsing. "
                       "If quality is poor, raise dpi (try 400–800; up to " max-pdf-raster-dpi
                       " for very fine print or dense diagrams — high RAM and slow; reduce max_pages). "
@@ -211,7 +108,7 @@
     :parameters {:type "object"
                  :required ["path"]
                  :properties {:path {:type "string"
-                                     :description "Path under workspace root (any extension if file is a valid PDF)."}
+                                     :description "Path to the file (absolute or relative; any extension if file is a valid PDF)."}
                               :max_pages {:type "integer"
                                           :description "Max pages to OCR (default 30, cap 100)."}
                               :dpi {:type "integer"
@@ -224,51 +121,6 @@
                                               :description "Tesseract PSM 0–13 (default 6 = uniform text block). Try 3 (auto) or 4 (single column) for layout issues."}
                               :preprocess {:type "boolean"
                                            :description "Grayscale + contrast boost before OCR (default true). Set false only for unusual color-dependent scans."}}}}})
-
-(def ^:private default-text-max 524288)
-(def ^:private text-max-cap 2097152)
-
-(def ^:private png-max-decoded-bytes (* 15 1024 1024))
-
-(defn- png-extension? [^String path]
-  (str/ends-with? (str/lower-case path) ".png"))
-
-(defn- png-magic-matches? [^bytes bs]
-  (when (>= (alength bs) 8)
-    (let [expect [0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A]]
-      (every? true? (map (fn [i e] (= (bit-and 0xff (aget ^bytes bs i)) e))
-                          (range 8)
-                          expect)))))
-
-(defn- strip-data-url-to-base64-payload [^String s]
-  (let [t (str/trim s)]
-    (if (str/starts-with? (str/lower-case t) "data:")
-      (if-let [i (str/index-of t ",")]
-        (subs t (inc i))
-        (throw (ex-info "data URL has no comma separator" {})))
-      t)))
-
-(defn- decode-png-base64-bytes! [^String raw]
-  (let [payload (strip-data-url-to-base64-payload raw)
-        ^bytes bs (try (.decode (Base64/getMimeDecoder) payload)
-                       (catch IllegalArgumentException e
-                         (throw (ex-info (str "invalid base64: " (.getMessage e)) {}))))]
-    (when (> (alength bs) png-max-decoded-bytes)
-      (throw (ex-info "PNG exceeds max decoded size"
-                      {:bytes (alength bs) :max_bytes png-max-decoded-bytes})))
-    (when-not (png-magic-matches? bs)
-      (throw (ex-info "decoded data is not a PNG (missing PNG file signature)" {})))
-    bs))
-
-(defn- bytes-valid-utf-8? [^bytes bs]
-  (try
-    (let [dec (doto (.newDecoder StandardCharsets/UTF_8)
-                (.onMalformedInput CodingErrorAction/REPORT)
-                (.onUnmappableCharacter CodingErrorAction/REPORT))]
-      (.decode dec (java.nio.ByteBuffer/wrap bs))
-      true)
-    (catch java.nio.charset.CharacterCodingException _
-      false)))
 
 (def ^:private default-pdf-max-pages 100)
 (def ^:private pdf-max-pages-cap 500)
@@ -415,523 +267,6 @@
            :preprocess preprocess?
            :text (normalize-ocr-text-for-llm raw)})))))
 
-(defn run-read-workspace-dir!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-raw (or (:path m) (get m "path") ".")
-          path-str (if (string? path-raw)
-                     (str/trim path-raw)
-                     (str path-raw))
-          path-for-resolve (if (str/blank? path-str) "." path-str)
-          max-ent (let [x (or (:max_entries m) (get m "max_entries")
-                              (:maxEntries m) (get m "maxEntries"))]
-                    (cond (number? x) (min dir-max-entries-cap (max 1 (long x)))
-                          :else default-dir-max-entries))
-          ^File d (resolve-file-under-workspace! path-for-resolve)]
-      (cond
-        (not (.exists d))
-        (json/generate-string {:error "path not found" :path path-for-resolve})
-
-        (not (.isDirectory d))
-        (json/generate-string {:error "not a directory" :path path-for-resolve})
-
-        :else
-        (let [files (->> (.listFiles d)
-                         (filter some?)
-                         (sort-by #(str/lower-case (.getName ^File %)))
-                         vec)
-              n (count files)
-              truncated (> n max-ent)
-              slice (vec (take max-ent files))]
-          (json/generate-string
-           {:format "directory_listing"
-            :path path-for-resolve
-            :resolved (.getPath d)
-            :entry_count n
-            :entries_returned (count slice)
-            :truncated truncated
-            :entries
-            (mapv (fn [^File f]
-                    (let [nm (.getName f)]
-                      (if (.isDirectory f)
-                        {:name nm :type "directory"}
-                        {:name nm :type "file" :size_bytes (.length f)})))
-                  slice)}))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "directory listing failed")
-                             :detail (str e)}))))
-
-(defn- read-file-range [^File f ^long offset ^long max-bytes]
-  (let [len (.length f)
-        off (max 0 (min offset len))
-        to-read (max 0 (min max-bytes (- len off)))
-        ba (byte-array to-read)]
-    (when (pos? to-read)
-      (with-open [raf (java.io.RandomAccessFile. f "r")]
-        (.seek raf off)
-        (.readFully raf ba)))
-    {:bytes ba :offset off :has_more (< (+ off to-read) len)}))
-
-(defn run-read-workspace-file!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          offset (let [x (or (:offset m) (get m "offset"))]
-                   (if (number? x) (max 0 (long x)) 0))
-          max-bytes (let [x (or (:max_bytes m) (get m "max_bytes"))]
-                      (cond (number? x) (min text-max-cap (max 1 (long x)))
-                            :else default-text-max))
-          ^File f (resolve-file-under-workspace! path-str)]
-      (cond
-        (not (.exists f))
-        (json/generate-string {:error "file not found" :path path-str})
-
-        (not (.isFile f))
-        (json/generate-string {:error "not a regular file" :path path-str})
-
-        :else
-        (let [{:keys [bytes ^long offset has-more]} (read-file-range f offset max-bytes)
-              bs ^bytes bytes]
-          (if (bytes-valid-utf-8? bs)
-            (json/generate-string {:type "text"
-                                   :path path-str
-                                   :size_bytes (.length f)
-                                   :offset offset
-                                   :bytes_read (alength bs)
-                                   :has_more has-more
-                                   :content (String. bs StandardCharsets/UTF_8)})
-            (json/generate-string {:type "binary"
-                                   :path path-str
-                                   :size_bytes (.length f)
-                                   :offset offset
-                                   :bytes_read (alength bs)
-                                   :has_more has-more
-                                   :encoding "base64"
-                                   :note "Not valid UTF-8; content is Base64."
-                                   :content (.encodeToString (Base64/getEncoder) bs)})))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "read failed")
-                             :detail (str e)}))))
-
-(defn grep-workspace-file-tool-spec []
-  {:type "function"
-   :function
-   {:name "grep_workspace_file"
-    :description (str "Search for lines matching a regex pattern inside a text file under the workspace. "
-                      "Returns matching lines with their line numbers. Useful for finding settings in config files "
-                      "without reading the entire file.")
-    :parameters {:type "object"
-                 :required ["path" "search"]
-                 :properties {:path {:type "string"
-                                    :description "Path relative to workspace root, or absolute if still under that root."}
-                              :search {:type "string"
-                                       :description "Regex pattern to search for (Java regex syntax)."}
-                              :max_results {:type "integer"
-                                           :description "Max number of matching lines to return (default 500, cap 5000)."}
-                              :case_sensitive {:type "boolean"
-                                              :description "Whether the search is case-sensitive (default true)."}}}}})
-
-(defn- grep-file-lines [^File f ^java.util.regex.Pattern pattern ^long max-results]
-  (with-open [rdr (io/reader f)]
-    (loop [line-num 1
-           matches []]
-      (if-let [line (.readLine ^java.io.BufferedReader rdr)]
-        (if (>= (count matches) max-results)
-          matches
-          (recur (inc line-num)
-                 (if (.find (.matcher pattern line))
-                   (conj matches {:line line-num :text line})
-                   matches)))
-        matches))))
-
-(defn run-grep-workspace-file!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          search-str (or (some-> (:search m) str str/trim not-empty)
-                         (some-> (get m "search") str str/trim not-empty))
-          case-sensitive? (if (contains? m :case_sensitive)
-                            (boolean (:case_sensitive m))
-                            (if (contains? m "case_sensitive")
-                              (boolean (get m "case_sensitive"))
-                              true))
-          max-results (let [x (or (:max_results m) (get m "max_results"))]
-                        (cond (number? x) (min 5000 (max 1 (long x)))
-                              :else 500))
-          ^File f (resolve-file-under-workspace! path-str)]
-      (cond
-        (not (.exists f))
-        (json/generate-string {:error "file not found" :path path-str})
-
-        (not (.isFile f))
-        (json/generate-string {:error "not a regular file" :path path-str})
-
-        (str/blank? search-str)
-        (json/generate-string {:error "search pattern is required" :path path-str})
-
-        :else
-        (let [pattern (if case-sensitive?
-                        (re-pattern search-str)
-                        (re-pattern (str "(?i:" search-str ")")))
-              matches (grep-file-lines f pattern max-results)]
-          (json/generate-string {:path path-str
-                                 :pattern search-str
-                                 :matches matches
-                                 :count (count matches)
-                                 :truncated (>= (count matches) max-results)}))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "grep failed")
-                             :detail (str e)}))))
-
-(defn stat-workspace-file-tool-spec []
-  {:type "function"
-   :function
-   {:name "stat_workspace_file"
-    :description (str "Get metadata for a file under the workspace: size in bytes, line count, and newline type "
-                      "(LF or CRLF). This helps plan chunk sizes before reading a large file.")
-    :parameters {:type "object"
-                 :required ["path"]
-                 :properties {:path {:type "string"
-                                    :description "Path relative to workspace root, or absolute if still under that root."}}}}})
-
-(defn- file-newline-type [^File f]
-  (with-open [rdr (io/reader f)]
-    (loop [crlf 0
-           lf 0]
-      (let [ch (.read ^java.io.BufferedReader rdr)]
-        (cond
-          (neg? ch) (cond (> crlf 0) "CRLF" (> lf 0) "LF" :else "unknown")
-          (== ch (int \return)) (let [next-ch (.read ^java.io.BufferedReader rdr)]
-                                  (if (== next-ch (int \newline))
-                                    (recur (inc crlf) lf)
-                                    (do (when (not (neg? next-ch))
-                                          (.unread ^java.io.BufferedReader rdr next-ch))
-                                        (recur crlf (inc lf)))))
-          (== ch (int \newline)) (recur crlf (inc lf))
-          :else (recur crlf lf))))))
-
-(defn- file-line-count [^File f]
-  (with-open [rdr (io/reader f)]
-    (loop [cnt 0]
-      (if (nil? (.readLine ^java.io.BufferedReader rdr))
-        cnt
-        (recur (inc cnt))))))
-
-(defn run-stat-workspace-file!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          ^File f (resolve-file-under-workspace! path-str)]
-      (cond
-        (not (.exists f))
-        (json/generate-string {:error "file not found" :path path-str})
-
-        (not (.isFile f))
-        (json/generate-string {:error "not a regular file" :path path-str})
-
-        :else
-        (json/generate-string {:path path-str
-                               :size_bytes (.length f)
-                               :line_count (file-line-count f)
-                               :newline_type (file-newline-type f)})))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "stat failed")
-                             :detail (str e)}))))
-
-(defn read-workspace-file-lines-tool-spec []
-  {:type "function"
-   :function
-   {:name "read_workspace_file_lines"
-    :description (str "Read a specific line range from a text file under the workspace. "
-                      "Ideal for config files where you care about specific line ranges. "
-                      "Returns the requested lines with their line numbers.")
-    :parameters {:type "object"
-                 :required ["path"]
-                 :properties {:path {:type "string"
-                                    :description "Path relative to workspace root, or absolute if still under that root."}
-                              :start_line {:type "integer"
-                                          :description "1-based line number to start from (default 1)."}
-                              :max_lines {:type "integer"
-                                         :description "Max lines to read (default 500, cap 5000)."}}}}})
-
-(defn- read-file-lines-range [^File f ^long start-line ^long max-lines]
-  (with-open [rdr (io/reader f)]
-    (loop [line-num 1
-           lines []]
-      (if-let [line (.readLine ^java.io.BufferedReader rdr)]
-        (if (>= (count lines) max-lines)
-          {:lines lines :has_more true}
-          (if (>= line-num start-line)
-            (recur (inc line-num) (conj lines {:line line-num :text line}))
-            (recur (inc line-num) lines)))
-        {:lines lines :has_more false}))))
-
-(defn run-read-workspace-file-lines!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          start-line (let [x (or (:start_line m) (get m "start_line"))]
-                       (if (number? x) (max 1 (long x)) 1))
-          max-lines (let [x (or (:max_lines m) (get m "max_lines"))]
-                      (cond (number? x) (min 5000 (max 1 (long x)))
-                            :else 500))
-          ^File f (resolve-file-under-workspace! path-str)]
-      (cond
-        (not (.exists f))
-        (json/generate-string {:error "file not found" :path path-str})
-
-        (not (.isFile f))
-        (json/generate-string {:error "not a regular file" :path path-str})
-
-        :else
-        (let [{:keys [lines has-more]} (read-file-lines-range f start-line max-lines)]
-          (json/generate-string {:path path-str
-                                 :start_line start-line
-                                 :lines lines
-                                 :count (count lines)
-                                 :has_more has-more}))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "read failed")
-                             :detail (str e)}))))
-
-(defn- coerce-write-content [v]
-  (cond (nil? v) ""
-        (string? v) v
-        :else (json/generate-string v)))
-
-(defn run-write-workspace-file!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          content (coerce-write-content (or (:content m) (get m "content")))
-          append? (json-bool (or (:append m) (get m "append")) false)
-          ^File f (resolve-file-under-workspace! path-str)
-          ^bytes bs (.getBytes ^String content StandardCharsets/UTF_8)]
-      (cond
-        (str/blank? path-str)
-        (json/generate-string {:error "path is required"})
-
-        (and (.exists f) (.isDirectory f))
-        (json/generate-string {:error "path is a directory" :path path-str})
-
-        (> (alength bs) text-max-cap)
-        (json/generate-string {:error "content too large"
-                               :path path-str
-                               :bytes (alength bs)
-                               :max_bytes text-max-cap})
-
-        :else
-        (let [^File parent (.getParentFile f)]
-          (when parent
-            (.mkdirs parent))
-          (if append?
-            (Files/write (.toPath f) bs
-                         (into-array StandardOpenOption
-                                     [StandardOpenOption/CREATE
-                                      StandardOpenOption/APPEND]))
-            (Files/write (.toPath f) bs
-                         (into-array StandardOpenOption
-                                     [StandardOpenOption/CREATE
-                                      StandardOpenOption/WRITE
-                                      StandardOpenOption/TRUNCATE_EXISTING])))
-          (json/generate-string {:ok true
-                                 :path path-str
-                                 :bytes_written (alength bs)
-                                 :mode (if append? "append" "write")
-                                 :exists_after true}))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "write failed")
-                             :detail (str e)}))))
-
-(defn run-write-workspace-png!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          path-str (or (some-> (:path m) str str/trim not-empty)
-                       (some-> (get m "path") str str/trim not-empty))
-          b64 (or (some-> (:png_base64 m) str not-empty)
-                  (some-> (get m "png_base64") str not-empty)
-                  (some-> (:pngBase64 m) str not-empty)
-                  (some-> (get m "pngBase64") str not-empty))]
-      (cond
-        (str/blank? path-str)
-        (json/generate-string {:error "path is required"})
-
-        (str/blank? b64)
-        (json/generate-string {:error "png_base64 is required"})
-
-        (not (png-extension? path-str))
-        (json/generate-string {:error "path must end with .png" :path path-str})
-
-        :else
-        (let [^bytes bs (decode-png-base64-bytes! b64)
-              ^File f (resolve-file-under-workspace! path-str)]
-          (if (and (.exists f) (.isDirectory f))
-            (json/generate-string {:error "path is a directory" :path path-str})
-            (let [^File parent (.getParentFile f)]
-              (when parent
-                (.mkdirs parent))
-              (Files/write (.toPath f) bs
-                           (into-array StandardOpenOption
-                                       [StandardOpenOption/CREATE
-                                        StandardOpenOption/WRITE
-                                        StandardOpenOption/TRUNCATE_EXISTING]))
-              (json/generate-string {:ok true
-                                     :path path-str
-                                     :format "png"
-                                     :bytes_written (alength bs)}))))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "PNG write failed")
-                             :detail (str e)}))))
-
-(defn- pdf-renderer-for-crop ^PDFRenderer [^PDDocument doc]
-  (doto (PDFRenderer. doc)
-    (.setSubsamplingAllowed false)
-    (.setRenderingHints
-     (doto (RenderingHints. RenderingHints/KEY_INTERPOLATION
-                            RenderingHints/VALUE_INTERPOLATION_BICUBIC)
-       (.put RenderingHints/KEY_RENDERING RenderingHints/VALUE_RENDER_QUALITY)
-       (.put RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
-       (.put RenderingHints/KEY_TEXT_ANTIALIASING
-             RenderingHints/VALUE_TEXT_ANTIALIAS_ON)))))
-
-(defn- file-kind-raster-or-pdf [^String name]
-  (let [n (str/lower-case name)]
-    (cond (str/ends-with? n ".pdf") :pdf
-          (or (str/ends-with? n ".png")
-              (str/ends-with? n ".jpg")
-              (str/ends-with? n ".jpeg")) :raster
-          :else :unknown)))
-
-(defn- get-long-opt [m kw & str-keys]
-  (let [x (or (get m kw) (some #(get m %) str-keys))]
-    (cond (number? x) (long x)
-          (and (string? x) (not (str/blank? x)))
-          (try (Long/parseLong (str/trim x))
-               (catch NumberFormatException _ nil))
-          :else nil)))
-
-(defn- load-image-for-crop!
-  ^BufferedImage [^File src-f kind page-1-based dpi]
-  (case kind
-    :raster
-    (or (ImageIO/read src-f)
-        (throw (ex-info "could not decode raster image" {:path (.getPath src-f)})))
-    :pdf
-    (do
-      (when (> (.length src-f) pdf-max-file-bytes)
-        (throw (ex-info "PDF too large" {:max_bytes pdf-max-file-bytes})))
-      (with-open [^PDDocument doc (Loader/loadPDF src-f)]
-        (when (.isEncrypted doc)
-          (throw (ex-info "encrypted PDFs are not supported" {})))
-        (let [pc (.getNumberOfPages doc)
-              p (dec (long page-1-based))]
-          (when (or (< p 0) (>= p pc))
-            (throw (ex-info "page out of range" {:page page-1-based :page_count pc})))
-          (let [^PDFRenderer r (pdf-renderer-for-crop doc)]
-            (.renderImageWithDPI r (int p) (float dpi) ImageType/RGB)))))))
-
-(defn run-crop-workspace-image!
-  [arguments]
-  (try
-    (let [m (parse-args-map arguments)
-          src (or (some-> (:source_path m) str str/trim not-empty)
-                  (some-> (get m "source_path") str str/trim not-empty)
-                  (some-> (:sourcePath m) str str/trim not-empty))
-          out (or (some-> (:out_path m) str str/trim not-empty)
-                  (some-> (get m "out_path") str str/trim not-empty)
-                  (some-> (:outPath m) str str/trim not-empty))
-          x (get-long-opt m :x "x")
-          y (get-long-opt m :y "y")
-          w (get-long-opt m :width "width")
-          h (get-long-opt m :height "height")
-          page (get-long-opt m :page "page")
-          dpi (long (min max-pdf-raster-dpi (max 72 (or (get-long-opt m :dpi "dpi") (long crop-default-pdf-dpi)))))
-          pad-raw (or (get-long-opt m :pad_px "pad_px")
-                      (get-long-opt m :padPx "padPx"))
-          pad (if (nil? pad-raw) 0 (min crop-max-pad (max 0 (long pad-raw))))]
-      (cond
-        (or (str/blank? src) (str/blank? out))
-        (json/generate-string {:error "source_path and out_path are required"})
-
-        (not (png-extension? out))
-        (json/generate-string {:error "out_path must end with .png" :out_path out})
-
-        (some nil? [x y w h])
-        (json/generate-string {:error "x, y, width, height must be integers"})
-
-        (or (< w 1) (> w crop-max-edge) (< h 1) (> h crop-max-edge))
-        (json/generate-string {:error "width and height must be between 1 and max (pixels)"
-                               :max_edge crop-max-edge})
-
-        (or (< x 0) (< y 0))
-        (json/generate-string {:error "x and y must be >= 0"})
-
-        :else
-        (let [^File src-f (resolve-file-under-workspace! src)
-              kind (file-kind-raster-or-pdf (.getName src-f))]
-          (cond
-            (not (.exists src-f))
-            (json/generate-string {:error "source file not found" :source_path src})
-
-            (not (.isFile src-f))
-            (json/generate-string {:error "source is not a regular file" :source_path src})
-
-            (= :unknown kind)
-            (json/generate-string {:error "source must be .png, .jpg, .jpeg, or .pdf" :source_path src})
-
-            (and (= :pdf kind) (or (nil? page) (< (long page) 1)))
-            (json/generate-string {:error "page is required for PDF (1-based page index)" :source_path src})
-
-            :else
-            (let [^BufferedImage full (load-image-for-crop! src-f kind page dpi)
-                  iw (.getWidth full)
-                  ih (.getHeight full)
-                  x0 (max 0 (- x pad))
-                  y0 (max 0 (- y pad))
-                  x1 (min iw (+ x w pad))
-                  y1 (min ih (+ y h pad))
-                  cw (max 1 (- x1 x0))
-                  ch (max 1 (- y1 y0))]
-              (when (or (> cw crop-max-edge) (> ch crop-max-edge))
-                (throw (ex-info "padded crop exceeds max edge" {:width cw :height ch :max crop-max-edge})))
-              (when (or (> (+ x0 cw) iw) (> (+ y0 ch) ih))
-                (throw (ex-info "crop rectangle out of bounds"
-                                {:image_width iw :image_height ih :x x0 :y y0 :width cw :height ch})))
-              (let [^BufferedImage sub (.getSubimage full (int x0) (int y0) (int cw) (int ch))
-                    ^File out-f (resolve-file-under-workspace! out)
-                    parent (.getParentFile out-f)]
-                (when (and (.exists out-f) (.isDirectory out-f))
-                  (throw (ex-info "out_path is a directory" {:out_path out})))
-                (when parent (.mkdirs parent))
-                (when-not (ImageIO/write sub "png" out-f)
-                  (throw (ex-info "failed to write PNG" {:out_path out})))
-                (json/generate-string
-                 (cond-> {:format "image_crop"
-                          :source_path src
-                          :out_path out
-                          :source_kind (name kind)
-                          :crop_applied {:x x0 :y y0 :width cw :height ch}
-                          :requested {:x x :y y :width w :height h :pad_px pad}
-                          :source_dimensions {:width iw :height ih}
-                          :hint (str "Saved PNG crop. Use same dpi as analyze_pdf_line_drawings when cropping from PDF; "
-                                     "pair with ocr_pdf_document on the same region path if you need text.")}
-                   (= :pdf kind) (assoc :pdf {:page (long page) :dpi dpi})))))))))
-    (catch Exception e
-      (json/generate-string {:error (or (.getMessage e) "image crop failed")
-                             :detail (str e)}))))
-
 (defn- extract-docx
   "Extract text/tables from a .docx, reading only `limit` body elements starting at element `offset`.
   Returns text, tables (each tagged with its element index), total element count, and count actually read."
@@ -1075,7 +410,7 @@
           row-limit (let [x (or (:row_limit m) (get m "row_limit"))]
                       (cond (number? x) (min office-max-rows-cap (max 1 (long x)))
                             :else nil))
-          ^File f (resolve-file-under-workspace! path-str)]
+          ^File f (resolve-file! path-str)]
       (cond
         (not (.exists f))
         (json/generate-string {:error "file not found" :path path-str})
@@ -1118,7 +453,7 @@
           max-pages (let [x (or (:max_pages m) (get m "max_pages"))]
                       (cond (number? x) (min pdf-max-pages-cap (max 1 (long x)))
                             :else default-pdf-max-pages))
-          ^File f (resolve-file-under-workspace! path-str)]
+          ^File f (resolve-file! path-str)]
       (cond
         (not (.exists f))
         (json/generate-string {:error "file not found" :path path-str})
@@ -1168,7 +503,7 @@
                        "eng")
           psm (parse-ocr-psm m)
           preprocess? (json-bool (or (:preprocess m) (get m "preprocess")) true)
-          ^File f (resolve-file-under-workspace! path-str)
+          ^File f (resolve-file! path-str)
           datapath (tessdata-path-or-nil)]
       (cond
         (str/blank? datapath)
@@ -1225,24 +560,8 @@
     (or (some-> (:path m) str str/trim not-empty)
         (some-> (get m "path") str str/trim not-empty))))
 
-(defn tool-log-crop-line
-  "Brief source -> out for stderr logging, or nil."
-  [arguments]
-  (let [m (parse-args-map arguments)
-        src (or (some-> (:source_path m) str str/trim not-empty)
-                (some-> (get m "source_path") str str/trim not-empty)
-                (some-> (:sourcePath m) str str/trim not-empty))
-        out (or (some-> (:out_path m) str str/trim not-empty)
-                (some-> (get m "out_path") str str/trim not-empty)
-                (some-> (:outPath m) str str/trim not-empty))]
-    (when (and src out)
-      (str (pr-str src) " -> " (pr-str out)))))
-
 (defn startup-status-line []
-  (str "Workspace file tools (paths must stay under :workspace :default-root): read_workspace_dir, read/write text, write_workspace_png, crop_workspace_image, "
-       "Office extract, PDF text/OCR, BoofCV lines — root "
-       (pr-str (cfg/workspace-root))
-       " — "
+  (str "File tools: Office extract, PDF text/OCR, BoofCV lines — "
        (if (tessdata-path-or-nil)
          "OCR: tessdata OK"
          "OCR: no tessdata (ocr_pdf_document needs Tesseract language data)")))

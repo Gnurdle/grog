@@ -20,12 +20,17 @@ else
 fi
 
 export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+# Repo root, exported so the app can find icon.png/logo.jpg regardless of the
+# process's CWD (desktop launchers often start with a different working dir).
+export GROG_HOME="$(pwd -P)"
 
 # The LLM API key is read from the OS keyring (LLM_API_KEY) as a fallback, so
 # desktop launches don't depend on a shell rc exporting it.
 
 LOG="${GROG_LOG:-$HOME/.grog-ui.log}"
 mkdir -p "$(dirname "$LOG")"
+# Start a fresh log each launch (truncate, then append the marker + stream).
+: > "$LOG"
 echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ ===" >> "$LOG"
 
 exec 3>&2

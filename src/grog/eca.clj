@@ -130,11 +130,19 @@
         (string? rid) rid
         :else nil))
 
-(defn- respond! [^OutputStreamWriter out lock id result error]
-  (write-frame! out lock
-                (cond-> {:jsonrpc "2.0" :id id}
-                  (some? error) (assoc :error error)
-                  (some? result) (assoc :result result))))
+(defn- trace-frame!
+  "Feed a raw JSON-RPC `frame` (one side of the ECA<->grog conversation) to the
+  connection's trace fn, labelled by `dir` (either :out or :in)."
+  [conn dir frame]
+  (when-let [tf (:trace-fn conn)]
+    (tf dir frame)))
+
+(defn- respond! [conn id result error]
+  (let [obj (cond-> {:jsonrpc "2.0" :id id}
+              (some? error) (assoc :error error)
+              (some? result) (assoc :result result))]
+    (write-frame! (:out conn) (:write-lock conn) obj)
+    (trace-frame! conn :out obj)))
 
 (defn- handle-frame!
   "Dispatch a single parsed frame on the connection."
@@ -156,7 +164,7 @@
                         {:error {:code -32601 :message (str "unhandled: " method)}}))
             result (:result resp)
             error  (:error resp)]
-        (respond! (:out conn) (:write-lock conn) (long id) result error))
+        (respond! conn (long id) result error))
 
       ;; notification
       :else
@@ -173,6 +181,7 @@
         nil
         (let [frame (parse-json body)]
           (when frame
+            (trace-frame! conn :in frame)
             (try (handle-frame! conn frame)
                  (catch Exception e
                    (when-let [lf (:log-fn conn)]
@@ -188,6 +197,7 @@
         cwd             (:cwd opts)
         log-fn          (:log-fn opts)
         on-stop         (:on-stop opts)
+        trace-fn        (:trace-fn opts)
         event-handler   (or (:event-handler opts)
                             (fn [_ _] nil))
         request-handler (or (:request-handler opts)
@@ -218,6 +228,7 @@
               :event-handler event-handler
               :request-handler request-handler
               :log-fn log-fn
+              :trace-fn trace-fn
               :on-stop on-stop}]
     (stderr-drain! proc log-fn)
     (doto (Thread. ^Runnable #(reader-loop! conn) "grog-eca-reader")
@@ -261,6 +272,8 @@
       (write-frame! (:out conn) (:write-lock conn)
                     (cond-> {:jsonrpc "2.0" :id id :method method}
                       params (assoc :params params)))
+      (trace-frame! conn :out (cond-> {:jsonrpc "2.0" :id id :method method}
+                                params (assoc :params params)))
       (let [res (deref p rpc-timeout-ms ::timeout)]
         (if (= ::timeout res)
           {:error {:code -32000 :message (str "ECA request timeout: " method)}}
@@ -276,7 +289,9 @@
   (let [conn (check-conn!)]
     (write-frame! (:out conn) (:write-lock conn)
                   (cond-> {:jsonrpc "2.0" :method method}
-                    params (assoc :params params)))))
+                    params (assoc :params params)))
+    (trace-frame! conn :out (cond-> {:jsonrpc "2.0" :method method}
+                              params (assoc :params params)))))
 
 (declare disconnect!)
 
@@ -290,6 +305,7 @@
                                            {:result …} or {:error …}
     :on-stop        (fn [])                called when the child's stdout closes
     :log-fn         (fn [line])            stderr lines from eca
+    :trace-fn       (fn [dir frame])       every JSON-RPC frame in/out; dir is :out or :in
     :eca-binary     binary name/path (default \"eca\")
     :args           extra args to `eca server` (e.g. [\"--config-file\" \"...\"])
     :env            extra env vars
@@ -379,3 +395,10 @@
   (send-notify! "chat/selectedAgentChanged"
                 (cond-> {:agent agent}
                   chatId (assoc :chatId chatId))))
+
+(defn set-trust!
+  "Persist trust (yolo) mode for `chatId`: when on, tool calls that would
+  normally require manual approval are auto-accepted (deny rules still win).
+  Applies immediately to subsequent tool calls in the active prompt."
+  [chatId on?]
+  (send-request! "chat/update" {:chatId chatId :trust (boolean on?)}))

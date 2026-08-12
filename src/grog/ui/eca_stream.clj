@@ -6,12 +6,13 @@
   stateful renderer returned by `make-streamer`. Runs on the ECA reader thread;
   the styled-writer marshals to the EDT.
 
-  Streamed text (`text`, `reasonText`) is printed *inline* (no newline between
-  chunks) so the reply/the reasoning flows continuously instead of one piece per
-  line; block boundaries (thinking start/finish, tool calls, metadata) close the
-  current line."
+  Streamed thinking (`reasonText`) prints inline for a continuous feel; answer
+  `text` is rendered as Markdown blocks (GFM tables → box tables) via
+  `grog.md-stream`. Block boundaries (thinking start/finish, tool calls,
+  metadata) close any in-progress line."
   (:require [clojure.string :as str]
-            [grog.appearance :as appearance]))
+            [grog.appearance :as appearance]
+            [grog.md-stream :as md-stream]))
 
 (def ^:private ansi-reset "\u001B[0m")
 
@@ -31,11 +32,14 @@
          " ──")))
 
 (defn make-streamer
-  "A stateful renderer `(fn [content])` that streams `text`/`reasonText` inline
-  rather than line-per-chunk. Blocks (tool calls, metadata, flags, thinking
-  start/finish, stream end) close any in-progress line first."
+  "A stateful renderer `(fn [content])`. Thinking (`reasonText`) and other
+  blocks stream inline as before, but answer `text` is fed through the shared
+  Markdown→ANSI streamer (`grog.md-stream`), so GFM pipe tables render as box
+  tables and complete blocks emit as they close (matching the CLI's
+  `:chat-stream-live-markdown` behavior)."
   []
-  (let [open? (atom false)]          ; an inline streamed block is being printed
+  (let [open? (atom false)                      ; an inline streamed block is being printed
+        md    (atom (md-stream/empty-state))]   ; answer Markdown buffer
     (fn [content]
       (when (map? content)
         (let [close-line! (fn []
@@ -48,14 +52,19 @@
                            (when @open? (println) (flush))
                            (reset! open? true)
                            (print color)
-                           (flush))]
+                           (flush))
+              emit-md! (fn [blocks]
+                         (doseq [b blocks]
+                           (close-line!)
+                           (print b)
+                           (flush)))]
           (case (:type content)
             "text"
             (let [txt (str (:text content))]
               (when (seq txt)
-                (when-not @open? (open-line! (appearance/ansi-answer)))
-                (print txt)
-                (flush)))
+                (let [[emitted new-state] (md-stream/feed @md txt)]
+                  (reset! md new-state)
+                  (emit-md! emitted))))
 
             "reasonText"
             (let [txt (str (:text content))]
@@ -111,6 +120,10 @@
 
             "progress"
             (when (= "finished" (:state content))
-              (close-line!))
+              (close-line!)
+              ;; flush any answer Markdown still buffered at end of stream
+              (let [[emitted new-state] (md-stream/finish @md)]
+                (reset! md new-state)
+                (emit-md! emitted)))
 
             nil))))))

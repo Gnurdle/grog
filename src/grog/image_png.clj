@@ -1,6 +1,6 @@
 (ns grog.image-png
   "Detect `<image-png>…</image-png>` or `<image-png>…<image-png/>` (case-insensitive) in assistant text.
-  Inner content is a workspace-relative or absolute-under-workspace path to a PNG file. Opens each image in
+  Inner content is an absolute or repo-root-relative path to a PNG file. Opens each image in
   a new Swing window; returns text with tags replaced by short notes for the terminal."
   (:require [clojure.string :as str]
             [grog.fs :as fs])
@@ -84,7 +84,7 @@
     (if (str/blank? path-raw)
       (.append sb "\n\n[image-png: empty path]\n\n")
       (try
-        (let [^java.io.File f (fs/resolve-workspace-path! path-raw)
+        (let [^java.io.File f (fs/resolve-repo-path! path-raw)
               name (.getName f)
               png? (.endsWith (.toLowerCase (str name)) ".png")]
           (cond

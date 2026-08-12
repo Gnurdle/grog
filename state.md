@@ -1,10 +1,10 @@
 # Grog Session State
 
 ## Date
-2026-08 (current session) — "migrate grog to ECA" workstream. ECA client build is
-in progress: stdio client + GUI stream rendering + control surface + config
-generation are implemented and verified (see Plan below). Remaining: prune
-superseded grog loop/tool code.
+2026-08 (current session) — "migrate grog to ECA" workstream is **complete and
+live**. grog's GUI now drives ECA end-to-end, the workspace abstraction is gone,
+and the MCP server suite is wired into the generated ECA config. This session has
+also iterated hard on GUI feel (fonts, toolbar, status/trust indicators).
 
 ## The big idea (see `doc/gap-analysis-grog-vs-eca.md` for the full analysis)
 Rather than rebuild grog's agentic loop to match ECA, **attach grog to ECA as a client**.
@@ -12,16 +12,20 @@ ECA is a server with a documented JSON-RPC-2.0-over-stdio protocol (`docs/protoc
 the ECA repo). grog keeps its client shell (Swing GUI, embedded terminal, appearance)
 and exposes its special tools as standalone **MCP servers** that ECA's loop calls.
 
-Key decisions locked in:
-- **Workspace model dies**: grog's `:workspace :default-root` + `resolve-workspace-path!` +
-  containment is a grog-only invention ECA ignores. ECA uses `workspaceFolders` (declared
-  at `initialize`). MCP servers take paths **as given** (no workspace layer). → doc §6.7.
+Key decisions locked in (all done):
+- **Workspace model dies** ✅ done: grog's `:workspace :default-root` + `resolve-workspace-path!` +
+  containment abstraction has been removed (`workspace_paths.clj` deleted). ECA uses
+  `workspaceFolders` (declared at `initialize`) pointed at the repo root
+  (`grog.config/repo-root` → `grog.home` / `GROG_HOME` / cwd). MCP servers take paths
+  **as given**; grog tool paths are plain absolute/repo-root-relative. → doc §6.7.
 - **Memory is Python/SQLite** (EDN-store idea dropped): `grog-memory` = associative
   `assoc_*` store keyed on `GROG_MEMORY_DB`. No `memory_*` EDN-file emulation.
 - **Language split**: imaging = JVM Clojure; memory = Python (sqlite3); odoo = JVM Clojure.
 
 ## What exists now (under `/d/gni/grog/`)
-Three self-contained MCP servers over stdio, all implemented & verified:
+Self-contained MCP servers over stdio, all implemented & verified. The generated ECA
+config (see §ECA config wiring) registers **five**: grog-imaging, grog-memory,
+grog-odoo, grog-office, grog-search.
 
 1. **`grog-imaging/`** (JVM Clojure, MCP SDK 0.8.0)
    - `deps.edn` (pdfbox 3.0.4, tess4j 5.14.0, boofcv 1.2.2, poi-ooxml 5.3.0, cheshire)
@@ -49,12 +53,38 @@ Three self-contained MCP servers over stdio, all implemented & verified:
      fault-aware. **Verified**: encode/decode against sample Odoo-shaped responses.
    - `src/grog_odoo/main.clj` — MCP server: `odoo_authenticate`, `odoo_search_read`,
      `odoo_create`, `odoo_write`, `odoo_unlink`, `odoo_call_method`, `odoo_get_fields`.
-   - Env connection: `GROG_ODOO_URL/DB/USER/PASSWORD`. **Verified**: handshake + tools/list.
+   - Env connection: `GROG_ODOO_URL/DB/USER/PASSWORD` or `GROG_ODOO_CONFIG`
+     (multi-instance JSON). **Verified**: handshake + tools/list.
    - Run: `clojure -M:mcp`.
 
-## ECA config wiring (for later)
-Each README has the `mcpServers` JSON to drop into a generated ECA `config.json`
-(JSON only; grog will generate it and launch `eca server --config-file <gen.json>`).
+4. **`grog-office/`** (JVM Clojure)
+   - `src/grog_office/core.clj` — Apache POI docx manipulation (import/block model,
+     find/replace/delete-table-row; optional LibreOffice render via `GROG_OFFICE_BIN`).
+   - `src/grog_office/main.clj` — MCP server: `import_document`, `list_handles`,
+     `list_blocks`, `get_text`, `find_text`, `replace_text`, `delete_table_row`,
+     `render`, `save`, `close_document`.
+   - Run: `clojure -M:mcp -m grog-office.main`. (Wired in config; verified handshake.)
+
+5. **`grog-search/`** (JVM Clojure) — Brave web search as MCP
+   - `src/grog_search/main.clj` — MCP server exposing `brave_web_search` (query + optional
+     count). Restores the tool ECA's model loop used to get from grog's old self-hosted
+     tool dispatch (see the gap-analysis keep-table). API key from OS keyring service
+     `grog`, account `BRAVE_SEARCH_API` (same as before). **Verified**: initialize +
+     tools/list show `brave_web_search`; a live `tools/call` returned real formatted hits.
+   - Run: `clojure -M:mcp -m grog-search.main`.
+
+**Also present:** `datascript-mcp-server/` (upstream sample, not ours — gitignored/untracked),
+`notes/` (scratch), `e` (stray untracked file, likely an accidental editor artifact).
+
+## ECA config wiring (live)
+`grog.eca-config/generate-config!` starts from `~/.config/eca/config.json` (working
+providers), merges the **five** `mcpServers` (grog-imaging / grog-memory / grog-odoo /
+grog-office / grog-search) + tool-approval allowlist + `defaultModel`
+(qualifies via `grog.models/qualify-eca-model`), writes
+`~/.config/grog/eca-config.generated.json`, and the GUI launches
+`eca server --config-file <that>`. The model sees the tool(s) of every server that
+reaches `running`.
+
 Example shape:
 ```json
 { "mcpServers": {
@@ -67,40 +97,41 @@ Example shape:
 } }
 ```
 Note: grog's old subfolder `workspace/` + data (e2-csv, PDFs, memory) are now just a
-normal directory to ECA.
+normal directory to ECA (no workspace-root semantics).
 
-## Plan / remaining steps (from eca task tracker)
-1. ✅ Migrate grog-imaging into `grog-imaging/` (done).
-2. ✅ Align grog-memory (EDN store dropped → SQLite assoc) (done).
-3. ✅ **Build grog's ECA client** — the critical path (done & verified):
-   - ✅ JSON-RPC-2.0-over-stdio client (`src/grog/eca.clj`): LSP-style `Content-Length`
-     framing; spawns `eca server`, `initialize` with `workspaceFolders`, `chat/prompt`,
-     dispatches `chat/contentReceived`. Verified against real `eca` 0.134.2
-     (`clojure -M:eca-test` streams reasonStarted→reasonText→text→reasonFinished).
-   - ✅ Render the stream into the Swing transcript (`src/grog/ui/eca_stream.clj`
-     maps text/reason*/toolCall*/usage/metadata/flag/progress onto styled runs;
-     `src/grog/ui.clj` now sends prompts via ECA instead of `run-tool-loop-on-messages`).
-   - ✅ Control surface: Stop→`chat/promptStop`; `toolCallRun` with `manualApproval`
-     → approve/reject dialog (`chat/toolCallApprove`/`chat/toolCallReject`);
-     `/eca-model <name>` → `chat/selectedModelChanged`.
-   - ✅ grog generates ECA's JSON config (`src/grog/eca_config.clj`): starts from
-     `~/.config/eca/config.json` (working providers), merges the three `mcpServers`
-     (grog-imaging / grog-memory / grog-odoo) + `defaultModel`, writes to
-     `~/.config/grog/eca-config.generated.json`, and the GUI launches
-     `eca server --config-file <that>`. **Verified**: all three MCP servers start
-     and reach `running` with tools loaded.
-4. ⬜ Prune superseded grog loop/tool code once the client is live (core.clj tool
-   dispatch, `chat-tools-payload`, `execute-tool-call!`, grog's `mcp.clj` client,
-   chat_context trim, dead code like `render.clj`/`e_trade.clj`/`ai.clj`/`physics.clj`).
+## GUI (this session's polish — all live)
+- **Fonts follow the system L&F** (`grog.ui.widgets`): `ui-font` / `mono-font` scale
+  the desktop's UI font ×1.5; `button-font` is compact (×1.3) for the toolbar.
+  `scale-ui-fonts!` bumps the L&F base font keys after FlatLaf setup.
+- **Footer is a real `JToolBar`**: icon-only op buttons (Send/Stop/Terminal/Settings/
+  Export/Clear) with hover tooltips (`widgets/toolbar-button` + `action-icon`
+  vector glyphs); status (idle/running/question/error) and trust (yolo on/off) are
+  **coloured-dot icons** (`grog.ui.footer`), right-aligned; model name is small/dim.
+- Approval dialog options: **Approve / Reject / YOLO** (YOLO approves + turns trust on).
+- **Copy UX**: drag → Enter (or Ctrl+C, or right-click menu) copies and unselects
+  (`transcript/copy-selection!`).
+- **`/clear` and the Clear tool-bar button wipe the transcript AND reset YOLO off.**
+- Window opened at **1350×1020** (~50% bigger both ways).
+- **`grog-ui` truncates `~/.grog-ui.log` on every launch** (fresh log per session).
+
+## Superseded grog loop / tool code
+- ✅ **Workspace-scoped tool loop pruned** from `grog.fs` / `grog.core`:
+  `read/write/grep/stat/…_workspace_*` and `crop_workspace_image` tool specs + run-*
+  dispatch are gone from the old loop. The old loop (`run-tool-loop-on-messages`) **stays**
+  because `grog.jobs` / `grog.chron` / CLI still use it with the **non-workspace** tools
+  (office/pdf/ocr/analyze, memory, skills, brave, oracle, babashka, mcp).
+- ⬜ Not yet pruned (still-present dead-ish code): `grog.core/chat-tools-payload` +
+  `execute-tool-call!` (kept for jobs/chron), `grog.mcp` client, `chat_context` trim,
+  dead tool namespaces `render.clj` / `e_trade.clj` / `ai.clj` / `physics.clj`.
+  Low priority while jobs/chron still invoke the loop.
 
 ## External prerequisite (satisfied)
-`eca` 0.134.2 is installed at `/usr/local/bin/eca`; `eca server` works, and the
-ECL "attach to ECA" client path is proven end-to-end. Providers are configured in
-`~/.config/eca/config.json` (moonshot / xai / ollama / openrouter). Working model
-used for testing: `openrouter/moonshotai/kimi-k2.6` (set via grog.edn `:eca :model`;
-the config's old `defaultModel` `openrouter/deepseek/...` had no matching model and
-was replaced by grog's generated config). Note the ECA repo at `/d/ericdallo/eca`
-holds `docs/protocol.md` (the client reference).
+`eca` is installed and `eca server` works; the "attach to ECA" client path is proven
+end-to-end. Providers are configured in `~/.config/eca/config.json`. Working model
+used for testing: `openrouter/moonshotai/kimi-k2.6` (set via grog.edn `:eca :model`).
+The ECA repo at `/d/ericdallo/eca` holds `docs/protocol.md` (the client reference,
+including `chat/promptSteer` — grog's `eca/steer!` exists but the GUI does **not**
+expose steering yet; that's a candidate next step).
 
 ## `doc/gap-analysis-grog-vs-eca.md`
 The canonical analysis doc — includes the keep/drop tool table (§6.5), MCP granularity
