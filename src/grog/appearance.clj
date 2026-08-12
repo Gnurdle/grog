@@ -4,9 +4,14 @@
   Load/save preserves every other top-level key in the file; writes are atomic
   (write temp, then replace)."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.edn :as edn]
             [clojure.pprint :as pp]))
 
+(defn windows?
+  "True when running on a Microsoft Windows OS (os.name contains 'win')."
+  []
+  (str/includes? (str/lower-case (System/getProperty "os.name")) "win"))
 (def defaults
   {:chat {:font-family "Monospaced"
           :font-size 18

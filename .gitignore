@@ -3,3 +3,4 @@ target/
 .*
 workspace/
 grog-memory/err.log
+grog-ui.log

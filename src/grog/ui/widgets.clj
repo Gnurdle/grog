@@ -2,6 +2,7 @@
   "Shared rounded dark buttons used across the GUI (main page and settings), so
   text is always readable on the dark theme. Dialog/button/status fonts are
   derived from the active Look & Feel's system font (see `scale-ui-fonts!`)."
+  (:require [grog.appearance :as appearance])
   (:import (java.awt BasicStroke Color Cursor Font Graphics RenderingHints)
            (java.awt.geom Path2D$Double)
            (java.awt.image BufferedImage)
@@ -58,7 +59,7 @@
 (defn mono-font
   "Readable monospace font for dialog body text, sized from the system UI font."
   ^Font []
-  (Font. "Monospaced" Font/PLAIN (mono-font-size)))
+  (Font. "Monospaced" (if (appearance/windows?) Font/BOLD Font/PLAIN) (mono-font-size)))
 
 (defn scale-ui-fonts!
   "After the Look & Feel is installed, bump its base UI font keys so every

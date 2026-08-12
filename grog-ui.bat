@@ -13,4 +13,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-clojure -M:gui %*
+rem Capture grog/ECA debug output to a log file (see dbg! traces in ui.clj).
+set "GROG_LOG=%~dp0grog-ui.log"
+if exist "%GROG_LOG%" del "%GROG_LOG%"
+clojure -M:gui %* >>"%GROG_LOG%" 2>&1

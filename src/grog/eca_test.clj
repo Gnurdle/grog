@@ -10,8 +10,8 @@
             [grog.eca :as eca]))
 
 (defn- file-uri [^String path]
-  (let [abs (.toAbsolutePath (.normalize (.toPath (java.io.File. path))))]
-    (str "file://" abs)))
+  (str (.toURI (-> (java.io.File. path)
+                   .toPath .toAbsolutePath .normalize .toFile))))
 
 (defn- event-summary [method params]
   (let [content (:content params)

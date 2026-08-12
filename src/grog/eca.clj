@@ -123,6 +123,92 @@
     (.setDaemon true)
     (.start)))
 
+;; ---------------------------------------------------------------------------
+;; ECA binary resolution
+;; ---------------------------------------------------------------------------
+;; On Linux (and typical dev setups) `eca` sits on the global PATH, so the bare
+;; name works. On Windows that is NOT the case: the ECA server ships as
+;; `eca.exe` bundled inside the VS Code extension ("editor-code-assistant.eca-*")
+;; and is normally started by VS Code with an explicit absolute path, so the bare
+;; name isn't resolvable here. We therefore resolve the binary in order:
+;;   1. an explicit `:eca-binary` path the caller supplied (if it exists),
+;;   2. the bare name via the OS PATH lookup,
+;;   3. well-known install locations (VS Code extension dirs, ~/.local, /usr/local)
+;; so `clojure -M:gui` / grog-ui works on Windows too.
+
+(defn- path-executable?
+  "True if `name` (optionally with a platform executable extension) resolves to
+  an executable file on the OS PATH."
+  [name]
+  (try
+    (let [win? (str/includes? (str/lower-case (System/getProperty "os.name")) "win")
+          exts (if win? ["exe" "cmd" "bat" ""] [""])
+          sep  (System/getProperty "path.separator")
+          dirs (remove str/blank? (str/split (or (System/getenv "PATH") "") #(java.util.regex.Pattern/quote sep)))]
+      (boolean
+        (some (fn [d]
+                (some (fn [ext]
+                        (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
+                          (and (.isFile f) (.canExecute f))))
+                      exts))
+              dirs)))
+    (catch Throwable _ false)))
+
+(defn- vscode-extension-dirs
+  "Candidate ECA directories under a VS Code install (`.../data/extensions`):
+  every `editor-code-assistant.eca-*/` folder and its `bin/` subfolder."
+  [^java.io.File vscode-home]
+  (try
+    (let [ext (java.io.File. vscode-home "data/extensions")]
+      (when (.isDirectory ext)
+        (->> (.listFiles ext)
+             (filter #(and (.isDirectory ^java.io.File %)
+                           (str/starts-with? (.getName ^java.io.File %) "editor-code-assistant")))
+             (mapcat (fn [^java.io.File d]
+                       [d (java.io.File. d "bin")])))))
+    (catch Throwable _ nil)))
+
+(defn- known-eca-candidates
+  "Absolute File objects for likely ECA binaries across OSes."
+  []
+  (let [home (System/getProperty "user.home")]
+    (sequence cat
+      (map (fn [d]
+             (when d
+               [(java.io.File. d "eca")
+                (java.io.File. d "eca.exe")]))
+           (concat
+             ;; VS Code: %USERPROFILE%\scoop\apps\vscode\{version,current}
+             (when-let [scoop-vscode (java.io.File. (System/getenv "USERPROFILE") "scoop/apps/vscode")]
+               (when (.isDirectory scoop-vscode)
+                 (mapcat vscode-extension-dirs (.listFiles scoop-vscode))))
+             ;; ~/.local/bin and /usr/local/bin on POSIX
+             [(java.io.File. home ".local/bin")
+              (java.io.File. "/usr/local/bin")
+              (java.io.File. "/usr/bin")])))))
+
+(defn- resolve-eca-binary!
+  "Resolve the ECA server binary to an absolute path (or a PATH-resolvable name).
+  Prefers an explicit, existing `eca-binary`; else a PATH-hit for the bare name;
+  else the first existing/candidate found in known install locations. Falls back
+  to the caller's value.
+  `extra-args` are the args grog will pass after `server`; a `--config-file` arg
+  is inspected only to keep this simple — returns just the binary."
+  [^String eca-binary]
+  (let [explicit (when (seq eca-binary)
+                   (let [f (java.io.File. eca-binary)]
+                     (and (.isFile f) f)))]
+    (cond
+      explicit (.getAbsolutePath explicit)
+
+      (or (nil? (seq eca-binary)) (path-executable? eca-binary))
+      (if (seq eca-binary) eca-binary "eca")
+
+      :else
+      (or (some (fn [^java.io.File f] (and (.isFile f) (.getAbsolutePath f)))
+                (known-eca-candidates))
+          (if (seq eca-binary) eca-binary "eca")))))
+
 (defn- next-id! ^long [^AtomicLong al] (.incrementAndGet al))
 
 (defn- pending-key [rid]
@@ -191,7 +277,7 @@
 (defn- make-connection!
   "Spawn `eca server` and wire up streams. Does NOT handshake."
   [opts]
-  (let [eca-binary      (or (:eca-binary opts) "eca")
+  (let [eca-binary      (resolve-eca-binary! (or (:eca-binary opts) "eca"))
         args            (:args opts)
         env             (:env opts)
         cwd             (:cwd opts)

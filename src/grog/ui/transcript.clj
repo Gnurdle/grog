@@ -312,7 +312,7 @@
                             x 0]
                        (if-let [{:keys [^String text color italic]} (first rs)]
                          (let [effective-font (if italic
-                                                (.deriveFont font (bit-or Font/PLAIN Font/ITALIC))
+                                                (.deriveFont font (bit-or (.getStyle font) Font/ITALIC))
                                                 font)
                                fm (font-metrics this effective-font)
                                advance (draw-run! g2 effective-font fm text color
@@ -330,7 +330,7 @@
               fm (font-metrics cell base-font)
               width (reduce (fn [acc {:keys [^String text italic]}]
                               (let [f (if italic
-                                        (.deriveFont base-font (bit-or Font/PLAIN Font/ITALIC))
+                                        (.deriveFont base-font (bit-or (.getStyle base-font) Font/ITALIC))
                                         base-font)
                                     fm2 (if italic (font-metrics cell f) fm)]
                                 (+ acc (.stringWidth fm2 text))))

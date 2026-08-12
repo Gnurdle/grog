@@ -37,7 +37,18 @@
                    "-Dlog4j2.statusLoggerLevel=OFF"
                    "-Dlog4j2.disableJmx=true"
                    ;; faster cold start from a desktop launcher: stop deep JIT
-                   "-XX:TieredStopAtLevel=1"]}
+                   "-XX:TieredStopAtLevel=1"
+                   ;; Windows: skip the Direct3D (GPU) rendering pipeline. On
+                   ;; Windows, Swing's D3D-accelerated surface can paint custom
+                   ;; panes (like the prompt box) as a blank/white box on the
+                   ;; physical screen even though the logical/software render is
+                   ;; correct (PrintWindow shows the right colors). Disabling D3D
+                   ;; routes rendering through the OS software pipeline, which
+                   ;; paints deterministically. (Linux uses XRender/GL and is
+                   ;; unaffected — this is why the bug only appears on Windows.)
+                   "-Dsun.java2d.d3d=false"
+                   "-Dsun.java2d.noddraw=true"
+                   "-Dsun.java2d.opengl=false"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :ns-default build}
   :eca-test {:main-opts ["-m" "grog.eca-test"]}

@@ -263,10 +263,13 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- file-uri
-  "A `file://` URI for a local path, for ECA `workspaceFolders`."
+  "A `file://` URI for a local path, for ECA `workspaceFolders`. Uses
+  `File/toURI` so Windows paths (backslashes, drive letters) become valid URIs
+  (`file:///C:/...`); a hand-built `(str \"file://\" abs)` would emit backslashes
+  and break ECA's URI parser on Windows."
   [^String path]
-  (let [abs (.toAbsolutePath (.normalize (.toPath (java.io.File. path))))]
-    (str "file://" abs)))
+  (str (.toURI (-> (java.io.File. path)
+                   .toPath .toAbsolutePath .normalize .toFile))))
 
 (defn- make-event-handler
   "Build the ECA event handler for the transcript: renders `chat/contentReceived`
@@ -783,6 +786,24 @@
     (.put (.getActionMap prompt) "grog-submit"
           (proxy [AbstractAction] []
             (actionPerformed [e] (submit!))))
+    ;; Robust cross-platform Enter handling. The WHEN_FOCUSED InputMap binding
+    ;; above is not honoured reliably on Windows when the JTextArea has a
+    ;; TransferHandler/setDragEnabled installed (see grog.ui.dnd) and default
+    ;; `insert-break` wins, so plain Enter inserts a newline instead of sending.
+    ;; A KeyListener on the focused component fires identically on every
+    ;; platform; consuming the event stops the InputMap/default newline from
+    ;; also running. Plain Enter submits (Ctrl+Enter still does too via `send`),
+    ;; Shift+Enter inserts a literal newline.
+    (.addKeyListener prompt
+      (proxy [java.awt.event.KeyAdapter] []
+        (keyPressed [e]
+          (when (= KeyEvent/VK_ENTER (.getKeyCode e))
+            (if (zero? (bit-and (.getModifiersEx e)
+                                java.awt.event.InputEvent/SHIFT_DOWN_MASK))
+              (do (.consume e)
+                  (submit!))
+              (do (.consume e)
+                  (.replaceSelection prompt "\n")))))))
     ;; Stop -> stop the ECA prompt (and cancel registry); Terminal -> shell window
     (.addActionListener stop (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (stop-action!))))
@@ -840,12 +861,24 @@
         (uifooter/set-trust-indicator! @yolo-ref))
       ;; readable prompt box: dark + light text; surrounding panes transparent
       (doto prompt
-        (.setOpaque true)
-        (.setBackground (Color. 18 18 18))
+        ;; NON-OPAQUE: FlatLaf's JTextArea UI paints an opaque WHITE fill on
+        ;; Windows (ignoring the component background) — a known FlatLaf text
+        ;; component bug. Making the text area transparent lets the dark
+        ;; JScrollPane viewport behind it show through as the background, while
+        ;; only the text/caret are drawn on top. This is the reliable fix.
+        (.setOpaque false)
         (.setForeground (Color. 230 230 230))
         (.setCaretColor (Color. 230 230 230)))
+      ;; The prompt's scrollpane/viewport must be OPAQUE dark (not transparent):
+      ;; a transparent viewport relies on the parent repainting behind it, which
+      ;; is unreliable on Windows and can show the default light background as a
+      ;; white box around/behind the prompt text area.
       (doto prompt-scroll
-        (make-viewport-transparent!))
+        (.setOpaque true)
+        (.setBackground (Color. 18 18 18)))
+      (when-let [vp (.getViewport prompt-scroll)]
+        (.setOpaque vp true)
+        (.setBackground vp (Color. 18 18 18)))
       ;; transcript transparent so the logo shows behind the conversation
       (make-viewport-transparent! transcript-scroll)
       (transparent! pane)
@@ -880,7 +913,17 @@
     (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
     (.setSize frame 1350 1020)
     (.setLocationRelativeTo frame nil)
-    (set-frame-icon! frame)))
+    (set-frame-icon! frame)
+    ;; Give the prompt keyboard focus once the frame is shown & laid out, so on
+    ;; Windows the caret/typing land in the input area (and Enter reaches it)
+    ;; instead of falling to the transcript/scrollpane. Best-effort; runs after
+    ;; the window is visible via invokeLater.
+    (SwingUtilities/invokeLater
+      (fn []
+        (try
+          (.requestFocusInWindow prompt)
+          (catch Throwable _ nil))))
+    frame))
 
 (defn -main
   "Entry point: `clojure -M -m grog.ui`, `./grog-ui`, or `grog-ui.bat`."
@@ -893,12 +936,39 @@
       (try
         ;; apply the modern dark Look & Feel across both windows
         (com.formdev.flatlaf.FlatDarkLaf/setup)
+        ;; Force dark text-area defaults through the L&F's UIManager so no
+        ;; Windows L&F default (white background) can override the prompt box.
+        ;; Without this, FlatLaf's TextArea UI can fall back to a light/white
+        ;; background on Windows while the foreground stays light — leaving a
+        ;; white box with barely-readable text.
+        (doseq [[k v] {"TextArea.background" (Color. 18 18 18)
+                       "TextArea.foreground" (Color. 230 230 230)
+                       "TextArea.caretForeground" (Color. 230 230 230)
+                       "TextArea.inactiveBackground" (Color. 18 18 18)
+                       "TextArea.inactiveForeground" (Color. 230 230 230)
+                       "TextPane.background" (Color. 18 18 18)
+                       "TextPane.foreground" (Color. 230 230 230)}]
+          (javax.swing.UIManager/put k v))
         ;; enlarge the L&F's base UI fonts from the desktop's system font so
         ;; dialogs (settings, model picker, approvals) and labels read larger
         (widgets/scale-ui-fonts!)
         ;; load persisted appearance (fonts/colours) from grog.edn
         (appearance/load!)
-        (.setVisible (build-chat-frame) true)
+        (let [^javax.swing.JFrame f (build-chat-frame)]
+          (.setVisible f true)
+          ;; DIAGNOSTIC: report what the JVM actually computed for the prompt's
+          ;; colors vs. the L&F defaults, so we can see whether the box should
+          ;; be dark (code) but the screen shows it light (rendering issue).
+          (SwingUtilities/invokeLater
+            (fn []
+              (try
+                (dbg! "UIManager TextArea.background=" (javax.swing.UIManager/get "TextArea.background")
+                      " TextArea.foreground=" (javax.swing.UIManager/get "TextArea.foreground")
+                      " LAF=" (or (some-> (javax.swing.UIManager/getLookAndFeel) .getName) "?")
+                      " d3d=" (System/getProperty "sun.java2d.d3d")
+                      " noddraw=" (System/getProperty "sun.java2d.noddraw"))
+                (catch Throwable e (dbg! "diag err:" (.getMessage e))))))
+          f)
         (catch Throwable t
           (println "grog.ui failed:" t)))))
   nil)

@@ -28,8 +28,15 @@
 (defn terminal-font-size []
   (float (or (appearance/terminal-font-size) 18)))
 
+;; Windows' default monospace font (Consolas) renders noticeably lighter/thinner
+;; than the fonts typical on Linux, so Linux looks "bolder" by comparison even
+;; with the same plain style. Compensate on Windows only (never touch Linux) by
+;; requesting a bold style; the font family/size are otherwise unchanged.
+(defn- chat-font-style []
+  (if (appearance/windows?) Font/BOLD Font/PLAIN))
+
 (defn chat-font ^Font []
-  (Font. (appearance/chat-font-family) Font/PLAIN (appearance/chat-font-size)))
+  (Font. (appearance/chat-font-family) (chat-font-style) (appearance/chat-font-size)))
 
 (defn- clamp [n] (max 8 (min 48 n)))
 
@@ -37,13 +44,16 @@
   "Re-apply the current chat font to all panes; chat-background colour only to the
   prompt box (the transcript stays transparent over the logo)."
   []
-  (let [f (chat-font)
-        bg (rgb->awt (appearance/chat-bg))]
+  (let [f (chat-font)]
     (doseq [[c kind] @chat-targets]
       (.setFont c f)
       (when (= kind :prompt)
-        (.setOpaque c true)
-        (.setBackground c bg)))))
+        ;; The prompt text area is intentionally kept NON-OPAQUE so FlatLaf's
+        ;; text UI can't paint its white opaque fill on Windows (it ignores the
+        ;; component background). The dark background is provided by the opaque
+        ;; JScrollPane viewport behind it, so we must NOT setOpaque(true) or
+        ;; setBackground here — that would reintroduce the white box.
+        (.setOpaque c false)))))
 
 (defn- rgb->awt [[r g b]] (Color. (int r) (int g) (int b)))
 
