@@ -5,7 +5,8 @@
   (`grog.home` / `GROG_HOME` / process cwd)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.projects :as projects])
   (:import (java.io File)))
 
 (defn- resolve-path!
@@ -33,6 +34,30 @@
   []
   (let [f (resolved-file)]
     (if (.exists f)
+      (str/trim (slurp f :encoding "UTF-8"))
+      "")))
+
+;; ---------------------------------------------------------------------------
+;; Per-project SOUL overlay
+;;
+;; Each project may carry its own `SOUL.md` under its project home
+;; (`~/grog-projects/<proj>/SOUL.md`). When present, those lines are layered on
+;; top of the **global** SOUL.md and act as an override for conflicting guidance.
+;; `project-soul-file` locates it; `read-project-text` reads just the project
+;; part (the composed global+project rules are assembled in grog.eca-config
+;; when generating ECA's standing-context rules file).
+
+(defn project-soul-file
+  "The per-project `SOUL.md` `File` for `project-name` (does not create it)."
+  ^java.io.File [project-name]
+  (when (and project-name (not (str/blank? (str project-name))))
+    (io/file (grog.projects/project-dir project-name) "SOUL.md")))
+
+(defn read-project-text
+  "The per-project SOUL.md contents (trimmed), or empty string if absent."
+  [project-name]
+  (let [^java.io.File f (project-soul-file project-name)]
+    (if (and f (.exists f))
       (str/trim (slurp f :encoding "UTF-8"))
       "")))
 

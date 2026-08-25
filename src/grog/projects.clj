@@ -391,6 +391,31 @@
   (when-let [p (resolve-active-project)]
     (memory-db-path p)))
 
+;; --- Stable per-project chat identity --------------------------------------
+;; Each project keeps its own ECA chat id so it can resume the same conversation
+;; across GUI launches, and switching projects switches conversations. Stored as
+;; a plain text file in the project's `state/` dir.
+
+(defn project-chat-id
+  "The stable ECA chat UUID for `project-name`, reading or minting (and
+  persisting) one under the project's `state/`. Returns nil for blank names."
+  ^String [project-name]
+  (when (and project-name (not (str/blank? (str project-name))))
+    (let [f (io/file (state-dir project-name) "chat-id")
+          cur (try (some-> (slurp f :encoding "UTF-8") str str/trim not-empty)
+                   (catch Exception _ nil))]
+      (if cur
+        cur
+        (let [id (str (java.util.UUID/randomUUID))]
+          (spit f id :encoding "UTF-8")
+          id)))))
+
+(defn active-project-chat-id
+  "The stable chat id for the active project (resolves it first)."
+  ^String []
+  (when-let [p (resolve-active-project)]
+    (project-chat-id p)))
+
 (defn startup-status-line
   []
   (let [h (projects-home)]

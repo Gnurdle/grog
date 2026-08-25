@@ -15,7 +15,8 @@
             [clojure.string :as str]
             [grog.config :as config]
             [grog.models :as models]
-            [grog.projects :as projects]))
+            [grog.projects :as projects]
+            [grog.soul :as soul]))
 
 (declare generate-config!)
 
@@ -324,6 +325,47 @@
     (config/deep-merge cfg {:toolCall {:approval a}})
     cfg))
 
+;; --- Per-project rules (global SOUL + project SOUL overlay + context) ------
+
+(defn project-rules-file
+  "The absolute path of the generated ECA rules markdown for the active project.
+  The file is the composed per-project standing context:
+    * global SOUL.md (base personality),
+    * the project's own SOUL.md (if present) — overrides global on conflicts,
+    * the project's loaded context (banner + notes + dialog snapshot).
+
+  Written under the project's `state/` dir so it stays out of the source tree.
+  Returns nil if no active project can be resolved."
+  ^String []
+  (when-let [proj (projects/resolve-active-project)]
+    (let [^java.io.File dir (projects/state-dir proj)
+          f (io/file dir "eca-rules.md")
+          global (soul/read-text)
+          project-soul (soul/read-project-text proj)
+          ctx (projects/load-context)
+          parts (cond-> []
+                  (seq global)
+                  (conj "## Persistent instructions (global SOUL)\n\n" global)
+
+                  (seq project-soul)
+                  (conj (str "\n\n## Project instructions (" proj " — overrides global on conflicts)\n\n"
+                             project-soul))
+
+                  (seq ctx)
+                  (conj (str "\n\n## Active project context\n\n" ctx)))]
+      (when (seq parts)
+        (spit f (str/join "\n\n" (cons (str "# " proj " — standing context") parts))
+              :encoding "UTF-8"))
+      (.getPath f))))
+
+(defn- add-rules!
+  "Add a `rules` entry pointing at the active project's generated rules file (if
+  any). ECA loads rule files/dirs as standing context on every prompt."
+  [cfg]
+  (if-let [rules-file (project-rules-file)]
+    (update cfg :rules conj {:path rules-file})
+    cfg))
+
 (defn generate-config!
   "Produce the merged ECA config map and write it to
   `(generated-config-path)`, dumping it to the debug log. Returns the written path."
@@ -345,7 +387,8 @@
          merged (-> base
                     (assoc :mcpServers (grog-mcp-servers))
                     (cond-> model (assoc :defaultModel model))
-                    (add-approval!))
+                    (add-approval!)
+                    (add-rules!))
          out (generated-config-path)]
      (spit (io/file out) (json/generate-string merged {:pretty true}))
      (debug-dump-config! out merged)

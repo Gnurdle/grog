@@ -25,6 +25,7 @@
             [grog.models :as models]
             [grog.appearance :as appearance]
             [grog.projects :as projects]
+            [grog.project-dialog :as project-dialog]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
             [grog.ui.eca-stream :as ecastream]
@@ -283,12 +284,24 @@
   before ECA consumes it (the protocol's documented fallback)."
   [^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!]
   (let [streamer (ecastream/make-streamer pane)
+        ;; Accumulate assistant text across `text` content events so the
+        ;; completed reply can be logged to the project dialog on finish.
+        assistant-acc (atom "")
         ;; a steer is consumed when ECA echoes it back; resend undelivered steers
         ;; on any idle/finished transition (protocol fallback).
         finish! (fn []
                   (when-let [s @pending-steer*]
                     (reset! pending-steer* nil)
                     (resend-steer! s))
+                  ;; the assistant reply is done — persist it to the project
+                  ;; dialog (best effort; ignore if no active project).
+                  (let [reply (str/trim (str @assistant-acc))]
+                    (reset! assistant-acc nil)
+                    (when (seq reply)
+                      (try
+                        (project-dialog/append-turn! :assistant reply)
+                        (catch Throwable e
+                          (dbg! "dialog append assistant error:" (.getMessage e))))))
                   (reset! running? false))]
     (fn [method params]
       (case method
@@ -305,6 +318,10 @@
                         (str/trim (str @pending-steer*))))
             (reset! pending-steer* nil))
           (when-not echo?
+            ;; accumulate the assistant reply text for the project dialog
+            (when (and (= "text" (:type content))
+                       (seq (str (:text content))))
+              (swap! assistant-acc str (str (:text content))))
             (streamer content)
             (when (= "finished" (:state content))
               (finish!))
@@ -813,7 +830,7 @@
         queue (LinkedBlockingQueue.)
         running? (atom false)
         history-ref (atom [])
-        chat-id (atom (str (java.util.UUID/randomUUID)))
+        chat-id (atom (projects/active-project-chat-id))
         _ (uifooter/init-model! (models/qualify-eca-model (config/eca-model)
                                                           nil
                                                           (try (config/llm-url) (catch Exception _ nil))))
@@ -865,6 +882,12 @@
                       (reset! running? true)
                       (cancel/clear!)
                       (reset! last-sent (str text))
+                      ;; persist the user's message to the project dialog
+                      ;; (best effort; no-op without an active project)
+                      (try
+                        (project-dialog/append-turn! :user (str text))
+                        (catch Throwable e
+                          (dbg! "dialog append user error:" (.getMessage e))))
                       (dbg! "send-fn: connected, about to prompt -> " (pr-str (str text)) " model-next=" (pr-str (uifooter/current-model)))
                       (let [url (try (config/llm-url) (catch Exception _ nil))
                             ;; ECA needs an explicit model or it fails with
@@ -1049,6 +1072,8 @@
                              (eca/disconnect!)
                              (reset! connected false))
                            (projects/set-project! nm)
+                           ;; new project -> new stable chat identity
+                           (reset! chat-id (projects/active-project-chat-id))
                            (transcript/clear! pane)
                            (transcript/append-status! pane (str "Project: " nm))
                            (.setTitle frame (str "grog — " nm))
