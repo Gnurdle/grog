@@ -1152,8 +1152,8 @@
         :else
         (do (projects/set-project! tail)
             (mcp/try-load-declared-config!)
-            (println "Project:" (pr-str tail))))))
-  true)
+            (println "Project:" (pr-str tail)))))
+        true))
 
 (defn- parse-secret-key-value [tail]
   (when-not (str/blank? tail)

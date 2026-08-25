@@ -38,7 +38,7 @@
             [grog.soul :as soul])
   (:import (java.awt Color Component Font Graphics Graphics2D Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
-           (javax.swing AbstractAction Box BoxLayout JComboBox JComponent JDialog JFrame JLabel JList
+           (javax.swing AbstractAction Box BoxLayout JComponent JDialog JFrame JLabel JList
                         JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
                         JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities)
            (java.util.concurrent LinkedBlockingQueue)
@@ -610,7 +610,17 @@
     (fn []
       (loop []
         (when-let [text (.take queue)]
-          (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn set-yolo-fn))
+          (dbg! "worker take: " (pr-str (str text)))
+          (try
+            (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn set-yolo-fn))
+            (catch Throwable e
+              ;; Never let a hidden exception in the turn pipeline kill the
+              ;; worker thread — that would silently swallow every message
+              ;; queued after it. Log it loudly so ~/.grog-ui.log shows what
+              ;; actually failed instead of a dead, mute queue.
+              (dbg! "worker turn error: " (.getMessage e))
+              (dbg! (str (with-out-str (.printStackTrace e))))
+              (transcript/append-status! pane (str "[grog] internal error handling that message: " (.getMessage e)))))
           (recur))))))
 
 (def ^:private shell-frame-ref (atom nil))
@@ -692,6 +702,100 @@
             (proxy [AbstractAction] []
               (actionPerformed [_] (scroll-to-top!)))))))
 
+(defn- show-project-manager!
+  "A modal dialog to manage projects: list them, switch, create, or delete one.
+  `frame` is the owner; `on-switch` is `(fn [name])` — the chat frame wires
+  switching there so the ECA workspace/context/title follow. Reads/writes the
+  projects home directly."
+  [^JFrame frame on-switch]
+  (let [list-model (javax.swing.DefaultListModel.)
+        proj-list (doto (JList. list-model)
+                    (.setSelectionMode ListSelectionModel/SINGLE_SELECTION)
+                    (.setFont (widgets/ui-font)))
+        cell-renderer (proxy [javax.swing.DefaultListCellRenderer] []
+                        (getListCellRendererComponent [list value idx sel? foc?]
+                          (let [nm (str value)
+                                cur (projects/project-name)
+                                active? (= nm cur)]
+                            (doto (proxy-super getListCellRendererComponent
+                                    list value idx sel? foc?)
+                              (.setFont (widgets/ui-font))
+                              (.setForeground (if active?
+                                                (Color. 235 200 90)
+                                                (Color. 225 228 232)))
+                              (.setText (if active? (str nm "  ← active") nm))))))
+        refresh! (fn []
+                   (.removeAllElements list-model)
+                   (doseq [n (projects/list-project-names)]
+                     (.addElement list-model n))
+                   (when-let [cur (projects/project-name)]
+                     (.setSelectedValue proj-list cur true)))
+        open-btn (widgets/styled-button "Open")
+        del-btn  (widgets/styled-button "Delete")
+        new-field (JTextField. 20)
+        new-btn  (widgets/styled-button "New + Open")
+        dialog-ref (atom nil)
+        dismiss! (fn []
+                   (when-let [d @dialog-ref]
+                     (.dispose d)))
+        open-selected! (fn []
+                         (when-let [nm (.getSelectedValue proj-list)]
+                           (when (and (seq nm) (not= nm (projects/project-name)))
+                             (on-switch (str nm))
+                             (dismiss!))
+                           (refresh!)))
+        create+open! (fn []
+                       (let [nm (str/trim (str (.getText new-field)))]
+                         (when (seq nm)
+                           (projects/create-project! nm)
+                           (on-switch nm)
+                           (dismiss!))))
+        delete! (fn []
+                  (let [nm (str/trim (str (.getSelectedValue proj-list)))]
+                    (cond
+                      (str/blank? nm) nil
+                      (= nm (projects/project-name))
+                      (JOptionPane/showMessageDialog
+                       nil (str "Can't delete the active project (" nm ").\nSwitch to another first.")
+                       "Delete project" JOptionPane/WARNING_MESSAGE)
+                      :else
+                      (let [res (JOptionPane/showConfirmDialog
+                                 nil (str "Delete project \"" nm "\"?") "Delete project" JOptionPane/YES_NO_OPTION)]
+                        (when (= res JOptionPane/YES_OPTION)
+                          (projects/delete-project! nm)
+                          (refresh!))))))
+        dialog (doto (JDialog. frame "Projects — grog" true)
+                 (.setLayout (BorderLayout.))
+                 (.setSize 360 380)
+                 (.setMinimumSize (java.awt.Dimension. 320 320))
+                 (.setLocationRelativeTo frame))]
+    (reset! dialog-ref dialog)
+    (let [proj-scroll (doto (JScrollPane. proj-list)
+                        (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 8 8)))
+        btn-row (doto (JPanel. (java.awt.GridLayout. 1 3 8 8))
+                  (.add open-btn)
+                  (.add new-btn)
+                  (.add del-btn))
+        south (doto (JPanel. (BorderLayout.))
+                (.add btn-row BorderLayout/CENTER)
+                (.add new-field BorderLayout/SOUTH))]
+    (.setCellRenderer proj-list cell-renderer)
+    (refresh!)
+    (.addActionListener open-btn
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_] (open-selected!))))
+    (.addActionListener del-btn
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_] (delete!))))
+    (doto dialog
+      (.add proj-scroll BorderLayout/CENTER)
+      (.add south BorderLayout/SOUTH)
+      (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE)
+      (.setVisible true))
+    (.addActionListener new-btn
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_] (create+open!)))))))
+
 (defn- build-chat-frame
   "Build the chat frame (not yet shown). Returns the JFrame."
   ^JFrame []
@@ -748,26 +852,55 @@
         send-fn (fn [history text]
                   (connect-eca!)
                   (if-not @connected
-                    (do (reset! running? false) history)
+                    (do (reset! running? false)
+                        ;; ECA is down after a send attempt — don't silently
+                        ;; swallow the user's message. Make it obvious both on
+                        ;; screen and in ~/.grog-ui.log (the log is the dif for
+                        ;; reproducing what happened next).
+                        (let [msg (str "[grog] not connected to ECA — message not sent: " text)]
+                          (dbg! msg)
+                          (transcript/append-status! pane msg))
+                        history)
                     (do
                       (reset! running? true)
                       (cancel/clear!)
                       (reset! last-sent (str text))
-                      (try
-                        (let [resp (eca/prompt! text {:chatId @chat-id
-                                                      :model (some-> (uifooter/current-model)
-                                                                     (models/qualify-eca-model
-                                                                      nil
-                                                                      (try (config/llm-url) (catch Exception _ nil))))
-                                                      :trust @yolo-ref})]
-                          (when-let [e (:error resp)]
-                            (transcript/append-status! pane (str "[grog] " (or (:message e) (pr-str e)))))
-                          (conj history {:user text}))
-                        (catch Throwable e
-                          (dbg! "eca prompt error:" (.getMessage e))
-                          (reset! running? false)
-                          (transcript/append-status! pane (str "[grog] " (.getMessage e)))
-                          history)))))
+                      (dbg! "send-fn: connected, about to prompt -> " (pr-str (str text)) " model-next=" (pr-str (uifooter/current-model)))
+                      (let [url (try (config/llm-url) (catch Exception _ nil))
+                            ;; ECA needs an explicit model or it fails with
+                            ;; "No available model found"; fall back to grog's
+                            ;; configured model when the footer model is unset.
+                            model (or (some-> (uifooter/current-model)
+                                              (models/qualify-eca-model nil url))
+                                      (models/qualify-eca-model (config/eca-model) nil url))]
+                        (try
+                          (let [resp (eca/prompt! text {:chatId @chat-id
+                                                        :model model
+                                                        :trust @yolo-ref})
+                                ;; ECA reports model/backend failures IN-BAND as
+                                ;; {:ok {:model "error" :status "error"}} (no
+                                ;; JSON-RPC :error key) — surface those instead
+                                ;; of silently swallowing them.
+                                e (:error resp)
+                                o (:ok resp)]
+                            (cond
+                              e
+                              (transcript/append-status! pane (str "[grog] " (or (:message e) (pr-str e))))
+
+                              (= "error" (some-> o :status str))
+                              (transcript/append-status!
+                               pane (str "[grog] ECA error: "
+                                         (or (some-> o :message str (not-empty))
+                                             (some-> o :model str (not-empty))
+                                             (pr-str o))))
+
+                              :else
+                              (dbg! "eca prompt ok: model=" (:model o) " status=" (:status o))))
+                          (catch Throwable e
+                            (dbg! "eca prompt error:" (.getMessage e))
+                            (reset! running? false)
+                            (transcript/append-status! pane (str "[grog] " (.getMessage e)))))
+                        (conj history {:user text})))))
         stop-action! (fn []
                        (when @connected (eca/stop! @chat-id))
                        (cancel/cancel!)
@@ -817,7 +950,9 @@
                             (when @connected
                               (eca/steer! @chat-id t)))
                         ;; idle: queue a normal prompt as before
-                        (.put ^LinkedBlockingQueue queue t)))))]
+                        (do
+                          (dbg! "submit -> queue: " (pr-str t) " running?=" @running?)
+                          (.put ^LinkedBlockingQueue queue t))))))]
     ;; larger fonts
     (doto pane
       (.setFont (ui-monospace-font))
@@ -903,35 +1038,34 @@
       ;; right: model / status / trust indicators
       (.add toolbar (Box/createHorizontalGlue))
       (.add toolbar (Box/createHorizontalStrut 14))
-      ;; project — combo picker, always-in-a-project
-      (let [projects (or (seq (projects/list-project-names)) ["default"])
-            cur (or (projects/project-name) "default")
-            proj-combo (JComboBox. (into-array String projects))]
-        (.setSelectedItem proj-combo (if ((set projects) cur) cur (first projects)))
-        (.setFont proj-combo (doto (widgets/ui-font) (.deriveFont (float 13))))
-        (doto proj-combo
-          (.setEditable true)
-          (.setMaximumSize (java.awt.Dimension. 180 26))
-          (.setToolTipText "Active project (enters / switches; context + workspace follow)"))
-        (.add toolbar (JLabel. " project "))
-        (.add toolbar proj-combo)
-        (.add toolbar (Box/createHorizontalStrut 14))
-        ;; switching project: disconnect ECA, set project, reconnect with new
-        ;; workspace, update the window title
-        (.addActionListener proj-combo
-          (proxy [java.awt.event.ActionListener] []
-            (actionPerformed [_]
-              (let [nm (str/trim (str (.getSelectedItem proj-combo)))]
-                (when (and (seq nm) (not= nm (projects/project-name)))
-                  (when @connected
-                    (eca/disconnect!)
-                    (reset! connected false))
-                  (projects/set-project! nm)
-                  (transcript/clear! pane)
-                  (transcript/append-status! pane (str "Project: " nm))
-                  (.setTitle frame (str "grog — " nm))
-                  (connect-eca!)
-                  ))))))
+      ;; project — status label + a Projects… button that opens a manager dialog
+      (let [proj-label (JLabel. " project: ")
+            update-label! (fn []
+                            (.setText proj-label
+                                      (str " project: " (or (projects/project-name) "default") "  ")))
+            switch-to! (fn [nm]
+                         (when (and (seq nm) (not= nm (projects/project-name)))
+                           (when @connected
+                             (eca/disconnect!)
+                             (reset! connected false))
+                           (projects/set-project! nm)
+                           (transcript/clear! pane)
+                           (transcript/append-status! pane (str "Project: " nm))
+                           (.setTitle frame (str "grog — " nm))
+                           (connect-eca!))
+                         (update-label!))
+            proj-btn (widgets/styled-button "Projects…")]
+          (.setFont proj-label
+                    (doto (widgets/ui-font)
+                      (.deriveFont (float 13))))
+          (.setForeground proj-label (Color. 235 200 90))
+          (update-label!)
+          (.addActionListener proj-btn
+            (proxy [java.awt.event.ActionListener] []
+              (actionPerformed [_] (show-project-manager! frame switch-to!))))
+          (.add toolbar proj-label)
+          (.add toolbar proj-btn)
+          (.add toolbar (Box/createHorizontalStrut 14)))
       ;; model — dainty, dim, small
       (let [model-label (JLabel. (str " " (or (uifooter/current-model) (config/model))))
             base (widgets/ui-font)
@@ -1013,7 +1147,12 @@
       (fn []
         (try
           (.requestFocusInWindow prompt)
-          (catch Throwable _ nil))))
+          (catch Throwable _ nil))
+        ;; Auto-connect ECA on startup (instead of lazily on the first send) so
+        ;; the initialize/initialized handshake lands in ~/.grog-ui.log right
+        ;; away — a failed connect is visible in the log before you type a
+        ;; single message.
+        (connect-eca!)))
     frame))
 
 (defn -main
