@@ -24,6 +24,7 @@
             [grog.eca-config :as ecacfg]
             [grog.models :as models]
             [grog.appearance :as appearance]
+            [grog.projects :as projects]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
             [grog.ui.eca-stream :as ecastream]
@@ -37,7 +38,7 @@
             [grog.soul :as soul])
   (:import (java.awt Color Component Font Graphics Graphics2D Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
-           (javax.swing AbstractAction Box BoxLayout JComponent JDialog JFrame JLabel JList
+           (javax.swing AbstractAction Box BoxLayout JComboBox JComponent JDialog JFrame JLabel JList
                         JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
                         JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities)
            (java.util.concurrent LinkedBlockingQueue)
@@ -263,14 +264,7 @@
 ;; Chat
 ;; ---------------------------------------------------------------------------
 
-(defn- file-uri
-  "A `file://` URI for a local path, for ECA `workspaceFolders`. Uses
-  `File/toURI` so Windows paths (backslashes, drive letters) become valid URIs
-  (`file:///C:/...`); a hand-built `(str \"file://\" abs)` would emit backslashes
-  and break ECA's URI parser on Windows."
-  [^String path]
-  (str (.toURI (-> (java.io.File. path)
-                   .toPath .toAbsolutePath .normalize .toFile))))
+;; (file-uri removed — ECA workspace URIs are built robustly in grog.projects/workspace-folders)
 
 (defn- make-event-handler
   "Build the ECA event handler for the transcript: renders `chat/contentReceived`
@@ -711,7 +705,7 @@
         settings (widgets/toolbar-button :settings "Settings")
         export (widgets/toolbar-button :export "Export transcript")
         clear (widgets/toolbar-button :clear "Clear")
-        frame (JFrame. "grog")
+        frame (JFrame. (str "grog — " (or (projects/project-name) "default")))
         queue (LinkedBlockingQueue.)
         running? (atom false)
         history-ref (atom [])
@@ -735,11 +729,12 @@
                        (when-not @connected
                          (try
                            (let [cfg (ecacfg/generate-config!)
+                                 ws (projects/workspace-folders)
                                  _ (dbg! "ECA starting: config=" cfg
                                          " model=" (or (uifooter/current-model) "(none)")
                                          " chatId=" @chat-id
-                                         " root=" (config/repo-root))
-                                 init (eca/connect! [{:uri (file-uri (config/repo-root)) :name "grog"}]
+                                         " workspace=" (pr-str ws))
+                                 init (eca/connect! ws
                                                     :event-handler event-handler
                                                     :request-handler (make-request-handler pane)
                                                     :args ["--config-file" cfg]
@@ -908,6 +903,35 @@
       ;; right: model / status / trust indicators
       (.add toolbar (Box/createHorizontalGlue))
       (.add toolbar (Box/createHorizontalStrut 14))
+      ;; project — combo picker, always-in-a-project
+      (let [projects (or (seq (projects/list-project-names)) ["default"])
+            cur (or (projects/project-name) "default")
+            proj-combo (JComboBox. (into-array String projects))]
+        (.setSelectedItem proj-combo (if ((set projects) cur) cur (first projects)))
+        (.setFont proj-combo (doto (widgets/ui-font) (.deriveFont (float 13))))
+        (doto proj-combo
+          (.setEditable true)
+          (.setMaximumSize (java.awt.Dimension. 180 26))
+          (.setToolTipText "Active project (enters / switches; context + workspace follow)"))
+        (.add toolbar (JLabel. " project "))
+        (.add toolbar proj-combo)
+        (.add toolbar (Box/createHorizontalStrut 14))
+        ;; switching project: disconnect ECA, set project, reconnect with new
+        ;; workspace, update the window title
+        (.addActionListener proj-combo
+          (proxy [java.awt.event.ActionListener] []
+            (actionPerformed [_]
+              (let [nm (str/trim (str (.getSelectedItem proj-combo)))]
+                (when (and (seq nm) (not= nm (projects/project-name)))
+                  (when @connected
+                    (eca/disconnect!)
+                    (reset! connected false))
+                  (projects/set-project! nm)
+                  (transcript/clear! pane)
+                  (transcript/append-status! pane (str "Project: " nm))
+                  (.setTitle frame (str "grog — " nm))
+                  (connect-eca!)
+                  ))))))
       ;; model — dainty, dim, small
       (let [model-label (JLabel. (str " " (or (uifooter/current-model) (config/model))))
             base (widgets/ui-font)
@@ -1025,6 +1049,7 @@
         ;; enlarge the L&F's base UI fonts from the desktop's system font so
         ;; dialogs (settings, model picker, approvals) and labels read larger
         (widgets/scale-ui-fonts!)
+        (projects/resolve-active-project)
         (let [^javax.swing.JFrame f (build-chat-frame)]
           (.setVisible f true)
           ;; DIAGNOSTIC: report what the JVM actually computed for the prompt's

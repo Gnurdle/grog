@@ -19,6 +19,7 @@
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
             [grog.pager :as pager]
+            [grog.projects :as projects]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
             [grog.secrets :as secrets]
@@ -912,7 +913,7 @@
     "  /paste               — enter multi-line input mode (blank line submits; Ctrl-D cancels)"
     "  /tools — list tool names plus a one-line role from each tool’s description (reflects current grog.edn)"
     "  /skills — list skills when :skills :roots is set; /skills <id> — print SKILL.md (same as read_skill)"
-    "  /project — list project dirs, or leave project mode if inside one; /project <name> — enter or switch project"
+    "  /project — list project dirs (active = *); /project <name> — switch active project (always in one)"
     "  /jobs — add|list|next|status (needs :edn-store + active project); queue in memory namespace grog-jobs under the project"
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
@@ -936,8 +937,12 @@
     :else "history: invalid :cli :chat-history-turns"))
 
 (defn- shell-cwd-file
+  "The shell's working directory: the active project root (project-centric), or
+  the repo root as a fallback when no project is active/dir."
   ^java.io.File []
-  (.getCanonicalFile (io/file (config/repo-root))))
+  (.getCanonicalFile
+   (or (projects/project-root-for-active)
+       (io/file (config/repo-root)))))
 
 (defn- run-shell-one-liner! [^String cmd]
   (try
@@ -1127,25 +1132,21 @@
 (defn- handle-project-command! [line]
   (when-let [[_ r] (re-matches #"(?i)^/project(?:\s+(.*))?$" (str/trim line))]
     (let [tail (str/trim (or r ""))]
-        (if (config/active-project-name)
-        (if (str/blank? tail)
-          (do (config/set-active-project! nil)
-              (mcp/try-load-declared-config!)
-              (println "Left project mode (prompt is chat> again)."))
-          (do (config/set-active-project! tail)
-              (mcp/try-load-declared-config!)
-              (println "Switched to project:" (pr-str tail))))
-        (if (str/blank? tail)
-          (let [names (edn-store/list-memory-project-display-names)]
-            (if (seq names)
-              (do (println "Projects:")
-                  (doseq [n names] (println " " n))
-                  (println "Use /project <name> to enter."))
-              (println "No projects yet (nothing under grog-memory/Projects/). /project <name> to start one.")))
-          (do (config/set-active-project! tail)
-              (mcp/try-load-declared-config!)
-              (println "Project:" (pr-str tail))))))
-    true))
+      (if (str/blank? tail)
+        ;; no arg -> list projects (always-in-a-project; no "leave" mode)
+        (let [names (projects/list-project-names)]
+          (if (seq names)
+            (do (println "Projects (under" (.getPath (projects/projects-home)) "), active ="
+                         (pr-str (projects/project-name)) ":")
+                (doseq [n names] (println " " n (when (= n (projects/project-name)) "(active)")))
+                (println "Use /project <name> to switch."))
+            (println "No projects yet (nothing under" (.getPath (projects/projects-home))
+                     "). /project <name> to start one.")))
+        ;; /project <name> -> switch (persists last-used)
+        (do (projects/set-project! tail)
+            (mcp/try-load-declared-config!)
+            (println "Project:" (pr-str tail))))))
+  true)
 
 (defn- parse-secret-key-value [tail]
   (when-not (str/blank? tail)

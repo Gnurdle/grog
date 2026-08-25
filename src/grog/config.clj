@@ -80,6 +80,22 @@
       (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
       "."))
 
+(def ^:private ^String default-projects-dir "~/grog-projects")
+
+(defn projects-dir
+  "The projects home: where per-project context lives, **outside** the source
+  tree. Resolved from `:projects {:dir …}` in grog.edn, defaulting to
+  `~/grog-projects`. `~` is expanded to the user home; a relative path is
+  resolved against the repo root. Returns a canonical `File` (may not exist yet)."
+  ^File []
+  (let [raw (or (some-> (get-in (grog) [:projects :dir]) str str/trim not-empty)
+                default-projects-dir)
+        f (io/file (str/replace-first raw #"^~(?=/|$)" (str (System/getProperty "user.home"))))]
+    (.getCanonicalFile
+     (if (.isAbsolute f)
+       f
+       (io/file (repo-root) raw)))))
+
 (defn eca-model
   "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
   `chat/prompt`. nil when unset (ECA falls back to its own default)."
@@ -234,7 +250,7 @@
 (defn active-project-status-line
   []
   (if-let [p (active-project-name)]
-    (str "In project: " p " — prompt \"" p " >\"; memory under Projects/" p "/…")
+    (str "In project: " p " — context under " (.getPath (projects-dir)) "/" p)
     "No active project — prompt \"chat>\"; /project lists dirs; /project <name> to enter"))
 
 (defn cli-cfg []

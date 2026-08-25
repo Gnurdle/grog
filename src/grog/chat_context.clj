@@ -1,7 +1,9 @@
 (ns grog.chat-context
-  "Shared LLM message construction: SOUL, project banner, skills system blocks."
+  "Shared LLM message construction: SOUL, project banner + loaded project context,
+  skills system blocks."
   (:require [clojure.string :as str]
             [grog.config :as config]
+            [grog.projects :as projects]
             [grog.skills :as skills]
             [grog.soul :as soul]))
 
@@ -9,6 +11,22 @@
   (str "## Persistent instructions (SOUL.md)\n\n"
        raw
        "\n\n---\nTreat the above as standing rules for your replies unless the user clearly overrides them for a single turn."))
+
+(defn- project-context-message
+  "The Active project system message: points the model at the project's home
+  directory (outside the source tree) and includes any loaded context."
+  []
+  (let [p (projects/resolve-active-project)]
+    {:role "system"
+     :content
+     (str "Active project: **" p "**. Its context lives in the project home at `"
+          (some-> (projects/project-dir p) .getPath)
+          "` (outside the source tree, under grog's projects dir). "
+          "The active project's directory is your working scope; its primary "
+          "working dir is " (some-> (projects/project-root p) .getPath) ".\n\n"
+          "### Project context\n\n"
+          (or (projects/load-context)
+              "(no context loaded)"))}))
 
 (defn system-messages
   "Vector of `{:role \"system\" :content …}` for the current session (uses `active-project-name`)."
@@ -18,9 +36,8 @@
      (concat
       (when-let [t (some-> (soul/read-text) str str/trim not-empty)]
         [{:role "system" :content (wrap-soul-as-system-prompt t)}])
-      (when-let [p (config/active-project-name)]
-        [{:role "system"
-          :content (str "Active project: **" p "**. `memory_*` tools persist under `Projects/" p "/…` in the configured edn-store; your turns are also logged to `Projects/" p "/dialog/thread.edn`.")}])
+      (when-let [m (project-context-message)]
+        [m])
       (when-let [blk (some-> (skills/system-prompt-block) str str/trim not-empty)]
         [{:role "system" :content blk}])))
     (catch Exception e

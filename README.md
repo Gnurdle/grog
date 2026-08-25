@@ -23,10 +23,10 @@ Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the mode
 
 | Topic | Detail |
 | --- | --- |
-| **Local-first** | Workspace files, skills, and memory live on disk; remote calls are explicit (Brave, `with_api_key`). |
+| **Local-first** | Project files, skills, and memory live on disk; remote calls are explicit (Brave, `with_api_key`). |
 | **Modest hardware** | Useful with smaller models (e.g. Qwen3.5-class on ~8 GB VRAM); tool use still buys you a lot. |
-| **GUI** | Swing desktop app (`clojure -M:gui` or `./grog-ui`): streaming transcript, model picker, appearance settings, integrated terminal, export. |
-| **Projects** | `/project` ties **`memory_*`** tools and dialog logging into per-project trees—iterable, restartable workstreams. |
+| **GUI** | Swing desktop app (`clojure -M:gui` or `./grog-ui`): streaming transcript, model picker, **project picker**, appearance settings, integrated terminal, export. |
+| **Project-centric** | Grog is **always in a project**. Active project chosen via the GUI picker or `/project`; its context loads (notes/dialog/state), its directory is the agent's workspace (ECA `workspaceFolders` = project dir) and the shell cwd — the source tree is no longer special. |
 | **Jobs** | With **`:edn-store`**, **`/jobs`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
 | **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same LLM+tools stack); respects **active project** and thread context when set. |
 | **Skills** | Packaged `skill.edn` + `SKILL.md` directories; the model can list, read, create, and update skills. |
@@ -86,11 +86,11 @@ These are **user** commands, not model tools.
 | `/clear`, `/fresh` | Clear session history |
 | `/tools`, `/skills` | Inspect tools / skill packs |
 | `/paste` | Multi-line input mode (blank line submits; Ctrl-D cancels) |
-| `/project`, `/project <name>` | Projects: memory namespaces + `Projects/<name>/dialog/thread.edn` |
+| `/project`, `/project <name>` | Projects: context from the project home `~/grog-projects/<name>/` (notes/dialog/state); `. = *` marks the active project. The active project's dir is also the agent workspace + shell cwd. |
 | `/jobs` | **`add` \| `list` \| `next` \| `status`** — project job queue in edn-store (`grog-jobs/`); needs **active project** + **`:edn-store`** |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
 | `/secret` | Keyring **`grog`** — list/set keys (values never printed) |
-| `/shell` | `sh -lc` under the repo root cwd, or interactive subshell |
+| `/shell` | `sh -lc` under the active project cwd (fallback: repo root), or interactive subshell |
 | `/mcp` | MCP server list in edn-store: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
 | `/soul` | **show** \| **path** \| **add** *text* \| **reload** — SOUL.md management |
 | `@path` | Inline files into the prompt (whitespace-separated tokens) |
@@ -109,7 +109,7 @@ Config merges in order:
 
 **Optional:** `:llm` also accepts `:max-context-tokens` (drop oldest non-system messages before each request; default 200000, set `nil` to disable), `:max-tool-result-chars` (truncate oversized tool outputs; default 50000, set `nil` to disable), `:temperature`, `:max-tokens`, `:api-key` (inline or `${LLM_API_KEY}` env-var interpolation; prefer OS keyring `LLM_API_KEY`), `:conn-timeout-sec` (default 60), `:socket-timeout-sec` (default 300), `:debug-payload` / `:debug-response` (print to stderr), `:provider-name` (human-readable label), and `:extra-payload` (provider-specific fields merged into every request — e.g. OpenRouter `{:transforms ["middle-out"]}` for context compression).
 
-**Optional:** `:soul`, `:skills`, `:edn-store`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
+**Optional:** `:soul`, `:skills`, `:edn-store`, **`:projects`** (project home, default `~/grog-projects`), Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
 
 ### MCP servers
 

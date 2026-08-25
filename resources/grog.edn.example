@@ -41,6 +41,11 @@
             }
  ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (relative path).
  ;; :edn-store {:root "edn-store"}
+ ;; Project home — where per-project context lives, OUTSIDE the source tree.
+ ;; Each immediate subdir is a project (GUI picker or /project lists/switches). Default ~/grog-projects.
+ ;; A project may hold project.edn with :description, :model, :mcp, :appearance, and :root (an
+ ;; absolute/~-expanded path to override the working dir, e.g. point a "grog" project at the repo).
+ ;; :projects {:dir "~/grog-projects" :default "gmail-cleanup"}
  ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.
  ;; :appearance {:chat {:font-family "Monospaced" :font-size 18
  ;;                     :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
