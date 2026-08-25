@@ -1,37 +1,49 @@
 (ns grog.jobs
-  "Project-scoped job queue in edn-store (`grog-jobs/queue.edn`). Each job has a goal; Grog runs the
-  tool loop with full project context (SOUL + thread + memory paths) and persists findings."
-  (:require [clojure.string :as str]
+  "Project-scoped job queue under the project home (`~/grog-projects/<proj>/jobs/`).
+  Each job has a goal; Grog runs the tool loop with full project context (SOUL +
+  thread + memory paths) and persists findings. Projects own their jobs — no more
+  edn-store `grog-memory/Projects/<proj>` indirection."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [grog.chat-context :as chat]
             [grog.config :as cfg]
-            [grog.edn-store :as store]
-            [grog.project-dialog :as pd])
-  (:import [java.net URLEncoder]
-           [java.util UUID]))
+            [grog.project-dialog :as pd]
+            [grog.projects :as projects])
+  (:import (java.io File)
+           (java.util UUID)))
 
-(def ^:private mem-root "grog-memory")
+(defn- queue-file ^File [^String project-name]
+  (io/file (projects/jobs-dir project-name) "queue.edn"))
 
-(defn- enc ^String [^String s]
-  (URLEncoder/encode s "UTF-8"))
+(defn- findings-file ^File [^String project-name ^String job-id]
+  (io/file (projects/jobs-dir project-name) (str "findings-" job-id ".edn")))
 
-(defn queue-keypath ^clojure.lang.PersistentVector [^String project-name]
-  [mem-root "Projects" (enc project-name) (enc "grog-jobs") (enc "queue")])
+(defn- read-edn [^File f]
+  (try
+    (let [s (slurp f :encoding "UTF-8")
+          m (when (seq (str/trim s)) (edn/read-string {:eof nil} s))]
+      (if (map? m) m {}))
+    (catch Exception _ {})))
 
-(defn findings-keypath ^clojure.lang.PersistentVector [^String project-name ^String job-id]
-  [mem-root "Projects" (enc project-name) (enc "grog-jobs") (enc (str "findings-" job-id))])
+(defn- write-edn! [^File f value]
+  (.mkdirs (.getParentFile f))
+  (spit f (with-out-str (pprint/pprint value)) :encoding "UTF-8"))
 
 (defn read-queue
   [^String project-name]
-  (when (store/configured?)
-    (store/read-leaf (queue-keypath project-name))))
+  (when-let [^File f (queue-file project-name)]
+    (when (.exists f)
+      (read-edn f))))
 
 (defn write-queue!
   [^String project-name data]
-  (store/write-leaf! (queue-keypath project-name) data))
+  (write-edn! (queue-file project-name) data))
 
 (defn ensure-queue!
   [^String project-name]
-  (when (and (store/configured?) (not (str/blank? project-name)))
+  (when-not (str/blank? project-name)
     (when (nil? (read-queue project-name))
       (write-queue! project-name {:items []}))))
 
@@ -40,8 +52,6 @@
   (cond
     (str/blank? (str/trim (or goal "")))
     {:ok false :error "goal is empty"}
-    (not (store/configured?))
-    {:ok false :error "edn-store not configured"}
     :else
     (let [pn (str/trim project-name)
           g (str/trim goal)]
@@ -80,49 +90,47 @@
   "Set active project, load context, run one pending job via `grog.core/run-tool-loop-on-messages`.
   Returns that map plus `:job-id` / `:project` when applicable."
   [^String project-name]
-  (if-not (store/configured?)
-    {:ok false :error "edn-store not configured"}
-    (let [pn (str/trim project-name)]
-      (if (str/blank? pn)
-        {:ok false :error "project name is empty"}
-        (do
-          (cfg/set-active-project! pn)
-          (ensure-queue! pn)
-          (let [data (read-queue pn)
-                items (vec (:items data))
-                job (first-pending items)]
-            (if-not job
-              {:ok false :error "no pending jobs" :project pn}
-              (let [tid (:id job)
-                    goal (str (:goal job))
-                    appendix (pd/thread-as-system-appendix pn :max-turns (cfg/jobs-thread-context-turns))
-                    base (chat/messages-with-project-context pn (str (or appendix "")))
-                    user-msg (str "## Project job (automated)\n\n"
-                                  "**Job id:** `" tid "`\n\n"
-                                  "**Goal:**\n" goal "\n\n"
-                                  "Work autonomously with tools. Persist durable notes under `memory_*` "
-                                  "in this project as needed (e.g. namespace **`grog-jobs`**, key **`notes-" tid "`**).\n\n"
-                                  "End with a clear **Findings** section: what you did, evidence, and outcomes.")
-                    msgs (conj (vec base) {:role "user" :content user-msg})
-                    runner (requiring-resolve 'grog.core/run-tool-loop-on-messages)
-                    res (runner msgs {:answer-prefix "\n\n[job] "})]
-                (if (:ok res)
-                  (do
-                    (store/write-leaf! (findings-keypath pn tid)
-                                       {:job-id tid
-                                        :goal goal
-                                        :findings (str (:content res ""))
-                                        :completed-at (System/currentTimeMillis)})
-                    (write-queue! pn (assoc data :items (replace-item items tid
+  (let [pn (str/trim project-name)]
+    (if (str/blank? pn)
+      {:ok false :error "project name is empty"}
+      (do
+        (cfg/set-active-project! pn)
+        (ensure-queue! pn)
+        (let [data (read-queue pn)
+              items (vec (:items data))
+              job (first-pending items)]
+          (if-not job
+            {:ok false :error "no pending jobs" :project pn}
+            (let [tid (:id job)
+                  goal (str (:goal job))
+                  appendix (pd/thread-as-system-appendix pn :max-turns (cfg/jobs-thread-context-turns))
+                  base (chat/messages-with-project-context pn (str (or appendix "")))
+                  user-msg (str "## Project job (automated)\n\n"
+                                "**Job id:** `" tid "`\n\n"
+                                "**Goal:**\n" goal "\n\n"
+                                "Work autonomously with tools. Persist durable notes under `memory_*` "
+                                "in this project as needed (e.g. namespace **`grog-jobs`**, key **`notes-" tid "`**).\n\n"
+                                "End with a clear **Findings** section: what you did, evidence, and outcomes.")
+                  msgs (conj (vec base) {:role "user" :content user-msg})
+                  runner (requiring-resolve 'grog.core/run-tool-loop-on-messages)
+                  res (runner msgs {:answer-prefix "\n\n[job] "})]
+              (if (:ok res)
+                (do
+                  (write-edn! (findings-file pn tid)
+                              {:job-id tid
+                               :goal goal
+                               :findings (str (:content res ""))
+                               :completed-at (System/currentTimeMillis)})
+                  (write-queue! pn (assoc data :items (replace-item items tid
                                                                      #(assoc % :status :done
                                                                              :completed-at (System/currentTimeMillis)))))
-                    (try
-                      (pd/append-turn! :user (str "[job] " goal))
-                      (pd/append-turn! :assistant (str (:content res "")))
-                      (catch Exception _))
-                    (assoc res :job-id tid :project pn))
-                  (do
-                    (write-queue! pn (assoc data :items (replace-item items tid
+                  (try
+                    (pd/append-turn! :user (str "[job] " goal))
+                    (pd/append-turn! :assistant (str (:content res "")))
+                    (catch Exception _))
+                  (assoc res :job-id tid :project pn))
+                (do
+                  (write-queue! pn (assoc data :items (replace-item items tid
                                                                      #(assoc % :status :failed
                                                                              :error (:error res)))))
-                    (assoc res :job-id tid :project pn)))))))))))
+                  (assoc res :job-id tid :project pn))))))))))

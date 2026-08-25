@@ -14,7 +14,8 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.config :as config]
-            [grog.models :as models]))
+            [grog.models :as models]
+            [grog.projects :as projects]))
 
 (declare generate-config!)
 
@@ -120,6 +121,15 @@
   ^String []
   (abs-path (System/getProperty "user.dir" ".")))
 
+(defn memory-db-path
+  "The grog-memory SQLite DB path. When a project is active it is the project's own
+  state store (`~/grog-projects/<proj>/state/mem.db`); otherwise the repo-root
+  default (`.grog-memory.db`). The GUI reconnects ECA with a fresh generated config
+  on project switch, so the memory server follows the active project."
+  ^String [root]
+  (or (projects/active-memory-db-path)
+      (str root "/.grog-memory.db")))
+
 (defn default-eca-config-path
   "The standard ECA config file this generator starts from."
   ^String []
@@ -219,7 +229,7 @@
      "grog-memory"
      (shell-wrapped (str root "/grog-memory")
                     "PYTHONPATH=src .venv/bin/python -m grog_memory.server"
-                    {"GROG_MEMORY_DB" (str root "/.grog-memory.db")})
+                    {"GROG_MEMORY_DB" (memory-db-path root)})
 
      "grog-odoo"
      (shell-wrapped (str root "/grog-odoo")

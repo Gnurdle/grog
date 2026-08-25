@@ -1,23 +1,39 @@
 (ns grog.project-dialog
-  "Append chat turns to `grog-memory/Projects/<project>/dialog/thread.edn` when an active project is set."
-  (:require [clojure.string :as str]
-            [grog.config :as cfg]
-            [grog.edn-store :as store])
-  (:import [java.net URLEncoder]))
+  "Append chat turns to the active project's `dialog/thread.edn` under its project
+  home (`~/grog-projects/<proj>/dialog/thread.edn`). Each project owns its own
+  dialog — no more edn-store `grog-memory/Projects/<proj>` indirection."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.pprint :as pprint]
+            [clojure.string :as str]
+            [grog.projects :as projects])
+  (:import (java.io File)))
 
-(def ^:private ^String mem-root "grog-memory")
+(defn- thread-file
+  "The project's `dialog/thread.edn` File (creates the dialog dir)."
+  ^File [^String project-name]
+  (let [d (projects/dialog-dir project-name)]
+    (io/file d "thread.edn")))
 
-(defn- enc ^String [^String s]
-  (URLEncoder/encode s "UTF-8"))
-
-(defn- thread-keypath [^String project-name]
-  [mem-root "Projects" (enc project-name) "dialog" "thread"])
+(defn- read-thread-file
+  "Parse thread.edn (map with :turns), or {} / {:turns []} if missing/invalid."
+  [^File f]
+  (try
+    (let [s (slurp f :encoding "UTF-8")
+          m (when (seq (str/trim s)) (edn/read-string {:eof nil} s))]
+      (cond
+        (nil? m) {}
+        (map? m) m
+        :else {}))
+    (catch Exception _ {})))
 
 (defn read-thread-raw
-  "Read `{:turns […]}` for `project-name` from edn-store, or `nil` if missing/off."
+  "Read `{:turns […]}` for `project-name`, or `nil` if the file is missing."
   [^String project-name]
-  (when (and (store/configured?) (some-> project-name str str/trim not-empty))
-    (store/read-leaf (thread-keypath (str/trim project-name)))))
+  (when (and project-name (not (str/blank? (str project-name))))
+    (let [^File f (thread-file (str/trim project-name))]
+      (when (.exists f)
+        (read-thread-file f)))))
 
 (defn thread-as-system-appendix
   "Format prior dialog turns as markdown for an extra `system` message (jobs/chron reload context)."
@@ -35,14 +51,13 @@
                             slice)))))))
 
 (defn append-turn!
-  "Append one message to the project dialog log. No-op if edn-store is off or no active project.
+  "Append one message to the active project's dialog log. No-op if no active project.
   `role` is `:user` or `:assistant` (or strings). `content` is coerced to string."
   [role content]
-  (when (and (store/configured?) (some? (cfg/active-project-name)))
-    (let [pn (cfg/active-project-name)
-          kp (thread-keypath pn)
-          raw (store/read-leaf kp)
-          turns (vec (if (and (map? raw) (sequential? (:turns raw))) (:turns raw) []))
+  (when-let [pn (projects/resolve-active-project)]
+    (let [^File f (thread-file pn)
+          raw (read-thread-file f)
+          turns (vec (if (sequential? (:turns raw)) (:turns raw) []))
           base (if (map? raw) raw {})
           r (cond
               (keyword? role) (name role)
@@ -51,4 +66,5 @@
           entry {:role r
                  :content (str content)
                  :at (System/currentTimeMillis)}]
-      (store/write-leaf! kp (assoc base :turns (conj turns entry))))))
+      (spit f (with-out-str (pprint/pprint (assoc base :turns (conj turns entry))))
+            :encoding "UTF-8"))))

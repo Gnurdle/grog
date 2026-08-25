@@ -17,7 +17,8 @@
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.projects :as projects])
   (:import [java.sql Connection DriverManager ResultSet]
            [java.util.regex Pattern]))
 
@@ -63,14 +64,25 @@
         default-db-rel)))
 
 (defn- db-file
-  "Absolute `File` for the store addressed by this call (relative paths resolve
-  against the repo root)."
+  "Absolute `File` for the store addressed by this call. Explicit `:name` /
+  `:db_path` resolve against the current active project's `state/` dir when a
+  project is active, else the repo root. With no explicit address and an active
+  project, the default DB resolves to the project's own `state/mem.db`, so the
+  kv-store is per-project."
   ^java.io.File [m]
-  (let [rel (store-db-rel m)
-        f (io/file rel)]
-    (if (.isAbsolute f)
-      f
-      (.getCanonicalFile (io/file (cfg/repo-root) rel)))))
+  (let [explicit? (boolean (pick m :name :store :Namespace :db_path :dbPath :db))
+        rel (store-db-rel m)
+        project-db (projects/active-memory-db-path)]
+    (if project-db
+      (if explicit?
+        (let [^java.io.File f (io/file project-db)]
+          ;; explicit named stores live alongside the project memory db
+          (.getCanonicalFile (io/file (.getParentFile f) (.getName (io/file rel)))))
+        (io/file project-db))
+      (let [f (io/file rel)]
+        (if (.isAbsolute f)
+          f
+          (.getCanonicalFile (io/file (cfg/repo-root) rel)))))))
 
 (defn- required-key [m]
   (let [k (pick m :key :Key)]

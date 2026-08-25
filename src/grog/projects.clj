@@ -284,6 +284,71 @@
                 body)
                (str/join "\n")))))))
 
+;; ---------------------------------------------------------------------------
+;; Project-owned state (collapse of the old edn-store "Projects/<proj>" split)
+;; Every project owns its runtime state under its own project home:
+;;   ~/grog-projects/<proj>/state/mem.db        (SQLite assoc memory store)
+;;   ~/grog-projects/<proj>/state/              (other working data)
+;;   ~/grog-projects/<proj>/dialog/thread.edn   (chat log)
+;;   ~/grog-projects/<proj>/jobs/queue.edn + findings-*.edn
+;; ---------------------------------------------------------------------------
+
+(defn- subdir-of ^File [^File base ^String name]
+  (let [d (io/file base name)]
+    (.mkdirs d)
+    d))
+
+(defn subdir
+  "The lazily-created `~/grog-projects/<project>/<name>` directory for a project."
+  ^File [project-name ^String name]
+  (subdir-of (ensure-project-dir! project-name) name))
+
+(defn state-dir
+  "The project's `state/` directory (working data, sqlite memory). Created lazily."
+  ^File [project-name]
+  (subdir project-name "state"))
+
+(defn dialog-dir
+  "The project's `dialog/` directory (chat thread). Created lazily."
+  ^File [project-name]
+  (subdir project-name "dialog"))
+
+(defn jobs-dir
+  "The project's `jobs/` directory (queue + findings). Created lazily."
+  ^File [project-name]
+  (subdir project-name "jobs"))
+
+(defn memory-db-path
+  "The SQLite memory DB path for a project: `~/grog-projects/<project>/state/mem.db`.
+  Returns an absolute path string. The `grog-memory` MCP server is pointed at this
+  via `GROG_MEMORY_DB` when a project is active."
+  ^String [project-name]
+  (str (.getPath (io/file (state-dir project-name) "mem.db"))))
+
+(defn active-state-dir
+  "The active project's state dir (resolves active project first), or nil."
+  ^File []
+  (when-let [p (resolve-active-project)]
+    (state-dir p)))
+
+(defn active-dialog-dir
+  "The active project's dialog dir, or nil."
+  ^File []
+  (when-let [p (resolve-active-project)]
+    (dialog-dir p)))
+
+(defn active-jobs-dir
+  "The active project's jobs dir, or nil."
+  ^File []
+  (when-let [p (resolve-active-project)]
+    (jobs-dir p)))
+
+(defn active-memory-db-path
+  "The active project's SQLite memory DB path, or nil when none resolvable."
+  ^String []
+  (when-let [p (resolve-active-project)]
+    (memory-db-path p)))
+
 (defn startup-status-line
   []
   (let [h (projects-home)]

@@ -68,9 +68,9 @@ Active set depends on `grog.edn`. Use **`/tools`** in chat for the live list and
 | **Web** | `brave_web_search` — Brave Search API key in OS keyring |
 | **HTTP + secrets** | `with_api_key` — allowlisted keyring names + optional URL prefixes |
 | **Skills** | `list_skills`, `read_skill`, `save_skill`, `delete_skill` — needs `:skills {:roots […]}` |
-| **Memory** | `memory_save`, `memory_load`, `memory_list_keys`, `memory_namespaces`, `memory_create_namespace`, `memory_delete` — needs `:edn-store {:root "…"}` |
+| **Memory** | `assoc_store/get/keys/delete/search` — SQLite kv-store, **per active project** (`~/grog-projects/<proj>/state/mem.db`); named stores too (`<name>.db` beside it) |
 | **Scripts** | `run_babashka` — always enabled; needs **`bb`** on `PATH` |
-| **MCP** | **`:edn-store`** + **`/mcp`** or **`mcp_*`** tools; persisted **`grog-mcp/servers.edn`** (project-scoped); after **`mcp_reload`**, tools **`<id>_<tool>`** |
+| **MCP** | **`/mcp`** or **`mcp_*`** tools; persisted **`grog-mcp/servers.edn`** (project-scoped); after **`mcp_reload`**, tools **`<id>_<tool>`** |
 
 </details>
 
@@ -87,11 +87,11 @@ These are **user** commands, not model tools.
 | `/tools`, `/skills` | Inspect tools / skill packs |
 | `/paste` | Multi-line input mode (blank line submits; Ctrl-D cancels) |
 | `/project`, `/project <name>` | Projects: context from the project home `~/grog-projects/<name>/` (notes/dialog/state); `. = *` marks the active project. The active project's dir is also the agent workspace + shell cwd. |
-| `/jobs` | **`add` \| `list` \| `next` \| `status`** — project job queue in edn-store (`grog-jobs/`); needs **active project** + **`:edn-store`** |
+| `/job`, `/jobs` | Project job queue in the project home (`~/grog-projects/<proj>/jobs/`): **`add` \| `list` \| `next` \| `status`** |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
 | `/secret` | Keyring **`grog`** — list/set keys (values never printed) |
 | `/shell` | `sh -lc` under the active project cwd (fallback: repo root), or interactive subshell |
-| `/mcp` | MCP server list in edn-store: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
+| `/mcp` | MCP server list: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
 | `/soul` | **show** \| **path** \| **add** *text* \| **reload** — SOUL.md management |
 | `@path` | Inline files into the prompt (whitespace-separated tokens) |
 
