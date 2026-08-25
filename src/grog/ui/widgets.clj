@@ -14,6 +14,17 @@
 (def ^:private button-scale 1.3)
 (def ^:private min-button-size 16)
 
+;; The *true* system UI font size, captured before grog inflates the L&F fonts in
+;; `scale-ui-fonts!`. `lf-base-font` reads the UIManager, which after
+;; `scale-ui-fonts!` holds an already-inflated font — deriving scales from that
+;; would double-scale (e.g. buttons 1.3x of a 1.5x base = huge). So we snapshot
+;; the desktop font once and always scale from it.
+(defonce ^:private system-base-size
+  (let [f (or (try (Font/getFont "Label.font" (Font. "SansSerif" Font/PLAIN 13))
+                   (catch Throwable _ nil))
+              (Font. "SansSerif" Font/PLAIN 13))]
+    (int (Math/round (float (.getSize f))))))
+
 (defn- lf-base-font
   "The active Look & Feel's base UI font (FlatLaf mirrors the desktop's system
   font + DPI settings). Falls back to a sensible default so font sizing always
@@ -23,26 +34,26 @@
       (try (UIManager/getFont "defaultFont") (catch Throwable _ nil))
       (Font. "SansSerif" Font/PLAIN 13)))
 
-(defn- scaled-size
-  "Round `(base-font-size * ui-font-scale)`, but never below `floor`."
-  [floor]
-  (max floor (int (Math/round (* (.getSize (lf-base-font)) ui-font-scale)))))
+(defn- stable-base-size
+  "The true desktop font size (pre-inflation), as an int >= 1."
+  []
+  (max 1 system-base-size))
 
 (defn ui-font-size
   "Font size for dialogs/buttons/status, from the system L&F font scaled up."
   []
-  (scaled-size min-ui-size))
+  (max min-ui-size (int (Math/round (* (stable-base-size) ui-font-scale)))))
 
 (defn mono-font-size
   "Monospace dialog font size, from the system L&F font scaled up."
   []
-  (scaled-size min-mono-size))
+  (max min-mono-size (int (Math/round (* (stable-base-size) ui-font-scale)))))
 
 (defn- button-size
   "Button font size: follows the system L&F font but stays compact (a footer of
   buttons full of 20pt text is too shouty; dialogs/status get the big scale)."
   []
-  (max min-button-size (int (Math/round (* (.getSize (lf-base-font)) button-scale)))))
+  (max min-button-size (int (Math/round (* (stable-base-size) button-scale)))))
 
 (defn button-font
   "Compact sans font for footer/action buttons, following the system family."
@@ -66,7 +77,7 @@
   scale, and uses regular weight, so a long tool-call summary in an approval
   dialog reads as plain body text rather than towering bold monospace."
   ^Font []
-  (Font. "Monospaced" Font/PLAIN (max 13 (int (.getSize (lf-base-font))))))
+  (Font. "Monospaced" Font/PLAIN (max 13 (stable-base-size))))
 
 (defn scale-ui-fonts!
   "After the Look & Feel is installed, bump its base UI font keys so every
@@ -75,13 +86,19 @@
   before building frames."
   []
   (let [f (ui-font)
-        keys ["defaultFont" "Label.font" "Button.font" "TextField.font"
+        bf (button-font)
+        keys ["defaultFont" "Label.font" "TextField.font"
               "ComboBox.font" "List.font" "Spinner.font" "TabbedPane.font"
               "ToolTip.font" "CheckBox.font" "RadioButton.font"
-              "OptionPane.messageFont" "OptionPane.buttonFont"
-              "TitledBorder.font" "Menu.font" "MenuItem.font"]]
+              "OptionPane.messageFont"
+              "TitledBorder.font" "Menu.font" "MenuItem.font"]
+        button-keys ["Button.font" "OptionPane.buttonFont"]]
     (doseq [k keys]
       (try (UIManager/put k f) (catch Throwable _)))
+    ;; buttons use the compact font so dialogs (approve/reject/yolo, question OK/
+    ;; cancel, settings) don't render oversized; the big scale is for labels/lists
+    (doseq [k button-keys]
+      (try (UIManager/put k bf) (catch Throwable _)))
     f))
 
 (def btn-normal (Color. 42 44 56))
