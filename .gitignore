@@ -4,3 +4,17 @@ target/
 workspace/
 grog-memory/err.log
 grog-ui.log
+
+# Python / tooling caches
+__pycache__/
+*.pyc
+
+# Local working databases (grog-memory / assoc stores) — never commit
+grog-memory.db
+grog-memory/*.db
+grog-memory/gmail-cleanup
+
+# clj-kondo / clojure-lsp / classpath caches
+.clj-kondo/
+.lsp/
+.cpcache/
