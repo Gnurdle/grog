@@ -320,49 +320,6 @@
                  (.add pick-btn)))
     (.add vbox (Box/createVerticalStrut 12))
 
-    ;; --- Oracle (strong remote model) ---
-    (let [oracle (models/oracle-config)]
-      (.add vbox (doto (JLabel. "Oracle (strong remote model — tool: oracle)")
-                   (.setPreferredSize (Dimension. 380 24))))
-      (let [o-model (JTextField. (str (or (:model oracle) "")))
-            o-url   (JTextField. (str (or (:url oracle) "")))
-            o-max   (JSpinner. (SpinnerNumberModel. (int (or (:max-tokens oracle) 4096)) 0 131072 256))
-            o-temp  (JSpinner. (SpinnerNumberModel. (double (or (:temperature oracle) 0.5)) 0.0 2.0 0.1))
-            o-key-btn (widgets/styled-button "Set oracle API key…")
-            o-key-lbl (JLabel. (if (secrets/get-secret "ORACLE_API_KEY")
-                                 "oracle key: in OS keyring"
-                                 "oracle key: not set"))
-            o-apply  (widgets/styled-button "Apply oracle")]
-        (doseq [row [(field-row "Oracle model" o-model)
-                     (field-row "Oracle URL" o-url)
-                     (spinner-row "Max tokens" o-max)
-                     (spinner-row "Temperature" o-temp)]]
-          (.add vbox row)
-          (.add vbox (Box/createVerticalStrut 6)))
-        (let [kr (JPanel. (FlowLayout. FlowLayout/LEFT))
-              l (JLabel. "API key")]
-          (.setPreferredSize l (Dimension. (int label-w) 24))
-          (.add kr l) (.add kr o-key-btn) (.add kr o-key-lbl)
-          (.add vbox kr))
-        (.add vbox (Box/createVerticalStrut 6))
-        (.add vbox (doto (JPanel. (FlowLayout. FlowLayout/LEFT))
-                     (.add o-apply)))
-        (.addActionListener o-key-btn
-          (reify java.awt.event.ActionListener
-            (actionPerformed [_ _]
-              (let [in (JOptionPane/showInputDialog o-key-btn "Paste the oracle API key:"
-                                                    "Set oracle API key" JOptionPane/QUESTION_MESSAGE)]
-                (when (and in (seq (str/trim in)))
-                  (secrets/set-secret! "ORACLE_API_KEY" (str/trim in))
-                  (.setText o-key-lbl "oracle key: in OS keyring"))))))
-        (.addActionListener o-apply
-          (reify java.awt.event.ActionListener
-            (actionPerformed [_ _]
-              (models/save-oracle-fields! {:model (.getText o-model)
-                                           :url (.getText o-url)
-                                           :max-tokens (int (.getValue o-max))
-                                           :temperature (double (.getValue o-temp))})
-              (config/reload!))))))
     (.add vbox (Box/createVerticalStrut 12))
 
     ;; profiles

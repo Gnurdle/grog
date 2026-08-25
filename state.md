@@ -119,7 +119,7 @@ normal directory to ECA (no workspace-root semantics).
   `read/write/grep/stat/…_workspace_*` and `crop_workspace_image` tool specs + run-*
   dispatch are gone from the old loop. The old loop (`run-tool-loop-on-messages`) **stays**
   because `grog.jobs` / `grog.chron` / CLI still use it with the **non-workspace** tools
-  (office/pdf/ocr/analyze, memory, skills, brave, oracle, babashka, mcp).
+  (office/pdf/ocr/analyze, memory, skills, brave, babashka, mcp).
 - ⬜ Not yet pruned (still-present dead-ish code): `grog.core/chat-tools-payload` +
   `execute-tool-call!` (kept for jobs/chron), `grog.mcp` client, `chat_context` trim,
   dead tool namespaces `render.clj` / `e_trade.clj` / `ai.clj` / `physics.clj`.

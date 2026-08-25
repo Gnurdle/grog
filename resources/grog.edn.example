@@ -35,8 +35,10 @@
           ;; :max-body-chars 65536
           ;; :prompt-skill-lines 16
           }
- ;; Optional: Babashka — enable the run_babashka tool (bb must be on PATH; override command with :command).
- :babashka {:enabled true}
+ ;; Babashka is always enabled (a given) — run_babashka is always exposed to the model.
+ ;; The only knob is the `bb` command; override with :command (or env GROG_BABASHKA_CMD).
+ :babashka {;; :command "bb"
+            }
  ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (relative path).
  ;; :edn-store {:root "edn-store"}
  ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.

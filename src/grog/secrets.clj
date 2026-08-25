@@ -2,7 +2,7 @@
   "OS-backed secrets via [java-keyring](https://github.com/javakeyring/java-keyring)
   (macOS Keychain, Windows Credential Manager, Linux Secret Service / KWallet).
 
-  Credentials are addressed by **service** (fixed to `\"grog\"`) and **account** (e.g. `BRAVE_SEARCH_API`, `ORACLE_API_KEY`).
+  Credentials are addressed by **service** (fixed to `\"grog\"`) and **account** (e.g. `BRAVE_SEARCH_API`, `LLM_API_KEY`).
 
   Only **known** accounts (see `known-secret-defs`) may be set via `/secret` in chat."
   (:require [clojure.string :as str])
@@ -12,16 +12,12 @@
 
 (def brave-search-api-account "BRAVE_SEARCH_API")
 
-(def oracle-api-account "ORACLE_API_KEY")
-
 (def llm-api-account "LLM_API_KEY")
 
 (def known-secret-defs
   "Accounts Grog knows about; used for `/secret` list and validation."
   [{:account brave-search-api-account
     :description "Brave Search API subscription token (header X-Subscription-Token)"}
-   {:account oracle-api-account
-    :description "Oracle (strong remote model) API Bearer token — tool `oracle`, OpenAI-style chat completions"}
    {:account llm-api-account
     :description "LLM API key for OpenAI-compatible providers (OpenRouter, OpenAI, Groq, etc.)"}])
 
@@ -113,4 +109,4 @@
   "One line for chat startup (Brave / keyring hint). Does not open the keyring — that can block without D-Bus."
   []
   (str "Secrets: OS keyring service \"" service-id "\" — /secret lists "
-       brave-search-api-account ", " oracle-api-account ", " llm-api-account " (values never printed)"))
+       brave-search-api-account ", " llm-api-account " (values never printed)"))

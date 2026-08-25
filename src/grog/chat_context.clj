@@ -1,8 +1,7 @@
 (ns grog.chat-context
-  "Shared LLM message construction: SOUL, project banner, skills, oracle system blocks."
+  "Shared LLM message construction: SOUL, project banner, skills system blocks."
   (:require [clojure.string :as str]
             [grog.config :as config]
-            [grog.oracle :as oracle]
             [grog.skills :as skills]
             [grog.soul :as soul]))
 
@@ -23,8 +22,6 @@
         [{:role "system"
           :content (str "Active project: **" p "**. `memory_*` tools persist under `Projects/" p "/…` in the configured edn-store; your turns are also logged to `Projects/" p "/dialog/thread.edn`.")}])
       (when-let [blk (some-> (skills/system-prompt-block) str str/trim not-empty)]
-        [{:role "system" :content blk}])
-      (when-let [blk (some-> (oracle/system-prompt-block) str str/trim not-empty)]
         [{:role "system" :content blk}])))
     (catch Exception e
       (binding [*out* *err*]

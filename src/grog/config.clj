@@ -216,30 +216,6 @@
   (or (some-> (get-in (effective-llm-cfg) [:provider-name]) str str/trim not-empty)
       "OpenAI-compatible"))
 
-(defn oracle-url
-  "`:oracle :url` — OpenAI-compatible chat completions POST URL."
-  []
-  (some-> (get-in (grog) [:oracle :url]) str str/trim not-empty))
-
-(defn oracle-model
-  "`:oracle :model` — remote model id (e.g. grok-2-latest)."
-  []
-  (some-> (get-in (grog) [:oracle :model]) str str/trim not-empty))
-
-(defn oracle-max-tokens
-  "`:oracle :max-tokens` — default 4096, capped at 128000."
-  []
-  (let [v (get-in (grog) [:oracle :max-tokens])]
-    (if (and (number? v) (pos? (long v)))
-      (min 128000 (long v))
-      4096)))
-
-(defn oracle-temperature
-  "`:oracle :temperature` — default 0.5."
-  []
-  (let [v (get-in (grog) [:oracle :temperature])]
-    (if (number? v) (double v) 0.5)))
-
 (defonce ^:private !active-project (atom nil))
 
 (defn active-project-name
@@ -431,9 +407,9 @@
   (:babashka (grog) {}))
 
 (defn babashka-configured?
-  "True when `:babashka :enabled` is true — exposes `run_babashka` to the model."
+  "Babashka is always enabled (a given) — `run_babashka` is exposed to the model."
   []
-  (true? (:enabled (babashka-cfg))))
+  true)
 
 (defn babashka-command
   "Shell command for Babashka (default `bb`). Override with `:babashka :command`."

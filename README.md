@@ -23,15 +23,14 @@ Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the mode
 
 | Topic | Detail |
 | --- | --- |
-| **Local-first** | Workspace files, skills, and memory live on disk; remote calls are explicit (Brave, oracle, `with_api_key`, Babashka when enabled). |
+| **Local-first** | Workspace files, skills, and memory live on disk; remote calls are explicit (Brave, `with_api_key`). |
 | **Modest hardware** | Useful with smaller models (e.g. Qwen3.5-class on ~8 GB VRAM); tool use still buys you a lot. |
 | **GUI** | Swing desktop app (`clojure -M:gui` or `./grog-ui`): streaming transcript, model picker, appearance settings, integrated terminal, export. |
-| **Oracle** | Optional stronger remote model (`:oracle` + keyring); the stack is wired so the agent can escalate when stuck—see SOUL for policy. |
 | **Projects** | `/project` ties **`memory_*`** tools and dialog logging into per-project trees—iterable, restartable workstreams. |
 | **Jobs** | With **`:edn-store`**, **`/jobs`** enqueues goals per project; Grog runs the full tool loop with **SOUL + project dialog** loaded, writes **findings** under `grog-jobs/` in the store, and appends to **`thread.edn`**. |
 | **Chron** | **`:chron`** runs scheduled **instruction** strings on a timer **while chat is running** (stderr banner, same LLM+tools stack); respects **active project** and thread context when set. |
 | **Skills** | Packaged `skill.edn` + `SKILL.md` directories; the model can list, read, create, and update skills. |
-| **Babashka** | Optional **`run_babashka`** for short scripted side effects (`bb` on `PATH`). |
+| **Babashka** | Always-on **`run_babashka`** for short scripted Clojure transforms (`bb` on `PATH`). |
 
 Tool paths are taken as given — absolute, or relative to the repo/conversation root. There is no workspace-root containment check.
 
@@ -67,11 +66,10 @@ Active set depends on `grog.edn`. Use **`/tools`** in chat for the live list and
 | --- | --- |
 | **Files** | `read_office_document`, `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings` |
 | **Web** | `brave_web_search` — Brave Search API key in OS keyring |
-| **Stronger model** | `oracle` — OpenAI-style chat completions; `:oracle` + **`ORACLE_API_KEY`** |
 | **HTTP + secrets** | `with_api_key` — allowlisted keyring names + optional URL prefixes |
 | **Skills** | `list_skills`, `read_skill`, `save_skill`, `delete_skill` — needs `:skills {:roots […]}` |
 | **Memory** | `memory_save`, `memory_load`, `memory_list_keys`, `memory_namespaces`, `memory_create_namespace`, `memory_delete` — needs `:edn-store {:root "…"}` |
-| **Scripts** | `run_babashka` — needs `:babashka {:enabled true}` and **`bb`** on `PATH` |
+| **Scripts** | `run_babashka` — always enabled; needs **`bb`** on `PATH` |
 | **MCP** | **`:edn-store`** + **`/mcp`** or **`mcp_*`** tools; persisted **`grog-mcp/servers.edn`** (project-scoped); after **`mcp_reload`**, tools **`<id>_<tool>`** |
 
 </details>
@@ -111,7 +109,7 @@ Config merges in order:
 
 **Optional:** `:llm` also accepts `:max-context-tokens` (drop oldest non-system messages before each request; default 200000, set `nil` to disable), `:max-tool-result-chars` (truncate oversized tool outputs; default 50000, set `nil` to disable), `:temperature`, `:max-tokens`, `:api-key` (inline or `${LLM_API_KEY}` env-var interpolation; prefer OS keyring `LLM_API_KEY`), `:conn-timeout-sec` (default 60), `:socket-timeout-sec` (default 300), `:debug-payload` / `:debug-response` (print to stderr), `:provider-name` (human-readable label), and `:extra-payload` (provider-specific fields merged into every request — e.g. OpenRouter `{:transforms ["middle-out"]}` for context compression).
 
-**Optional:** `:soul`, `:skills`, `:edn-store`, `:oracle`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
+**Optional:** `:soul`, `:skills`, `:edn-store`, Brave / `:with-api-key`, `:babashka`, **`:chron`**, **`:jobs`**, `:appearance`, `:cli` (history, thinking, streaming, markdown, optional **`chat-tool-loop-limit`** only).
 
 ### MCP servers
 
@@ -155,7 +153,7 @@ Both use the **same agent stack** as normal chat (`run-tool-loop-on-messages`) a
 - **Findings:** `grog-memory/Projects/<project>/grog-jobs/findings-<job-id>.edn`.
 - **Commands:** `/jobs add <goal>`, `/jobs list`, `/jobs next`, `/jobs status` (see **`/help`**).
 
-Each run loads **SOUL, skills, oracle hints, and recent project dialog** into the message list before the job prompt.
+Each run loads **SOUL, skills, and recent project dialog** into the message list before the job prompt.
 
 ### Chron (`:chron`)
 
@@ -174,7 +172,7 @@ Each run loads **SOUL, skills, oracle hints, and recent project dialog** into th
 
 Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.edn`**. Adjust model names and paths; merge order is `resources/` → user config → this file.
 
-**Secrets** (Brave, oracle, `with_api_key`) live in the OS keyring — set with **`/secret <ACCOUNT> <value>`** in chat, never in this file.
+**Secrets** (Brave, `with_api_key`) live in the OS keyring — set with **`/secret <ACCOUNT> <value>`** in chat, never in this file.
 
 ```clojure
 {:soul {:path "SOUL.md"}
@@ -217,17 +215,12 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
  ;;         :tasks [{:id "heartbeat" :every-minutes 60 :instruction "Short status check; use memory_* if useful."}]}
 
  ;; Optional: dialog turns loaded for /jobs and chron (default 40)
- ;; :jobs {:max-thread-turns 40}
-
- ;; Optional: xAI Grok (or any OpenAI-style chat/completions URL) for the `oracle` tool
- ;; Keyring: ORACLE_API_KEY — /secret ORACLE_API_KEY <token>
- :oracle {:url "https://api.x.ai/v1/chat/completions"
-          :model "grok-3"
-          :max-tokens 4096
-          :temperature 0.5}
-
- ;; Optional: Babashka scripts (`bb` on PATH; enable with :enabled true)
- :babashka {:enabled true}
+  ;; :jobs {:max-thread-turns 40}
+ 
+ 
+  ;; Babashka is always enabled — only the command is configurable (default `bb`)
+  :babashka {;; :command "bb"
+             }
 
  ;; Optional: MCP — not in this file; needs :edn-store, then /mcp or mcp_* tools (see README "MCP servers")
 
@@ -277,10 +270,6 @@ chat> /help
 1. [Brave Search API](https://brave.com/search/api/) subscription.  
 2. Store token: service **`grog`**, account **`BRAVE_SEARCH_API`** — e.g. **`/secret BRAVE_SEARCH_API <token>`** in chat, or your OS secret UI (e.g. GNOME Seahorse).  
 3. Grog uses [java-keyring](https://github.com/javakeyring/java-keyring).
-
-### Optional: Oracle
-
-Set `:oracle` with `:url` (e.g. `…/v1/chat/completions`) and `:model`; put the API key in the keyring as **`ORACLE_API_KEY`** (`/secret` in chat).
 
 ### Optional: LLM API key
 

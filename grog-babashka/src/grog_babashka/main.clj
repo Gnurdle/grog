@@ -7,9 +7,8 @@
   `grog.babashka` (same contract: script reads problem input from **stdin**, writes
   the answer to **stdout**, must not mutate the host; Python is off-limits).
 
-  * Enable in `grog.edn` `:babashka {:enabled true}` (like the original) or with env
-    `GROG_BABASHKA_ENABLED=true`.
-  * `bb` must be on PATH (override with `:babashka :command` / env `GROG_BABASHKA_CMD`).
+  * Babashka is a **given** — always enabled (no config toggle). `bb` must be on
+    PATH (override the command with env `GROG_BABASHKA_CMD`).
   * Tool: `run_babashka` — `script` (required), `stdin`, `timeout_seconds`.
 
   ECA discovers this over stdio like the other grog servers:
@@ -38,12 +37,6 @@
 ;; ---------------------------------------------------------------------------
 ;; Configuration (ported from grog.config babashka-*)
 ;; ---------------------------------------------------------------------------
-
-(defn- babashka-enabled? []
-  (or (true? (get-in (try (clojure.edn/read-string (slurp "grog.edn" :encoding "UTF-8"))
-                          (catch Exception _ {}))
-                     [:babashka :enabled]))
-      (= "true" (str/trim (str (System/getenv "GROG_BABASHKA_ENABLED"))))))
 
 (defn- babashka-command []
   (or (some-> (System/getenv "GROG_BABASHKA_CMD") str str/trim not-empty)
@@ -146,38 +139,36 @@
 
 (defn- run-babashka!
   [arguments]
-  (if-not (babashka-enabled?)
-    (json/generate-string
-     {:error "run_babashka is disabled"
-      :hint "Set :babashka {:enabled true} in grog.edn (or GROG_BABASHKA_ENABLED=true) and 'bb' on PATH."})
-    (let [m (parse-json-args arguments)
-          script (str-trim (or (:script m) (get m "script")))
-          stdin-str (str (or (:stdin m) (get m "stdin") ""))
-          timeout-sec (let [x (or (:timeout_seconds m) (get m "timeout_seconds"))]
-                        (if (and (number? x) (pos? (long x)))
-                          (min max-timeout-sec (long x))
-                          default-timeout-sec))
-          bb-cmd (babashka-command)]
-      (cond
-        (str/blank? script)
-        (json/generate-string {:error "script is required"})
+  (let [m (parse-json-args arguments)
+        script (str-trim (or (:script m) (get m "script")))
+        stdin-str (str (or (:stdin m) (get m "stdin") ""))
+        timeout-sec (if-let [x (or (:timeout_seconds m) (get m "timeout_seconds"))]
+                      (if (and (number? x) (pos? (long x)))
+                        (min max-timeout-sec (long x))
+                        default-timeout-sec)
+                      default-timeout-sec)
+        bb-cmd (babashka-command)]
+    (cond
+      (str/blank? script)
+      (json/generate-string {:error "script is required"})
 
-        (> (count script) max-script-chars)
-        (json/generate-string {:error "script too long"
-                               :max_chars max-script-chars
-                               :chars (count script)})
+      (> (count script) max-script-chars)
+      (json/generate-string {:error "script too long"
+                             :max_chars max-script-chars
+                             :chars (count script)})
 
-        :else
-        (let [sandbox ^File (.toFile (Files/createTempDirectory "grog-bb-" (into-array java.nio.file.attribute.FileAttribute [])))
-              script-file (io/file sandbox "script.clj")]
-          (try
-            (spit script-file script :encoding "UTF-8")
-            (run-bb-process! bb-cmd script-file sandbox stdin-str timeout-sec max-stdout-chars max-stderr-chars)
-            (finally
-              (delete-tree! sandbox))))))))
+      :else
+      (let [sandbox ^File (.toFile (Files/createTempDirectory "grog-bb-" (into-array java.nio.file.attribute.FileAttribute [])))
+            script-file (io/file sandbox "script.clj")]
+        (try
+          (spit script-file script :encoding "UTF-8")
+          (run-bb-process! bb-cmd script-file sandbox stdin-str
+                           timeout-sec max-stdout-chars max-stderr-chars)
+          (finally
+            (delete-tree! sandbox)))))))
 
 ;; ---------------------------------------------------------------------------
-;; MCP server wiring (same pattern as grog-search / grog-oracle)
+;; MCP server wiring (same pattern as grog-search / grog-memory)
 ;; ---------------------------------------------------------------------------
 
 (defn- text-content [^String s] (McpSchema$TextContent. s))

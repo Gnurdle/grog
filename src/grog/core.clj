@@ -18,7 +18,6 @@
             [grog.memory-tools :as memory-tools]
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
-            [grog.oracle :as oracle]
             [grog.pager :as pager]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
@@ -591,11 +590,6 @@
             (if (str/blank? q)
               (tool-call-println! "grog: tool" nm "(query missing or empty)")
               (tool-call-println! "grog: tool" nm (pr-str q))))
-          (= nm "oracle")
-          (let [q (:query (oracle/parse-oracle-args args))]
-            (if (str/blank? q)
-              (tool-call-println! "grog: tool" nm "(query missing or empty)")
-              (tool-call-println! "grog: tool" nm (pr-str (if (> (count q) 120) (str (subs q 0 120) "…") q)))))
           (#{"read_office_document" "read_pdf_document" "ocr_pdf_document"
              "analyze_pdf_line_drawings"} nm)
           (if-let [p (some-> (fs/tool-log-path args) not-empty)]
@@ -645,7 +639,6 @@
           (= nm "read_skill") (skills/run-read-skill! args)
           (= nm "save_skill") (skills/run-save-skill! args)
           (= nm "delete_skill") (skills/run-delete-skill! args)
-          (= nm "oracle") (oracle/run-oracle! args)
           (= nm "with_api_key") (wkey/run-with-api-key! args)
           (= nm "run_babashka") (babashka/run-babashka! args)
           (mcp/mcp-admin-tool-name? nm) (mcp/run-mcp-admin-tool! nm args)
@@ -654,7 +647,6 @@
           (str "Unknown tool \"" nm "\". Available: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings, assoc_store, assoc_get, assoc_keys, assoc_search"
                (when (config/skills-configured?) ", list_skills, read_skill, save_skill, delete_skill")
                (when (brave/brave-search-configured?) ", brave_web_search")
-               (when (oracle/oracle-configured?) ", oracle")
                (when (config/with-api-key-configured?) ", with_api_key")
                (when (config/babashka-configured?) ", run_babashka")
                (when (edn-store/configured?)
@@ -689,8 +681,6 @@
                (assoc-memory/tool-specs)
                (when (brave/brave-search-configured?)
                  [(brave/tool-spec)])
-               (when (oracle/oracle-configured?)
-                 [(oracle/tool-spec)])
                (when (edn-store/configured?)
                  (memory-tools/tool-specs))
                (when (config/skills-configured?)
@@ -738,7 +728,7 @@
   (println "Tools in this session (same set sent to the model):")
   (doseq [{:keys [name role]} (active-tool-rows)]
     (println " " name "—" role))
-  (println "Optional tools: grog.edn (:oracle, :with-api-key, :edn-store, …); MCP via edn-store + /mcp or mcp_* (cached tools/list, lazy server processes); Brave/oracle/with_api_key use the OS keyring (/secret)."))
+  (println "Optional tools: grog.edn (:with-api-key, :edn-store, …); MCP via edn-store + /mcp or mcp_* (cached tools/list, lazy server processes); Brave/with_api_key use the OS keyring (/secret)."))
 
 (defn- handle-tools-command! [line]
   (when (re-matches #"(?i)^/tools$" (str/trim line))
@@ -763,7 +753,7 @@
 
 (defn- chat-with-tools!
   "Run /v1/chat/completions, executing `tool_calls` (Office/PDF, OCR, BoofCV lines, optional Brave,
-  optional oracle tool, optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
+  optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
   ([messages] (chat-with-tools! messages {}))
   ([messages opts]
    (let [answer-prefix (or (:answer-prefix opts) (chat-answer-prefix))
@@ -865,12 +855,6 @@
            " (auth: api-key)"
            " (auth: no key)"))))
 
-(defn- oracle-status-line []
-  (if (oracle/oracle-configured?)
-    "oracle: enabled (remote model per :oracle in grog.edn — use sparingly per SOUL.md)"
-    (str "oracle: off — set :oracle {:url … :model …} and keyring "
-         (pr-str secrets/oracle-api-account) " (or /secret)")))
-
 (defn- with-api-key-status-line []
   (if (config/with-api-key-configured?)
     (str "with_api_key: enabled — allowed secret names " (pr-str (vec (config/with-api-key-allowed-accounts)))
@@ -897,10 +881,9 @@
     "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under repo root"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
     "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
-    "API keys (Brave, oracle): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API and ORACLE_API_KEY; set via /secret in chat"
-    "          :oracle {:url \"https://…/v1/chat/completions\" :model \"…\"} — optional remote model for tool oracle; :max-tokens, :temperature"
+    "API keys (Brave): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API; set via /secret in chat"
     "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
-    "Tools: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings (Office/PDF/OCR/BoofCV); list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; oracle if :oracle + ORACLE_API_KEY set; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka if :babashka :enabled (Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
+    "Tools: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings (Office/PDF/OCR/BoofCV); list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka (always enabled; Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
     "          MCP: servers.edn + tools-cache.edn under grog-memory/grog-mcp/ (or Projects/<project>/…) — /mcp or mcp_* tools; mcp_reload (or set/servers_set) re-probes servers and refreshes the cache without leaving subprocesses running."
     "          :chron {:enabled true :tasks [{:id \"…\" :every-minutes 30 :instruction \"…\"}]} — periodic LLM+tools while chat runs (stderr banner); optional :interval-seconds"
     "          :jobs {:max-thread-turns 40} — project dialog turns injected for /jobs and chron (default 40)"
@@ -1300,7 +1283,6 @@
     (println (secrets/startup-status-line))
     (println (brave-status-line))
     (println (llm-status-line))
-    (println (oracle-status-line))
     (println (with-api-key-status-line))
     (println (fs/startup-status-line))
     (println (edn-store/startup-status-line))

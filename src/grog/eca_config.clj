@@ -216,11 +216,6 @@
                     "clojure -M:mcp -m grog-search.main"
                     nil)
 
-     "grog-oracle"
-     (shell-wrapped (str root "/grog-oracle")
-                    "clojure -M:mcp -m grog-oracle.main"
-                    nil)
-
      "grog-babashka"
      (shell-wrapped (str root "/grog-babashka")
                     "clojure -M:mcp -m grog-babashka.main"

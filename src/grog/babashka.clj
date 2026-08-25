@@ -49,8 +49,7 @@
          "(PATH, JAVA_HOME, temp vars; HOME set to that directory). **Contract:** read problem input from **stdin** "
          "(Grog passes `stdin` as the pipe contents; in code use `(slurp *in*)` or `*in*`), write the answer to **stdout** only; "
          "use stderr sparingly for errors. **Do not** rely on repo files, network, or mutating the host — SOUL forbids "
-         "\"mutating the universe\"; prefer pure data transforms. **Python is off-limits** — Babashka/Clojure only. "
-         "Enable in grog.edn: `:babashka {:enabled true}`.")
+         "\"mutating the universe\"; prefer pure data transforms. **Python is off-limits** — Babashka/Clojure only.")
     :parameters
     {:type "object"
      :required ["script"]
@@ -131,23 +130,19 @@
 
 (defn run-babashka!
   [arguments]
-  (if-not (cfg/babashka-configured?)
-    (json/generate-string
-     {:error "run_babashka is disabled"
-      :hint "Set :babashka {:enabled true} in grog.edn (see resources/grog.edn example)."})
-    (let [m (parse-json-args arguments)
-          script (str-trim (or (:script m) (get m "script")))
-          stdin-str (str (or (:stdin m) (get m "stdin") ""))
-          max-script (cfg/babashka-max-script-chars)
-          max-out (cfg/babashka-max-stdout-chars)
-          max-err (cfg/babashka-max-stderr-chars)
-          timeout-sec (let [x (or (:timeout_seconds m) (get m "timeout_seconds"))]
-                        (if (and (number? x) (pos? (long x)))
-                          (min (cfg/babashka-max-timeout-sec) (long x))
-                          (cfg/babashka-default-timeout-sec)))
-          bb-cmd (cfg/babashka-command)]
-      (cond
-        (str/blank? script)
+  (let [m (parse-json-args arguments)
+        script (str-trim (or (:script m) (get m "script")))
+        stdin-str (str (or (:stdin m) (get m "stdin") ""))
+        max-script (cfg/babashka-max-script-chars)
+        max-out (cfg/babashka-max-stdout-chars)
+        max-err (cfg/babashka-max-stderr-chars)
+        timeout-sec (let [x (or (:timeout_seconds m) (get m "timeout_seconds"))]
+                      (if (and (number? x) (pos? (long x)))
+                        (min (cfg/babashka-max-timeout-sec) (long x))
+                        (cfg/babashka-default-timeout-sec)))
+        bb-cmd (cfg/babashka-command)]
+    (cond
+      (str/blank? script)
         (json/generate-string {:error "script is required"})
 
         (> (count script) max-script)
@@ -162,11 +157,9 @@
             (spit script-file script :encoding "UTF-8")
             (run-bb-process! bb-cmd script-file sandbox stdin-str timeout-sec max-out max-err)
             (finally
-              (delete-tree! sandbox))))))))
+              (delete-tree! sandbox)))))))
 
 (defn startup-status-line
   []
-  (if (cfg/babashka-configured?)
-    (str "run_babashka: enabled — command " (pr-str (cfg/babashka-command))
-         " (empty temp cwd, reduced env; :babashka in grog.edn)")
-    "run_babashka: off — set :babashka {:enabled true} in grog.edn"))
+  (str "run_babashka: enabled — command " (pr-str (cfg/babashka-command))
+       " (empty temp cwd, reduced env; babashka is a given)"))

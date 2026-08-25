@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe an MCP stdio server: send initialize + tools/list, print tool names.
 set -e
-SRV="$1"  # e.g. grog-oracle or grog-babashka
+SRV="$1"  # e.g. grog-babashka or grog-search
 DIR="/d/gni/grog/${SRV}"
 cd "$DIR"
 #

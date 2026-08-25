@@ -64,30 +64,12 @@
   []
   (sort (map name (keys (or (:profiles (llm-config)) {})))))
 
-;; --- oracle config ---------------------------------------------------------
-
-(defn oracle-config
-  "The current :oracle map from grog.edn (empty if absent)."
-  []
-  (or (:oracle (read-map)) {}))
-
-(defn save-oracle!
-  "Persist the whole :oracle map into grog.edn atomically, preserving other keys."
-  [m]
-  (persist! #(assoc % :oracle m))
-  m)
-
 (defn save-eca-model!
   "Persist the GUI/ECA model as `:eca :model` in grog.edn atomically, preserving
   every other key — this is the model the GUI's ECA chat uses."
   [m]
   (persist! #(assoc-in % [:eca :model] (str m)))
   m)
-
-(defn save-oracle-fields!
-  "Merge `updates` into the saved :oracle config."
-  [updates]
-  (save-oracle! (merge (oracle-config) updates)))
 
 ;; --- fetching available models (OpenRouter + local Ollama) ------------------
 
