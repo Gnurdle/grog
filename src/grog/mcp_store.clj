@@ -1,5 +1,5 @@
 (ns grog.mcp-store
-  "Persist MCP server definitions and cached `tools/list` under `:edn-store` (project-scoped like `memory_*`).
+  "Persist MCP server definitions and cached `tools/list` under `:edn-store` (project-scoped like the kv-store).
   Files: `grog-memory/grog-mcp/servers.edn`, `grog-memory/grog-mcp/tools-cache.edn`
   (or under `Projects/<project>/grog-mcp/` when a project is active)."
   (:require [clojure.string :as str]

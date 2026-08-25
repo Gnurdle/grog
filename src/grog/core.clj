@@ -15,7 +15,6 @@
             [grog.jobs :as jobs]
             [grog.edn-store :as edn-store]
             [grog.md-stream :as md-stream]
-            [grog.memory-tools :as memory-tools]
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
             [grog.pager :as pager]
@@ -596,9 +595,6 @@
           (if-let [p (some-> (fs/tool-log-path args) not-empty)]
             (tool-call-println! "grog: tool" nm (pr-str p))
             (tool-call-println! "grog: tool" nm "(path missing or empty)"))
-          (#{"memory_save" "memory_load" "memory_list_keys" "memory_namespaces"
-             "memory_create_namespace" "memory_delete"} nm)
-          (tool-call-println! "grog: tool" nm (pr-str (memory-tools/tool-log-summary nm args)))
           (#{"assoc_store" "assoc_get" "assoc_keys" "assoc_search"} nm)
           (tool-call-println! "grog: tool" nm (pr-str (assoc-memory/tool-log-summary nm args)))
           (#{"list_skills" "read_skill" "save_skill" "delete_skill"} nm)
@@ -626,12 +622,6 @@
           (= nm "read_pdf_document") (fs/run-read-pdf-document! args)
           (= nm "ocr_pdf_document") (fs/run-ocr-pdf-document! args)
           (= nm "analyze_pdf_line_drawings") (boofcv-pdf/run-analyze-pdf-line-drawings! args)
-          (= nm "memory_save") (memory-tools/run-memory-save! args)
-          (= nm "memory_load") (memory-tools/run-memory-load! args)
-          (= nm "memory_list_keys") (memory-tools/run-memory-list-keys! args)
-          (= nm "memory_namespaces") (memory-tools/run-memory-namespaces! args)
-          (= nm "memory_create_namespace") (memory-tools/run-memory-create-namespace! args)
-          (= nm "memory_delete") (memory-tools/run-memory-delete! args)
           (= nm "assoc_store") (assoc-memory/run-assoc-store! args)
           (= nm "assoc_get") (assoc-memory/run-assoc-get! args)
           (= nm "assoc_keys") (assoc-memory/run-assoc-keys! args)
@@ -651,7 +641,7 @@
                (when (config/with-api-key-configured?) ", with_api_key")
                (when (config/babashka-configured?) ", run_babashka")
                (when (edn-store/configured?)
-                 ", memory_save, memory_load, memory_list_keys, memory_namespaces, memory_create_namespace, memory_delete; mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload; <serverId>_<toolName> from cached MCP tools/list (process starts on first call)")
+                 ", mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload; <serverId>_<toolName> from cached MCP tools/list (process starts on first call)")
                "."))))))
 
 (defn- tool-result-messages [tool-calls]
@@ -682,8 +672,6 @@
                (assoc-memory/tool-specs)
                (when (brave/brave-search-configured?)
                  [(brave/tool-spec)])
-               (when (edn-store/configured?)
-                 (memory-tools/tool-specs))
                (when (config/skills-configured?)
                  [(skills/list-skills-tool-spec)
                   (skills/read-skill-tool-spec)
@@ -754,7 +742,7 @@
 
 (defn- chat-with-tools!
   "Run /v1/chat/completions, executing `tool_calls` (Office/PDF, OCR, BoofCV lines, optional Brave,
-  optional memory_* when :edn-store is set; with active project, dialog turns append to edn-store) until a text reply or error."
+  optional assoc_* kv-store; with active project, dialog turns append to the project home) until a text reply or error."
   ([messages] (chat-with-tools! messages {}))
   ([messages opts]
    (let [answer-prefix (or (:answer-prefix opts) (chat-answer-prefix))
@@ -879,12 +867,12 @@
     "          :llm {:extra-payload {:transforms [\"middle-out\"]} — provider-specific fields merged into every request payload"
     "          :llm {:profiles {:local {:model \"qwen2.5-coder:7b-instruct\" :url \"http://localhost:11434/v1\"} …}} — named model presets; switch with /model <profile>"
     "Optional: paths resolve against the repo root — grog.home property, GROG_HOME env, or cwd (exported by grog-ui); SOUL path resolves here"
-    "          :edn-store {:root \"edn-store\"} — optional .edn tree + memory_* tools; root under repo root"
+    "          :edn-store {:root \"edn-store\"} — optional .edn tree (MCP admin config); root under repo root"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
     "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
     "API keys (Brave): OS keyring only — service \"grog\", accounts BRAVE_SEARCH_API; set via /secret in chat"
     "          :with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]} — tool with_api_key (HTTP + keyring secret via secret_method; legacy :allowed-accounts); each name must exist in /secret; optional :allowed-url-prefixes, :max-response-chars, :allow-insecure-http"
-    "Tools: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings (Office/PDF/OCR/BoofCV); list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka (always enabled; Babashka bb on PATH); memory_* and MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
+    "Tools: read_office_document, read_pdf_document, ocr_pdf_document, analyze_pdf_line_drawings (Office/PDF/OCR/BoofCV); list_skills/read_skill/save_skill/delete_skill if :skills :roots set; brave_web_search if configured; with_api_key if :with-api-key :allowed-secrets (or :allowed-accounts) set; run_babashka (always enabled; Babashka bb on PATH); assoc_store/get/keys/delete/search kv-store (per active project); MCP admin tools (mcp_config_load, mcp_config_save, mcp_servers_set, mcp_reload) if :edn-store is set; MCP tools use cached tools/list (tools-cache.edn); a server process starts on first tools/call for that server."
     "          MCP: servers.edn + tools-cache.edn under grog-memory/grog-mcp/ (or Projects/<project>/…) — /mcp or mcp_* tools; mcp_reload (or set/servers_set) re-probes servers and refreshes the cache without leaving subprocesses running."
     "          :chron {:enabled true :tasks [{:id \"…\" :every-minutes 30 :instruction \"…\"}]} — periodic LLM+tools while chat runs (stderr banner); optional :interval-seconds"
     "          :jobs {:max-thread-turns 40} — project dialog turns injected for /jobs and chron (default 40)"
@@ -913,7 +901,7 @@
     "  /paste               — enter multi-line input mode (blank line submits; Ctrl-D cancels)"
     "  /tools — list tool names plus a one-line role from each tool’s description (reflects current grog.edn)"
     "  /skills — list skills when :skills :roots is set; /skills <id> — print SKILL.md (same as read_skill)"
-    "  /project — list project dirs (active = *); /project <name> — switch active project (always in one)"
+    "  /project — list project dirs (active = *); /project <name> — switch; /project new <name> — create+switch; /project rm <name> — delete"
     "  /jobs — add|list|next|status (needs :edn-store + active project); queue in memory namespace grog-jobs under the project"
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
@@ -1132,17 +1120,36 @@
 (defn- handle-project-command! [line]
   (when-let [[_ r] (re-matches #"(?i)^/project(?:\s+(.*))?$" (str/trim line))]
     (let [tail (str/trim (or r ""))]
-      (if (str/blank? tail)
+      (cond
         ;; no arg -> list projects (always-in-a-project; no "leave" mode)
+        (str/blank? tail)
         (let [names (projects/list-project-names)]
           (if (seq names)
             (do (println "Projects (under" (.getPath (projects/projects-home)) "), active ="
                          (pr-str (projects/project-name)) ":")
                 (doseq [n names] (println " " n (when (= n (projects/project-name)) "(active)")))
-                (println "Use /project <name> to switch."))
+                (println "Use /project <name> to switch; /project new <name> to create; /project rm <name> to delete."))
             (println "No projects yet (nothing under" (.getPath (projects/projects-home))
-                     "). /project <name> to start one.")))
+                     "). /project new <name> to start one.")))
+
+        ;; /project rm <name> -> delete (refuses the active project)
+        (re-matches #"(?i)^rm\s+\S.*$" tail)
+        (let [[_ nm] (re-matches #"(?i)^rm\s+(\S+).*$" tail)
+              res (projects/delete-project! nm)]
+          (if (:deleted res)
+            (println "Deleted project:" (pr-str nm))
+            (println "Delete failed:" (:error res))))
+
+        ;; /project new <name> -> create + switch
+        (re-matches #"(?i)^new\s+\S.*$" tail)
+        (let [[_ nm] (re-matches #"(?i)^new\s+(\S+).*$" tail)]
+          (projects/create-project! nm)
+          (projects/set-project! nm)
+          (mcp/try-load-declared-config!)
+          (println "Created and switched to project:" (pr-str nm)))
+
         ;; /project <name> -> switch (persists last-used)
+        :else
         (do (projects/set-project! tail)
             (mcp/try-load-declared-config!)
             (println "Project:" (pr-str tail))))))

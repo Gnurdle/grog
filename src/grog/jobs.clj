@@ -108,8 +108,8 @@
                   user-msg (str "## Project job (automated)\n\n"
                                 "**Job id:** `" tid "`\n\n"
                                 "**Goal:**\n" goal "\n\n"
-                                "Work autonomously with tools. Persist durable notes under `memory_*` "
-                                "in this project as needed (e.g. namespace **`grog-jobs`**, key **`notes-" tid "`**).\n\n"
+                                "Work autonomously with tools. Persist durable notes via `assoc_store` "
+                                "in this project as needed (e.g. key **`grog-jobs-notes-" tid "`**).\n\n"
                                 "End with a clear **Findings** section: what you did, evidence, and outcomes.")
                   msgs (conj (vec base) {:role "user" :content user-msg})
                   runner (requiring-resolve 'grog.core/run-tool-loop-on-messages)

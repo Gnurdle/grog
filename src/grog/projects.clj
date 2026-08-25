@@ -78,11 +78,16 @@
     (catch Exception _ nil)))
 
 (defn set-project!
-  "Switch the session active project to `name` (persisting it as last-used)."
+  "Switch the session active project to `name`, eagerly creating its dir (and a
+  `project.edn` manifest if missing) and persisting it as last-used. A named
+  project always exists once switched to."
   [name]
-  (cfg/set-active-project! name)
-  (write-last-used! name)
-  name)
+  (let [n (str/trim (str name))]
+    (when (seq n)
+      (cfg/set-active-project! n)
+      (ensure-project-dir! n)
+      (write-last-used! n))
+    n))
 
 (defn- read-last-used
   "Last-used active project name from the marker file, or nil."
@@ -210,6 +215,43 @@
   (let [d (project-dir name)]
     (.mkdirs d)
     d))
+
+(defn create-project!
+  "Create a new project named `name`: creates its dir under the projects home and
+  writes an initial `project.edn` manifest (with `:name` and `:created`). Returns
+  the created dir. If the project already exists, returns its dir unchanged."
+  ^File [name]
+  (let [d (ensure-project-dir! name)
+        f (manifest-file d)]
+    (when-not (.exists f)
+      (write-manifest! name {:name (str name)
+                             :created (System/currentTimeMillis)}))
+    d))
+
+(defn delete-project!
+  "Delete a project by name: remove its directory under the projects home.
+  Refuses to delete the **active** project (grog must always be in a project) or a
+  blank name. Clears the last-used marker if it pointed at the deleted project.
+  Returns {:deleted true :name n} on success, or {:deleted false :error ...}."
+  [name]
+  (let [n (str/trim (str name))]
+    (cond
+      (str/blank? n)
+      {:deleted false :error "project name is empty"}
+
+      (= n (project-name))
+      {:deleted false :error "cannot delete the active project — switch projects first"}
+
+      :else
+      (let [d (project-dir n)]
+        (if-not (.isDirectory d)
+          {:deleted false :error (str "no such project: " n)}
+          (do
+            (doseq [^File f (reverse (file-seq d))]
+              (.delete f))
+            (when (= n (read-last-used))
+              (try (.delete (state-file)) (catch Exception _ nil)))
+            {:deleted true :name n}))))))
 
 (def ^:private text-extensions
   "Extensions treated as readable context text (lowercased)."
