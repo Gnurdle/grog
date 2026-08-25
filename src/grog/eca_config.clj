@@ -186,12 +186,7 @@
   []
   (let [root (grog-root)
         servers
-        {"grog-docs"
-     (shell-wrapped (str root "/grog-docs")
-                    "clojure -M:mcp -m grog-docs.main"
-                    nil)
-
-     "grog-imaging"
+        {"grog-imaging"
      (shell-wrapped (str root "/grog-imaging")
                     "clojure -M:mcp -m grog-imaging.main"
                     nil)
