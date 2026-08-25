@@ -161,10 +161,35 @@
     (.mkdirs d)
     (str d "/imap-accounts.json")))
 
-(defn- imap-accounts-data
-  "Account *metadata* from grog.edn's `:imap` (never secrets)."
+(defn imap-project-config-file
+  "Path to the email project's IMAP account metadata (project data, outside the
+  source tree). Sourced from the active project home under the `email` project."
+  ^String []
+  (let [d (io/file (str (System/getProperty "user.home") "/grog-projects/email/state"))]
+    (.mkdirs d)
+    (str d "/imap-accounts.json")))
+
+(defn imap-configured?
+  "True when IMAP account metadata is available — from the email project file, or
+  (backward compat) grog.edn's `:imap :accounts`."
   []
-  (let [accts (get-in (config/grog) [:imap :accounts])]
+  (boolean
+   (or (.exists (io/file (imap-project-config-file)))
+       (seq (get-in (config/grog) [:imap :accounts])))))
+
+(defn- imap-accounts-data
+  "Account *metadata* (never secrets). Source of truth is the email project file
+  at `~/grog-projects/email/state/imap-accounts.json`; falls back to grog.edn's
+  `:imap :accounts` for backward compatibility."
+  []
+  (let [project-file (io/file (imap-project-config-file))
+        accts (cond
+                (.exists project-file)
+                (try (some-> (json/parse-string (slurp project-file) true)
+                             :accounts)
+                     (catch Exception _ nil))
+                :else
+                (get-in (config/grog) [:imap :accounts]))]
     (when (seq accts)
       {:accounts (mapv #(clean-imap-account
                          (select-keys % [:name :host :port :tls :user :sasl
@@ -216,7 +241,7 @@
                     "clojure -M:mcp -m grog-babashka.main"
                     nil)}]
     (cond-> servers
-      (seq (get-in (config/grog) [:imap :accounts]))
+      (imap-configured?)
       (assoc "grog-imap"
              (shell-wrapped (str root "/grog-imap")
                             "clojure -M:mcp -m grog-imap.main"

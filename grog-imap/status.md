@@ -1,59 +1,120 @@
 # grog-imap — Status & Completion Plan
 
-> Last updated: Phase 1 complete. This file is the source of truth for where the
-> project stands and the ordered work needed to finish it. The single most
-> important architectural decision (confirmed by the user) is stated in
-> **Target architecture**.
+> Last updated: Phase 4 complete for Gmail (live MCP verification) + grog launch
+> integration. This file is the source of truth for where the project stands and
+> the ordered work needed to finish it. The single most important architectural
+> decision (confirmed by the user) is stated in **Target architecture**.
 
 ---
 
 ## 1. Where we are (current, verified state)
 
-**Phase 1 (protocol-layer correctness) is done and green.** Files present:
-`README.md`, `deps.edn`, `src/grog_imap/protocol.clj`, and `test/` with
-`protocol_test.clj`.
+**Phases 1 (protocol), 2 (public library), and 3 (MCP server) are done and green.**
+Files: `README.md`, `deps.edn`, `build.clj`, `build-uberjar.{sh,bat}`,
+`src/grog_imap/{protocol,core,oauth,main}.clj`, `docs/OAuth2.md`,
+`scripts/{gmail-smoke,oauth-authorize}.clj`, and `test/` with `support.clj`,
+`protocol_test.clj`, `core_test.clj`, `oauth_test.clj`, `main_test.clj`.
 
 ### What works (all verified)
 
-- **`protocol.clj` compiles clean** — `(require 'grog-imap.protocol)` succeeds with
-  **zero warnings, zero errors**.
-- **Full test suite green**: `clojure -M:test` → 17 tests / 90 assertions / 0 failures.
-  Covers tokenizer, parser, command encoding, literal handling, read/completion
-  plumbing, SASL AUTHENTICATE, and an **end-to-end round trip over real sockets**
-  (an in-process fake IMAP server): connect → greeting → login → select → list →
-  fetch → search → logout.
-- **All Phase-1 blockers fixed**:
-  1. Compile blocker — forward `(declare read-response* b64 utf8)`, and `connect`
-     no longer self-references its own `let` binding.
-  2. `read-response` single-read (was double-reading two lines).
-  3. `status` collision resolved — helper renamed to `completion-status`; the
-     mailbox `STATUS` command stays `status`; `ok?`/`throw-unless-ok` work.
-  4. `auth-command!` repaired — SASL LOGIN/PLAIN send base64 after each `+`
-     continuation; `authenticate-login`/`authenticate-plain` wire-verified.
-  5. `starttls` implemented — wraps the existing socket with SSLSocketFactory
-     (hostname verification on) instead of throwing "not yet wired".
-  6. `idle` now **fails loudly** (deferred for v1) instead of deadlocking.
-  7. `tokenize`/`parse-line` rewritten — the original had `recur` arity errors and
-     ran quoted strings through `finish-atom` (turning them into symbols).
+- **Both namespaces compile clean** — `(require 'grog-imap.protocol
+  'grog-imap.core)` succeeds with zero warnings/errors.
+- **Full test suite green**: `clojure -M:test` → 50 tests / 223 assertions /
+  0 failures. Coverage includes error paths (server NO response), read-only
+  EXAMINE, UID variants, envelope/body FETCH normalization, multi-literal
+  APPEND, OAuth refresh/XOAUTH2 wire, and the MCP tool surface (discovery,
+  allowlist, read-only gating, no-secret echoes). Live: TLS + greeting +
+  CAPABILITY verified against Dovecot / Gmail / MS365, and a full Gmail
+  LOGIN + LIST/EXAMINE/SEARCH round trip (non-destructive). `core.clj` has
+  **no MCP SDK dependency**.
+- **Protocol layer (Phase 1)** — tokenizer/parser, command encoding, literals,
+  SASL AUTHENTICATE, STARTTLS, single-read plumbing, all fixed and covered by
+  unit tests plus a real-socket round trip against an in-process fake server.
+- **Public library `grog-imap.core` (Phase 2)**:
+  - Config/account model — `load-config` reads `GROG_IMAP_CONFIG` (path or
+    inline JSON), keyword-normalized metadata, `:read-only` defaults true,
+    strict `get-account` allowlist (unknown names throw). No passwords in
+    metadata.
+  - Session registry — `connect-account!` / `ensure-connected!` (reconnect on
+    drop) / `connected?` (NOOP probe) / `disconnect-account!` /
+    `disconnect-all!`. Credentials injected by the caller as a map or a
+    `[account] -> credential` fn; never stored in config.
+  - Mailbox ops — `list-mailboxes` (decorated), `select`/`examine` (mailbox
+    state incl. unseen/uidnext/uidvalidity/read-write), `mailbox-status`,
+    `close-mailbox`, `expunge`, create/rename/delete/subscribe/unsubscribe.
+  - Message ops — `search`, `fetch`/`uid-fetch` (normalized message maps with
+    uid/flags/size/internal-date/envelope/body/header), `set-flags`,
+    `mark-read`, `mark-unread`, `delete-messages`, `move`/`copy` (+ UID),
+    `append`.
+- **Build** — `build.clj` + `build-uberjar.{sh,bat}` produce
+  `target/grog-imap.jar` (verified; `target/` is gitignored by the root
+  `.gitignore`).
+- **Shared test support** — `test/grog_imap/support.clj` hosts the in-process
+  fake IMAP server (multi-connection, handles multi-literal APPEND via a
+  lookahead timeout) used by both test namespaces.
+- **XOAUTH2 + OAuth2** — `protocol/authenticate-xoauth2` (SASL-IR initial
+  response + failure-continuation handling), `grog-imap.oauth` (zero-dep
+  java.net.http: authorize-url / interactive authorize! / refresh-token! /
+  cached access-token!), and `core` wiring for `:sasl :xoauth2` via
+  `{:access-token ...}` or `{:oauth {...} :refresh-token ...}`. TLS connect now
+  verifies the peer hostname.
+- **MCP server `grog-imap.main` (Phase 3)** — stdio server, a thin adapter
+  over `core` with 11 tools (`imap_list_accounts`, `imap_use_account`,
+  `imap_authenticate`, `imap_list_mailboxes`, `imap_search`, `imap_fetch`,
+  `imap_set_flags`, `imap_delete`, `imap_move`, `imap_copy`, `imap_append`).
+  Credentials resolved from `GROG_IMAP_PASSWORD_<NAME>` /
+  `GROG_IMAP_REFRESH_<NAME>` env (never tool args/results). Mutation tools are
+  rejected for read-only accounts (`:read-only` defaults true). Uberjar
+  compiles `grog-imap.main`.
 
-  Additionally fixed during the work: `parse-line`'s `(rest rest)` shadow bug,
-  the CR/LF handling in `read-crlf-line` (lines after the first were read empty),
-  `finish-atom` producing uppercase `:OK` (broke `ok?`), `parenthesized` defined
-  too late for `status` and double-uppercasing flag strings, `uid-search` emitting
-  duplicated criteria, `safe-astring?` allowing `"` in unquoted atoms, and dead
-  `write-line!`/`delete-mbox!` removed.
+### What is still missing
 
-### What is still missing (unchanged)
+- STARTTLS needs a live TLS-capable server to confirm the handshake (Phase 4).
+- **Real-mailbox login tests still need a user step** for non-Gmail providers
+  (secrets never transit the model context): a password for private Dovecot
+  `LOGIN`, or an OAuth registration + one-time `grog-imap.oauth/authorize!` for
+  a refresh token (required for MS-365, optional for Gmail). Gmail is verified
+  live both via `core` (LOGIN round trip) and via the MCP server.
 
-- **No `main.clj`** — the MCP stdio server does not exist yet.
-- **No high-level library layer** (`core.clj` — see architecture below).
-- No uberjar/build script (`build.clj`, `build-uberjar.{sh,bat}`).
-- STARTTLS code is implemented but only exercised for the pre-TLS command; needs
-  a live TLS-capable server to confirm the handshake (Phase 4 verification).
+### Phase 4 status (complete for Gmail + grog integration)
 
-Bottom line: **the protocol layer now builds, is correct per its tests, and
-proves the full connect→login→manage round trip in-process. Everything above it
-(main.clj, core.clj, packaging) remains per the plan.**
+- ✅ README refreshed for the 3-layer dual-use architecture.
+- ✅ `scripts/mcp-smoke.py` — minimal stdio MCP client (env or file credential).
+- ✅ Live MCP run against Gmail: initialize / tools-list / all read-only tools
+  OK, including `imap_search` and `imap_fetch` (returning real message data);
+  read-only gate rejected `imap_set_flags`.
+- ✅ **Bug fixes surfaced by live Gmail**: mailbox-scoped tools now auto-`SELECT`
+  `:mailbox` (default `INBOX`); `parenthesized` returns a `{:paren …}` marker so
+  data-item/flag lists are sent **inline** (Gmail rejects them as literals);
+  `safe-astring?` allows `:`/`,` so sequence-sets like `1:10` stay inline.
+- ✅ **Credential-by-file**: the MCP server's `credential-provider` reads
+  `~/.grog-imap-<name>` (or `GROG_IMAP_PASSWORD_FILE_<NAME>`) as a fallback —
+  the secret stays on disk, never in grog.edn/env results.
+- ✅ **Uberjar**: `java -cp target/grog-imap.jar clojure.main -m grog-imap.main`
+  serves the same tools and authenticates against live Gmail.
+- ✅ **grog launch wiring** (upstairs, `/d/gni/grog`): `grog-mcp-servers`
+  registers `grog-imap` conditionally when IMAP account metadata is available —
+  from the **email project** (`~/grog-projects/email/state/imap-accounts.json`)
+  or (backward compat) `:imap` in `grog.edn`. `imap-env` writes account
+  *metadata* to `~/.config/grog/imap-accounts.json` and sets `GROG_IMAP_CONFIG`.
+  Account data lives in the email project; grog.edn fallback is metadata only
+  (no password). Registered ids: imaging, memory, odoo, office, search, **imap**.
+
+### Remaining for other providers / deployment
+
+- Dovecot `LOGIN` and MS-365 `XOAUTH2` are implemented but need a credential
+  provisioned locally (password for Dovecot; OAuth `authorize!` for MS-365/Gmail
+  if not using an app password). Gmail (app password) is verified live.
+- STARTTLS needs a live TLS-capable server to confirm the handshake.
+- To go live in grog: restart grog/ECA so it regenerates the config and spawns
+  grog-imap; add the `imap_*` tool names to the ECA permanent-approval allowlist
+  if you want them to run without prompting.
+
+Bottom line: **the whole stack works end-to-end: `core` (no MCP SDK) is the
+contract, `main` is a thin MCP adapter over it, tests are green (50 tests / 223
+assertions), and Gmail was verified live through both `core` and the MCP wire.
+Phase 4 remains: re-verify Gmail search/fetch via the MCP after the
+auto-select fix, run the uberjar, and (optionally) test Dovecot/MS-365.**
 
 ---
 
@@ -155,7 +216,7 @@ exposed / are hidden for that account.
 **Exit criteria:** `(require 'grog-imap.protocol)` compiles clean; tests green;
 round-trip smoke test passes.
 
-### Phase 2 — Build the public library (`grog-imap.core`)
+### Phase 2 — Build the public library (`grog-imap.core`) — ✅ DONE
 1. **Account/config model**: `GROG_IMAP_CONFIG` JSON loader of account
    *metadata* (`{:accounts [{:name :host :port :tls :user}]}` — **no passwords in
    metadata**), strict named selection, lazy per-account connection. Credentials
@@ -179,7 +240,7 @@ round-trip smoke test passes.
 **Exit criteria:** app code can drive the whole inbox/manage surface through
 `grog-imap.core` with no MCP SDK on the classpath.
 
-### Phase 3 — MCP server on top (`grog-imap.main`)
+### Phase 3 — MCP server on top (`grog-imap.main`) — ✅ DONE
 1. Port the MCP boilerplate from `grog-odoo.main` (async tool spec helper, text
    content/result/error helpers, `kargs`, JSON encoding, stdio server,
    `-main` loop).
@@ -234,8 +295,9 @@ as MCP tools); whole surface tested; jar artifacts documented.
 
 ## 5. Immediate next step
 
-Phase 1 is complete: protocol layer compiles clean, tests green, and the in-process
-fake-server round trip proves connect → login → select → fetch → search → logout.
-The next step is **Phase 2 — build the public `grog-imap.core` library layer**
-(account/config model, session registry, and the high-level operations), which
-both app code and the eventual MCP server (`main.clj`, Phase 3) will call.
+Phases 1–3 are complete: protocol layer, public `core` library, and the MCP
+stdio server are all green (50 tests / 223 assertions). Gmail was verified live
+(LOGIN + read-only ops). The next step is **Phase 4 — docs, verification, and
+packaging**: refresh the README's stale Status/architecture sections, verify
+against the private Dovecot and (optionally) MS-365 accounts, and confirm the
+uberjar runs as `java -jar grog-imap.jar`.
