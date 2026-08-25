@@ -42,18 +42,22 @@
 
 (defn apply-chat-fonts!
   "Re-apply the current chat font to all panes; chat-background colour only to the
-  prompt box (the transcript stays transparent over the logo)."
+   prompt box (the transcript stays transparent over the logo). The transcript is
+   a custom-painted component — it reads the appearance directly each paint, so
+   it only needs a repaint (not a font change)."
   []
   (let [f (chat-font)]
     (doseq [[c kind] @chat-targets]
-      (.setFont c f)
-      (when (= kind :prompt)
-        ;; The prompt text area is intentionally kept NON-OPAQUE so FlatLaf's
-        ;; text UI can't paint its white opaque fill on Windows (it ignores the
-        ;; component background). The dark background is provided by the opaque
-        ;; JScrollPane viewport behind it, so we must NOT setOpaque(true) or
-        ;; setBackground here — that would reintroduce the white box.
-        (.setOpaque c false)))))
+      (if (instance? javax.swing.text.JTextComponent c)
+        (do (.setFont c f)
+            (when (= kind :prompt)
+              ;; The prompt text area is intentionally kept NON-OPAQUE so FlatLaf's
+              ;; text UI can't paint its white opaque fill on Windows (it ignores the
+              ;; component background). The dark background is provided by the opaque
+              ;; JScrollPane viewport behind it, so we must NOT setOpaque(true) or
+              ;; setBackground here — that would reintroduce the white box.
+              (.setOpaque c false)))
+        (.repaint c)))))
 
 (defn- rgb->awt [[r g b]] (Color. (int r) (int g) (int b)))
 

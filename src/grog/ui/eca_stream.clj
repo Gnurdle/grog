@@ -1,129 +1,108 @@
 (ns grog.ui.eca-stream
-  "Renders ECA `chat/contentReceived` content events onto the grog transcript pane.
+  "Renders ECA `chat/contentReceived` content events onto the rich transcript.
 
-  The caller binds `*out*` to `grog.ui.transcript/styled-writer` (which parses
-  ANSI SGR into styled runs on the EDT), then feeds each `:content` object to a
-  stateful renderer returned by `make-streamer`. Runs on the ECA reader thread;
-  the styled-writer marshals to the EDT.
+  Unlike the old ANSI printer, this feeds the *structured* transcript API
+  (grog.ui.transcript): assistant `text` streams into a live assistant message,
+  thinking streams into a live thinking section, and tool events are drawn as
+  tool cards. Interleaving (thinking → text → tool → text) is handled by closing
+  the current live message whenever the kind of content changes, so the markdown
+  renderer gets clean per-message blocks."
+  (:require [grog.ui.transcript :as transcript]))
 
-  Streamed thinking (`reasonText`) prints inline for a continuous feel; answer
-  `text` is rendered as Markdown blocks (GFM tables → box tables) via
-  `grog.md-stream`. Block boundaries (thinking start/finish, tool calls,
-  metadata) close any in-progress line."
-  (:require [clojure.string :as str]
-            [grog.appearance :as appearance]
-            [grog.md-stream :as md-stream]))
-
-(def ^:private ansi-reset "\u001B[0m")
-
-(defn- say! [& xs]
-  (apply println xs)
-  (flush))
-
-(defn- tool-banner
-  "A compact one-line banner for a tool-call content event."
-  [content]
-  (let [name (:name content)
-        server (:server content)
-        summary (:summary content)]
-    (str "── tool " name
-         (when (seq server) (str " [" server "]"))
-         (when (seq summary) (str " — " (str/trim summary)))
-         " ──")))
+(defn- content-id [content]
+  (or (:id content) (str (:name content))))
 
 (defn make-streamer
-  "A stateful renderer `(fn [content])`. Thinking (`reasonText`) and other
-  blocks stream inline as before, but answer `text` is fed through the shared
-  Markdown→ANSI streamer (`grog.md-stream`), so GFM pipe tables render as box
-  tables and complete blocks emit as they close (matching the CLI's
-  `:chat-stream-live-markdown` behavior)."
-  []
-  (let [open? (atom false)                      ; an inline streamed block is being printed
-        md    (atom (md-stream/empty-state))]   ; answer Markdown buffer
+  "A stateful renderer `(fn [content])`. `pane` is the transcript view from
+  `grog.ui.transcript/chat-pane`. Runs on the ECA reader thread; the
+  transcript API marshals to the EDT."
+  [pane]
+  (let [live (atom :none)]
     (fn [content]
       (when (map? content)
-        (let [close-line! (fn []
-                            (when @open?
-                              (print ansi-reset)
-                              (println)
-                              (flush)
-                              (reset! open? false)))
-              open-line! (fn [^String color]
-                           (when @open? (println) (flush))
-                           (reset! open? true)
-                           (print color)
-                           (flush))
-              emit-md! (fn [blocks]
-                         (doseq [b blocks]
-                           (close-line!)
-                           (print b)
-                           (flush)))]
+        (let [close-live! (fn []
+                            (transcript/finish-assistant! pane)
+                            (transcript/finish-thinking! pane)
+                            (reset! live :none))]
           (case (:type content)
             "text"
-            (let [txt (str (:text content))]
-              (when (seq txt)
-                (let [[emitted new-state] (md-stream/feed @md txt)]
-                  (reset! md new-state)
-                  (emit-md! emitted))))
+            (do
+              (when (not= :assistant @live)
+                (when (= :thinking @live)
+                  (transcript/finish-thinking! pane))
+                (reset! live :assistant))
+              (when-let [t (:text content)]
+                (transcript/append-assistant! pane (str t))))
 
             "reasonText"
-            (let [txt (str (:text content))]
-              (when (seq txt)
-                (when-not @open? (open-line! (appearance/ansi-thinking)))
-                (print txt)
-                (flush)))
+            (do
+              (when (not= :thinking @live)
+                (when (= :assistant @live)
+                  (transcript/finish-assistant! pane))
+                (transcript/start-thinking! pane)
+                (reset! live :thinking))
+              (when-let [t (:text content)]
+                (transcript/append-thinking! pane (str t))))
 
             "reasonStarted"
-            (do (close-line!)
-                (say! (appearance/ansi-thinking) "── thinking ──" ansi-reset))
+            (do (close-live!)
+                (transcript/start-thinking! pane)
+                (reset! live :thinking))
 
             "reasonFinished"
-            (close-line!)
+            (do (transcript/finish-thinking! pane)
+                (reset! live :none))
 
-            "toolCallPrepare" nil
+            "toolCallPrepare"
+            (do (close-live!)
+                (transcript/tool! pane
+                                  {:key (content-id content)
+                                   :name (:name content)
+                                   :server (:server content)
+                                   :args (or (:arguments content)
+                                            (:argumentsText content)
+                                            {})
+                                   :status :preparing}))
 
             "toolCallRun"
-            (do (close-line!)
-                (say! (appearance/ansi-tool-call) (tool-banner content)
-                      (when (true? (:manualApproval content)) "  ⚠ approval required")
-                      ansi-reset))
+            (do (close-live!)
+                (transcript/tool! pane
+                                  {:key (content-id content)
+                                   :name (:name content)
+                                   :server (:server content)
+                                   :args (or (:arguments content)
+                                            (:argumentsText content)
+                                            {})
+                                   :summary (:summary content)
+                                   :status :running}))
 
             "toolCallRunning"
-            (do (close-line!)
-                (say! (appearance/ansi-tool-call) (str "   running " (:name content) "…")
-                      ansi-reset))
+            (transcript/set-tool-status! pane (content-id content) :running nil)
 
             "toolCalled"
-            (do (close-line!)
-                (let [err (:error content)]
-                  (say! (appearance/ansi-tool-call)
-                        (str "   " (if err "✗" "✓") " " (:name content)
-                             (when-let [ms (:totalTimeMs content)] (str " (" ms "ms)")))
-                        ansi-reset)))
+            (transcript/set-tool-status! pane
+                                        (content-id content)
+                                        (if (:error content) :error :done)
+                                        (:totalTimeMs content))
 
             "toolCallRejected"
-            (do (close-line!)
-                (say! (appearance/ansi-tool-call) (str "   ✗ " (:name content) " rejected")
-                      ansi-reset))
+            (transcript/set-tool-status! pane (content-id content) :rejected nil)
 
             "metadata"
-            (do (close-line!)
-                (let [t (:title content)]
-                  (when (seq t) (say! (str "[" t "]")))))
+            (do (close-live!)
+                (when-let [t (:title content)]
+                  (transcript/append-status! pane (str "[" t "]"))))
 
             "flag"
-            (do (close-line!)
-                (let [t (:text content)]
-                  (when (seq t) (say! (str "[" t "]")))))
+            (do (close-live!)
+                (when-let [t (:text content)]
+                  (transcript/append-status! pane (str "[" t "]"))))
 
-            "usage" nil
+            "usage"
+            nil
 
             "progress"
             (when (= "finished" (:state content))
-              (close-line!)
-              ;; flush any answer Markdown still buffered at end of stream
-              (let [[emitted new-state] (md-stream/finish @md)]
-                (reset! md new-state)
-                (emit-md! emitted)))
+              (close-live!))
 
             nil))))))

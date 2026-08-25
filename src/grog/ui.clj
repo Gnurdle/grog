@@ -35,7 +35,7 @@
             [grog.ui.transcript :as transcript]
             [grog.ui.widgets :as widgets]
             [grog.soul :as soul])
-  (:import (java.awt Color Component Font Graphics Image Toolkit BorderLayout FlowLayout Point)
+  (:import (java.awt Color Component Font Graphics Graphics2D Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
            (javax.swing AbstractAction Box BoxLayout JComponent JDialog JFrame JLabel JList
                         JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
@@ -44,14 +44,7 @@
            (java.awt.datatransfer StringSelection)
            (java.awt.event KeyEvent MouseAdapter)))
 
-;; ANSI styling mirrors grog.core for plain mode (parsed by transcript writer).
-(def ^:private ansi-reset  "\u001B[0m")
-
-;; echoed user prompt colour (dark yellow)
-(def ^:private ansi-user "\u001B[38;2;165;138;25m")
-
-;; orange, italic startup snark (visible on the dark pane)
-(def ^:private ansi-snark "\u001B[38;2;255;150;40m\u001B[3m")
+;; Startup snark fallback when the soul pool is empty.
 (def ^:private chat-startup-snark-fallback
   "No snark pool — someone edited the wrong file. Pity.")
 
@@ -183,9 +176,16 @@
   f)
 
 (defn- background-panel
-  "Returns {:panel <JPanel that paints logo.jpg scaled-to-fill> :subdue! <fn [bool]>}.
-  `subdue!` darkens the logo under a heavy black scrim (used once chat starts so
-  the transcript stays readable)."
+  "Returns {:panel <JPanel painted with the chat background colour and the logo>
+  :subdue! <fn [bool]>}.
+
+  The panel paints the chat background colour (matching the transcript while it
+  is non-opaque), then, while the transcript is still in its splash state
+  (`:splash? true`, i.e. no conversation yet), the viewport stays transparent so
+  the centred logo shows through here. `subdue!` darkens the logo under a heavy
+  scrim once the first real message arrives (the transcript then paints its own
+  opaque background, so this primarily affects the moment of the transition).
+  Painted with the current chat background colour; the logo is aspect-fit scaled."
   []
   (let [img @logo-image
         subdued? (atom false)
@@ -193,12 +193,13 @@
     {:panel (reset! panel-ref
               (proxy [JPanel] []
                 (paintComponent [g]
-                  ;; 1) solid black base — fills any letterbox bands around the
-                  ;;    aspect-fit logo so there are no white margins
-                  (let [g2 (.create ^Graphics g)]
-                    (.setColor g2 (Color. 0 0 0))
+                  (let [^Graphics2D g2 (.create ^Graphics g)
+                        [r gr b] (appearance/rgb [:chat :background])]
+                    ;; 1) solid chat-background base — fills any letterbox bands
+                    ;;    around the aspect-fit logo so there are no mismatched margins
+                    (.setColor g2 (Color. (int r) (int gr) (int b)))
                     (.fillRect g2 0 0 (.getWidth this) (.getHeight this))
-                    ;; 2) centered logo scaled-to-fit (keeps aspect ratio)
+                    ;; 2) centred logo scaled-to-fit (keeps aspect ratio)
                     (when img
                       (let [iw (.getWidth ^Image img)
                             ih (.getHeight ^Image img)
@@ -221,7 +222,7 @@
                 (when-let [p @panel-ref] (.repaint p)))}))
 
 (defn- transparent!
-  "Make `c` non-opaque so the background logo shows through (no-op unless it's
+  "Make `c` non-opaque so the background color shows through (no-op unless it's
   a JComponent)."
   [^Component c]
   (when (instance? JComponent c)
@@ -275,9 +276,8 @@
   "Build the ECA event handler for the transcript: renders `chat/contentReceived`
   (streaming inline), flips `running?` when a prompt finishes, and prompts the
   user to approve/reject manual-approval tool calls. Runs on the ECA reader thread.
-  NOTE: a single `styled-writer` is shared across all events so its active ANSI
-  color persists between contiguous streamed chunks (a fresh writer per event
-  would reset the color to black mid-stream).
+  Rendering is driven by `grog.ui.eca-stream`, which emits structured messages
+  (assistant/thinking/tool cards) onto the rich transcript.
 
   `yolo-ref` is the trust (YOLO) atom: when it's truthy, manual-approval tool
   calls are auto-approved and the dialog is skipped — \"check it and everything
@@ -288,8 +288,7 @@
   called with the steer text to re-issue it as a normal prompt if the run ends
   before ECA consumes it (the protocol's documented fallback)."
   [^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!]
-  (let [streamer (ecastream/make-streamer)
-        writer (transcript/styled-writer pane)
+  (let [streamer (ecastream/make-streamer pane)
         ;; a steer is consumed when ECA echoes it back; resend undelivered steers
         ;; on any idle/finished transition (protocol fallback).
         finish! (fn []
@@ -312,53 +311,129 @@
                         (str/trim (str @pending-steer*))))
             (reset! pending-steer* nil))
           (when-not echo?
-            (binding [*out* writer]
-              (streamer content))
+            (streamer content)
             (when (= "finished" (:state content))
               (finish!))
             ;; manual-approval tool call -> in YOLO mode auto-approve (everything
             ;; goes, no permission dialog); otherwise ask the user in a dialog
-            ;; with a readable font and a check-box to switch into YOLO mode.
+            ;; with a readable font and a click of YOLO to switch into trust mode.
             (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
               (if @yolo-ref
                 (eca/approve! @chat-id (:id content))
                 (let [id (:id content)
                       name (str (:name content))
                       summary (:summary content)
-                      msg (doto (JTextArea.
-                                 (str "Approve tool call?\n\n  " name "\n"
-                                      (when (seq summary) (str "\n" summary "\n"))
-                                      "\n• Approve — just this once\n"
-                                      "• Reject — don't run it\n"
-                                      "• YOLO — this call and everything after, no more dialogs"))
+                      ;; Tool name/summary in a modest, regular-weight monospace
+                      ;; (NOT the 1.5x dialog scale) so long summaries stay
+                      ;; compact instead of towering over the dialog.
+                      body (doto (JTextArea.
+                                  (str "Approve tool call?\n\n  " name "\n"
+                                       (when-let [args (:arguments content)]
+                                         (when (seq args)
+                                           (str "\n  args: " (pr-str args) "\n")))
+                                       (when (seq summary) (str "\n" summary "\n"))
+                                       "\n• Approve — just this once\n"
+                                       "• Approve tool — permanently allow this tool\n"
+                                       "• Reject — don't run it\n"
+                                       "• YOLO — this call and everything after, no more dialogs"))
                              (.setEditable false)
                              (.setLineWrap true)
                              (.setWrapStyleWord true)
-                             (.setFont (ui-monospace-font))
+                             (.setFont (widgets/dialog-mono-font))
                              (.setOpaque true)
+                             (.setBackground (Color. 22 24 30))
+                             (.setForeground (Color. 224 226 232))
+                             (.setCaretColor (Color. 224 226 232))
+                             (.setCaretPosition 0)
                              (.setBorder (javax.swing.BorderFactory/createEmptyBorder
-                                          8 8 8 8)))
-                      panel (doto (JPanel. (BorderLayout.))
-                              (.setBorder (javax.swing.BorderFactory/createEmptyBorder
-                                           8 8 8 8))
-                              (.add msg BorderLayout/CENTER))
-                      opts (into-array ["Approve" "Reject" "YOLO"])
-                      dismiss (JOptionPane/DEFAULT_OPTION)
-                      choice (JOptionPane/showOptionDialog
-                               pane panel
-                               "grog — tool approval"
-                               dismiss
-                               JOptionPane/QUESTION_MESSAGE
-                               nil opts opts)]
-                  (case (int choice)
-                    0 (eca/approve! @chat-id id)
-                    1 (eca/reject! @chat-id id)
-                    ;; "YOLO" — approve this call and switch into trust mode so
-                    ;; all future tool calls auto-approve
-                    (do (reset! yolo-ref true)
+                                          12 14 12 14)))
+                      ;; Scrollable center keeps the body bounded; the buttons
+                      ;; live in a separate SOUTH panel so they are ALWAYS
+                      ;; visible and reachable, no matter how long the summary.
+                      scroll (doto (JScrollPane. body)
+                               (.setBorder (javax.swing.BorderFactory/createLineBorder
+                                             (Color. 60 63 72))))
+                      approve (widgets/styled-button "Approve")
+                      approve-tool (widgets/styled-button "Approve tool")
+                      reject  (widgets/styled-button "Reject")
+                      yolo    (widgets/styled-button "YOLO")
+                      ;; GridLayout (not FlowLayout) so all four buttons stay
+                      ;; visible at any dialog/font size — FlowLayout clips the
+                      ;; trailing button (YOLO) when they overflow the width.
+                      buttons (doto (JPanel. (java.awt.GridLayout. 1 4 8 8))
+                                (.setBorder (javax.swing.BorderFactory/createEmptyBorder
+                                             10 12 12 12))
+                                (.add approve)
+                                (.add approve-tool)
+                                (.add reject)
+                                (.add yolo))
+                      dialog (doto (JDialog. (JOptionPane/getFrameForComponent pane)
+                                             "grog — tool approval" true)
+                               (.setLayout (BorderLayout.))
+                               (.add scroll BorderLayout/CENTER)
+                               (.add buttons BorderLayout/SOUTH)
+                               (.setSize (java.awt.Dimension. 620 340))
+                               (.setMinimumSize (java.awt.Dimension. 380 200))
+                               ;; Resizable, so a tall summary on a short screen
+                               ;; can always be shrunk/scrolled to reach the
+                               ;; buttons on the SOUTH panel.
+                               (.setResizable true)
+                               (.setLocationRelativeTo pane)
+                               ;; X / Esc / focus loss without a click:
+                               ;; windowClosed fires the reject path below.
+                               (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
+                      ;; guard so windowClosed (fired by dispose in the button
+                      ;; handlers too) doesn't double-answer with a reject.
+                      decided? (volatile! false)]
+                  ;; Enter approves (the natural default action); Esc closes.
+                  (when-let [^javax.swing.JRootPane rp (.getRootPane dialog)]
+                    (.setDefaultButton rp approve))
+                  (.put (.getInputMap (.getRootPane dialog) JComponent/WHEN_IN_FOCUSED_WINDOW)
+                        (KeyStroke/getKeyStroke KeyEvent/VK_ESCAPE 0)
+                        "grog-approval-cancel")
+                  (.put (.getActionMap (.getRootPane dialog)) "grog-approval-cancel"
+                        (proxy [AbstractAction] []
+                          (actionPerformed [_] (.dispose dialog))))
+                  (.addActionListener approve
+                    (proxy [java.awt.event.ActionListener] []
+                      (actionPerformed [_]
+                        (vreset! decided? true)
+                        (.dispose dialog)
+                        (eca/approve! @chat-id id))))
+                  (.addActionListener reject
+                    (proxy [java.awt.event.ActionListener] []
+                      (actionPerformed [_]
+                        (vreset! decided? true)
+                        (.dispose dialog)
+                        (eca/reject! @chat-id id))))
+                  ;; "Approve tool" — permanently allow this tool in the
+                  ;; approved-tools allowlist, then approve the current call.
+                  (.addActionListener approve-tool
+                    (proxy [java.awt.event.ActionListener] []
+                      (actionPerformed [_]
+                        (vreset! decided? true)
+                        (.dispose dialog)
+                        (ecacfg/approve-tool! name)
+                        (eca/approve! @chat-id id))))
+                  (.addActionListener yolo
+                    (proxy [java.awt.event.ActionListener] []
+                      (actionPerformed [_]
+                        (vreset! decided? true)
+                        (.dispose dialog)
+                        ;; "YOLO" — approve this call and switch into trust mode
+                        ;; so all future tool calls auto-approve.
+                        (reset! yolo-ref true)
                         (uifooter/set-trust-indicator! true)
                         (eca/set-trust! @chat-id true)
-                        (eca/approve! @chat-id id))))))))
+                        (eca/approve! @chat-id id))))
+                  ;; Dialog dismissed (X / Esc / lost focus) without a choice →
+                  ;; treat as a safe reject rather than running the tool.
+                  (.addWindowListener dialog
+                    (proxy [java.awt.event.WindowAdapter] []
+                      (windowClosed [_]
+                        (when-not @decided?
+                          (eca/reject! @chat-id id)))))
+                  (.setVisible dialog true))))))
 
         "chat/statusChanged"
         (let [st (str (:status params))]
@@ -479,9 +554,9 @@
             options (when (sequential? (:options params)) (vec (:options params)))
             allow-freeform? (not (false? (:allowFreeform params)))
             res (atom {:cancelled true :answer nil})]
-        (binding [*out* (transcript/styled-writer pane)]
-          (println (str "\n[" (appearance/ansi-tool-call) "LLM question" ansi-reset "] "
-                        prompt)))
+        (transcript/append-status!
+         pane
+         (str "🔶 LLM question: " prompt))
         (SwingUtilities/invokeAndWait
           (fn []
             (reset! res (show-question-dialog! pane prompt options allow-freeform?))))
@@ -498,12 +573,12 @@
   `/eca-model <name>` via `set-model-fn` and `/yolo [on|off]` via `set-yolo-fn`.
   Returns the updated history."
   [^JComponent pane history text send-fn set-model-fn set-yolo-fn]
-  (binding [*out* (transcript/styled-writer pane)
-            *err* (transcript/styled-writer pane)]
-    (cancel/clear!)
-    ;; echo the user's input (prompt or command) into the transcript in dark yellow
-    (when (seq (str/trim text))
-      (println (str "\n" (appearance/ansi-user) text ansi-reset)))
+  (cancel/clear!)
+  ;; echo the user's input (prompt or command) as a bubble
+  (when (seq (str/trim text))
+    (transcript/append-user! pane text))
+  (binding [*out* (transcript/console-writer pane)
+            *err* (transcript/console-writer pane)]
     (cond
       (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))
       (let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
@@ -522,8 +597,8 @@
         (do (System/exit 0) history)
         :grog.core/clear
         (do
-          ;; clear the virtualized transcript log, and drop any trust (yolo)
-          ;; auto-approve so a fresh transcript starts from a clean slate
+          ;; wipe the transcript, and drop any trust (yolo) auto-approve so a
+          ;; fresh transcript starts from a clean slate
           (transcript/clear! pane)
           (set-yolo-fn false)
           (println "History cleared.")
@@ -576,9 +651,10 @@
         scroll-to-top! (fn []
                          (.setViewPosition (.getViewport scroll-pane)
                                            (Point. 0 0)))]
-    ;; compute line height from the pane's current font
-    (let [fm (.getFontMetrics pane (.getFont pane))]
-      (reset! line-h (max 12 (.getHeight fm))))
+    ;; compute line height from the chat appearance (matches the renderer)
+    (try
+      (reset! line-h (max 12 (transcript/line-height-px pane)))
+      (catch Throwable _ (reset! line-h 20)))
     (scroll-unit!)
     ;; ---- pane-focused keys (Up / Down / j / k / End / Home) ----
     (let [im (.getInputMap pane JComponent/WHEN_FOCUSED)
@@ -652,9 +728,7 @@
                                           (fn [s]
                                             ;; steer was dropped (run finished before
                                             ;; ECA consumed it): re-issue as a normal prompt
-                                            (binding [*out* (transcript/styled-writer pane)
-                                                      *err* (transcript/styled-writer pane)]
-                                              (println (str "[grog] resending as a prompt: " s)))
+                                            (transcript/append-status! pane (str "[grog] resending as a prompt: " s))
                                             (reset! last-sent (str s))
                                             (.put ^LinkedBlockingQueue queue (str s))))
         connect-eca! (fn []
@@ -674,8 +748,7 @@
                              (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
                            (reset! connected true)
                            (catch Throwable e
-                             (binding [*out* (transcript/styled-writer pane)]
-                               (println (str "[grog] ECA connect failed: " (.getMessage e))))
+                             (transcript/append-status! pane (str "[grog] ECA connect failed: " (.getMessage e)))
                              (reset! running? false)))))
         send-fn (fn [history text]
                   (connect-eca!)
@@ -693,14 +766,12 @@
                                                                       (try (config/llm-url) (catch Exception _ nil))))
                                                       :trust @yolo-ref})]
                           (when-let [e (:error resp)]
-                            (binding [*out* (transcript/styled-writer pane)]
-                              (println (str "[grog] " (or (:message e) (pr-str e))))))
+                            (transcript/append-status! pane (str "[grog] " (or (:message e) (pr-str e)))))
                           (conj history {:user text}))
                         (catch Throwable e
                           (dbg! "eca prompt error:" (.getMessage e))
                           (reset! running? false)
-                          (binding [*out* (transcript/styled-writer pane)]
-                            (println (str "[grog] " (.getMessage e))))
+                          (transcript/append-status! pane (str "[grog] " (.getMessage e)))
                           history)))))
         stop-action! (fn []
                        (when @connected (eca/stop! @chat-id))
@@ -716,17 +787,17 @@
                          (when id (models/save-eca-model! id))
                          (config/reload!)
                          (uifooter/set-model! id)
-                         (binding [*out* (transcript/styled-writer pane)]
-                           (println (str "model: " id)))))
+                         (transcript/append-status! pane (str "model: " id))))
         set-yolo-fn (fn [on?]
                       (let [next (if (nil? on?) (not @yolo-ref) on?)]
                         (reset! yolo-ref next)
                         (uifooter/set-trust-indicator! next)
                         (when @connected
                           (eca/set-trust! @chat-id next))
-                        (binding [*out* (transcript/styled-writer pane)]
-                          (println (str "trust (yolo) mode: "
-                                        (if next "ON — tool calls auto-approved" "off"))))))
+                        (transcript/append-status!
+                         pane
+                         (str "trust (yolo) mode: "
+                              (if next "ON — tool calls auto-approved" "off")))))
         bg (background-panel)
         sent? (atom false)   ; first real message flips the logo to subdued
         submit! (fn []
@@ -747,9 +818,7 @@
                         ;; prompt (see make-event-handler's finish handling).
                         (do (reset! pending-steer* t)
                             (reset! last-sent t)
-                            (binding [*out* (transcript/styled-writer pane)
-                                      *err* (transcript/styled-writer pane)]
-                              (println (str "\n" (appearance/ansi-user) t ansi-reset)))
+                            (transcript/append-user! pane t)
                             (when @connected
                               (eca/steer! @chat-id t)))
                         ;; idle: queue a normal prompt as before
@@ -767,8 +836,7 @@
     ;; drag-and-drop on the prompt only (the transcript is a virtualized JList)
     (dnd/install! prompt)
     ;; right-click Copy on the transcript and prompt
-    (with-copy-menu! pane [["Copy selection" #(transcript/copy-selection! pane)]
-                           ["Copy all" #(transcript/text pane)]])
+    (with-copy-menu! pane [["Copy all" #(transcript/text pane)]])
     (with-copy-menu! prompt [["Copy" #(.getSelectedText prompt)]])
     ;; single-line scroll keys on the transcript
     (install-transcript-scroll-keys! pane transcript-scroll frame)
@@ -908,8 +976,7 @@
     ;; greet with a snarky startup line in the transcript
     (let [snark (or (some-> (soul/startup-snark-line) str/trim not-empty)
                     chat-startup-snark-fallback)]
-      (binding [*out* (transcript/styled-writer pane)]
-        (println (str ansi-snark snark ansi-reset "\n"))))
+      (transcript/append-banner! pane snark))
     (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
     (.setSize frame 1350 1020)
     (.setLocationRelativeTo frame nil)
@@ -934,8 +1001,14 @@
   (SwingUtilities/invokeLater
     (fn []
       (try
-        ;; apply the modern dark Look & Feel across both windows
-        (com.formdev.flatlaf.FlatDarkLaf/setup)
+        ;; load persisted appearance (fonts/colours/theme) from grog.edn, then
+        ;; install the matching FlatLaf Look & Feel
+        (appearance/load!)
+        (case (appearance/theme)
+          "flat-intelliJ" (com.formdev.flatlaf.FlatIntelliJLaf/setup)
+          "flat-darcula"  (com.formdev.flatlaf.FlatDarculaLaf/setup)
+          "flat-light"    (com.formdev.flatlaf.FlatLightLaf/setup)
+          (com.formdev.flatlaf.FlatDarkLaf/setup))
         ;; Force dark text-area defaults through the L&F's UIManager so no
         ;; Windows L&F default (white background) can override the prompt box.
         ;; Without this, FlatLaf's TextArea UI can fall back to a light/white
@@ -952,8 +1025,6 @@
         ;; enlarge the L&F's base UI fonts from the desktop's system font so
         ;; dialogs (settings, model picker, approvals) and labels read larger
         (widgets/scale-ui-fonts!)
-        ;; load persisted appearance (fonts/colours) from grog.edn
-        (appearance/load!)
         (let [^javax.swing.JFrame f (build-chat-frame)]
           (.setVisible f true)
           ;; DIAGNOSTIC: report what the JVM actually computed for the prompt's

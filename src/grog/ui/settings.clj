@@ -114,11 +114,58 @@
           (repopulate))))
     b))
 
+(def ^:private themes
+  [{:id "flat-dark"      :label "Dark"      :laf com.formdev.flatlaf.FlatDarkLaf}
+   {:id "flat-intelliJ"  :label "IntelliJ"  :laf com.formdev.flatlaf.FlatIntelliJLaf}
+   {:id "flat-darcula"   :label "Darcula"   :laf com.formdev.flatlaf.FlatDarculaLaf}
+   {:id "flat-light"     :label "Light"     :laf com.formdev.flatlaf.FlatLightLaf}])
+
+(defn- apply-laf!
+  "Install a FlatLaf theme, keep the prompt text-area dark (the chat renderer is
+   always dark-paletted), re-scale UI fonts, refresh appearance and repaint every
+   open window."
+  [^Class laf]
+  (javax.swing.UIManager/setLookAndFeel laf)
+  (doseq [[k v] {"TextArea.background" (Color. 18 18 18)
+                 "TextArea.foreground" (Color. 230 230 230)
+                 "TextArea.caretForeground" (Color. 230 230 230)
+                 "TextArea.inactiveBackground" (Color. 18 18 18)
+                 "TextArea.inactiveForeground" (Color. 230 230 230)
+                 "TextPane.background" (Color. 18 18 18)
+                 "TextPane.foreground" (Color. 230 230 230)}]
+    (javax.swing.UIManager/put k v))
+  (widgets/scale-ui-fonts!)
+  (uifonts/apply-all!)
+  (doseq [^java.awt.Window w (java.awt.Window/getWindows)]
+    (SwingUtilities/updateComponentTreeUI ^java.awt.Component w)))
+
+(defn- theme-row
+  "A labeled combo box of FlatLaf themes."
+  ^JPanel []
+  (let [row (JPanel. (FlowLayout. FlowLayout/LEFT))
+        l (JLabel. "Theme")
+        cur (appearance/theme)
+        cb (JComboBox. (into-array String (map :label themes)))
+        _ (when-let [t (some #(when (= cur (:id %)) %) themes)]
+            (.setSelectedItem cb (:label t)))
+        _ (doto cb (.setPrototypeDisplayValue "XXXXXXXXXXXX"))
+        _ (row-align! row l)]
+    (.add row l)
+    (.add row cb)
+    (.addActionListener cb
+      (reify java.awt.event.ActionListener
+        (actionPerformed [_ _]
+          (when-let [t (some #(when (= (str (.getSelectedItem cb)) (:label %)) %) themes)]
+            (appearance/set-theme! (:id t))
+            (apply-laf! (:laf t))))))
+    row))
+
 (defn- populate-appearance!
-  "Fill the appearance tab panel (a vertical box) with the current chat controls."
+  "Fill the appearance tab panel (a vertical box) with the theme + chat controls."
   [^JPanel panel families]
   (.removeAll panel)
-  (doseq [r [(font-size-row     "Chat font size"   [:chat :font-size])
+  (doseq [r [(theme-row)
+             (font-size-row     "Chat font size"   [:chat :font-size])
              (font-family-row   "Chat font"        [:chat :font-family] families)
              (color-row "User text"          [:chat :user])
              (color-row "Thinking"           [:chat :thinking])

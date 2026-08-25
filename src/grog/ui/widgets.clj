@@ -6,8 +6,7 @@
   (:import (java.awt BasicStroke Color Cursor Font Graphics RenderingHints)
            (java.awt.geom Path2D$Double)
            (java.awt.image BufferedImage)
-           (javax.swing ImageIcon JButton SwingConstants UIManager)
-           (javax.swing.border Border)))
+           (javax.swing ImageIcon JButton SwingConstants UIManager)))
 
 (def ^:private ui-font-scale 1.5)
 (def ^:private min-ui-size 19)
@@ -60,6 +59,14 @@
   "Readable monospace font for dialog body text, sized from the system UI font."
   ^Font []
   (Font. "Monospaced" (if (appearance/windows?) Font/BOLD Font/PLAIN) (mono-font-size)))
+
+(defn dialog-mono-font
+  "Moderate monospace font for dialog/approval body text. Unlike `mono-font`
+  this stays at (roughly) the system L&F base size instead of the 1.5x dialog
+  scale, and uses regular weight, so a long tool-call summary in an approval
+  dialog reads as plain body text rather than towering bold monospace."
+  ^Font []
+  (Font. "Monospaced" Font/PLAIN (max 13 (int (.getSize (lf-base-font))))))
 
 (defn scale-ui-fonts!
   "After the Look & Feel is installed, bump its base UI font keys so every
@@ -207,8 +214,8 @@
   no-arg fn returning the current java.awt.Color (evaluated each repaint, so it
   updates live after the user picks a new colour)."
   ^JButton [text get-color]
-  (let [sw 20]
-    (let [b (proxy [JButton] []
+  (let [sw 20
+        b (proxy [JButton] []
               (paintComponent [g]
                 (paint-rounded! g this)
                 (let [h (.getHeight this)
@@ -218,7 +225,7 @@
                            (.fillRoundRect 12 (int (/ (- h sw) 2)) sw sw 4 4))]
                   (.dispose g2))
                 (proxy-super paintComponent g)))
-          _ (.setText b text)]
-      (-> b
-          (style!)
-          (doto (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 44 8 18)))))))
+        _ (.setText b text)]
+    (-> b
+        (style!)
+        (doto (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 44 8 18))))))

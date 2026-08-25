@@ -1,0 +1,9 @@
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.11.1"}
+        cheshire/cheshire {:mvn/version "5.13.0"}
+        clj-http/clj-http {:mvn/version "3.13.0"}
+        io.modelcontextprotocol.sdk/mcp {:mvn/version "0.8.0"}
+        com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
+        org.slf4j/slf4j-nop {:mvn/version "2.0.3"}}
+ :aliases
+ {:mcp {:main-opts ["-m" "grog-oracle.main"]}}}

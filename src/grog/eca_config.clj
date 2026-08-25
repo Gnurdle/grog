@@ -145,11 +145,53 @@
            "args" ["-lc" (str "cd '" dir "' && " cmdline)]}
     env (assoc "env" env)))
 
+(defn- clean-imap-account
+  "Interpolate env refs in string fields; preserve numbers/booleans as-is."
+  [m]
+  (into {}
+        (keep (fn [[k v]]
+                (when (some? v)
+                  [k (if (string? v) (interp-inst v) v)])))
+        m))
+
+(defn imap-instances-path
+  "Where grog writes the grog-imap MCP account metadata config."
+  ^String []
+  (let [d (io/file (str (System/getProperty "user.home") "/.config/grog"))]
+    (.mkdirs d)
+    (str d "/imap-accounts.json")))
+
+(defn- imap-accounts-data
+  "Account *metadata* from grog.edn's `:imap` (never secrets)."
+  []
+  (let [accts (get-in (config/grog) [:imap :accounts])]
+    (when (seq accts)
+      {:accounts (mapv #(clean-imap-account
+                         (select-keys % [:name :host :port :tls :user :sasl
+                                         :oauth :read-only]))
+                       accts)})))
+
+(defn- imap-env
+  "Env map for the grog-imap MCP server: write account *metadata* to
+  ~/.config/grog/imap-accounts.json and hand it via GROG_IMAP_CONFIG. The
+  server resolves the secret itself from its per-account file — never here."
+  []
+  (let [data (imap-accounts-data)
+        path (imap-instances-path)]
+    (spit (io/file path) (json/generate-string data {:pretty true}))
+    {"GROG_IMAP_CONFIG" path}))
+
 (defn grog-mcp-servers
   "The grog MCP server specs, keyed by server id."
   []
-  (let [root (grog-root)]
-    {"grog-imaging"
+  (let [root (grog-root)
+        servers
+        {"grog-docs"
+     (shell-wrapped (str root "/grog-docs")
+                    "clojure -M:mcp -m grog-docs.main"
+                    nil)
+
+     "grog-imaging"
      (shell-wrapped (str root "/grog-imaging")
                     "clojure -M:mcp -m grog-imaging.main"
                     nil)
@@ -172,7 +214,23 @@
      "grog-search"
      (shell-wrapped (str root "/grog-search")
                     "clojure -M:mcp -m grog-search.main"
-                    nil)}))
+                    nil)
+
+     "grog-oracle"
+     (shell-wrapped (str root "/grog-oracle")
+                    "clojure -M:mcp -m grog-oracle.main"
+                    nil)
+
+     "grog-babashka"
+     (shell-wrapped (str root "/grog-babashka")
+                    "clojure -M:mcp -m grog-babashka.main"
+                    nil)}]
+    (cond-> servers
+      (seq (get-in (config/grog) [:imap :accounts]))
+      (assoc "grog-imap"
+             (shell-wrapped (str root "/grog-imap")
+                            "clojure -M:mcp -m grog-imap.main"
+                            (imap-env))))))
 
 (defn debug-dump-config!
   "Write the full ECA config map to the grog debug log.

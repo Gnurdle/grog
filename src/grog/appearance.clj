@@ -13,14 +13,21 @@
   []
   (str/includes? (str/lower-case (System/getProperty "os.name")) "win"))
 (def defaults
-  {:chat {:font-family "Monospaced"
+  {:theme {:name "flat-dark"}
+   :chat {:font-family "Monospaced"
           :font-size 18
-          :background {:rgb [0 0 0]}
+          :background {:rgb [13 14 17]}
           :user      {:rgb [165 138 25]}
-          :thinking  {:rgb [55 165 95]}
+          :thinking  {:rgb [105 180 120]}
           :answer    {:rgb [100 220 255]}
-          :tool-call {:rgb [255 0 255]}
-          :snark     {:rgb [128 128 140]}}
+          :tool-call {:rgb [255 160 90]}
+          :snark     {:rgb [130 134 146]}
+          ;; GUI-specific palette (the message renderer)
+          :text      {:rgb [216 224 234]}  ; assistant prose
+          :code-bg   {:rgb [22 30 36]}
+          :bubble-bg {:rgb [43 44 54]}
+          :card-bg   {:rgb [26 29 35]}
+          :border    {:rgb [60 66 78]}}
    :terminal {:font-family "Monospaced"
               :font-size 18
               :foreground {:rgb [40 230 90]}
@@ -143,3 +150,21 @@
 (defn ansi-thinking [] (ansi-fg [:chat :thinking]))
 (defn ansi-answer   [] (ansi-fg [:chat :answer]))
 (defn ansi-tool-call [] (ansi-fg [:chat :tool-call]))
+
+;; --- GUI message-renderer palette ------------------------------------------
+
+(defn theme
+  "FlatLaf theme name stored under :theme :name (default \"flat-dark\")."
+  []
+  (get-of [:theme :name] "flat-dark"))
+
+(defn set-theme!
+  "Set the FlatLaf theme name, persist, and return the current appearance."
+  [name]
+  (set-of! [:theme :name] (str name)))
+
+(defn chat-text  [] (rgb [:chat :text]))
+(defn code-bg    [] (rgb [:chat :code-bg]))
+(defn bubble-bg  [] (rgb [:chat :bubble-bg]))
+(defn card-bg    [] (rgb [:chat :card-bg]))
+(defn border     [] (rgb [:chat :border]))

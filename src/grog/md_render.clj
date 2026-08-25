@@ -79,6 +79,50 @@
         (walk-fn c)
         (recur nxt)))))
 
+(defn node-children
+  "Children of a CommonMark node as a seq (empty when it's a leaf)."
+  [^Node parent]
+  (persistent!
+    (loop [^Node c (.getFirstChild parent) v (transient [])]
+      (if c
+        (let [^Node nxt (.getNext c)]
+          (recur nxt (conj! v c)))
+        v))))
+
+(defn- strip-markdown-tags
+  "Remove `<text/markdown>` / `</text/markdown>` / `<text/markdown/>` wrappers
+  (and the legacy `<text-markdown>` forms). Returns the bare content."
+  ^String [^String s]
+  (str/replace s
+               #"(?i)</?text[-/]markdown/?>|</text[-/]markdown>"
+               ""))
+
+(declare rewrite-single-backtick-code-with-newlines table-block-rows normalize-row-widths)
+
+(defn table-rows
+  "Public: a normalized grid for a GFM table node. Returns a vector of
+   `{:header? bool :cells [..]}`, one entry per row, each cell a plain string
+   (markup flattened). Column count is padded to be consistent."
+  [^TableBlock block]
+  (let [raw (vec (table-block-rows block))
+        rows (if (empty? raw) [] (normalize-row-widths raw))]
+    (mapv (fn [r]
+            {:header? (:header? r)
+             :cells   (mapv (fn [p] {:text (:text p) :align (:align p)}) (:parts r))})
+          rows)))
+
+(defn parse!
+  "Public entrypoint: parse `markdown` as CommonMark (with GFM tables), stripping
+  any `<text/markdown>` MIME-style wrappers before parsing so the caller gets a
+  clean AST. Returns the root `org.commonmark.node.Document`. On parse failure
+  returns an empty Document (never throws)."
+  ^org.commonmark.node.Document [^String markdown]
+  (try
+    (let [s (strip-markdown-tags (or markdown ""))]
+      (.parse (make-parser) (rewrite-single-backtick-code-with-newlines s)))
+    (catch Exception _
+      (.parse (make-parser) ""))))
+
 (defn- align-kw [^TableCell cell]
   (let [^TableCell$Alignment a (.getAlignment cell)]
     (cond (identical? a TableCell$Alignment/LEFT) :left
