@@ -13,7 +13,26 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Capture grog/ECA debug output to a log file (see dbg! traces in ui.clj).
-set "GROG_LOG=%~dp0grog-ui.log"
-if exist "%GROG_LOG%" del "%GROG_LOG%"
-clojure -M:gui %* >>"%GROG_LOG%" 2>&1
+rem --- per-instance log with a size cap -------------------------------------
+rem Each instance writes to its own file: base = %GROG_LOG% or ~/.grog-ui.log,
+rem suffixed with the process id, so multiple instances don't clobber each other.
+rem The file is capped at %GROG_UI_LOG_MAX% bytes (default 5MB) keeping the tail.
+if "%GROG_LOG%"=="" (
+  set "LOG_BASE=%USERPROFILE%\.grog-ui.log"
+) else (
+  set "LOG_BASE=%GROG_LOG%"
+)
+if "%GROG_UI_LOG_MAX%"=="" (
+  set "MAX_LOG=5242880"
+) else (
+  set "MAX_LOG=%GROG_UI_LOG_MAX%"
+)
+set "LOG=%LOG_BASE:%.log=%.%RANDOM%.log"
+set "GROG_LOG=%LOG%"
+
+rem prune the log to the last MAX_LOG bytes (best effort, only on launch)
+if exist "%LOG%" powershell -NoProfile -Command "if((Get-Item -LiteralPath '%LOG%').Length -gt %MAX_LOG%){$b=New-Object byte[] %MAX_LOG%;$s=[IO.File]::Open('%LOG%','Open','Read','ReadWrite');$s.Seek(-%MAX_LOG%,[IO.SeekOrigin]::End) | Out-Null;$s.Read($b,0,%MAX_LOG%) | Out-Null;$s.Dispose();[IO.File]::WriteAllBytes('%LOG%',$b)}" 2>nul
+
+echo === grog-ui launch: %date% %time% log=%LOG% ===>> "%LOG%"
+
+clojure -M:gui %* >>"%LOG%" 2>&1

@@ -1,13 +1,31 @@
 (ns grog.config
-  "Loads `grog.edn` only (no environment-variable overrides).
+  "Loads `grog.edn` (no environment-variable overrides).
 
-  Merge order (later wins): classpath `resources/grog.edn` →
-  `~/.config/grog/grog.edn` → `./grog.edn` in the current working directory."
+  User-level config lives in a **platform-aware config home** (`config-home-dir`):
+    * `$GROG_CONFIG_HOME/grog.edn` when that env var is set,
+    * Windows: `%APPDATA%\\grog\\grog.edn`,
+    * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn`.
+
+  Merge order (later wins): classpath `resources/grog.edn` → user config home →
+  legacy `~/.config/grog/grog.edn` (if present, for existing installs) →
+  `./grog.edn` in the current working directory."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [grog.platform :as platform]
             [grog.secrets :as secrets])
   (:import (java.io File)))
+
+(defn windows?
+  "True when running on a Microsoft Windows OS."
+  []
+  (platform/windows?))
+
+(defn config-home-dir
+  "Where grog keeps its user-level config and generated/secrets files (see
+  `grog.platform/config-home-dir`)."
+  ^File []
+  (platform/config-home-dir))
 
 (defn deep-merge
   "Recursively merge maps; non-map values from `b` replace `a`."
@@ -31,25 +49,44 @@
 (defn load-merge!
   "Load and deep-merge all config fragments (does not touch the cache atom)."
   []
-  (let [home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
+  (let [home-file (io/file (config-home-dir) "grog.edn")
+        legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
         cwd-file (io/file "grog.edn")
         fragments (remove nil?
                     [(resource-edn "grog.edn")
                      (slurp-edn home-file)
+                     ;; Legacy installs kept config under ~/.config/grog even on
+                     ;; Windows; keep honoring it (deduped against the new path).
+                     (when (and legacy-home-file
+                                (.exists legacy-home-file)
+                                (not (and (.exists home-file)
+                                          (= (.getCanonicalPath home-file)
+                                             (.getCanonicalPath legacy-home-file)))))
+                       (slurp-edn legacy-home-file))
                      (slurp-edn cwd-file)])]
     (reduce deep-merge {} fragments)))
 
 (defonce ^:private !cfg (atom nil))
 
 (defn reload!
-  "Re-read config files from disk (REPL / tests)."
+  "Re-read config files from disk (REPL / tests). Also registers any
+  `:secrets :accounts` declared in the merged config so `/secret` and
+  `with_api_key` know about them."
   []
-  (reset! !cfg (load-merge!)))
+  (let [c (load-merge!)]
+    (reset! !cfg c)
+    (secrets/refresh-known-accounts! c)
+    c))
 
 (defn grog
   "Merged configuration map."
   []
-  (swap! !cfg (fn [cur] (or cur (load-merge!)))))
+  (swap! !cfg
+         (fn [cur]
+           (or cur
+               (let [c (load-merge!)]
+                 (secrets/refresh-known-accounts! c)
+                 c)))))
 
 (defonce ^:private !llm-override (atom nil))
 
@@ -492,7 +529,7 @@
           (do (println "grog: LLM HTTP" st "-" (.getMessage e))
               (println "       :llm :model" (pr-str m) "— :url" url)
               (when (and (= 401 st) (not (llm-api-key)))
-                (println "       No API key found. Set :llm :api-key or store LLM_API_KEY in OS keyring.")))
+                (println "       No API key found. Set :llm :api-key or store LLM_API_KEY in the secret store (/secret set LLM_API_KEY <key>).")))
           :else
           (do (println "grog: LLM request failed:" (.getMessage e))
               (println "       :llm :model" (pr-str m) "— :url" url)))

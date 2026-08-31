@@ -41,6 +41,8 @@
                                 (let [^javax.net.ssl.SSLSocket s
                                       (.createSocket (javax.net.ssl.SSLSocketFactory/getDefault)
                                                      ^String host (int port))]
+                                  ;; verify the peer certificate hostname (like HTTPS)
+                                  (.setEndpointIdentificationAlgorithm (.getSSLParameters s) "HTTPS")
                                   (.startHandshake s)
                                   s)
                                 (java.net.Socket. ^String host (int port)))
@@ -144,7 +146,7 @@
         (let [c (.charAt s i)]
           (cond
             ;; literal portal {n} followed inline by its content
-            (and (nil? cur) (= c \{) (re-matches #"\{\d+\}.*" (subs s i)))
+            (and (nil? cur) (= c \{) (re-matches #"(?s)\{\d+\}.*" (subs s i)))
             (let [close (long (str/index-of s "}" i))
                   len (long (Long/parseLong (subs s (inc i) close)))
                   start (inc close)
@@ -220,11 +222,14 @@
 (defn- safe-astring? [^String s]
   ;; conservative safe-atom set: anything not in it falls back to a literal.
   ;; excludes SP, controls, \" \\ ( ) { } % * [ ] which would need escaping.
+  ;; ':' and ',' are included so sequence-sets like "1:3,5" stay inline atoms.
   (and (pos? (count s))
-       (re-matches #"[A-Za-z0-9._+\-@/=$]+" s)))
+       (re-matches #"[A-Za-z0-9._+\-@/=$:,]+" s)))
 
 (defn- encode-arg [arg]
   (cond
+    ;; {:paren "...(a b)"} from `parenthesized` — emit inline (never a literal)
+    (and (map? arg) (:paren arg)) (:paren arg)
     (nil? arg) "NIL"
     (string? arg) (cond
                     (zero? (count arg)) "\"\""
@@ -360,6 +365,29 @@
 (defn authenticate-plain [conn user pass & [authzid]]
   (auth-command! conn "PLAIN" [(str (or authzid "") \u0000 user \u0000 pass)]))
 
+(defn authenticate-xoauth2
+  "AUTHENTICATE XOAUTH2 with `access-token`. Sends the SASL initial response
+  inline (`user=...\\x01auth=Bearer <token>\\x01\\x01`). On failure the server
+  replies with a `+ <base64-error>` continuation which the client MUST answer
+  with an empty line before the tagged result — handled here."
+  [conn user access-token]
+  (let [tag (next-tag conn)
+        ^java.io.Writer w (:writer conn)
+        ir (str "user=" user "\u0001auth=Bearer " access-token "\u0001\u0001")]
+    (.write w (str tag " AUTHENTICATE XOAUTH2 " (b64 (utf8 ir)) "\r\n"))
+    (.flush w)
+    (loop []
+      (let [resp (read-response conn)]
+        (case (:type resp)
+          :continuation (do (.write w "\r\n") (.flush w) (recur))
+          :untagged (recur)
+          :empty (throw (ex-info "IMAP connection closed (EOF) while awaiting completion"
+                                 {:expected tag}))
+          :tagged (if (= tag (:tag resp))
+                    {:tagged resp :untagged []}
+                    (throw (ex-info "Unexpected completion tag"
+                                    {:expected tag :got (:tag resp)}))))))))
+
 (defn starttls
   "Upgrade the current (plaintext) connection to TLS via STARTTLS. The server
   must advertise the STARTTLS capability. Returns an updated connection map with
@@ -399,18 +427,21 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn parenthesized
-  "Encode a list of items as an IMAP parenthesized list. Keywords are
-  uppercased (data items like :uid -> UID); strings pass through verbatim
-  (pre-wired flag strings like \"\\\\Seen\"); everything else is str'd."
+  "Encode a list of items as an IMAP parenthesized list. Returns
+  `{:paren \"(UID FLAGS)\"}` — a marker so the command encoder emits it inline
+  as a parenthesized list (never as a string literal), which servers require
+  for data-item lists. Keywords are uppercased (data items like :uid -> UID);
+  strings pass through verbatim (pre-wired flag strings like \"\\\\Seen\");
+  everything else is str'd."
   [items]
-  (str "(" (str/join " "
-                     (map (fn [x]
-                            (cond
-                              (keyword? x) (str/upper-case (name x))
-                              (string? x) x
-                              :else (str x)))
-                          items))
-       ")"))
+  {:paren (str "(" (str/join " "
+                             (map (fn [x]
+                                    (cond
+                                      (keyword? x) (str/upper-case (name x))
+                                      (string? x) x
+                                      :else (str x)))
+                                  items))
+               ")")})
 
 (defn seq-set
   "Collapse a collection of message numbers into an IMAP seq-set string:

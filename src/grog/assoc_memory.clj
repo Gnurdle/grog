@@ -63,26 +63,45 @@
     (or (pick m :db_path :dbPath :db)
         default-db-rel)))
 
+(defn- global-store-name?
+  "True when the store spec explicitly selects the reserved cross-project store
+  (any recognition of `global` as :name/:store/:Namespace)."
+  [m]
+  (let [n (pick m :name :store :Namespace)]
+    (and (some? n)
+         (re-matches #"(?i)\s*global\s*" (str (name n))))))
+
 (defn- db-file
-  "Absolute `File` for the store addressed by this call. Explicit `:name` /
-  `:db_path` resolve against the current active project's `state/` dir when a
-  project is active, else the repo root. With no explicit address and an active
-  project, the default DB resolves to the project's own `state/mem.db`, so the
-  kv-store is per-project."
+  "Absolute `File` for the store addressed by this call.
+
+  Store resolution:
+    * `:name \"global\"` (or `:store`/`:Namespace`) → the reserved cross-project
+      store at `<config-home>/global-mem.db`, regardless of active project.
+    * any other `:name` → `<state>/<name>.db` when a project is active, else the
+      repo root `<name>.db`.
+    * an explicit `:db_path` → that path (absolute or repo-root-relative).
+    * no explicit address and a project active → the project's `state/mem.db`
+      (the default per-project store).
+    * otherwise → `<repo-root>/assoc.db`."
   ^java.io.File [m]
-  (let [explicit? (boolean (pick m :name :store :Namespace :db_path :dbPath :db))
-        rel (store-db-rel m)
-        project-db (projects/active-memory-db-path)]
-    (if project-db
-      (if explicit?
-        (let [^java.io.File f (io/file project-db)]
-          ;; explicit named stores live alongside the project memory db
-          (.getCanonicalFile (io/file (.getParentFile f) (.getName (io/file rel)))))
-        (io/file project-db))
-      (let [f (io/file rel)]
-        (if (.isAbsolute f)
-          f
-          (.getCanonicalFile (io/file (cfg/repo-root) rel)))))))
+  (cond
+    (global-store-name? m)
+    (.getCanonicalFile (io/file (cfg/config-home-dir) "global-mem.db"))
+
+    :else
+    (let [explicit? (boolean (pick m :name :store :Namespace :db_path :dbPath :db))
+          rel (store-db-rel m)
+          project-db (projects/active-memory-db-path)]
+      (if project-db
+        (if explicit?
+          (let [^java.io.File f (io/file project-db)]
+            ;; explicit named stores live alongside the project memory db
+            (.getCanonicalFile (io/file (.getParentFile f) (.getName (io/file rel)))))
+          (io/file project-db))
+        (let [f (io/file rel)]
+          (if (.isAbsolute f)
+            f
+            (.getCanonicalFile (io/file (cfg/repo-root) rel))))))))
 
 (defn- required-key [m]
   (let [k (pick m :key :Key)]
@@ -131,9 +150,11 @@
 
 (defn tool-specs
   "LLM function tools for associative memory (SQLite).
-  A store is addressed by a simple `:name` -> the file `<name>.db` in the store root
-  (default name \"assoc\" -> \"assoc.db\"). Multiple named stores are supported, e.g. `notes`,
-  `contacts`, `facts` — each lives in its own <name>.db."
+  A store is addressed by a simple `:name` -> the file `<name>.db`. The default
+  store is per-project (`state/mem.db` when a project is active); the reserved
+  name `global` selects the cross-project store at `<config-home>/global-mem.db`
+  regardless of project. Other named stores (`notes`, `facts`, ...) live beside
+  the project memory db when a project is active."
   []
   [{:type "function"
     :function
@@ -141,11 +162,11 @@
      :description (str "Store a blob value under a `key` in an associative-memory store (a SQLite file "
                        "<name>.db, default " default-db-rel "). Creates or overwrites the key. "
                        "`value` is any text or JSON string; stored as bytes and returned unchanged by assoc_get. "
-                       "Pick a store with :name (each name is its own <name>.db; e.g. notes, facts) or an explicit :db_path.")
+                       "Pick a store with :name — default is the per-project store; use :name \"global\" for the cross-project store — or an explicit :db_path.")
      :parameters {:type "object"
                   :required ["key" "value"]
                   :properties {:name {:type "string"
-                                      :description (str "Store name -> <name>.db (default \"" default-store-name "\"). Use different names for separate stores.")}
+                                      :description "Store name -> <name>.db (default appears when unset = per-project mem.db; reserved name \"global\" = cross-project store)."}
                                :key {:type "string"
                                      :description "Key to store the value under (create or overwrite)."}
                                :value {:type "string"
@@ -161,7 +182,7 @@
      :parameters {:type "object"
                   :required ["key"]
                   :properties {:name {:type "string"
-                                      :description (str "Store name -> <name>.db (default \"" default-store-name "\").")}
+                                      :description "Store name -> <name>.db (default per-project mem.db when unset; reserved \"global\" = cross-project store)."}
                                :key {:type "string"}
                                :db_path {:type "string"
                                          :description "Optional explicit SQLite path instead of :name."}}}}}
@@ -170,10 +191,10 @@
     {:name "assoc_keys"
      :description (str "Enumerate all keys in an associative-memory store (a SQLite file <name>.db, "
                        "default " default-db-rel "), sorted alphabetically. Optional positive :limit caps the count. "
-                       "Pick a store with :name or :db_path.")
+                       "When a project is active with no :name, the default store is per-project (`state/mem.db`); the reserved name `global` selects the cross-project store at <config-home>/global-mem.db. Other names live beside the project memory db.")
      :parameters {:type "object"
                   :properties {:name {:type "string"
-                                      :description (str "Store name -> <name>.db (default \"" default-store-name "\").")}
+                                      :description "Store name -> <name>.db (default per-project mem.db when unset; reserved \"global\" = cross-project store)."}
                                :limit {:type "integer"
                                        :description "Optional max number of keys to return."}
                                :db_path {:type "string"
@@ -183,11 +204,11 @@
     {:name "assoc_search"
      :description (str "Search the keys of an associative-memory store (a SQLite file <name>.db, "
                        "default " default-db-rel ") by a Java regular expression `regex`; returns all matching keys, "
-                       "sorted alphabetically. Optional positive :limit caps the count. Pick a store with :name or :db_path.")
+                       "sorted alphabetically. Optional positive :limit caps the count. When a project is active with no :name, the default store is per-project (`state/mem.db`); the reserved name `global` selects the cross-project store at <config-home>/global-mem.db. Other names live beside the project memory db.")
      :parameters {:type "object"
                   :required ["regex"]
                   :properties {:name {:type "string"
-                                      :description (str "Store name -> <name>.db (default \"" default-store-name "\").")}
+                                      :description "Store name -> <name>.db (default per-project mem.db when unset; reserved \"global\" = cross-project store)."}
                                :regex {:type "string"
                                        :description "Java regular expression to match against key names."}
                                :limit {:type "integer"

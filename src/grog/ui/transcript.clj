@@ -25,9 +25,9 @@
                      Point Rectangle RenderingHints Toolkit)
            (java.awt.datatransfer StringSelection)
            (java.awt.image BufferedImage)
-           (java.awt.event AdjustmentListener ComponentAdapter MouseAdapter MouseEvent)
+           (java.awt.event AdjustmentListener ComponentAdapter MouseAdapter MouseEvent InputEvent)
            (java.io Writer)
-           (javax.swing JComponent JScrollPane SwingUtilities)
+           (javax.swing AbstractAction JComponent JScrollPane KeyStroke SwingUtilities)
            (org.commonmark.node BlockQuote BulletList Code Document Emphasis FencedCodeBlock
                                 HardLineBreak Heading HtmlBlock HtmlInline IndentedCodeBlock
                                 Link ListItem Node OrderedList Paragraph SoftLineBreak
@@ -51,7 +51,9 @@
 
 (defn- palette []
   (let [bg (appearance/rgb [:chat :background])
-        text (appearance/rgb [:chat :text])]
+        ;; assistant prose color: use the "Answer" setting (the user-facing
+        ;; color picker label) so changing it in Settings actually takes effect.
+        text (appearance/rgb [:chat :answer])]
     {:bg      (acolor bg)
      :text    (acolor text)
      :user    (acolor (appearance/rgb [:chat :user]))
@@ -69,7 +71,11 @@
         fam (str (or (appearance/chat-font-family) "Monospaced"))]
     {:base (Font. fam Font/PLAIN size)
      :bold (Font. fam Font/BOLD size)
-     :mono (Font. "Monospaced" Font/PLAIN (max 11 size))
+     ;; Follow the configured chat family (Fira Code on this box) so tool-call
+     ;; args, code, and inline `code` render at the same visual size/weight as
+     ;; the surrounding text — the generic logical "Monospaced" falls back to a
+     ;; compact face (Consolas on Windows) that looks smaller next to it.
+     :mono (Font. fam Font/PLAIN (max 11 size))
      :h1   (Font. fam Font/BOLD (int (* size 1.35)))
      :h2   (Font. fam Font/BOLD (int (* size 1.18)))
      :h3   (Font. fam Font/BOLD (int (* size 1.06)))
@@ -83,6 +89,27 @@
 ;; ---------------------------------------------------------------------------
 ;; Styled-run helpers (measure / wrap / draw)
 ;; ---------------------------------------------------------------------------
+
+(def ^:private unicode-fallback-families
+  "Logical font families Java composites across the whole OS font set. Used when
+  the configured chat font (e.g. Fira Code SemiBold) lacks a glyph, so Unicode
+  that the physical font can't draw still renders instead of a `[?]`/`□` box."
+  ["SansSerif" "Dialog" "Monospaced"])
+
+(defn- display-font
+  "Return a font that can render every char in `s`. Prefers `base`; if any char
+  is missing, falls back to a composite logical font of the same size/style."
+  ^Font [^Font base ^String s]
+  (if (or (str/blank? s)
+          (<= (.canDisplayUpTo base s) -1))
+    base
+    (let [style (.getStyle base)
+          size (.getSize base)]
+      (or (some (fn [fam]
+                  (let [c (Font. fam style size)]
+                    (when (<= (.canDisplayUpTo c s) -1) c)))
+                unicode-fallback-families)
+          base))))
 
 (defn- runs-text ^String [runs]
   (apply str (map :text runs)))
@@ -115,10 +142,9 @@
              (recur (rest rs) r-end (conj! acc (assoc r :text t))))))
        acc))))
 
-(defn- wrap-text-plain
-  "Greedy word-wrap of plain `text` to `max-w` px using `fm` metrics. Returns a
-   vector of lines whose concatenation equals the original text (whitespace
-   preserved), so char offsets can be recovered for styled slicing."
+(defn- wrap-paragraph-plain
+  "Greedy word-wrap of a single paragraph (no `\\n`) to `max-w` px using `fm`
+   metrics."
   [^FontMetrics fm ^String text ^double max-w]
   (let [tokens (str/split text #"(?<=\s)")
         n (count tokens)]
@@ -129,10 +155,29 @@
               fits (<= (.stringWidth fm cand) max-w)]
           (cond
             (and (seq line) (not fits))
-            (recur i (str tok) (conj! lines line))
+            (recur (inc i) (str tok) (conj! lines line))
             :else
             (recur (inc i) cand lines)))
-        (if (seq line) (conj! lines line) lines)))))
+        (persistent! (if (seq line) (conj! lines line) lines))))))
+
+(defn- wrap-text-plain
+  "Greedy word-wrap of plain `text` to `max-w` px using `fm` metrics. Explicit
+   `\\n` always starts a new line. Returns a vector of lines whose concatenation
+   equals the original text (whitespace preserved), so char offsets can be
+   recovered for styled slicing."
+  [^FontMetrics fm ^String text ^double max-w]
+  (if-not (str/includes? text "\n")
+    (wrap-paragraph-plain fm text max-w)
+    (let [paras (str/split text #"\n" -1)
+          n (count paras)]
+      (loop [i 0, acc (transient [])]
+        (if (< i n)
+          (let [lines (wrap-paragraph-plain fm (nth paras i) max-w)]
+            (recur (inc i)
+                   (if (< i (dec n))
+                     (conj! (reduce conj! acc lines) "\n")
+                     (reduce conj! acc lines))))
+          (persistent! acc))))))
 
 (defn- wrap-runs
   "Wrap `runs` so each line fits `max-w` px. Returns a vector of line vectors of
@@ -147,7 +192,7 @@
       (let [^Font f (or (some-> (first runs) :font)
                         (Font. "Monospaced" Font/PLAIN 13))
             fm (.getFontMetrics g f)
-            lines (persistent! (wrap-text-plain fm text max-w))]
+            lines (wrap-text-plain fm text max-w)]
         (loop [lines lines, off 0, acc (transient [])]
           (if-let [ln (first lines)]
             (let [len (count ln)]
@@ -192,6 +237,8 @@
 ;; ---------------------------------------------------------------------------
 
 (declare node-height)
+(declare rows-for-message)
+(declare build-zones)
 
 (defn- inline-runs
   "Flatten a CommonMark inline subtree into styled runs."
@@ -201,16 +248,18 @@
       Text
       (if-let [s (.getLiteral ^Text n)]
         [{:text s
-          :font (let [style (bit-or (if bold? Font/BOLD 0) (if italic? Font/ITALIC 0))]
-                  (if (zero? style) base (.deriveFont base style)))
+          :font (let [style (bit-or (if bold? Font/BOLD 0) (if italic? Font/ITALIC 0))
+                      f (if (zero? style) base (.deriveFont base style))]
+                  (display-font f s))
           :color color
           :underline? (boolean underline?)}]
         [])
 
       Code
-      [{:text (str " " (.getLiteral ^Code n) " ")
-        :font (:mono fonts)
-        :color (:text (:pal ctx))}]
+      (let [s (str " " (.getLiteral ^Code n) " ")]
+        [{:text s
+          :font (display-font (:mono fonts) s)
+          :color (:text (:pal ctx))}])
 
       Emphasis
       (mapcat #(inline-runs ctx % base color bold? true underline?)
@@ -231,7 +280,8 @@
       [{:text "\n" :font base :color color}]
 
       HtmlInline
-      [{:text (.getLiteral ^HtmlInline n) :font (:mono fonts) :color (:status (:pal ctx))}]
+      (let [s (.getLiteral ^HtmlInline n)]
+        [{:text s :font (display-font (:mono fonts) s) :color (:status (:pal ctx))}])
 
       (mapcat #(inline-runs ctx % base color bold? italic? underline?)
               (md-render/node-children n)))))
@@ -274,7 +324,7 @@
     (+ (* (max 1 (count lines)) ln) 14)))
 
 (defn- status-runs [ctx ^Color color ^String text]
-  [{:text text :font (:base (:fonts ctx)) :color color}])
+  [{:text text :font (display-font (:base (:fonts ctx)) text) :color color}])
 
 ;; --- tables ---------------------------------------------------------------
 
@@ -379,7 +429,10 @@
     (.fillRoundRect g (int bx) (int y) (int bw) (int h) 8 8)
     (loop [i 0, yy (+ y 7)]
       (when (< i (count lines))
-        (let [runs (wrap-runs g [{:text (nth lines i) :font f :color (:text pal)}] text-w)]
+        (let [cell-text (nth lines i)
+              runs (wrap-runs g [{:text cell-text :font (display-font f cell-text)
+                                  :color (:text pal)}]
+                               text-w)]
           (doseq [line runs]
             (draw-lines! g [line] (+ bx 6) (double yy))))
         (recur (inc i) (+ yy ln))))
@@ -404,7 +457,7 @@
         items (md-render/node-children n)]
     (loop [idx 0, yy (double y), items items]
       (if-let [^ListItem li (first items)]
-        (let [marker (if ordered? (str (inc idx) ".") "•")]
+        (let [marker (if ordered? (str (inc idx) ".") "·")]
           (.setColor g (:thinking pal))
           (.setFont g (:base (:fonts ctx)))
           (.drawString g marker (float (+ x 2))
@@ -504,7 +557,8 @@
         fonts (:fonts ctx)
         pal (:pal ctx)
         cap (max 80 (long (- (* maxw max-user-frac) (* 2 outer-pad))))
-        lines (wrap-runs g [{:text text :font (:base fonts) :color (:user pal)}] cap)
+        lines (wrap-runs g [{:text text :font (display-font (:base fonts) text)
+                             :color (:user pal)}] cap)
         content-w (apply max 40 (map #(runs-width g %) lines))
         bubble-w (min cap (+ content-w 24))]
     {:lines lines :content-w content-w :w bubble-w :h (+ (lines-height g lines) 20)}))
@@ -522,9 +576,11 @@
         hdr (+ (.getHeight (.getFontMetrics g (:base (:fonts ctx)))) 8)
         base (+ hdr 10)]
     (if expanded?
-      (let [args-lines (wrap-runs g [{:text (pr-str args) :font (:mono (:fonts ctx))
-                                     :color (:status (:pal ctx))}]
-                                 (max 40 (- maxw 20)))
+      (let [args-str (pr-str args)
+            args-lines (wrap-runs g [{:text args-str
+                                      :font (display-font (:mono (:fonts ctx)) args-str)
+                                      :color (:status (:pal ctx))}]
+                                  (max 40 (- maxw 20)))
             sum-lines (when (seq summary)
                         (wrap-runs g (status-runs ctx (:status (:pal ctx)) summary)
                                    (max 40 (- maxw 20))))]
@@ -546,13 +602,14 @@
       0)))
 
 (defn- paint-user!
-  [ctx {:keys [text] :as m} y maxw]
-  (let [ul (user-layout ctx m (+ maxw (* 2 outer-pad)))
+  [ctx {:keys [text] :as m} y inner]
+  (let [fullw (+ inner (* 2 outer-pad))
+        ul (user-layout ctx m fullw)
         ^Graphics2D g (:g2 ctx)
         pal (:pal ctx)
         h (:h ul)
         bw (:w ul)
-        bx (- maxw (+ bw outer-pad))]
+        bx (- fullw (+ bw outer-pad))]
     (.setColor g (:bubble pal))
     (.fillRoundRect g (int (Math/round (double bx))) (int y) (int bw) (int h) corner corner)
     (draw-lines! g (:lines ul) (+ bx 12) (+ y 10))
@@ -571,7 +628,7 @@
     (.drawRoundRect g (int outer-pad) (int y) (int maxw) (int h) corner corner)
     (.setFont g (:base (:fonts ctx)))
     (.setColor g (:thinking pal))
-    (.drawString g (if open? "▾ thinking" "▸ thinking")
+    (.drawString g (if open? "- thinking" "+ thinking")
                   (float (+ outer-pad 10)) (float (+ y (.getAscent fm) 6)))
     (when actions
       (swap! actions conj {:rect (Rectangle. (int outer-pad) (int y) (int maxw) (int hdr-h))
@@ -596,7 +653,7 @@
                        :error (Color. 235 94 94)
                        :rejected (:status pal)
                        (:tool pal))
-        icon (case status :done "✓" :error "✗" :rejected "⊘" "…")
+        icon (case status :done "ok" :error "!!" :rejected "no" "...")
         header (str "  " icon " " name
                     (when-let [ms ms] (str "  " ms "ms"))
                     (when (seq server) (str "  [" server "]")))
@@ -612,9 +669,11 @@
       (swap! actions conj {:rect (Rectangle. (int outer-pad) (int y) (int maxw) (int hdr-h))
                            :kind :toggle :msg-id id}))
     (when expanded?
-      (let [args-lines (wrap-runs g [{:text (pr-str args) :font (:mono (:fonts ctx))
-                                     :color (:status pal)}]
-                                 (max 40 (- maxw 20)))
+      (let [args-str (pr-str args)
+            args-lines (wrap-runs g [{:text args-str
+                                      :font (display-font (:mono (:fonts ctx)) args-str)
+                                      :color (:status pal)}]
+                                  (max 40 (- maxw 20)))
             sum-lines (when (seq summary)
                         (wrap-runs g (status-runs ctx (:status pal) summary)
                                    (max 40 (- maxw 20))))]
@@ -634,10 +693,11 @@
     (+ y (lines-height g lines) 4)))
 
 (defn- paint-message!
-  [ctx m maxw hover? actions]
+  [ctx m maxw hover? _sel actions]
   (let [inner (- maxw (* 2 outer-pad))]
+    ;; (selection highlight is painted centrally in paint-view! from :zones)
     (case (:type m)
-      :user (paint-user! ctx m (or (:y-offset m) 0.0) maxw)
+      :user (paint-user! ctx m (or (:y-offset m) 0.0) inner)
 
       :assistant
       (let [y0 (+ 4.0 (double (or (:y-offset m) 0.0)))]
@@ -687,6 +747,9 @@
    :heights {}
    :hover-msg nil
    :actions []
+   :sel nil        ; {:from {:mi idx :row line} :to {:mi idx :row line}}
+   :zones []       ; flat cached row geometry, recomputed each paint:
+                   ;   [{:mi idx :row line :y0 y :y1 y+h :text "..."} ...]
    :g (create-metrics-g)})
 
 (defn- st-of ^clojure.lang.Atom [^JComponent c]
@@ -723,7 +786,10 @@
                      (+ y0 (+ (long h) msg-gap))))
             [hm ys y]))
         total' (if (seq ys) (- total msg-gap) 0)]
-    (swap! st assoc :heights hm :ys ys :total total'))
+    (swap! st assoc :heights hm :ys ys :total total')
+    ;; keep the zone geometry in sync even before a repaint, so mouse events
+    ;; always hit-test against the current layout (not a stale previous frame)
+    (swap! st assoc :zones (build-zones st)))
   (when-let [^JComponent c (:component @st)]
     (.revalidate c)
     (.repaint c))
@@ -743,6 +809,334 @@
                   (StringSelection. s)
                   nil)))
 
+;; --- selection -------------------------------------------------------------
+;; The SINGLE source of truth for hit-testing and copy is `:zones`, a flat
+;; geometry list rebuilt during paint (`{:mi idx :row j :y0 y :y1 y+h :text}`).
+;; Selection endpoints are ZONE INDICES, so pressing/dragging/copying all use
+;; exactly the coordinates the painter just used — impossible to drift.
+
+(defn- build-zones
+  "Recompute the flat zone vector from the current layout (messages/ys/heights).
+  Zone y-coordinates are in view space (each message's rows positioned at its
+  real `:ys` entry)."
+  [st]
+  (let [s @st
+        msgs (:messages s)
+        ys (:ys s)
+        g (:g s)
+        width (max 160 (:width s))
+        ctx {:g2 g :pal (palette) :fonts (fonts-map)}]
+    (loop [i 0 out []]
+      (if (>= i (count msgs))
+        out
+        (let [y0 (double (nth ys i 0.0))
+              m (assoc (nth msgs i) :y-offset y0)
+              rows (rows-for-message ctx m width)
+              zones (mapv (fn [j r]
+                            {:mi i :row j
+                             :x0 (double (:x0 r))
+                             :y0 (double (:y r))
+                             :y1 (+ (double (:y r)) (double (:h r)))
+                             :font (:font r)
+                             :text (:text r)})
+                          (range (count (or rows []))) (or rows []))]
+          (recur (inc i) (into out zones)))))))
+
+(defn- zone-at-y
+  "Zone index (or nil) at view-y. STRICT: only a y that actually falls inside a
+  zone's band [y0,y1) matches; blank space returns nil."
+  [st ^double y]
+  (loop [i 0 zones (seq (:zones @st))]
+    (when zones
+      (let [z (first zones)]
+        (if (and (>= (double y) (double (:y0 z)))
+                 (< (double y) (double (:y1 z))))
+          i
+          (recur (inc i) (next zones)))))))
+
+;; --- character-level selection ---------------------------------------------
+;; Endpoints are `{:zone idx :col col}` (0-based char column within the zone's
+;; text). Ordering is by (zone, col). This gives char-granular selection.
+
+(defn- char-col-at-x
+  "Column index (0..len) within `zone` for a view-x, using FontMetrics."
+  ^long [st zone ^double x]
+  (let [text (str (:text zone))
+        len (count text)
+        g (:g @st)
+        zone-x (double (:x0 zone))]
+    (if (<= (double x) zone-x)
+      0
+      (let [fm (.getFontMetrics g (or (:font zone) (Font. "Monospaced" Font/PLAIN 13)))
+            w (.stringWidth fm text)
+            rel (- (double x) zone-x)]
+        (if (>= rel w)
+          len
+          (loop [c 0 prev 0]
+            (if (>= c len)
+              c
+              (let [cw (.charWidth fm (.charAt text c))
+                    nw (+ prev cw)]
+                (if (> nw rel)
+                  (if (< (- rel prev) (- nw rel))
+                    c
+                    (inc c))
+                  (recur (inc c) nw))))))))))
+
+(defn- endpoint-order
+  "Compare selection endpoints (zone, col) ascending."
+  [{a-zone :zone a-col :col} {b-zone :zone b-col :col}]
+  (or (< a-zone b-zone)
+      (and (= a-zone b-zone) (< a-col b-col))))
+
+(defn- selection-zone-range
+  "Inclusive [lo hi] zone indices covered by `:sel`, or nil."
+  [st]
+  (when-let [{:keys [from to]} (:sel @st)]
+    (when (and from to)
+      (let [lo (if (endpoint-order from to) from to)
+            hi (if (endpoint-order from to) to from)]
+        [(long (:zone lo)) (long (:zone hi))]))))
+
+(defn- selection-text
+  "Text of the selected char span (plain text)."
+  ^String [st]
+  (when-let [{:keys [from to]} (:sel @st)]
+    (when (and from to)
+      (let [lo (if (endpoint-order from to) from to)
+            hi (if (endpoint-order from to) to from)
+            zones (:zones @st)
+            lo-zone (long (:zone lo))
+            hi-zone (long (:zone hi))
+            lo-col (max 0 (long (:col lo)))
+            hi-col (long (:col hi))]
+        (if (= lo-zone hi-zone)
+          (when (< lo-zone (count zones))
+            (subs (str (:text (nth zones lo-zone)))
+                  lo-col
+                  (min hi-col (count (str (:text (nth zones lo-zone)))))))
+          (str/join "\n"
+                    (loop [z lo-zone acc []]
+                      (if (> z hi-zone)
+                        acc
+                        (let [t (str (:text (nth zones z)))]
+                          (recur (inc z)
+                                 (conj acc
+                                       (cond
+                                         (= z lo-zone) (subs t lo-col)
+                                         (= z hi-zone) (subs t 0 (min hi-col (count t)))
+                                         :else t))))))))))))
+
+(defn- line->rows
+  "Wrap `lines` (run-lines from wrap-runs) into geometry rows
+  {:x0 :y :h :font :text} starting at (x, y)."
+  [g ^Font fallback-f lines x y]
+  (loop [ls (seq lines) yy (double y) acc (transient [])]
+    (if-let [ln (first ls)]
+      (let [hdr (first ln)
+            f (or (:font hdr) fallback-f)
+            txt (apply str (map :text ln))
+            h (apply max 1 (map (fn [r]
+                                  (if-let [rf (:font r)]
+                                    (.getHeight (.getFontMetrics g rf))
+                                    0))
+                                ln))]
+        (recur (next ls) (+ yy h)
+               (conj! acc {:x0 (double x) :y yy :h h :font f :text txt})))
+      (persistent! acc))))
+
+(declare doc-rows)
+
+(defn- doc-rows
+  "Mirror paint-doc!/paint-node! and collect every drawn text row as
+  {:x0 :y :h :font :text}. Returns [rows final-y]."
+  [ctx ^Node n x y maxw]
+  (let [g (:g2 ctx)
+        pal (:pal ctx)]
+    (condp instance? n
+      Document
+      (reduce (fn [[rows yy] c]
+                (let [[rs yy2] (doc-rows ctx c x yy maxw)]
+                  [(into rows rs) yy2]))
+              [[] (double y)]
+              (md-render/node-children n))
+
+      Paragraph
+      (let [lines (wrap-runs g (para-runs ctx n) maxw)]
+        [(line->rows g (:base (:fonts ctx)) lines x (+ y 1))
+         (+ (double y) (lines-height g lines) block-gap)])
+
+      Heading
+      (let [f (heading-font ctx (.getLevel ^Heading n))
+            runs (inline-runs ctx n f (:text pal) true false false)
+            lines (wrap-runs g runs maxw)]
+        [(line->rows g f lines x y)
+         (+ (double y) (lines-height g lines) block-gap 2)])
+
+      FencedCodeBlock
+      (let [f (:mono (:fonts ctx))
+            fm (.getFontMetrics g f)
+            ln (.getHeight fm)
+            lines (code-lines (code-text n))
+            h (+ (* (max 1 (count lines)) ln) 14)
+            x0 (+ x 16)
+            rows (loop [i 0 yy (+ y 7) acc (transient [])]
+                   (if (< i (count lines))
+                     (recur (inc i) (+ yy ln)
+                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
+                                        :font (:mono (:fonts ctx))
+                                        :text (nth lines i)}))
+                     (persistent! acc)))]
+        [rows (+ (double y) (double h))])
+
+      IndentedCodeBlock
+      (let [f (:mono (:fonts ctx))
+            fm (.getFontMetrics g f)
+            ln (.getHeight fm)
+            lines (code-lines (code-text n))
+            h (+ (* (max 1 (count lines)) ln) 14)
+            x0 (+ x 16)
+            rows (loop [i 0 yy (+ y 7) acc (transient [])]
+                   (if (< i (count lines))
+                     (recur (inc i) (+ yy ln)
+                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
+                                        :font (:mono (:fonts ctx))
+                                        :text (nth lines i)}))
+                     (persistent! acc)))]
+        [rows (+ (double y) (double h))])
+
+      HtmlBlock
+      (let [f (:mono (:fonts ctx))
+            fm (.getFontMetrics g f)
+            ln (.getHeight fm)
+            lines (code-lines (code-text n))
+            h (+ (* (max 1 (count lines)) ln) 14)
+            x0 (+ x 16)
+            rows (loop [i 0 yy (+ y 7) acc (transient [])]
+                   (if (< i (count lines))
+                     (recur (inc i) (+ yy ln)
+                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
+                                        :font (:mono (:fonts ctx))
+                                        :text (nth lines i)}))
+                     (persistent! acc)))]
+        [rows (+ (double y) (double h))])
+
+      BulletList
+      (reduce (fn [[rows yy] ^ListItem li]
+                (let [[li-rows yy2] (doc-rows ctx li (+ x 20) yy (- maxw 20))]
+                  [(into rows (cons {:x0 (double (+ x 2)) :y yy :h (double (.getHeight (.getFontMetrics g (:base (:fonts ctx)))))
+                                     :font (:base (:fonts ctx))
+                                     :text "\u2022"}
+                                    li-rows))
+                   yy2]))
+              [[] (double y)]
+              (md-render/node-children n))
+
+      OrderedList
+      (let [items (vec (md-render/node-children n))]
+        (reduce (fn [[rows yy] [idx ^ListItem li]]
+                  (let [[li-rows yy2] (doc-rows ctx li (+ x 20) yy (- maxw 20))]
+                    [(into rows (cons {:x0 (double (+ x 2)) :y yy :h (double (.getHeight (.getFontMetrics g (:base (:fonts ctx)))))
+                                       :font (:base (:fonts ctx))
+                                       :text (str (inc idx) ".")}
+                                      li-rows))
+                     yy2]))
+                [[] (double y)]
+                (map-indexed vector items)))
+
+      ListItem
+      (reduce (fn [[rows yy] c]
+                (let [[rs2 yy3] (doc-rows ctx c x yy maxw)]
+                  [(into rows rs2) yy3]))
+              [[] (double y)]
+              (md-render/node-children n))
+
+      BlockQuote
+      (reduce (fn [[rows yy] c]
+                (let [[rs2 yy3] (doc-rows ctx c (+ x 12) yy (- maxw 16))]
+                  [(into rows rs2) yy3]))
+              [[] (+ (double y) 2)]
+              (md-render/node-children n))
+
+      ThematicBreak
+      [[] (+ (double y) (double (+ (.getHeight (.getFontMetrics g (:base (:fonts ctx)))) 6)))]
+
+      TableBlock
+      (let [rows (table-rows-of n)
+            f (:base (:fonts ctx))
+            fm (.getFontMetrics g f)
+            lh (.getHeight fm)
+            out (loop [rs rows idx 0 yy (+ y 4) acc (transient [])]
+                  (if-let [r (first rs)]
+                    (recur (next rs) (inc idx) (+ yy lh)
+                           (conj! acc {:x0 (double x) :y yy :h lh :font f
+                                       :text (str/join " | " (or (:cells r) []))}))
+                    (persistent! acc)))
+            h (apply + 0 (map :h out))]
+        [out (+ (double y) 8 (double h))])
+
+      (let [[rs yy2] (reduce (fn [[rows yy] c]
+                               (let [[rs2 yy3] (doc-rows ctx c x yy maxw)]
+                                 [(into rows rs2) yy3]))
+                             [[] (double y)]
+                             (md-render/node-children n))]
+        [rs yy2]))))
+
+(defn- rows-for-message
+  "All text rows for message `m` in the current view coordinate space."
+  [ctx m w]
+  (let [inner (- w (* 2 outer-pad))
+        y0 (double (or (:y-offset m) 0.0))
+        g (:g2 ctx)]
+    (case (:type m)
+      :user
+      (let [fullw (+ inner (* 2 outer-pad))
+            ul (user-layout ctx m fullw)
+            bx (- fullw (+ (:w ul) outer-pad))]
+        (line->rows g (:base (:fonts ctx)) (:lines ul) (+ bx 12) (+ y0 10)))
+
+      :assistant
+      (let [doc (md-render/parse! (:text m))]
+        (first (doc-rows ctx doc outer-pad (+ y0 4) inner)))
+
+      :thinking
+      (if (:open? m)
+        (let [hdr-h (.getHeight (.getFontMetrics g (:base (:fonts ctx))))
+              lines (wrap-runs g (status-runs ctx (:thinking (:pal ctx)) (:text m))
+                               (max 40 (- inner 20)))]
+          (line->rows g (:base (:fonts ctx)) lines (+ outer-pad 10)
+                      (+ y0 hdr-h 12)))
+        [])
+
+      :tool
+      (let [hdr-h (double (.getHeight (.getFontMetrics g (:base (:fonts ctx)))))
+            hdr-row {:x0 (+ outer-pad 10.0) :y (+ y0 4.0) :h hdr-h
+                     :font (:base (:fonts ctx))
+                     :text (str (case (:status m) :done "ok" :error "!!" :rejected "no" "...")
+                                " " (:name m)
+                                (when-let [ms (:ms m)] (str "  " ms "ms"))
+                                (when (seq (:server m)) (str "  [" (:server m) "]")))}
+            args-str (pr-str (:args m))
+            args-lines (wrap-runs g [{:text args-str :font (:mono (:fonts ctx))}] (max 40 (- inner 20)))
+            args-rows (line->rows g (:mono (:fonts ctx)) args-lines (+ outer-pad 10)
+                                  (+ y0 hdr-h 12))
+            sum-lines (when (seq (:summary m))
+                        (wrap-runs g (status-runs ctx (:status (:pal ctx)) (:summary m))
+                                   (max 40 (- inner 20))))
+            sum-rows (when (seq sum-lines)
+                       (line->rows g (:base (:fonts ctx)) sum-lines (+ outer-pad 10)
+                                   (+ y0 hdr-h 12 (lines-height g args-lines) 6)))]
+        (cond-> [hdr-row]
+          (:expanded? m) (into args-rows)
+          (:expanded? m) (into (or sum-rows []))))
+
+      (:status :banner)
+      (line->rows g (:base (:fonts ctx))
+                  (wrap-runs g (status-runs ctx (:status (:pal ctx)) (:text m)) inner)
+                  (+ outer-pad 2) (+ y0 2))
+
+      [])))
+
 (defn- paint-view!
   [^JComponent view ^Graphics g ^clojure.lang.Atom st]
   (let [s @st
@@ -753,29 +1147,69 @@
         msgs (:messages s)
         ys (:ys s)
         heights (:heights s)]
-    ;; While in splash (conversation not started) the view stays fully
-    ;; transparent so the background logo shows  through; once content exists
-    ;; it paints its own opaque background.
-    (when-not (:splash? s)
-      (.setColor g2 (:bg (palette)))
-      (.fillRect g2 0 0 w (.getHeight view)))
-    (let [^JScrollPane sp (:scrollpane s)
-          vp (when sp (.getViewport sp))
-          vr (if vp (.getViewRect vp) (Rectangle. 0 0 (int w) 800))
-          top (.getY ^Rectangle vr)
-          bot (+ top (.getHeight ^Rectangle vr))
-          actions (atom [])]
-      (dotimes [i (count msgs)]
-        (let [m (nth msgs i)
-              y (double (nth ys i))
-              h (double (get-in heights [(:id m) :h] 1))]
-          (when (and (< y (+ bot 400.0))
-                     (> (+ y h) (- top 400.0)))
-            (let [hover? (= (:hover-msg s) (:id m))
-                  m (assoc m :y-offset y)]
-              (paint-message! (make-ctx g2) m w hover? actions)))))
-      (swap! st assoc :actions (deref actions)))
-    (.dispose g2)))
+    ;; Rebuild the zone geometry used for hit-testing + highlight from the exact
+    ;; layout just painted. This is the ONE place geometry is computed for
+    ;; selection; mouse handlers and copy only read `:zones`.
+    (let [zones (build-zones st)
+          sel (selection-zone-range st)]
+      (swap! st assoc :zones zones)
+      (when-not (:splash? s)
+        (.setColor g2 (:bg (palette)))
+        (.fillRect g2 0 0 w (.getHeight view)))
+      (when sel
+        ;; paint the selection as inverted text: a solid light background bar over
+        ;; the selected characters, then re-draw those characters in the dark
+        ;; background color — a true text/background invert that's easy to see
+        (let [{:keys [from to]} (:sel @st)
+              lo (if (endpoint-order from to) from to)
+              hi (if (endpoint-order from to) to from)
+              lo-zone (long (:zone lo))
+              hi-zone (long (:zone hi))
+              lo-col (long (:col lo))
+              hi-col (long (:col hi))
+              inv-bg (Color. 235 238 245)      ; light bar
+              inv-fg (Color. 20 24 30)]         ; dark glyphs
+          (doseq [idx (range lo-zone (inc (min hi-zone (dec (count zones)))))]
+            (let [z (nth zones idx)
+                  text (str (:text z))
+                  f (or (:font z) (Font. "Monospaced" Font/PLAIN 13))
+                  fm (.getFontMetrics g2 f)
+                  c0 (if (= idx lo-zone) lo-col 0)
+                  c1 (if (= idx hi-zone) (min hi-col (count text)) (count text))
+                  sub (subs text c0 c1)
+                  x0 (+ (double (:x0 z)) (.stringWidth fm (subs text 0 c0)))
+                  y0 (double (:y0 z))
+                  y1 (double (:y1 z))
+                  h0 (max 2 (int (- y1 y0)))
+                  ascent (double (.getAscent fm))
+                  baseline (+ y0 ascent)]
+              (when (seq sub)
+                ;; invert bar
+                (.setColor g2 inv-bg)
+                (.fillRect g2 (int x0) (int y0)
+                           (max 1 (int (.stringWidth fm sub))) (int h0))
+                ;; re-draw the selected glyphs in the dark fg
+                (.setFont g2 f)
+                (.setColor g2 inv-fg)
+                (.drawString g2 sub (float x0) (float baseline)))))))
+      (let [^JScrollPane sp (:scrollpane s)
+            vp (when sp (.getViewport sp))
+            vr (if vp (.getViewRect vp) (Rectangle. 0 0 (int w) 800))
+            top (.getY ^Rectangle vr)
+            bot (+ top (.getHeight ^Rectangle vr))
+            actions (atom [])]
+        (dotimes [i (count msgs)]
+          (let [m (nth msgs i)
+                y (double (nth ys i))
+                h (double (get-in heights [(:id m) :h] 1))]
+            (when (and (< y (+ bot 400.0))
+                       (> (+ y h) (- top 400.0)))
+              (let [ctx (make-ctx g2)
+                    hover? (= (:hover-msg s) (:id m))
+                    m (assoc m :y-offset y :sel-h h)]
+                (paint-message! ctx m w hover? nil actions)))))
+        (swap! st assoc :actions (deref actions)))
+      (.dispose g2))))
 
 (defn- make-view-st
   [^clojure.lang.Atom st]
@@ -783,9 +1217,25 @@
                (getPreferredSize []
                  (Dimension. (max 100 (:width @st)) (max 1 (:total @st))))
                (paintComponent [g]
-                 (paint-view! this g st)))]
+                 (paint-view! this g st))
+               ;; Dynamic per-item tooltips: thinking/tool headers say whether a
+               ;; click expands or collapses, so the click affordance is obvious.
+               (getToolTipText [event]
+                 (when-let [a (hit-action st (.getPoint event))]
+                   (case (:kind a)
+                     :toggle
+                     (let [m (some #(when (= (:msg-id a) (:id %)) %) (:messages @st))]
+                       (when m
+                         (case (:type m)
+                           :thinking (if (:open? m) "Collapse thinking" "Expand thinking")
+                           :tool (if (:expanded? m) "Collapse tool call" "Expand tool call")
+                           "Toggle")))
+                     :copy-code "Copy code block"
+                     :copy-message "Copy message"
+                     nil))))]
     (swap! st assoc :component view)
     (.setOpaque view false)
+    (.setFocusable view true)
     (.putClientProperty view state-key st)
     view))
 
@@ -805,7 +1255,9 @@
         view (make-view-st st)
         sp (JScrollPane. view)]
     (swap! st assoc :scrollpane sp)
-    ;; manual scroll-away disables follow mode
+    ;; manual scroll-away disables follow mode; scrolling back to the bottom
+    ;; re-enables it, so the transcript auto-follows whenever it's positioned at
+    ;; the end (and stops following the moment you scroll up to read).
     (.addAdjustmentListener (.getVerticalScrollBar sp)
       (reify AdjustmentListener
         (adjustmentValueChanged [_ _]
@@ -813,40 +1265,94 @@
             (let [vr (.getViewRect vp)
                   vh (.getHeight (.getView vp))
                   near? (<= (- vh (+ (.getY ^Rectangle vr) (.getHeight ^Rectangle vr))) 60)]
-              (when-not near?
-                (swap! st assoc :follow? false)))))))
-    ;; click: toggle disclosures / copy. hover: switching + cursor.
-    (let [mouse (proxy [MouseAdapter] []
-                  (mouseClicked [^MouseEvent e]
-                    (when-let [a (hit-action st (.getPoint e))]
-                      (case (:kind a)
-                        :toggle
-                        (do
-                          (swap! st update :messages
-                                 (fn [msgs]
-                                   (mapv (fn [m]
-                                           (if (= (:id a) (:id m))
-                                             (case (:type m)
-                                               :thinking (update m :open? not)
-                                               :tool (update m :expanded? not)
-                                               m)
-                                             m))
-                                         msgs)))
-                          (update-and-validate! st))
-                        :copy-code (copy-text! (:payload a))
-                        :copy-message (copy-text! (:payload a)))))
-                  (mouseMoved [^MouseEvent e]
-                    (let [a (hit-action st (.getPoint e))
-                          hover-msg (when a (:msg-id a))]
-                      (when (not= hover-msg (:hover-msg @st))
-                        (swap! st assoc :hover-msg hover-msg)
-                        (.repaint view))
-                      (.setCursor view
-                                  (if a
-                                    (Cursor/getPredefinedCursor Cursor/HAND_CURSOR)
-                                    (Cursor/getDefaultCursor))))))]
-      (.addMouseListener view mouse)
-      (.addMouseMotionListener view mouse))
+              (swap! st assoc :follow? (boolean near?)))))))
+    ;; click/drag: text selection over the painted `:zones` (the single geometry
+    ;; source). Press picks the zone under the cursor; drag extends to the zone
+    ;; under the cursor; release copies the selected zone span. Ctrl+A/C use the
+    ;; same selected span.
+    (let [drag-pt (atom nil)
+          dragged (atom false)
+          endpoint-at (fn [^MouseEvent e]
+                        ;; {:zone z :col c} for a point, or nil
+                        (when-let [z (zone-at-y st (.getY e))]
+                          (let [zone (nth (:zones @st) z)]
+                            {:zone (long z)
+                             :col (char-col-at-x st zone (.getX e))})))]
+      (let [mouse (proxy [MouseAdapter] []
+                    (mousePressed [^MouseEvent e]
+                      (reset! dragged false)
+                      (.requestFocusInWindow view)
+                      (when (= MouseEvent/BUTTON1 (.getButton e))
+                        (if (hit-action st (.getPoint e))
+                          (reset! drag-pt nil)
+                          (do (reset! drag-pt (.getPoint e))
+                              (when-let [ep (endpoint-at e)]
+                                (swap! st assoc :sel {:from ep :to ep})
+                                (.repaint view))))))
+                    (mouseDragged [^MouseEvent e]
+                      (when @drag-pt
+                        (reset! dragged true)
+                        (when-let [ep (endpoint-at e)]
+                          (swap! st assoc-in [:sel :to] ep)
+                          (.repaint view))))
+                    (mouseReleased [^MouseEvent e]
+                      (when @drag-pt
+                        (reset! drag-pt nil)
+                        (let [txt (selection-text st)]
+                          (when (seq txt) (copy-text! txt)))))
+                    (mouseClicked [^MouseEvent e]
+                      ;; drag handled in mouseReleased; plain clicks dispatch to
+                      ;; toggle/copy actions only when not a drag.
+                      (when-not @dragged
+                        (when-let [a (hit-action st (.getPoint e))]
+                          (case (:kind a)
+                            :toggle
+                            (do
+                              (swap! st update :messages
+                                     (fn [msgs]
+                                       (mapv (fn [m]
+                                               (if (= (:msg-id a) (:id m))
+                                                 (case (:type m)
+                                                   :thinking (update m :open? not)
+                                                   :tool (update m :expanded? not)
+                                                   m)
+                                                 m))
+                                             msgs)))
+                              (update-and-validate! st))
+                            :copy-code (copy-text! (:payload a))
+                            :copy-message (copy-text! (:payload a))))))
+                    (mouseMoved [^MouseEvent e]
+                      (let [a (hit-action st (.getPoint e))
+                            hover-msg (when a (:msg-id a))]
+                        (when (not= hover-msg (:hover-msg @st))
+                          (swap! st assoc :hover-msg hover-msg)
+                          (.repaint view))
+                        (.setCursor view
+                                    (if a
+                                      (Cursor/getPredefinedCursor Cursor/HAND_CURSOR)
+                                      (Cursor/getDefaultCursor))))))]
+        (.addMouseListener view mouse)
+        (.addMouseMotionListener view mouse)))
+    ;; Ctrl+A select all; Ctrl+C copy the selection.
+    (let [im (.getInputMap view JComponent/WHEN_FOCUSED)
+          am (.getActionMap view)
+          ctrl (int InputEvent/CTRL_DOWN_MASK)]
+      (.put im (KeyStroke/getKeyStroke (int \a) ctrl) "grog-select-all")
+      (.put im (KeyStroke/getKeyStroke (int \c) ctrl) "grog-copy")
+      (.put am "grog-select-all"
+            (proxy [AbstractAction] []
+              (actionPerformed [_]
+                (let [n (count (:zones @st))]
+                  (when (pos? n)
+                    (swap! st assoc :sel {:from {:zone 0 :col 0}
+                                          :to   {:zone (dec n)
+                                                 :col (count (str (:text (peek (:zones @st)))))}})
+                    (.repaint view))))))
+      (.put am "grog-copy"
+            (proxy [AbstractAction] []
+              (actionPerformed [_]
+                (let [txt (selection-text st)]
+                  (when (seq txt) (copy-text! txt)))))))
     (.addComponentListener view
       (proxy [ComponentAdapter] []
         (componentResized [e]
@@ -898,13 +1404,39 @@
                 (:text m))))
        (str/join "\n\n")))
 
+(defn select-all!
+  "Select every visible line (zone) in the transcript."
+  [c]
+  (with-state c
+    (fn [st]
+      (let [n (count (:zones st))]
+        (when (pos? n)
+          (swap! st assoc :sel {:from {:zone 0 :col 0}
+                                :to   {:zone (dec n)
+                                       :col (count (str (:text (peek (:zones st)))))}}))))))
+
+(defn clear-selection!
+  "Clear the current selection highlight."
+  [c]
+  (with-state c
+    (fn [st]
+      (swap! st assoc :sel nil))))
+
+(defn copy-selection!
+  "Copy the currently selected message span to the clipboard."
+  [c]
+  (with-state c
+    (fn [st]
+      (let [txt (selection-text st)]
+        (when (seq txt) (copy-text! txt))))))
+
 (defn clear!
   "Wipe the transcript (keeps the offscreen metrics)."
   [c]
   (with-state c
     (fn [st]
       (swap! st assoc :messages [] :heights {} :ys [] :total 0 :actions [] :hover-msg nil
-             :splash? true))))
+             :sel nil :zones [] :splash? true))))
 
 (defn follow!
   "Enable/disable follow-mode (viewport pinned to the bottom)."

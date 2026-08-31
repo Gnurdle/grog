@@ -1,10 +1,16 @@
-{:eca {:model "openrouter/moonshotai/kimi-k2.6"}
+{:eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"}
+ ;; Config location (user-level grog.edn) is platform-aware:
+ ;;   Linux/macOS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
+ ;;   Windows:     %APPDATA%\grog\grog.edn          (e.g. C:\Users\you\AppData\Roaming\grog)
+ ;;   override:    $GROG_CONFIG_HOME/grog.edn
+ ;; Merge order: bundled defaults → the file above → ./grog.edn in the run dir.
  ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
- ;; For local Ollama use: :url "http://localhost:11434/v1"
- :llm {:url "http://localhost:11434/v1"
-       :model "qwen3.5:9b"
+ ;; Default below is DeepSeek via OpenRouter (match the ECA model above).
+ ;; For local Ollama swap to: :url "http://localhost:11434/v1" and a local model.
+ :llm {:url "https://openrouter.ai/api/v1"
+       :model "deepseek/deepseek-v4-flash-0731"
        ;; Optional: inline API key (not recommended). Prefer OS keyring account LLM_API_KEY set via /secret.
-       ;; :api-key "${LLM_API_KEY}"
+       ;; :api-key "${OPENROUTER_API_KEY}"
        ;; Optional: debug request payload and/or raw response content to stderr.
        ;; :debug-payload true
        ;; :debug-response true
@@ -21,13 +27,13 @@
        ;; :conn-timeout-sec 60
        ;; :socket-timeout-sec 300
        ;; Optional: human-readable label for status lines.
-       ;; :provider-name "Ollama Local"
+       ;; :provider-name "OpenRouter · DeepSeek"
        ;; Optional: provider-specific fields merged into every request payload.
        ;; E.g. OpenRouter context compression: :extra-payload {:transforms ["middle-out"]}
        ;; :extra-payload {:transforms ["middle-out"]}
        ;; Optional: named presets for /model. Each profile overrides base :llm keys for the session.
        ;; :profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
-       ;;            :remote {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k2.7-code"}}
+       ;;            :remote {:url "https://openrouter.ai/api/v1" :model "deepseek/deepseek-v4-flash-0731"}}
        }
  :soul {:path "SOUL.md"}
  ;; Skills: each subdir of these roots must contain skill.edn + SKILL.md
@@ -46,6 +52,11 @@
  ;; A project may hold project.edn with :description, :model, :mcp, :appearance, and :root (an
  ;; absolute/~-expanded path to override the working dir, e.g. point a "grog" project at the repo).
  ;; :projects {:dir "~/grog-projects" :default "gmail-cleanup"}
+ ;; Optional: additional named secrets for /secret and the with_api_key tool.
+ ;; Each map adds a known account you can set/unset via /secret (values never printed).
+ ;; Built-ins are BRAVE_SEARCH_API and LLM_API_KEY.
+ ;; :secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}
+ ;;                       {:account "PHANTOM_X" :description "Another API token"}]}
  ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.
  ;; :appearance {:chat {:font-family "Monospaced" :font-size 18
  ;;                     :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
@@ -61,4 +72,11 @@
        :chat-stream-live-thinking true
        :chat-stream-live-content true
        :chat-stream-live-markdown false
-       :format-markdown true}}
+       :format-markdown true}
+ ;; Optional: recurring feed monitor. The agent can call the MCP `fetch_feed`
+ ;; tool (grog-rss) itself, so a chron task just tells it which feeds to watch:
+ ;; :chron {:enabled true
+ ;;         :tasks [{:id "rss-tech"
+ ;;                  :every-minutes 240
+ ;;                  :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
+ }

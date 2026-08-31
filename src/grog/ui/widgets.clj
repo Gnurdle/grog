@@ -4,9 +4,10 @@
   derived from the active Look & Feel's system font (see `scale-ui-fonts!`)."
   (:require [grog.appearance :as appearance])
   (:import (java.awt BasicStroke Color Cursor Font Graphics RenderingHints)
+           (java.awt.event MouseWheelEvent MouseWheelListener)
            (java.awt.geom Path2D$Double)
            (java.awt.image BufferedImage)
-           (javax.swing ImageIcon JButton SwingConstants UIManager)))
+           (javax.swing ImageIcon JButton JScrollPane SwingConstants UIManager)))
 
 (def ^:private ui-font-scale 1.5)
 (def ^:private min-ui-size 19)
@@ -72,12 +73,43 @@
   (Font. "Monospaced" (if (appearance/windows?) Font/BOLD Font/PLAIN) (mono-font-size)))
 
 (defn dialog-mono-font
-  "Moderate monospace font for dialog/approval body text. Unlike `mono-font`
-  this stays at (roughly) the system L&F base size instead of the 1.5x dialog
-  scale, and uses regular weight, so a long tool-call summary in an approval
-  dialog reads as plain body text rather than towering bold monospace."
+  "Monospace font for dialog/approval body text. Follows the configured chat
+  font family (Fira Code, …) at a readable size clamped to roughly the chat
+  font size — so approval call text reads the same size as the transcript it
+  accompanies, without ever towering beyond the chat font itself."
   ^Font []
-  (Font. "Monospaced" Font/PLAIN (max 13 (stable-base-size))))
+  (let [size (long (appearance/chat-font-size))]
+    (Font. (or (some-> (appearance/chat-font-family) str not-empty) "Monospaced")
+           Font/PLAIN
+           (int (max 14 (min 21 size))))))
+
+(defn- wheel-step-px
+  "How far one notched wheel step should scroll horizontally when Shift is held.
+  Derived from the UI scale so it feels proportional on any DPI/font size."
+  []
+  (let [base (max 14 (ui-font-size))]
+    (max 120 (int (* base 7)))))
+
+(defn boost-horizontal-wheel!
+  "Boost Shift+MouseWheel horizontal scrolling on `sp`. The JVM default scrolls a
+  single unit per notch (for a text view that's ~1 character), which feels
+  horribly sluggish; this handler scrolls the horizontal scrollbar by a generous
+  fixed step and consumes the event so the default handler doesn't also run.
+  Vertical wheel scrolling is left untouched."
+  ^JScrollPane [^JScrollPane sp]
+  (let [step (atom (wheel-step-px))]
+    (.addMouseWheelListener sp
+      (reify MouseWheelListener
+        (mouseWheelMoved [_ e]
+          (when (.isShiftDown ^MouseWheelEvent e)
+            (.consume ^MouseWheelEvent e)
+            (let [sb (.getHorizontalScrollBar sp)]
+              (when (and sb (pos? (- (.getMaximum sb) (.getMinimum sb))))
+                (.setValue sb
+                           (+ (.getValue sb)
+                              (* (long (.getWheelRotation ^MouseWheelEvent e))
+                                 (long @step)))))))))))
+  sp)
 
 (defn scale-ui-fonts!
   "After the Look & Feel is installed, bump its base UI font keys so every
@@ -189,6 +221,18 @@
             (line! 5 8 9 11)
             (line! 13 8 9 11)
             (line! 3 15 15 15))
+
+        :html
+        (do
+          ;; "< >" code glyph: a chevron pair inside a document-ish box
+          (line! 5 5 5 15)
+          (line! 5 15 15 15)
+          (line! 15 15 15 5)
+          (line! 15 5 5 5)
+          (line! 6 8 9 10)
+          (line! 9 10 6 12)
+          (line! 11 8 14 10)
+          (line! 14 10 11 12))
 
         :clear
         (do (line! 5 5 13 13)

@@ -13,6 +13,7 @@
             [grog.chron :as chron]
             [grog.fs :as fs]
             [grog.jobs :as jobs]
+            [grog.tasks :as tasks]
             [grog.edn-store :as edn-store]
             [grog.md-stream :as md-stream]
             [grog.mcp :as mcp]
@@ -790,7 +791,7 @@
 
 (declare help-text handle-shell-command! handle-jobs-command! handle-chron-command!
          handle-mcp-command! handle-project-command! handle-secret-command!
-         handle-soul-command! handle-model-command!)
+         handle-soul-command! handle-model-command! handle-tasks-command!)
 
 (defn route-slash-command!
   "Route a chat line that is a slash command (or quit/exit) to its handler,
@@ -808,7 +809,7 @@
 
       (= "/paste" lc)
       (do (binding [*out* *err*]
-            (println "GUI: /paste isn't needed — Ctrl+Enter inserts a new line, then Enter sends."))
+            (println "GUI: /paste isn't needed — Enter inserts a new line, then Ctrl+Enter sends."))
           ::handled)
 
       (= "/help" lc)
@@ -820,6 +821,7 @@
       (handle-shell-command! line)  ::handled
       (handle-project-command! line) ::handled
       (handle-jobs-command! line)   ::handled
+      (handle-tasks-command! line)  ::handled
       (handle-chron-command! line)  ::handled
       (handle-mcp-command! line)    ::handled
       (handle-secret-command! line) ::handled
@@ -830,9 +832,8 @@
 (defn- brave-status-line []
   (if (brave/brave-search-configured?)
     "Brave web search: enabled (model may call `brave_web_search`)"
-    (str "Brave web search: off — store token in OS keyring (service \"grog\", account \""
-         secrets/brave-search-api-account
-         "\") or /secret in chat")))
+    (str "Brave web search: off — store token via /secret set " secrets/brave-search-api-account
+         " <value> (OS keyring, or file store on headless systems)")))
 
 (defn- llm-status-line []
   (let [name (config/provider-name)
@@ -860,7 +861,7 @@
    \newline
    ["Grog — simple chat via OpenAI-compatible /v1/chat/completions."
     ""
-    "Config merges: resources/grog.edn → ~/.config/grog/grog.edn → ./grog.edn"
+    "Config merges: resources/grog.edn → user grog.edn (Linux ~/.config/grog/grog.edn or $XDG_CONFIG_HOME; Windows %APPDATA%\\grog\\grog.edn; override with $GROG_CONFIG_HOME) → ./grog.edn"
     "Required: :llm {:url \"…/v1\" :model \"…\"}"
     "Optional: :llm {:max-context-tokens N} — drop oldest non-system messages before each request; default 200000 (nil to disable); rough estimate (~4 chars/token)"
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"
@@ -905,7 +906,7 @@
     "  /jobs — add|list|next|status (needs :edn-store + active project); queue in memory namespace grog-jobs under the project"
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
-    "  /secret — list known secret keys and set/unset status (never prints values); /secret <KEY> <value> — store in OS keyring (service grog)"
+    "  /secret — list known secret keys and set/unset status (values never printed); /secret set <KEY> <value> (or /secret <KEY> <value>) stores in the OS keyring, falling back to <config-home>/secrets.edn on headless/unsupported systems; /secret rm <KEY> removes; /secret file|backend | status"
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
     "  /model — show current LLM model and URL, plus any :llm :profiles"
@@ -998,6 +999,106 @@
           (println "No active project."))
         :else
         (println "Unknown /jobs — try /jobs with no args for help")))
+    true))
+
+(defn- handle-tasks-command! [line]
+  (when-let [[_ more] (re-matches #"(?i)^/tasks(?:\s+(.*))?$" (str/trim line))]
+    (let [tail (str/trim (or more ""))
+          p (config/active-project-name)
+          parse (fn [s] (str/lower-case (first (str/split (str/trim (or s "")) #"\s+" 2))))]
+      (if (str/blank? p)
+        (println "No active project. Set one first: /project <name>")
+        (let [cmd (parse tail)]
+          (cond
+            (str/blank? tail)
+            (do
+              (println "Usage: /tasks [due] | add <title> [|due …] [|every …] | done <id> | rm <id>")
+              (println "  add <title>      todo (default)")
+              (println "  add <title> |every <Nh>    recurring check every N hours")
+              (println "  add <title> |due +Nh |due +Nm |due HH:mm |due @epochms")
+              (println "  Tasks are always user-instigated — nothing runs automatically.")
+              (println)
+              (if (seq (tasks/open-tasks p))
+                (do (println "Open tasks:")
+                    (doseq [t (tasks/upcoming-tasks p)]
+                      (let [k (if (= :recurring (:kind t)) "rec" "todo")
+                            due-flag (when (and (:due t)
+                                                (<= (long (:due t)) (System/currentTimeMillis)))
+                                       " [DUE]")]
+                        (println (str "  [" k "]" due-flag " " (:id t) " — " (:title t))))))
+                (println "No open tasks for this project.")))
+
+            (= cmd "due")
+            (let [due (tasks/due-tasks p)]
+              (if (seq due)
+                (do (println "Due/overdue tasks:")
+                    (doseq [t due]
+                      (println "  " (:id t) "—" (:title t)))
+                    (println "Mark done: /tasks done <id>. Ask me 'what needs doing?' for reminders."))
+                (println "No tasks are currently due.")))
+
+            (= cmd "add")
+            (let [body (str/trim (subs tail 4))
+                  segs (str/split body #"(?i)\s*\|\s*")
+                  title (str/trim (first segs))
+                  opts (mapv #(let [sp (str/split (str/trim (or % "")) #"\s+" 2)
+                                    k (str/lower-case (or (first sp) ""))
+                                    v (str/join " " (rest sp))]
+                                [k v])
+                             (rest segs))
+                  due-str (some (fn [[k v]] (when (= k "due") v)) opts)
+                  every-str (some (fn [[k v]] (when (= k "every") v)) opts)
+                  kind (if every-str :recurring :todo)
+                  interval (when-let [es every-str]
+                             (when-let [[_ h] (re-matches #"(?i)^(\d+)h$" (str/trim es))]
+                               (* 3600 (Long/parseLong h))))
+                  due (cond
+                        (and due-str (re-matches #"(?i)^\+(\d+)h$" (str/trim due-str)))
+                        (+ (System/currentTimeMillis)
+                           (* 3600000 (Long/parseLong (second (re-matches #"(?i)^\+(\d+)h$" (str/trim due-str))))))
+
+                        (and due-str (re-matches #"(?i)^\+(\d+)m$" (str/trim due-str)))
+                        (+ (System/currentTimeMillis)
+                           (* 60000 (Long/parseLong (second (re-matches #"(?i)^\+(\d+)m$" (str/trim due-str))))))
+
+                        (and due-str (re-matches #"(?i)^@(\d+)$" (str/trim due-str)))
+                        (Long/parseLong (second (re-matches #"(?i)^@(\d+)$" (str/trim due-str))))
+
+                        (and due-str (re-matches #"(?i)^(\d{1,2}):(\d{2})$" (str/trim due-str)))
+                        (let [[_ h m] (re-matches #"(?i)^(\d{1,2}):(\d{2})$" (str/trim due-str))
+                              target (+ (* 3600000 (Long/parseLong h)) (* 60000 (Long/parseLong m)))
+                              now-ms (mod (System/currentTimeMillis) 86400000)]
+                          (+ (System/currentTimeMillis)
+                             (if (>= target now-ms) (- target now-ms) (+ 86400000 (- target now-ms)))))
+
+                        :else nil)]
+              (if (str/blank? title)
+                (println "Usage: /tasks add <title> [|due …] [|every …]")
+                (let [out (tasks/add-task! p title :kind kind :due due :interval interval)]
+                  (if (:ok out)
+                    (let [bits (cond-> [(name kind)]
+                                 due (conj "due")
+                                 every-str (conj (str "every " interval "s")))]
+                      (println "Task added" (:id out) "-" (str/join ", " bits)))
+                    (println "Error:" (:error out))))))
+
+            (= cmd "done")
+            (let [id (str/trim (subs tail 5))]
+              (if (str/blank? id)
+                (println "Usage: /tasks done <id>")
+                (do (tasks/mark-done! p id)
+                    (println "Task marked done:" id))))
+
+            (= cmd "rm")
+            (let [id (str/trim (subs tail 3))]
+              (if (str/blank? id)
+                (println "Usage: /tasks rm <id>")
+                (println (if (:removed (tasks/delete-task! p id))
+                           (str "Removed task " id)
+                           (str "No task " id)))))
+
+            :else
+            (println "Unknown /tasks — try /tasks with no args")))))
     true))
 
 (defn- handle-chron-command! [line]
@@ -1166,15 +1267,68 @@
 (defn- handle-secret-command! [line]
   (when-let [[_ rest] (re-matches #"(?i)^/secret(?:\s+(.*))?$" (str/trim line))]
     (let [tail (str/trim (or rest ""))]
-      (if (str/blank? tail)
+      (cond
+        (str/blank? tail)
         (secrets/print-known-secrets-summary!)
+
+        ;; /secret file — show the fallback store path
+        (re-matches #"(?i)^(file|path|where)$" tail)
+        (println "Secret store file:" (.getPath (secrets/secrets-file)))
+
+        ;; /secret backend — which backend is active
+        (re-matches #"(?i)^(backend|status)$" tail)
+        (let [b (secrets/backend-status)]
+          (println (if (= :keyring (:backend b))
+                     "Backend: OS keyring"
+                     (str "Backend: file fallback — " (:reason b))))
+          (println "Store file:" (:path b)))
+
+        ;; /secret rm <KEY> | del <KEY> | delete <KEY>
+        (re-matches #"(?i)^(rm|del|delete|unset)\s+\S+$" tail)
+        (let [[_ _ k] (re-matches #"(?i)^(rm|del|delete|unset)\s+(\S+)$" tail)
+              k (str/trim k)]
+          (try
+            (let [res (secrets/delete-secret! k)
+                  keyring-msg (case (:keyring res)
+                                :deleted "from OS keyring"
+                                :absent "(was not in keyring)"
+                                "(keyring unavailable; removed from file)")
+                  file-msg (when (= :removed (:file res)) "and from file store")
+                  where (str/join " " (remove nil? [keyring-msg file-msg]))]
+              (println (str/join " " ["Removed" (pr-str k) where])))
+            (catch Exception e
+              (println "grog:/secret error:" (.getMessage e)))))
+
+        ;; /secret set <KEY> <value> — explicit set
+        (re-matches #"(?i)^set\s+.+$" tail)
+        (let [[_ k v] (re-matches #"(?i)^set\s+(\S+)\s+([\s\S]+)$" (str/trim tail))]
+          (if (and k (not (str/blank? k)) v (not (str/blank? (str/trim v))))
+            (try
+              (let [res (secrets/set-secret! (str/trim k) (str/trim v))]
+                (println "Stored" (pr-str (str/trim k))
+                         (if (= :keyring (:backend res))
+                           "in OS secret store (service \"grog\")."
+                           (str "in file store (OS backend unavailable: " (:reason res) ").")))
+                (when (= "LLM_API_KEY" (str/trim k))
+                  (println "LLM_API_KEY is set — it is used automatically by :llm requests.")))
+              (catch Exception e
+                (println "grog:/secret error:" (.getMessage e))))
+            (println "grog:/secret: need /secret set <KEY> <value> (value may contain spaces).")))
+
+        ;; legacy: /secret <KEY> <value>
+        :else
         (if-let [[k v] (parse-secret-key-value tail)]
           (try
-            (secrets/set-secret! k v)
-            (println "Stored" (pr-str k) "in OS secret store (service \"grog\").")
+            (let [res (secrets/set-secret! k v)]
+              (println "Stored" (pr-str k)
+                       (if (= :keyring (:backend res))
+                         "in OS secret store (service \"grog\")."
+                         (str "in file store (OS backend unavailable: " (:reason res) ").")))
+              (when (= secrets/llm-api-account k)
+                (println "LLM_API_KEY is set — it is used automatically by :llm requests.")))
             (catch Exception e
               (println "grog:/secret error:" (.getMessage e))))
-          (println "grog:/secret: need /secret <KEY> <value> (value may contain spaces). Use /secret alone to list keys."))))
+          (println "grog:/secret: try /secret (list), /secret set <KEY> <value>, /secret rm <KEY>, /secret file, /secret backend."))))
     true))
 
 (defn- handle-soul-command! [line]

@@ -94,11 +94,12 @@ Files: `README.md`, `deps.edn`, `build.clj`, `build-uberjar.{sh,bat}`,
   serves the same tools and authenticates against live Gmail.
 - ✅ **grog launch wiring** (upstairs, `/d/gni/grog`): `grog-mcp-servers`
   registers `grog-imap` conditionally when IMAP account metadata is available —
-  from the **email project** (`~/grog-projects/email/state/imap-accounts.json`)
-  or (backward compat) `:imap` in `grog.edn`. `imap-env` writes account
-  *metadata* to `~/.config/grog/imap-accounts.json` and sets `GROG_IMAP_CONFIG`.
-  Account data lives in the email project; grog.edn fallback is metadata only
-  (no password). Registered ids: imaging, memory, odoo, office, search, **imap**.
+  from the **email project** (`~/grog-projects/email/state/imap-accounts.edn`,
+  legacy `.json` accepted) or (backward compat) `:imap` in `grog.edn`.
+  `imap-env` writes account *metadata* to `~/.config/grog/imap-accounts.edn` and
+  sets `GROG_IMAP_CONFIG`. Account data lives in the email project; grog.edn
+  fallback is metadata only (no password). Registered ids: imaging, memory,
+  odoo, office, search, **imap**.
 
 ### Remaining for other providers / deployment
 

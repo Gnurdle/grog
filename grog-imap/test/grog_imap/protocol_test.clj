@@ -6,8 +6,8 @@
   AUTHENTICATE path. A tiny in-process IMAP server (real sockets) proves the
   connect -> login -> select -> list -> fetch -> search round trip."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
-            [grog-imap.protocol :as imap]))
+            [grog-imap.protocol :as imap]
+            [grog-imap.support :as support]))
 
 ;;; ---------------------------------------------------------------------------
 ;;; access to private fns under test
@@ -21,103 +21,6 @@
 (def build-parts #'grog-imap.protocol/build-parts)
 (def send-parts! #'grog-imap.protocol/send-parts!)
 (def auth-command! #'grog-imap.protocol/auth-command!)
-
-;;; ---------------------------------------------------------------------------
-;;; helpers
-;;; ---------------------------------------------------------------------------
-
-(defn- fake-conn
-  "A connection map backed by string streams — enough for the read/write
-  plumbing the unit tests below exercise."
-  [^String input]
-  {:reader (java.io.BufferedReader. (java.io.StringReader. input))
-   :writer (java.io.StringWriter.)
-   :tag (atom 0)})
-
-(defn- written [conn]
-  (str (.toString ^java.io.StringWriter (:writer conn))))
-
-(defn- b64-of [^String s]
-  (.encodeToString (java.util.Base64/getEncoder) (.getBytes s "UTF-8")))
-
-(defn- reply!
-  [^java.io.Writer out ^String s]
-  (.write out s)
-  (.flush out))
-
-(defn- reply-to-line!
-  "Emit the canned response for one client command line."
-  [^java.io.BufferedWriter out ^String line]
-  (let [parts (str/split line #"\s+")
-        tag (first parts)
-        cmd (second parts)
-        cmd2 (nth parts 2 nil)]
-    (case cmd
-      "LOGOUT" (reply! out (str "* BYE fake closing\r\n" tag " OK LOGOUT done\r\n"))
-      "LOGIN" (reply! out (str tag " OK LOGIN completed\r\n"))
-      "SELECT" (reply! out (str "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n"
-                                "* 5 EXISTS\r\n"
-                                "* 3 RECENT\r\n"
-                                tag " OK [READ-WRITE] SELECT completed\r\n"))
-      "LIST" (reply! out (str "* LIST (\\HasNoChildren) \"/\" INBOX\r\n"
-                              "* LIST (\\HasNoChildren \\Trash) \"/\" Trash\r\n"
-                              tag " OK LIST completed\r\n"))
-      "FETCH" (reply! out (str "* 1 FETCH (UID 42 FLAGS (\\Seen) RFC822.SIZE 1234)\r\n"
-                               tag " OK FETCH completed\r\n"))
-      "UID" (if (= "FETCH" cmd2)
-              (reply! out (str "* 1 FETCH (UID 42 FLAGS (\\Seen))\r\n"
-                               tag " OK UID FETCH completed\r\n"))
-              (reply! out (str tag " OK done\r\n")))
-      "SEARCH" (reply! out (str "* SEARCH 1 2 3\r\n" tag " OK SEARCH completed\r\n"))
-      "NOOP" (reply! out (str tag " OK done\r\n"))
-      "UNSELECT" (reply! out (str tag " OK done\r\n"))
-      (reply! out (str tag " BAD unknown command\r\n")))))
-
-(defn- serve-connection!
-  "Serve one client connection against the canned script."
-  [^java.io.BufferedReader in ^java.io.BufferedWriter out]
-  (reply! out "* OK [CAPABILITY IMAP4rev1 IDLE] fake ready\r\n")
-  (loop []
-    (let [line (.readLine in)]
-      (when line
-        (if-let [[_ n] (re-find #"\{(\d+)\}$" line)]
-          ;; literal portal -> continuation + bytes + trailing CRLF, then reply
-          (do (reply! out "+ \r\n")
-              (let [buf (char-array (int (Long/parseLong n)))]
-                (when (pos? (count buf))
-                  (.read in buf 0 (count buf))))
-              (.readLine in)
-              (reply-to-line! out line)
-              (recur))
-          (do (reply-to-line! out line)
-              (recur)))))))
-
-(defn- handle-accept
-  "Accept one connection and serve it with the canned script."
-  [^java.net.ServerSocket ss]
-  (try
-    (let [sock (.accept ss)]
-      (with-open [sock sock
-                  in (java.io.BufferedReader.
-                      (java.io.InputStreamReader.
-                       (.getInputStream sock) "UTF-8"))
-                  out (java.io.BufferedWriter.
-                       (java.io.OutputStreamWriter.
-                        (.getOutputStream sock) "UTF-8"))]
-        (serve-connection! in out)))
-    (catch Exception _)))
-
-(defn- start-fake-server
-  "One-shot, single-connection IMAP server on an ephemeral localhost port with a
-  canned script (greeting + LOGIN/SELECT/LIST/FETCH/UID FETCH/SEARCH/NOOP/
-  LOGOUT). Handles `{n}` literal portals. Returns {:port port}."
-  []
-  (let [ss (java.net.ServerSocket. 0)
-        port (.getLocalPort ss)
-        t (Thread. (fn [] (handle-accept ss)))]
-    (.setDaemon t true)
-    (.start t)
-    {:port port}))
 
 ;;; ---------------------------------------------------------------------------
 ;;; tokenizer
@@ -182,7 +85,7 @@
 
 (deftest read-response-single-read
   (testing "reads exactly one response; the next read gets the following line"
-    (let [conn (fake-conn "* OK hi\r\nA1 OK done\r\n")
+    (let [conn (support/fake-conn "* OK hi\r\nA1 OK done\r\n")
           r1 (read-response conn)
           r2 (read-response conn)]
       (is (= :untagged (:type r1)))
@@ -192,14 +95,14 @@
 
 (deftest read-response-literal
   (testing "literal content is assembled into the same parsed line"
-    (let [conn (fake-conn "* 1 FETCH (BODY[] {5}hello)\r\nA1 OK done\r\n")
+    (let [conn (support/fake-conn "* 1 FETCH (BODY[] {5}hello)\r\nA1 OK done\r\n")
           r (read-response conn)]
       (is (= :untagged (:type r)))
       ;; data: (1 FETCH [BODY[] "hello"])
       (is (= "hello" (-> (:data r) (nth 2) (nth 1)))))))
 
 (deftest collect-until-tagged
-  (let [conn (fake-conn "* 5 EXISTS\r\nA1 OK done\r\n")
+  (let [conn (support/fake-conn "* 5 EXISTS\r\nA1 OK done\r\n")
         res (collect-until-tagged! conn "A1")]
     (is (= :ok (:status (:tagged res))))
     (is (= 1 (count (:untagged res))))
@@ -234,25 +137,25 @@
   (is (= "MyFlag" (imap/flag-wire "MyFlag"))))
 
 (deftest parenthesized-test
-  (is (= "(UID FLAGS)" (imap/parenthesized [:uid :flags])))
-  (is (= "(MESSAGES UNSEEN)" (imap/parenthesized [:messages :unseen])))
+  (is (= {:paren "(UID FLAGS)"} (imap/parenthesized [:uid :flags])))
+  (is (= {:paren "(MESSAGES UNSEEN)"} (imap/parenthesized [:messages :unseen])))
   (testing "pre-wired flag strings pass through verbatim"
-    (is (= "(\\Seen \\Draft)"
+    (is (= {:paren "(\\Seen \\Draft)"}
            (imap/parenthesized [(imap/flag-wire :seen) (imap/flag-wire :draft)])))))
 
 (deftest build-parts-literal-portal
-  (let [conn (fake-conn "")
+  (let [conn (support/fake-conn "")
         msg "long message body\r\nwith spaces"
         parts (build-parts conn "APPEND" ["INBOX" msg])]
     (is (= (str "A1 APPEND INBOX {" (count msg) "}") (first parts)))
     (is (= {:lit msg} (second parts)))))
 
 (deftest send-parts-literal
-  (let [conn (fake-conn "+ \r\nA3 OK APPEND done\r\n")
+  (let [conn (support/fake-conn "+ \r\nA3 OK APPEND done\r\n")
         msg "body text"
         items ["A2 APPEND INBOX {9}" {:lit msg}]]
     (send-parts! conn items)
-    (is (= (str "A2 APPEND INBOX {9}\r\n" msg "\r\n") (written conn)))))
+    (is (= (str "A2 APPEND INBOX {9}\r\n" msg "\r\n") (support/written conn)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; completion helpers
@@ -281,21 +184,37 @@
 ;;; ---------------------------------------------------------------------------
 
 (deftest auth-login-wire
-  (let [conn (fake-conn "+ VXNlcm5hbWU6\r\n+ UGFzc3dvcmQ6\r\nA1 OK done\r\n")
+  (let [conn (support/fake-conn "+ VXNlcm5hbWU6\r\n+ UGFzc3dvcmQ6\r\nA1 OK done\r\n")
         res (auth-command! conn "LOGIN" ["user" "pass"])]
     (is (= :ok (imap/completion-status res)))
     (is (= (str "A1 AUTHENTICATE LOGIN\r\n"
-                (b64-of "user") "\r\n"
-                (b64-of "pass") "\r\n")
-           (written conn)))))
+                (support/b64-of "user") "\r\n"
+                (support/b64-of "pass") "\r\n")
+           (support/written conn)))))
 
 (deftest auth-rejects-without-continuation
-  (let [conn (fake-conn "A1 NO auth failed\r\n")]
+  (let [conn (support/fake-conn "A1 NO auth failed\r\n")]
     (is (thrown? clojure.lang.ExceptionInfo
                  (auth-command! conn "LOGIN" ["u" "p"])))))
 
+(deftest xoauth2-wire
+  (let [ir (str "user=" "u@example.com" "\u0001auth=Bearer tok123\u0001\u0001")
+        b64 (support/b64-of ir)]
+    (testing "success (no continuation)"
+      (let [conn (support/fake-conn "A1 OK AUTHENTICATE completed\r\n")
+            res (imap/authenticate-xoauth2 conn "u@example.com" "tok123")]
+        (is (imap/ok? res))
+        (is (= (str "A1 AUTHENTICATE XOAUTH2 " b64 "\r\n")
+               (support/written conn)))))
+    (testing "failure continuation answered with empty line"
+      (let [conn (support/fake-conn "+ eyJlcnJvciI6ImJhZGRfY3JlZGVudGlhbHMifQ\r\nA1 NO auth failed\r\n")
+            res (imap/authenticate-xoauth2 conn "u@example.com" "tok123")]
+        (is (= :no (imap/completion-status res)))
+        (is (= (str "A1 AUTHENTICATE XOAUTH2 " b64 "\r\n\r\n")
+               (support/written conn)))))))
+
 (deftest idle-deferred
-  (let [conn (fake-conn "")]
+  (let [conn (support/fake-conn "")]
     (is (thrown? clojure.lang.ExceptionInfo (imap/idle conn)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -303,7 +222,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (deftest e2e-connect-login-select-list-fetch-search
-  (let [{:keys [port]} (start-fake-server)
+  (let [{:keys [port]} (support/start-fake-server)
         conn (imap/connect "127.0.0.1" :port port :timeout 5000)]
     (try
       (testing "greeting"

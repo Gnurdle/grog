@@ -30,7 +30,7 @@ Speaks MCP over **stdio** (newline-delimited JSON-RPC). Wire into ECA:
     "grog-odoo": {
       "command": "clojure",
       "args": ["-M:mcp", "-m", "grog-odoo.main"],
-      "env": { "GROG_ODOO_CONFIG": "/home/you/.config/grog/odoo-instances.json" }
+      "env": { "GROG_ODOO_CONFIG": "/home/you/.config/grog/odoo-instances.edn" }
     }
 } }
 ```
@@ -59,7 +59,7 @@ And wire it into ECA with a plain JRE command (no bash wrapper; works on Windows
     "grog-odoo": {
       "command": "java",
       "args": ["-cp", "/path/to/grog-odoo.jar", "clojure.main", "-m", "grog-odoo.main"],
-      "env": { "GROG_ODOO_CONFIG": "/path/to/odoo-instances.json" }
+      "env": { "GROG_ODOO_CONFIG": "/path/to/odoo-instances.edn" }
     }
 } }
 ```
@@ -68,33 +68,27 @@ And wire it into ECA with a plain JRE command (no bash wrapper; works on Windows
 
 ### Multiple instances (recommended)
 
-Point `GROG_ODOO_CONFIG` at a JSON file:
+Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
 
-```json
-{
-  "instances": [
-    { "name": "stage",
-      "url": "https://exclave.cmsaero.com",
-      "db": "odoo18_stage",
-      "user": "admin",
-      "password": "secret-or-api-key",
-      "sql": {
-        "type": "postgres",
-        "host": "127.0.0.1",
-        "port": 5432,
-        "db": "odoo18_stage",
-        "user": "odoo",
-        "password": "..."
-      }
-    },
-    { "name": "prod",
-      "url": "https://odoo.example.com",
-      "db": "odoo18",
-      "user": "admin",
-      "password": "..."
-    }
-  ]
-}
+```edn
+{:instances [
+  {:name "stage"
+   :url "https://exclave.cmsaero.com"
+   :db "odoo18_stage"
+   :user "admin"
+   :password "secret-or-api-key"
+   :sql {:type "postgres"
+         :host "127.0.0.1"
+         :port 5432
+         :db "odoo18_stage"
+         :user "odoo"
+         :password "..."}}
+  {:name "prod"
+   :url "https://odoo.example.com"
+   :db "odoo18"
+   :user "admin"
+   :password "..."}
+]}
 ```
 
 - `name` is the only identifier the model can use. Selection is **locked to these
@@ -104,8 +98,8 @@ Point `GROG_ODOO_CONFIG` at a JSON file:
   clean error for that instance. Two backends are supported:
   - `"postgres"` — direct JDBC to the Odoo Postgres (default, shown above).
   - `"odoo-method"` — run SQL inside Odoo by calling a method you expose:
-    ```json
-    "sql": { "type": "odoo-method", "model": "custom.sql.runner", "method": "run_sql" }
+    ```edn
+    :sql {:type "odoo-method" :model "custom.sql.runner" :method "run_sql"}
     ```
 
 ### Legacy single instance (backwards compatible)

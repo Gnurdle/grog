@@ -97,6 +97,46 @@
                #"(?i)</?text[-/]markdown/?>|</text[-/]markdown>"
                ""))
 
+(defn- delimiter-width-line
+  "Given a `|`-delimited header line, produce a GFM `|---|` separator row with
+  the same number of cells."
+  ^String [^String header]
+  (let [trimmed (str/trim header)
+        cells (remove str/blank? (str/split trimmed #"(?<!\\)\|"))
+        n (max 1 (count cells))]
+    (str (when (str/starts-with? trimmed "|") "|")
+         (str/join "|" (repeat n "---"))
+         "|")))
+
+(defn- normalize-pipe-tables
+  "Repair tables the model wrote without a delimiter row: when a contiguous
+  block of `|`-lines parses as a paragraph (no GFM table), insert a `---|---`
+  separator after the first line so CommonMark upgrades it to a TableBlock.
+  Only acts when the block clearly has no delimiter already (conservative)."
+  ^String [^String s]
+  (let [lines (str/split (or s "") #"\n")
+        out (loop [i 0 out (transient [])]
+              (if (>= i (count lines))
+                (persistent! out)
+                (let [line (nth lines i)
+                      is-pipe? (str/starts-with? (str/trim line) "|")
+                      has-delim? (re-matches #"(?i)\|?\s*:?-{3,}(?:\s*:?)\s*\|?" (str/trim line))]
+                  (cond
+                    (and is-pipe?
+                         (not has-delim?)
+                         (< (inc i) (count lines))
+                         (str/starts-with? (str/trim (nth lines (inc i))) "|")
+                         (or (zero? i)
+                             (not (str/starts-with? (str/trim (nth lines (dec i))) "|"))))
+                    (recur (inc i)
+                           (-> out
+                               (conj! line)
+                               (conj! (delimiter-width-line line))))
+
+                    :else
+                    (recur (inc i) (conj! out line))))))]
+    (str/join "\n" out)))
+
 (declare rewrite-single-backtick-code-with-newlines table-block-rows normalize-row-widths)
 
 (defn table-rows
@@ -114,12 +154,16 @@
 (defn parse!
   "Public entrypoint: parse `markdown` as CommonMark (with GFM tables), stripping
   any `<text/markdown>` MIME-style wrappers before parsing so the caller gets a
-  clean AST. Returns the root `org.commonmark.node.Document`. On parse failure
-  returns an empty Document (never throws)."
+  clean AST. Also inserts missing `---|---` separator rows for pipe tables the
+  model wrote without a delimiter row (CommonMark would otherwise render them as
+  a literal `|` paragraph). Returns the root `org.commonmark.node.Document`. On
+  parse failure returns an empty Document (never throws)."
   ^org.commonmark.node.Document [^String markdown]
   (try
-    (let [s (strip-markdown-tags (or markdown ""))]
-      (.parse (make-parser) (rewrite-single-backtick-code-with-newlines s)))
+    (let [s (-> (strip-markdown-tags (or markdown ""))
+                (rewrite-single-backtick-code-with-newlines)
+                (normalize-pipe-tables))]
+      (.parse (make-parser) s))
     (catch Exception _
       (.parse (make-parser) ""))))
 

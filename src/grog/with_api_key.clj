@@ -110,8 +110,8 @@
    :function
    {:name "with_api_key"
     :description
-    (str "HTTP request with a **secret from the OS keyring** applied for you — you never see the secret value. "
-         "Pass **`secret_name`**: the keyring account name (same labels as `/secret` in chat). It must be listed "
+    (str "HTTP request with a **secret from the grog secret store** applied for you — you never see the secret value. "
+         "Pass **`secret_name`**: the store account name (same labels as `/secret` in chat). It must be listed "
          "under grog.edn `:with-api-key :allowed-secrets` (or `:allowed-accounts`). Pass **`secret_method`** to say "
          "how Grog attaches the secret (new schemes can be added over time). Prefer **https**. "
          "**Do not** put tokens or passwords in tool arguments — only `secret_name`.")
@@ -122,7 +122,7 @@
      {:url {:type "string"
             :description "Full URL (https). Existing query string is preserved; query-method merges the secret param."}
       :secret_name {:type "string"
-                    :description "Keyring secret name (e.g. BRAVE_SEARCH_API) — must be in :with-api-key :allowed-secrets."}
+                    :description "Grog secret store account name (e.g. BRAVE_SEARCH_API) — must be in :with-api-key :allowed-secrets."}
       :secret_method {:type "string"
                       :enum ["header" "query" "bearer" "x_subscription_token"]
                       :description (str "header = custom HTTP header (set header_name; optional header_prefix e.g. \"Bearer \"). "
@@ -202,7 +202,7 @@
         :else
         (let [secret (secrets/get-secret secret-name)]
           (if (str/blank? secret)
-            (json/generate-string {:error "secret not set in keyring" :secret_name secret-name})
+            (json/generate-string {:error "secret not set in store" :secret_name secret-name})
             (try
               (let [^URI uri (URI/create url)
                     scheme (.getScheme uri)

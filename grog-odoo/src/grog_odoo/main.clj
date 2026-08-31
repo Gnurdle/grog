@@ -10,18 +10,17 @@
   Multiple Odoo *instances* can be configured. The model can only ever select
   one of the pre-configured instance *names* (never a URL / endpoint), e.g.::
 
-    GROG_ODOO_CONFIG=/path/to/instances.json
+    GROG_ODOO_CONFIG=/path/to/instances.edn
 
-  where the file is JSON:
+  where the file is EDN (legacy JSON also accepted):
 
-    { \"instances\": [
-        { \"name\": \"stage\", \"url\": \"https://exclave.cmsaero.com\",
-          \"db\": \"odoo18_stage\", \"user\": \"admin\", \"password\": \"...\",
-          \"sql\": { \"type\": \"postgres\", \"host\": \"127.0.0.1\", \"port\": 5432,
-                     \"db\": \"odoo18_stage\", \"user\": \"odoo\", \"password\": \"...\" } },
-        { \"name\": \"prod\", \"url\": \"https://prod.example.com\",
-          \"db\": \"odoo18\", \"user\": \"admin\", \"password\": \"...\" }
-      ] }
+    {:instances [
+        {:name \"stage\", :url \"https://exclave.cmsaero.com\",
+         :db \"odoo18_stage\", :user \"admin\", :password \"...\",
+         :sql {:type \"postgres\", :host \"127.0.0.1\", :port 5432,
+               :db \"odoo18_stage\", :user \"odoo\", :password \"...\"}},
+        {:name \"prod\", :url \"https://prod.example.com\",
+         :db \"odoo18\", :user \"admin\", :password \"...\"}]}
 
   Backwards compatible single-instance env fallback:
     GROG_ODOO_URL / GROG_ODOO_DB / GROG_ODOO_USER / GROG_ODOO_PASSWORD
@@ -33,6 +32,7 @@
   configured instance selection, and only read-only SQL statements are
   accepted."
   (:require [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [grog-odoo.xmlrpc :as xrpc])
   (:import [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
@@ -69,9 +69,14 @@
   (str/replace (str url) #"/+$" ""))
 
 (defn- read-config-file!
-  "Load instances from the JSON file at `path`. Returns a vector of instance maps."
+  "Load instances from the config file at `path`. Accepts EDN (the current grog
+  writer format, `*` `.edn`) or legacy JSON. Returns a vector of instance maps."
   [path]
-  (let [data (json/read-str (slurp (java.io.File. path)) :key-fn keyword)
+  (let [raw (slurp (java.io.File. path))
+        data (try
+               (edn/read-string {:eof nil} raw)
+               (catch Exception _
+                 (json/read-str raw :key-fn keyword)))
         raw-insts (get-in data [:instances])
         insts (if (sequential? raw-insts) (vec raw-insts) [])]
     (when-not (seq insts)
@@ -89,8 +94,8 @@
           insts)))
 
 (defn- load-config!
-  "Populate `config*` from GROG_ODOO_CONFIG (JSON) else legacy single-instance
-  env vars. Returns the config map."
+  "Populate `config*` from GROG_ODOO_CONFIG (EDN or legacy JSON) else legacy
+  single-instance env vars. Returns the config map."
   []
   (let [cfg-file (not-empty (str/trim (or (System/getenv "GROG_ODOO_CONFIG") "")))
         instances (if cfg-file

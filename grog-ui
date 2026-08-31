@@ -27,11 +27,51 @@ export GROG_HOME="$(pwd -P)"
 # The LLM API key is read from the OS keyring (LLM_API_KEY) as a fallback, so
 # desktop launches don't depend on a shell rc exporting it.
 
-LOG="${GROG_LOG:-$HOME/.grog-ui.log}"
+# --- log management ---------------------------------------------------------
+# Each instance logs to its own file so multiple concurrent grog-ui processes
+# never fight over the same path. Base = $GROG_LOG or ~/.grog-ui.log; with a
+# per-instance suffix the common case is ~/.grog-ui.log (single instance).
+# The log is capped: if it would exceed $GROG_UI_LOG_MAX bytes (default 5MB) we
+# keep only the most recent tail. GW is best-effort and cheap (only pruned on
+# launch, not per line).
+if [ -n "${GROG_LOG:-}" ]; then
+  LOG_BASE="$GROG_LOG"
+else
+  LOG_BASE="$HOME/.grog-ui.log"
+fi
+MAX_LOG="${GROG_UI_LOG_MAX:-5242880}"
+
+# Compute a stable per-instance suffix: the launcher's PID. ($$ is stable for
+# the lifetime of this shell and unique enough across concurrent launches.)
+LOG="${LOG_BASE%.log}.$$.log"
+export GROG_LOG="$LOG"
+
+prune_log() {
+  local f="$1" max="$2" size tmp
+  if [ -f "$f" ]; then
+    size=$(wc -c < "$f" 2>/dev/null || echo 0)
+    size=${size// /}
+    if [ "$size" -gt "$max" ]; then
+      # keep the newest ~max bytes
+      tmp="$f.tmp"
+      tail -c "$max" "$f" > "$tmp" 2>/dev/null || return 0
+      mv -f "$tmp" "$f" 2>/dev/null || return 0
+      # clear any tmp left behind
+      rm -f "$f.tmp" 2>/dev/null || true
+    fi
+  fi
+}
+
 mkdir -p "$(dirname "$LOG")"
-# Start a fresh log each launch (truncate, then append the marker + stream).
-: > "$LOG"
-echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ ===" >> "$LOG"
+prune_log "$LOG" "$MAX_LOG"
+echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ$$ ===" >> "$LOG"
+# Also prune the legacy default path if it's our own (avoid unbounded growth
+# from earlier runs). Never touch a path belonging to another live instance —
+# the per-instance suffix already prevents collisions, so this only cleans up
+# the plain default leftover.
+if [ "$LOG" != "$LOG_BASE" ]; then
+  prune_log "$LOG_BASE" "$MAX_LOG"
+fi
 
 exec 3>&2
 "$CLJ" -M:gui "$@" > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&3)

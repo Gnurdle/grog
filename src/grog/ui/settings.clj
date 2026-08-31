@@ -189,7 +189,8 @@
         _ (populate-appearance! vbox families)
         outer (doto (JPanel. (BorderLayout.))
                 (.setOpaque false)
-                (.add (JScrollPane. vbox) BorderLayout/CENTER))]
+                (.add (doto (JScrollPane. vbox)
+                        (widgets/boost-horizontal-wheel!)) BorderLayout/CENTER))]
     outer))
 
 ;; --- Terminal tab ----------------------------------------------------------
@@ -219,7 +220,8 @@
         _ (populate-terminal! vbox families)
         outer (doto (JPanel. (BorderLayout.))
                 (.setOpaque false)
-                (.add (JScrollPane. vbox) BorderLayout/CENTER))]
+                (.add (doto (JScrollPane. vbox)
+                        (widgets/boost-horizontal-wheel!)) BorderLayout/CENTER))]
     outer))
 
 ;; --- Models tab ------------------------------------------------------------
@@ -282,9 +284,13 @@
         max-sp   (JSpinner. (SpinnerNumberModel. (int (or (:max-tokens llm) 0)) 0 131072 256))
         temp-sp  (JSpinner. (SpinnerNumberModel. (double (or (:temperature llm) 0.7)) 0.0 2.0 0.1))
         key-btn  (widgets/styled-button "Set default API key…")
-        key-lbl  (JLabel. (if (secrets/get-secret "LLM_API_KEY")
-                            "default key: in OS keyring"
-                            "default key: not set"))
+        key-clear-btn (widgets/styled-button "Clear API key")
+        key-lbl  (JLabel. "default key: not set")
+        refresh-key-lbl! (fn []
+                           (.setText key-lbl
+                                     (if (seq (secrets/get-secret "LLM_API_KEY"))
+                                       "default key: in store"
+                                       "default key: not set")))
         apply-btn (widgets/styled-button "Apply defaults")
         pick-btn  (widgets/styled-button "Pick model…")
         ;; profiles
@@ -312,7 +318,7 @@
     (let [kr (JPanel. (FlowLayout. FlowLayout/LEFT))
           l (JLabel. "API key")]
       (.setPreferredSize l (Dimension. (int label-w) 24))
-      (.add kr l) (.add kr key-btn) (.add kr key-lbl)
+      (.add kr l) (.add kr key-btn) (.add kr key-clear-btn) (.add kr key-lbl)
       (.add vbox kr))
     (.add vbox (Box/createVerticalStrut 6))
     (.add vbox (doto (JPanel. (FlowLayout. FlowLayout/LEFT))
@@ -325,7 +331,8 @@
     ;; profiles
     (.add vbox (doto (JLabel. "Models (named profiles)")
                  (.setPreferredSize (Dimension. 240 24))))
-    (.add vbox (JScrollPane. profile-list))
+    (.add vbox (doto (JScrollPane. profile-list)
+             (widgets/boost-horizontal-wheel!)))
     (.add vbox (doto p-name-lbl (.setPreferredSize (Dimension. 300 22))))
     (doseq [row [(field-row "Profile model" p-model)
                  (field-row "Profile URL" p-url)
@@ -356,8 +363,31 @@
           (let [in (JOptionPane/showInputDialog key-btn "Paste the default API key:"
                                                 "Set API key" JOptionPane/QUESTION_MESSAGE)]
             (when (and in (seq (str/trim in)))
-              (secrets/set-secret! "LLM_API_KEY" (str/trim in))
-              (.setText key-lbl "default key: in OS keyring"))))))
+              (try
+                (let [res (secrets/set-secret! "LLM_API_KEY" (str/trim in))]
+                  (JOptionPane/showMessageDialog key-btn
+                    (if (= :keyring (:backend res))
+                      "Saved to the OS keyring."
+                      (str "OS keyring unavailable; saved to the file store.\n"
+                           (:reason res) "\nStore file: " (:path (secrets/backend-status))))
+                    "API key" JOptionPane/INFORMATION_MESSAGE))
+                (catch Exception e
+                  (JOptionPane/showMessageDialog key-btn
+                    (str "Failed to store API key:\n" (.getMessage e))
+                    "API key" JOptionPane/ERROR_MESSAGE)))
+              (refresh-key-lbl!))))))
+    (.addActionListener key-clear-btn
+      (reify java.awt.event.ActionListener
+        (actionPerformed [_ _]
+          (try
+            (secrets/delete-secret! "LLM_API_KEY")
+            (JOptionPane/showMessageDialog key-clear-btn
+              "Removed the default API key." "API key" JOptionPane/INFORMATION_MESSAGE)
+            (catch Exception e
+              (JOptionPane/showMessageDialog key-clear-btn
+                (str "Failed to clear API key:\n" (.getMessage e))
+                "API key" JOptionPane/ERROR_MESSAGE)))
+          (refresh-key-lbl!))))
     (.addActionListener apply-btn
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
@@ -410,9 +440,43 @@
 
     (doto (JPanel. (BorderLayout.))
       (.setOpaque false)
-      (.add (JScrollPane. vbox) BorderLayout/CENTER))))
+      (.add (doto (JScrollPane. vbox)
+              (widgets/boost-horizontal-wheel!)) BorderLayout/CENTER))))
 
 ;; --- dialog ----------------------------------------------------------------
+
+;; --- General tab -----------------------------------------------------------
+
+(defn- build-general-tab
+  "Basic info panel: config home, the secrets store, and which backend is active —
+  so if something isn't where you expect it on your OS, you can see it here."
+  ^JPanel []
+  (let [vbox (JPanel.)
+        _ (.setLayout vbox (BoxLayout. vbox BoxLayout/Y_AXIS))
+        _ (.setBorder vbox (javax.swing.BorderFactory/createEmptyBorder 16 18 16 18))
+        b (secrets/backend-status)
+        home (config/config-home-dir)
+        rows [["Config file (user)" (str home "/grog.edn")]
+              ["Config override" (or (some-> (System/getenv "GROG_CONFIG_HOME") str not-empty) "(GROG_CONFIG_HOME not set)")]
+              ["Secrets store" (.getPath (secrets/secrets-file))]
+              ["Secret backend" (if (= :keyring (:backend b))
+                                  "OS keyring (Keychain / Credential Manager / Secret Service)"
+                                  (str "File fallback — " (:reason b)))]
+              ["Projects home" (try (.getPath (config/projects-dir)) (catch Exception _ "(default)"))]]]
+    (doseq [[label value] rows]
+      (.add vbox (doto (JLabel. (str label ":"))
+                   (.setFont (widgets/ui-font))
+                   (.setForeground (Color. 130 134 146))))
+      (.add vbox (doto (JLabel. (str "  " value))
+                   (.setFont (widgets/ui-font))))
+      (.add vbox (Box/createVerticalStrut 10)))
+    (.add vbox (Box/createVerticalStrut 4))
+    (.add vbox (doto (JLabel. "Secrets live in the OS keyring when available and fall back to a file store on headless/remote systems. Values are never shown anywhere in grog UI or logs.")
+                 (.setFont (widgets/ui-font))
+                 (.setForeground (Color. 130 134 146))))
+    (doto (JPanel. (BorderLayout.))
+      (.setOpaque false)
+      (.add vbox BorderLayout/NORTH))))
 
 (defn show-settings!
   "Open a modal tabbed settings dialog owned by `owner` (a JFrame)."
@@ -421,7 +485,7 @@
         tabs (JTabbedPane.)
         close-btn (widgets/styled-button "Close")
         bottom (JPanel. (FlowLayout. FlowLayout/RIGHT))]
-    (.addTab tabs "General" (stub-tab "General settings — coming soon."))
+    (.addTab tabs "General" (build-general-tab))
     (.addTab tabs "Appearance" (build-appearance-tab))
     (.addTab tabs "Models" (build-models-tab))
     (.addTab tabs "Terminal" (build-terminal-tab))

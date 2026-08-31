@@ -1,6 +1,40 @@
-# Grog
+# GROG - Gnurdle Reasoning Orchestration Gateway (shameless forced acronym)
 
-Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the model calls tools, Grog runs them on your machine, and the turn ends when you get a plain-text answer (or an error). There is **no tool-round cap by default**; you can set `:cli :chat-tool-loop-limit` only if you want an explicit ceiling. Behavior is shaped by **`grog.edn`** and optional **SOUL.md**—no code changes required.
+# Why
+I started this project about the time Openclaw came out, out of curiosity as to 
+discovering what was possible in that era.
+
+Specifically, it was a discovery platform to see:
+- learn a bit about how this ecosystem works
+- how well models worked with the clojure/babashka ecosystem
+- learn how MCPs work, and build a few
+- come up with a paradigm for daily work, which for me is fragmented delerious
+  demand-driven multitasking
+- was tired of seeing everything agent generated doing things with python
+  and/or javascript.
+
+The code in this repo is about 99.9% untouched by human hands.  It was prompted 
+into existance from absolutely nothing, and is maintained and developed similarly
+
+# ECA (https://github.com/editor-code-assistant)
+This was something I was using as my daily driver in VS-code for AI assisted coding.
+
+Since I noticed that I was spending too much time trying to ape its behavior,
+it eventually occured to me to simply co-opt it rather then try to clone it.
+
+This proved to be a satisfying and fruitful path, and how it works as of
+now.  GROG is a wrapper that communicates with ECA - it starts the ECA
+server with a generated configuration file and uses it for LLM traffic.
+
+
+A **GUI chat that wraps ECA** (a real agent) with **OpenAI-compatible LLMs** and a
+**real tool loop**: the model calls tools, grog runs them on your machine (via local
+MCP servers for babashka, search, web fetch, RSS, project memory, Odoo, IMAP, …),
+and a turn ends when you get a plain-text answer (or an error). There is **no
+tool-round cap by default** in the grog/ECA loop; the legacy jobs/chron loop stays
+uncapped unless you set `:cli :chat-tool-loop-limit`. Behavior is shaped by
+**`grog.edn`**, optional **SOUL.md**, and a generated ECA config — no code changes
+required.
 
 ---
 
@@ -12,6 +46,7 @@ Terminal chat for **OpenAI-compatible LLMs** with a real **tool loop**: the mode
 - [Chat commands](#chat-commands)
 - [Configuration](#configuration)
   - [MCP servers](#mcp-servers)
+- [Users guide (config + secrets)](#users-guide-config--secrets)
 - [Jobs and chron](#jobs-and-chron)
 - [Example `grog.edn`](#example-grogedn)
 - [Quick start](#quick-start)
@@ -40,14 +75,14 @@ Tool paths are taken as given — absolute, or relative to the repo/conversation
 
 ### Core runtime
 
-- **OpenAI-compatible `/v1/chat/completions`** with **tool calling** (use a model that supports tools).
-- **Multi-step rounds** — **unlimited by default** (runs until the model returns text without `tool_calls`). Set `:cli :chat-tool-loop-limit` to a **positive integer** only if you want a hard stop. With thinking enabled: banner is **`── thinking k ──`** when unlimited, **`── thinking k/n ──`** when a limit is set.
-- **Session history** — `:cli :chat-history-turns` or **`/clear`** / **`/fresh`**.
-- **Streaming** — optional live thinking; answer tokens stream in cyan only when **`:format-markdown` is false**. With default Markdown rendering, the reply is buffered for the round so GFM tables and layout render correctly, but you can set **`:cli :chat-stream-live-markdown true`** to render blocks as they close (paragraphs and fenced code stream; tables still wait for a blank line). Set **`:cli :chat-stream-live-content false`** to buffer plain text too until the round completes.
-- **Markdown** — optional ANSI rendering (tables, code fences, etc.); replies are buffered for the round when Markdown is on so GFM pipe tables draw as box tables. `<image-png>path.png</image-png>` tags open images in a Swing viewer.
-- **On-the-fly model switching** — `/model` shows the current model/URL and any `:llm :profiles`; `/model <profile>` activates a named profile; `/model <model-name>` switches to a model for the session (e.g. `qwen2.5-coder:7b-instruct`); `/model reset` reverts to the config file values.
-- **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits.
-- **GUI** — `clojure -M:gui` (or `./grog-ui`) opens a Swing desktop app with streaming transcript, Settings, export, and an integrated terminal.
+- **OpenAI-compatible `/v1/chat/completions`** with **tool calling** (use a model that supports tools) — either local (Ollama) or remote (OpenRouter etc.).
+- **Multi-step rounds** — **unlimited by default** in grog/ECA (the agent loops until it returns text without `tool_calls`). The legacy jobs/chron loop is also uncapped unless you opt into `:cli :chat-tool-loop-limit`.
+- **Rich GUI transcript** — streaming assistant/thinking/tool cards, markdown, GFM tables, collapsible thinking, drag-to-select copy, and HTML preview/export.
+- **Session history** — `:cli :chat-history-turns` plus **`/clear`** / **`/fresh`**.
+- **Thinking streamed live** into collapsible sections; answer renders as markdown as it completes. (The old console ANSI streaming lives in the one-shot/background loop only.)
+- **On-the-fly model switching** — via the GUI model picker / footer, **`/eca-model <name>`**, or `:eca :model` in `grog.edn` (the active ECA model). The console `:llm :profiles` presets still exist for the one-shot/background loop.
+- **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits (prints to stdout/stderr).
+- **GUI** — `clojure -M:gui` (or `./grog-ui`) opens a Swing desktop app with streaming transcript, Settings, integrated terminal, and export. This is the primary chat surface (the old console chat was removed).
 
 ### Repo root
 
@@ -85,15 +120,19 @@ These are **user** commands, not model tools.
 | `/help` | Full in-app help |
 | `/clear`, `/fresh` | Clear session history |
 | `/tools`, `/skills` | Inspect tools / skill packs |
-| `/paste` | Multi-line input mode (blank line submits; Ctrl-D cancels) |
+| `/eca-model <name>` | Switch the running ECA model (GUI chat) |
 | `/project`, `/project <name>` | Projects: context from the project home `~/grog-projects/<name>/` (notes/dialog/state); `. = *` marks the active project. The active project's dir is also the agent workspace + shell cwd. |
 | `/job`, `/jobs` | Project job queue in the project home (`~/grog-projects/<proj>/jobs/`): **`add` \| `list` \| `next` \| `status`** |
+| `/tasks` | **Per-project tasks** (`~/grog-projects/<proj>/tasks.edn`), always user-instigated: **`add <title>`** (`|due +Nh` / `HH:mm` / `@epochms`, `|every Nh` for recurring), **`done <id>`**, **`rm <id>`**, **`due`**. Ask "what needs doing?" for reminders. |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
-| `/secret` | Keyring **`grog`** — list/set keys (values never printed) |
+| `/secret` | Keyring **`grog`** (or file fallback) — `set <KEY> <value>` / `rm <KEY>` / `file` / `backend`; values never printed |
 | `/shell` | `sh -lc` under the active project cwd (fallback: repo root), or interactive subshell |
 | `/mcp` | MCP server list: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
 | `/soul` | **show** \| **path** \| **add** *text* \| **reload** — SOUL.md management |
 | `@path` | Inline files into the prompt (whitespace-separated tokens) |
+
+> In the GUI, multi-line input is handled with **Ctrl+Enter** (Enter sends; Shift+Enter
+> inserts a newline) — `/paste` is a console-loop carryover and not needed there.
 
 ---
 
@@ -102,8 +141,12 @@ These are **user** commands, not model tools.
 Config merges in order:
 
 1. Code defaults — see `resources/grog.edn.example` for a full annotated template  
-2. `~/.config/grog/grog.edn` — user overrides  
-3. `./grog.edn` — project overrides  
+2. `grog.edn` in your **user config home** (platform-aware):
+   - Linux/macOS: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn`
+   - Windows: `%APPDATA%\grog\grog.edn` (e.g. `C:\Users\you\AppData\Roaming\grog\grog.edn`)
+   - Override for both: `$GROG_CONFIG_HOME/grog.edn`
+   - Legacy `~/.config/grog/grog.edn` is still honored if present
+3. `./grog.edn` — project overrides (in the run directory)  
 
 **Required:** `:llm {:url "…/v1" :model "…"}`. For local Ollama use `:url "http://localhost:11434/v1"`.
 
@@ -142,6 +185,15 @@ The GUI also supports zoom (Ctrl+Shift+Plus/Minus) and transcript export (Ctrl+E
 
 ---
 
+## Users guide (config + secrets)
+
+For a step-by-step walkthrough covering where `grog.edn` lives on Linux vs
+Windows, how to store secrets (OS keyring + automatic file fallback for
+headless/remote setups), and how to configure any OpenAI-compatible provider,
+see **[`USERS-GUIDE.md`](USERS-GUIDE.md)**.
+
+---
+
 ## Jobs and chron
 
 Both use the **same agent stack** as normal chat (`run-tool-loop-on-messages`) and the **edn-store** tree in your repo.
@@ -158,7 +210,7 @@ Each run loads **SOUL, skills, and recent project dialog** into the message list
 ### Chron (`:chron`)
 
 - **Requires:** **`:chron {:enabled true :tasks […]}`** in `grog.edn`.
-- **Runs only during** **`clojure -M:run chat`** / **`clojure -M:gui`** (started after the banner, stopped when you leave chat).
+- **Runs while the app is running** — started with the GUI (`clojure -M:gui` / `./grog-ui`) or the one-shot program; stopped when you quit. (The old `clojure -M:run chat` console loop was removed.)
 - Each task: **`:id`**, **`:instruction`** (or **`:prompt`**), plus **`:every-minutes`** or **`:interval-seconds`** (minimum **15** seconds if using seconds).
 - Output goes to **stderr** with a visible banner (it can interleave with typing). If a **project** is active, chron may append **`[chron] …`** turns to **`thread.edn`**. Last run summaries can live under **`grog-chron/last-run/…`** in the store.
 
@@ -170,9 +222,9 @@ Each run loads **SOUL, skills, and recent project dialog** into the message list
 
 ## Example `grog.edn`
 
-Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.edn`**. Adjust model names and paths; merge order is `resources/` → user config → this file.
+Save as **`./grog.edn`** next to your project or under your user config home (Linux `~/.config/grog/grog.edn`, Windows `%APPDATA%\grog\grog.edn`, or `$GROG_CONFIG_HOME`). Adjust model names and paths; merge order is `resources/` → user config → this file.
 
-**Secrets** (Brave, `with_api_key`) live in the OS keyring — set with **`/secret <ACCOUNT> <value>`** in chat, never in this file.
+**Secrets** (Brave, `with_api_key`, LLM key) normally live in the **OS keyring** — set with **`/secret set <ACCOUNT> <value>`** in chat, never in this file. If no OS secret backend is available (headless Linux, SSH/WSL, containers), grog automatically falls back to **`secrets.edn`** in your config home (created with owner-only permissions, outside the repo). `with_api_key` is gated by **`:with-api-key {:allowed-secrets […]}`**; additional named secrets that can be set with `/secret` are declared under **`:secrets {:accounts […]}`**.
 
 ```clojure
 {:soul {:path "SOUL.md"}
@@ -254,26 +306,29 @@ Save as **`./grog.edn`** next to your project or under **`~/.config/grog/grog.ed
 
 ```bash
 cd grog
-clojure -M:run chat
+clojure -M:gui          # or ./grog-ui
 ```
 
-(`clojure -M:run chat` starts interactive chat; `clojure -M:run "message"` is one-shot; `clojure -M:gui` opens the Swing GUI.)
+(`clojure -M:gui` / `./grog-ui` opens the Swing GUI; `clojure -M:run "your message"` is a one-shot reply. The old `clojure -M:run chat` console loop was removed in favor of the GUI.)
 
-At the prompt:
+At the prompt in the GUI:
 
 ```text
-chat> /help
+/help
 ```
 
 ### Optional: Brave Search
 
 1. [Brave Search API](https://brave.com/search/api/) subscription.  
-2. Store token: service **`grog`**, account **`BRAVE_SEARCH_API`** — e.g. **`/secret BRAVE_SEARCH_API <token>`** in chat, or your OS secret UI (e.g. GNOME Seahorse).  
+2. Store token: service **`grog`**, account **`BRAVE_SEARCH_API`** — e.g. **`/secret set BRAVE_SEARCH_API <token>`** in chat, or your OS secret UI (e.g. GNOME Seahorse). On headless/remote setups it is stored in the config-home file store automatically.  
 3. Grog uses [java-keyring](https://github.com/javakeyring/java-keyring).
 
 ### Optional: LLM API key
 
-For cloud providers (OpenAI, OpenRouter, Groq, etc.), store the key as **`LLM_API_KEY`** in the OS keyring (or use `:api-key` with `${LLM_API_KEY}` env-var interpolation in `grog.edn`).
+For cloud providers (OpenAI, OpenRouter, Groq, etc.), store the key as **`LLM_API_KEY`** (or use `:api-key` with `${LLM_API_KEY}` env-var interpolation in `grog.edn`):
+
+- **GUI:** Settings → Models → *Set default API key…* (and *Clear API key*).
+- **Chat:** `/secret set LLM_API_KEY <key>`.
 
 ---
 
@@ -281,10 +336,10 @@ For cloud providers (OpenAI, OpenRouter, Groq, etc.), store the key as **`LLM_AP
 
 | Command | Effect |
 | --- | --- |
-| `clojure -M:run chat` | Interactive chat |
 | `clojure -M:run "your message"` | One-shot reply, then exit |
 | `clojure -M:run help` | Print help |
-| `clojure -M:gui` | Swing GUI (or `./grog-ui` / `grog-ui.bat`) |
+| `clojure -M:gui` | Swing GUI (or `./grog-ui` / `grog-ui.bat`) — the primary chat surface |
+| `clojure -M:run chat` | Removed — run the GUI instead (prints a pointer and exits) |
 
 ---
 

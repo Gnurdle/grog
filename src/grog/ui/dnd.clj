@@ -95,11 +95,15 @@
                 (.exportAsDrag (.getTransferHandler comp) comp e TransferHandler/COPY)))))))))
 
 (defn install!
-  "Enable dragging selected text out of `c` and dropping text onto it."
+  "Enable dragging selected text out of `c` and dropping text onto it.
+
+  For editable components we intentionally do NOT call `setDragEnabled true`:
+  on several platforms that turns a normal mouse drag into an export-drag, so
+  click-and-drag text selection stops copying. Instead we use the same manual
+  listener as non-editable panes, which only starts an export-drag when the
+  press lands inside an *existing* selection — normal drag-select keeps working."
   [^JTextComponent c]
   (let [th (make-transfer-handler)]
     (.setTransferHandler c th)
-    (if (.isEditable c)
-      (.setDragEnabled c true)
-      (install-manual-drag! c)))
+    (install-manual-drag! c))
   c)

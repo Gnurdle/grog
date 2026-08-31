@@ -12,6 +12,7 @@
   (:require [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.pprint :as pprint]
             [clojure.string :as str]
             [grog.config :as config]
             [grog.models :as models]
@@ -36,11 +37,13 @@
                      (or (System/getenv var-name) default-val ""))))))
 
 (defn odoo-instances-path
-  "Where grog writes the grog-odoo MCP instances config."
+  "Path to the **user-maintained** grog-odoo instances config (EDN), in the grog
+  config home. This file is the source of truth for Odoo connections — edit it
+  directly (never put Odoo credentials in grog.edn)."
   ^String []
-  (let [d (io/file (str (System/getProperty "user.home") "/.config/grog"))]
+  (let [d (config/config-home-dir)]
     (.mkdirs d)
-    (str d "/odoo-instances.json")))
+    (str d "/odoo-instances.edn")))
 
 (defn- interp-inst
   "Interpolate `${ENV}` / `${ENV:-default}` in a scalar, then trim; nil if blank."
@@ -66,7 +69,8 @@
           sql)))
 
 (defn- odoo-instances-data
-  "Instances list from grog.edn's `:odoo`.
+  "Legacy instances list from grog.edn's `:odoo` (used only as a one-time
+  migration fallback — Odoo config now lives in `odoo-instances.edn`).
 
   New shape: `:instances [{:name ... :url ... :db ... :user ... :password ...
                            :sql {...}} ...]`.
@@ -84,23 +88,49 @@
         (when (and (:url inst) (:db inst) (:user inst))
           [(merge {:name "default"} inst)])))))
 
+(defn- read-odoo-instances-file
+  "Read the user-maintained `odoo-instances.edn` if present. Returns the
+  `:instances` vector, or nil if the file is absent/unreadable."
+  []
+  (let [f (io/file (odoo-instances-path))]
+    (if (.exists f)
+      (try (some-> (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
+                   :instances)
+           (catch Exception _ nil))
+      nil)))
+
+(defn odoo-configured?
+  "True when Odoo is configured anywhere: the user-maintained
+  `odoo-instances.edn`, a legacy `grog.edn :odoo` block, or legacy
+  `GROG_ODOO_*` env vars."
+  []
+  (boolean
+   (or (seq (read-odoo-instances-file))
+       (seq (odoo-instances-data))
+       (some-> (System/getenv "GROG_ODOO_URL") str str/trim not-empty))))
+
 (defn- odoo-env
   "Env map for the grog-odoo MCP server.
 
-  New mode: grog.edn `:odoo {:instances [...]}` is written to
-  `~/.config/grog/odoo-instances.json` and handed to the MCP server via
-  `GROG_ODOO_CONFIG` — the server then lets the model select among exactly
-  those pre-configured instances (no arbitrary endpoints).
+  Source of truth: the **user-maintained** `~/.config/grog/odoo-instances.edn`.
+  Edit that file directly (credentials stay in config home, never in grog.edn).
+  If it's absent and grog.edn still carries a legacy `:odoo` block, grog writes
+  the file once (migration) so the model still sees the same instances.
 
-  Legacy mode (no `:instances`): single-instance `:url`/`:db`/`:user`/`:password`
-  is passed as `GROG_ODOO_*` env vars. Values may reference `${ENV}` /
-  `${ENV:-default}`."
+  Final fallback is legacy single-instance env vars (`GROG_ODOO_URL` /
+  `GROG_ODOO_DB` / `GROG_ODOO_USER` / `GROG_ODOO_PASSWORD`)."
   []
-  (let [instances (odoo-instances-data)]
-    (if (seq instances)
-      (let [path (odoo-instances-path)]
-        (spit (io/file path) (json/generate-string {:instances instances} {:pretty true}))
-        {"GROG_ODOO_CONFIG" path})
+  (let [path (odoo-instances-path)
+        f (io/file path)]
+    (cond
+      (.exists f)
+      {"GROG_ODOO_CONFIG" path}
+
+      (seq (odoo-instances-data))
+      (do (spit f (with-out-str (pprint/pprint {:instances (odoo-instances-data)})))
+          {"GROG_ODOO_CONFIG" path})
+
+      :else
       (let [o (get-in (config/grog) [:odoo] {})
             one (fn [k]
                   (some-> (get o k)
@@ -139,14 +169,14 @@
 (defn generated-config-path
   "Where grog writes its merged ECA config."
   ^String []
-  (let [d (io/file (str (System/getProperty "user.home") "/.config/grog"))]
+  (let [d (config/config-home-dir)]
     (.mkdirs d)
     (str d "/eca-config.generated.json")))
 
 (defn approved-tools-path
   "Persistent store of tool names grog has been asked to always allow."
   ^String []
-  (str (System/getProperty "user.home") "/.config/grog/approved-tools.edn"))
+  (str (config/config-home-dir) "/approved-tools.edn"))
 
 (defn- shell-wrapped
   "An MCP stdio server spec that first `cd`s into `dir`, so `clojure -M:...`
@@ -166,11 +196,11 @@
         m))
 
 (defn imap-instances-path
-  "Where grog writes the grog-imap MCP account metadata config."
+  "Where grog writes the grog-imap MCP account metadata config (EDN)."
   ^String []
-  (let [d (io/file (str (System/getProperty "user.home") "/.config/grog"))]
+  (let [d (config/config-home-dir)]
     (.mkdirs d)
-    (str d "/imap-accounts.json")))
+    (str d "/imap-accounts.edn")))
 
 (defn imap-project-config-file
   "Path to the email project's IMAP account metadata (project data, outside the
@@ -178,7 +208,7 @@
   ^String []
   (let [d (io/file (str (System/getProperty "user.home") "/grog-projects/email/state"))]
     (.mkdirs d)
-    (str d "/imap-accounts.json")))
+    (str d "/imap-accounts.edn")))
 
 (defn imap-configured?
   "True when IMAP account metadata is available — from the email project file, or
@@ -186,21 +216,31 @@
   []
   (boolean
    (or (.exists (io/file (imap-project-config-file)))
+       (.exists (io/file (str/replace (imap-project-config-file) #"\.edn$" ".json")))
        (seq (get-in (config/grog) [:imap :accounts])))))
+
+(defn- read-imap-accts
+  "Read the email project's account metadata file as EDN, falling back to legacy
+  JSON (the old `imap-accounts.json`). Returns a seq (possibly nil)."
+  []
+  (let [edn-file (java.io.File. (imap-project-config-file))
+        json-file (java.io.File. (str/replace (imap-project-config-file) #"\.edn$" ".json"))]
+    (cond
+      (.exists edn-file)
+      (try (some-> (edn/read-string {:eof nil} (slurp edn-file)) :accounts)
+           (catch Exception _ nil))
+      (.exists json-file)
+      (try (some-> (json/parse-string (slurp json-file) true) :accounts)
+           (catch Exception _ nil))
+      :else nil)))
 
 (defn- imap-accounts-data
   "Account *metadata* (never secrets). Source of truth is the email project file
-  at `~/grog-projects/email/state/imap-accounts.json`; falls back to grog.edn's
-  `:imap :accounts` for backward compatibility."
+  at `~/grog-projects/email/state/imap-accounts.edn` (legacy `.json` accepted);
+  falls back to grog.edn's `:imap :accounts` for backward compatibility."
   []
-  (let [project-file (io/file (imap-project-config-file))
-        accts (cond
-                (.exists project-file)
-                (try (some-> (json/parse-string (slurp project-file) true)
-                             :accounts)
-                     (catch Exception _ nil))
-                :else
-                (get-in (config/grog) [:imap :accounts]))]
+  (let [accts (or (read-imap-accts)
+                  (get-in (config/grog) [:imap :accounts]))]
     (when (seq accts)
       {:accounts (mapv #(clean-imap-account
                          (select-keys % [:name :host :port :tls :user :sasl
@@ -208,13 +248,13 @@
                        accts)})))
 
 (defn- imap-env
-  "Env map for the grog-imap MCP server: write account *metadata* to
-  ~/.config/grog/imap-accounts.json and hand it via GROG_IMAP_CONFIG. The
+  "Env map for the grog-imap MCP server: write account *metadata* to the grog
+  config home (`imap-accounts.edn`, EDN) and hand it via GROG_IMAP_CONFIG. The
   server resolves the secret itself from its per-account file — never here."
   []
   (let [data (imap-accounts-data)
         path (imap-instances-path)]
-    (spit (io/file path) (json/generate-string data {:pretty true}))
+    (spit (io/file path) (with-out-str (pprint/pprint data)))
     {"GROG_IMAP_CONFIG" path}))
 
 (defn grog-mcp-servers
@@ -224,7 +264,7 @@
         servers
         {"grog-imaging"
      (shell-wrapped (str root "/grog-imaging")
-                    "clojure -M:mcp -m grog-imaging.main"
+                    "clojure -M:mcp"
                     nil)
 
      "grog-memory"
@@ -232,31 +272,54 @@
                     "PYTHONPATH=src .venv/bin/python -m grog_memory.server"
                     {"GROG_MEMORY_DB" (memory-db-path root)})
 
-     "grog-odoo"
-     (shell-wrapped (str root "/grog-odoo")
-                    "clojure -M:mcp -m grog-odoo.main"
-                    (odoo-env))
-
      "grog-office"
      (shell-wrapped (str root "/grog-office")
-                    "clojure -M:mcp -m grog-office.main"
+                    "clojure -M:mcp"
                     nil)
 
      "grog-search"
      (shell-wrapped (str root "/grog-search")
-                    "clojure -M:mcp -m grog-search.main"
+                    "clojure -M:mcp"
                     nil)
+
+     "grog-big"
+     (shell-wrapped (str root "/grog-big")
+                    "clojure -M:mcp"
+                    {"GROG_BIG_URL" "http://localhost:4000/v1"
+                     "GROG_BIG_MODEL" "big"
+                     "GROG_BIG_API_KEY" "sk-dummy"})
 
      "grog-babashka"
      (shell-wrapped (str root "/grog-babashka")
-                    "clojure -M:mcp -m grog-babashka.main"
-                    nil)}]
+                    "clojure -M:mcp"
+                    nil)
+
+     "grog-fetch"
+     (shell-wrapped (str root "/grog-fetch")
+                    "clojure -M:mcp"
+                    nil)
+
+     "grog-rss"
+     (shell-wrapped (str root "/grog-rss")
+                    "clojure -M:mcp"
+                    nil)
+
+     "grog-project-search"
+     (shell-wrapped (str root "/grog-project-search")
+                    "clojure -M:mcp"
+                    {"GROG_PROJECTS_DIR" (.getPath (config/projects-dir))
+                     "GROG_PROJECT" (or (projects/project-name) "")})}]
     (cond-> servers
       (imap-configured?)
       (assoc "grog-imap"
              (shell-wrapped (str root "/grog-imap")
-                            "clojure -M:mcp -m grog-imap.main"
-                            (imap-env))))))
+                            "clojure -M:mcp"
+                            (imap-env)))
+      (odoo-configured?)
+      (assoc "grog-odoo"
+             (shell-wrapped (str root "/grog-odoo")
+                            "clojure -M:mcp"
+                            (odoo-env))))))
 
 (defn debug-dump-config!
   "Write the full ECA config map to the grog debug log.

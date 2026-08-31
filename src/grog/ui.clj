@@ -55,10 +55,12 @@
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
 
-;; --- ECA<->grog protocol tracing into the debug log ------------------------
+;; --- ECA<->grog protocol tracing -------------------------------------------
 ;; Every JSON-RPC frame that crosses the stdio pipe to the `eca server` child is
-;; summarized here (via eca.clj's :trace-fn) so ~/.grog-ui.log shows what is
-;; actually flowing between grog and ECA.
+;; summarized here (via eca.clj's :trace-fn). The launcher (./grog-ui /
+;; grog-ui.bat) tees stderr/stdout into a per-instance log file (default
+;; ~/.grog-ui.log, or $GROG_LOG), so these traces land there regardless of any
+;; *out*/*err* rebinding to the transcript pane.
 
 (defn- trunc
   "Clip a string to `n` chars with an ellipsis; used to keep streamed text lines
@@ -237,21 +239,31 @@
   sp)
 
 (defn- with-copy-menu!
-  "Add a right-click copy menu to `c`. `items` is a seq of [label text-fn];
-  selecting an item copies `(text-fn)` to the clipboard (e.g. the transcript's
-  \"Copy selection\" / \"Copy all\" and the prompt's \"Copy\")."
+  "Add a right-click popup menu to `c`. Each item is either `[label text-fn]`
+  (copies `(text-fn)` to the clipboard — e.g. the transcript's \"Copy selection\" /
+  \"Copy all\" and the prompt's \"Copy\") or `{:label label :action (fn [])}`
+  which runs an action instead (e.g. \"Open transcript as HTML…\")."
   [^java.awt.Component c items]
   (let [menu (JPopupMenu.)]
-    (doseq [[label text-fn] items]
-      (let [item (JMenuItem. label)]
-        (.addActionListener item
-          (reify java.awt.event.ActionListener
-            (actionPerformed [_ _]
-              (let [sel (try (text-fn) (catch Throwable _ nil))]
-                (when (seq sel)
-                  (.setContents (.getSystemClipboard (Toolkit/getDefaultToolkit))
-                                (StringSelection. sel)
-                                nil))))))
+    (doseq [it items]
+      (let [item (if (map? it)
+                   (let [item (JMenuItem. (:label it))]
+                     (.addActionListener item
+                       (reify java.awt.event.ActionListener
+                         (actionPerformed [_ _]
+                           (try ((:action it)) (catch Throwable _ nil)))))
+                     item)
+                   (let [[label text-fn] it
+                         item (JMenuItem. label)]
+                     (.addActionListener item
+                       (reify java.awt.event.ActionListener
+                         (actionPerformed [_ _]
+                           (let [sel (try (text-fn) (catch Throwable _ nil))]
+                             (when (seq sel)
+                               (.setContents (.getSystemClipboard (Toolkit/getDefaultToolkit))
+                                             (StringSelection. sel)
+                                             nil))))))
+                     item))]
         (.add menu item)))
     (.addMouseListener c
       (proxy [MouseAdapter] []
@@ -364,6 +376,7 @@
                       scroll (doto (JScrollPane. body)
                                (.setBorder (javax.swing.BorderFactory/createLineBorder
                                              (Color. 60 63 72))))
+                      _ (widgets/boost-horizontal-wheel! scroll)
                       approve (widgets/styled-button "Approve")
                       approve-tool (widgets/styled-button "Approve tool")
                       reject  (widgets/styled-button "Reject")
@@ -444,7 +457,18 @@
                       (windowClosed [_]
                         (when-not @decided?
                           (eca/reject! @chat-id id)))))
-                  (.setVisible dialog true))))))
+                  ;; Show the MODAL approval dialog on the EDT. This handler runs
+                  ;; on the ECA reader thread; showing a modal dialog directly off
+                  ;; the EDT spins a nested event pump that can wedge the EDT and
+                  ;; leave the whole app unresponsive to close. Hoisting the show
+                  ;; onto the EDT keeps the frame responsive and lets the reader
+                  ;; thread keep dispatching.
+                  (SwingUtilities/invokeLater
+                    (fn []
+                      (try
+                        (.setVisible dialog true)
+                        (catch Throwable e
+                          (dbg! "approval dialog error:" (.getMessage e)))))))))))
 
         "chat/statusChanged"
         (let [st (str (:status params))]
@@ -514,7 +538,8 @@
           south (JPanel. (FlowLayout. FlowLayout/RIGHT))]
       (.add center q)
       (when list
-        (.add center (JScrollPane. list)))
+        (.add center (doto (JScrollPane. list)
+                       (widgets/boost-horizontal-wheel!))))
       (when custom-row
         (.add center custom-row))
       (.add south cancel)
@@ -537,12 +562,23 @@
                          (choose!))))]
       (.addMouseListener q listener)
       (when list (.addMouseListener list listener)))
-    (when custom
-      (.put (.getInputMap custom JComponent/WHEN_FOCUSED)
-            (KeyStroke/getKeyStroke KeyEvent/VK_ENTER 0) "question-ok")
-      (.put (.getActionMap custom) "question-ok"
-            (proxy [AbstractAction] []
-              (actionPerformed [_ _] (choose!)))))
+    ;; Robust Enter handling. A WHEN_FOCUSED InputMap binding put here is
+    ;; discarded when the LAF UI installs during `setVisible` (installUI
+    ;; replaces the component's WHEN_FOCUSED map), so plain Enter on the custom
+    ;; field would fall through to the text field's default `notify-field-accept`
+    ;; — which has no listeners — doing nothing. A KeyListener fires on the
+    ;; focused component regardless of UI install timing; consuming the event
+    ;; stops the default action from also running. Enter submits from either the
+    ;; custom field or the option list.
+    (let [enter-listener
+          (proxy [java.awt.event.KeyAdapter] []
+            (keyPressed [e]
+              (when (= KeyEvent/VK_ENTER (.getKeyCode e))
+                (.consume e)
+                (choose!))))]
+      (.addKeyListener custom enter-listener)
+      (when list
+        (.addKeyListener list enter-listener)))
     (.setVisible dlg true)
     @result))
 
@@ -567,7 +603,7 @@
             res (atom {:cancelled true :answer nil})]
         (transcript/append-status!
          pane
-         (str "🔶 LLM question: " prompt))
+         (str "[LLM question] " prompt))
         (SwingUtilities/invokeAndWait
           (fn []
             (reset! res (show-question-dialog! pane prompt options allow-freeform?))))
@@ -720,12 +756,16 @@
               (actionPerformed [_] (scroll-to-top!)))))))
 
 (defn- show-project-manager!
-  "A modal dialog to manage projects: list them, switch, create, or delete one.
+  "A modal dialog to manage projects: **create** (the primary action, with an
+  optional description), switch, or delete one. A dedicated 'New project' form
+  sits at the top (name + optional description + Create button, focused on
+  open) with the existing project list below for Open/Delete.
   `frame` is the owner; `on-switch` is `(fn [name])` — the chat frame wires
   switching there so the ECA workspace/context/title follow. Reads/writes the
   projects home directly."
   [^JFrame frame on-switch]
-  (let [list-model (javax.swing.DefaultListModel.)
+  (let [create-btn (widgets/styled-button "Create project")
+        list-model (javax.swing.DefaultListModel.)
         proj-list (doto (JList. list-model)
                     (.setSelectionMode ListSelectionModel/SINGLE_SELECTION)
                     (.setFont (widgets/ui-font)))
@@ -749,24 +789,45 @@
                      (.setSelectedValue proj-list cur true)))
         open-btn (widgets/styled-button "Open")
         del-btn  (widgets/styled-button "Delete")
-        new-field (JTextField. 20)
-        new-btn  (widgets/styled-button "New + Open")
+        close-btn (widgets/styled-button "Close")
+        name-field (JTextField. 30)
+        desc-field (JTextField. 30)
+        error-label (doto (JLabel. " ")
+                      (.setFont (widgets/ui-font))
+                      (.setForeground (Color. 255 110 110)))
         dialog-ref (atom nil)
         dismiss! (fn []
                    (when-let [d @dialog-ref]
                      (.dispose d)))
+        set-error! (fn [msg]
+                     (doto error-label
+                       (.setText (or msg " "))
+                       (.setVisible (boolean msg))))
+        name-error
+        (fn [nm]
+          (cond
+            (str/blank? nm) "enter a project name."
+            (or (str/includes? nm "/") (str/includes? nm "\\"))
+            "the name can't contain a path separator (/ or \\)."
+            (or (= nm ".") (= nm "..")) "that's not a usable project name."
+            :else nil))
         open-selected! (fn []
                          (when-let [nm (.getSelectedValue proj-list)]
                            (when (and (seq nm) (not= nm (projects/project-name)))
                              (on-switch (str nm))
                              (dismiss!))
                            (refresh!)))
-        create+open! (fn []
-                       (let [nm (str/trim (str (.getText new-field)))]
-                         (when (seq nm)
-                           (projects/create-project! nm)
-                           (on-switch nm)
-                           (dismiss!))))
+        create! (fn []
+                  (let [nm (str/trim (str (.getText name-field)))
+                        desc (str/trim (str (.getText desc-field)))
+                        problem (name-error nm)]
+                    (if problem
+                      (set-error! (str "Can't create: " problem))
+                      (do
+                        (set-error! nil)
+                        (projects/create-project! nm desc)
+                        (on-switch nm)
+                        (dismiss!)))))
         delete! (fn []
                   (let [nm (str/trim (str (.getSelectedValue proj-list)))]
                     (cond
@@ -783,35 +844,99 @@
                           (refresh!))))))
         dialog (doto (JDialog. frame "Projects — grog" true)
                  (.setLayout (BorderLayout.))
-                 (.setSize 360 380)
-                 (.setMinimumSize (java.awt.Dimension. 320 320))
+                 (.setSize 480 560)
+                 (.setMinimumSize (java.awt.Dimension. 420 480))
                  (.setLocationRelativeTo frame))]
     (reset! dialog-ref dialog)
-    (let [proj-scroll (doto (JScrollPane. proj-list)
-                        (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 8 8)))
-        btn-row (doto (JPanel. (java.awt.GridLayout. 1 3 8 8))
-                  (.add open-btn)
-                  (.add new-btn)
-                  (.add del-btn))
-        south (doto (JPanel. (BorderLayout.))
-                (.add btn-row BorderLayout/CENTER)
-                (.add new-field BorderLayout/SOUTH))]
-    (.setCellRenderer proj-list cell-renderer)
-    (refresh!)
-    (.addActionListener open-btn
-      (proxy [java.awt.event.ActionListener] []
-        (actionPerformed [_] (open-selected!))))
-    (.addActionListener del-btn
-      (proxy [java.awt.event.ActionListener] []
-        (actionPerformed [_] (delete!))))
-    (doto dialog
-      (.add proj-scroll BorderLayout/CENTER)
-      (.add south BorderLayout/SOUTH)
-      (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE)
-      (.setVisible true))
-    (.addActionListener new-btn
-      (proxy [java.awt.event.ActionListener] []
-        (actionPerformed [_] (create+open!)))))))
+    (let [name-label (doto (JLabel. "Name")
+                       (.setFont (widgets/ui-font)))
+          desc-label (doto (JLabel. "Description (optional)")
+                       (.setFont (widgets/ui-font)))
+          form-inner (let [p (JPanel.)]
+                       (doto p
+                         (.setLayout (BoxLayout. p BoxLayout/Y_AXIS))
+                         (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 4 8))))
+          form (doto (JPanel. (BorderLayout.))
+                 (.setBorder (javax.swing.BorderFactory/createTitledBorder "New project"))
+                 (.add form-inner BorderLayout/CENTER))
+          list-label (doto (JLabel. "Open an existing project:")
+                       (.setFont (widgets/ui-font)))
+          proj-scroll (doto (JScrollPane. proj-list)
+                        (widgets/boost-horizontal-wheel!))
+          btn-row (doto (JPanel. (java.awt.FlowLayout. java.awt.FlowLayout/LEFT 8 8))
+                     (.add open-btn)
+                     (.add del-btn)
+                     (.add close-btn))
+          south (doto (JPanel. (java.awt.GridLayout. 0 1 4 4))
+                 (.add list-label)
+                 (.add btn-row))]
+      ;; ---- the create-form ----
+      (doto form-inner
+        (.add name-label)
+        (.add (doto name-field
+                (.setFont (widgets/ui-font))
+                (.setToolTipText "Project name; becomes its directory under the projects home.")
+                (.addActionListener
+                 (proxy [java.awt.event.ActionListener] []
+                   (actionPerformed [_] (create!))))))
+        (.add (Box/createVerticalStrut 6))
+        (.add desc-label)
+        (.add (doto desc-field
+                (.setFont (widgets/ui-font))
+                (.setToolTipText "One-line description shown as context (optional).")
+                (.addActionListener
+                 (proxy [java.awt.event.ActionListener] []
+                   (actionPerformed [_] (create!))))))
+        (.add (Box/createVerticalStrut 10))
+        (.add (doto (JPanel. (java.awt.FlowLayout. java.awt.FlowLayout/LEFT 0 0))
+                (.add create-btn)))
+        (.add (Box/createVerticalStrut 6))
+        (.add error-label))
+      (doto create-btn
+        (.setToolTipText "Create the project's directory + notes/ context, then open it.")
+        (.addActionListener
+         (proxy [java.awt.event.ActionListener] []
+           (actionPerformed [_] (create!)))))
+      ;; ---- existing project list: switch / delete ----
+      (.setCellRenderer proj-list cell-renderer)
+      (refresh!)
+      (doto proj-list
+        (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 8 8)))
+      (.addActionListener open-btn
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [_] (open-selected!))))
+      (.addActionListener del-btn
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [_] (delete!))))
+      (.addActionListener close-btn
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [_] (dismiss!))))
+      ;; Enter in the list opens the selected project; double-click too
+      (.addKeyListener proj-list
+        (proxy [java.awt.event.KeyAdapter] []
+          (keyPressed [e]
+            (when (= java.awt.event.KeyEvent/VK_ENTER (.getKeyCode e))
+              (open-selected!)))))
+      (.addMouseListener proj-list
+        (proxy [java.awt.event.MouseAdapter] []
+          (mouseClicked [e]
+            (when (and (= (.getClickCount e) 2)
+                       (= java.awt.event.MouseEvent/BUTTON1 (.getButton e))
+                       (seq (.getSelectedValue proj-list)))
+              (open-selected!)))))
+      (doto dialog
+        (.add form BorderLayout/NORTH)
+        (.add proj-scroll BorderLayout/CENTER)
+        (.add south BorderLayout/SOUTH)
+        (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
+      ;; focus the name field so creating a project is one keystroke away
+      (SwingUtilities/invokeLater
+        (fn []
+          (try
+            (.requestFocusInWindow name-field)
+            (.selectAll name-field)
+            (catch Throwable _ nil))))
+      (.setVisible dialog true))))
 
 (defn- build-chat-frame
   "Build the chat frame (not yet shown). Returns the JFrame."
@@ -825,6 +950,7 @@
         term (widgets/toolbar-button :terminal "Terminal")
         settings (widgets/toolbar-button :settings "Settings")
         export (widgets/toolbar-button :export "Export transcript")
+        view-html (widgets/toolbar-button :html "Open transcript as HTML")
         clear (widgets/toolbar-button :clear "Clear")
         frame (JFrame. (str "grog — " (or (projects/project-name) "default")))
         queue (LinkedBlockingQueue.)
@@ -989,42 +1115,54 @@
     ;; drag-and-drop on the prompt only (the transcript is a virtualized JList)
     (dnd/install! prompt)
     ;; right-click Copy on the transcript and prompt
-    (with-copy-menu! pane [["Copy all" #(transcript/text pane)]])
+    (with-copy-menu! pane
+      [["Copy all" #(transcript/text pane)]
+       {:label "Copy selected"
+        :action #(transcript/copy-selection! pane)}
+       {:label "Open transcript as HTML…"
+        :action #(uiexport/show-transcript-html! frame pane)}])
     (with-copy-menu! prompt [["Copy" #(.getSelectedText prompt)]])
     ;; single-line scroll keys on the transcript
     (install-transcript-scroll-keys! pane transcript-scroll frame)
-    ;; Send: button + Ctrl+Enter
+    ;; Shift+MouseWheel horizontal scroll: the JVM default is a single unit per
+    ;; notch (≈1 char for text views) — too sluggish. Boost it on the chat input
+    ;; and transcript so one wheel step moves a meaningful chunk.
+    (widgets/boost-horizontal-wheel! prompt-scroll)
+    (widgets/boost-horizontal-wheel! transcript-scroll)
+    ;; Send button submits
     (.addActionListener send (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (submit!))))
-    ;; Enter submits the prompt; Shift+Enter inserts a literal newline
-    ;; (reversed from before) so the prompt stays multiline but sending is one key.
+    ;; Enter inserts a newline; Ctrl+Enter submits
     (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
           (KeyStroke/getKeyStroke KeyEvent/VK_ENTER 0)
+          "insert-break")
+    (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
+          (KeyStroke/getKeyStroke KeyEvent/VK_ENTER (java.awt.event.InputEvent/CTRL_DOWN_MASK))
           "grog-submit")
     (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
           (KeyStroke/getKeyStroke KeyEvent/VK_ENTER (java.awt.event.InputEvent/SHIFT_DOWN_MASK))
           "insert-break")
+    (.put (.getInputMap prompt javax.swing.JComponent/WHEN_FOCUSED)
+          (KeyStroke/getKeyStroke KeyEvent/VK_ENTER (java.awt.event.InputEvent/ALT_DOWN_MASK))
+          "insert-break")
     (.put (.getActionMap prompt) "grog-submit"
           (proxy [AbstractAction] []
             (actionPerformed [e] (submit!))))
-    ;; Robust cross-platform Enter handling. The WHEN_FOCUSED InputMap binding
-    ;; above is not honoured reliably on Windows when the JTextArea has a
-    ;; TransferHandler/setDragEnabled installed (see grog.ui.dnd) and default
-    ;; `insert-break` wins, so plain Enter inserts a newline instead of sending.
-    ;; A KeyListener on the focused component fires identically on every
-    ;; platform; consuming the event stops the InputMap/default newline from
-    ;; also running. Plain Enter submits (Ctrl+Enter still does too via `send`),
-    ;; Shift+Enter inserts a literal newline.
+    ;; Robust cross-platform Enter handling. A KeyListener fires identically on
+    ;; every platform; consuming the event stops the default action from also
+    ;; running. Plain Enter (and Shift/Alt+Enter) insert a literal newline;
+    ;; Ctrl+Enter submits.
     (.addKeyListener prompt
       (proxy [java.awt.event.KeyAdapter] []
         (keyPressed [e]
           (when (= KeyEvent/VK_ENTER (.getKeyCode e))
-            (if (zero? (bit-and (.getModifiersEx e)
-                                java.awt.event.InputEvent/SHIFT_DOWN_MASK))
-              (do (.consume e)
-                  (submit!))
-              (do (.consume e)
-                  (.replaceSelection prompt "\n")))))))
+            (let [ctrl? (pos? (bit-and (.getModifiersEx e)
+                                       java.awt.event.InputEvent/CTRL_DOWN_MASK))]
+              (if ctrl?
+                (do (.consume e)
+                    (submit!))
+                (do (.consume e)
+                    (.replaceSelection prompt "\n"))))))))
     ;; Stop -> stop the ECA prompt (and cancel registry); Terminal -> shell window
     (.addActionListener stop (reify java.awt.event.ActionListener
                                (actionPerformed [_ _] (stop-action!))))
@@ -1036,6 +1174,9 @@
     (.addActionListener export (reify java.awt.event.ActionListener
                                  (actionPerformed [_ _]
                                    (uiexport/save-transcript! frame pane))))
+    (.addActionListener view-html (reify java.awt.event.ActionListener
+                                    (actionPerformed [_ _]
+                                      (uiexport/show-transcript-html! frame pane))))
     ;; Clear button routes through the same behavior as /clear: wipe the
     ;; transcript and drop trust (yolo) auto-approve, without echoing "/clear".
     (let [do-clear! (fn []
@@ -1055,17 +1196,18 @@
                     (.setOpaque false)
                     (.setBorder nil))]
       ;; left: operation buttons (icons + hover tooltips set by `toolbar-button`)
-      (doseq [b [send stop term settings export clear]]
+      (doseq [b [send stop term settings export view-html clear]]
         (.add toolbar b)
         (.add toolbar (Box/createHorizontalStrut 4)))
       ;; right: model / status / trust indicators
       (.add toolbar (Box/createHorizontalGlue))
       (.add toolbar (Box/createHorizontalStrut 14))
-      ;; project — status label + a Projects… button that opens a manager dialog
-      (let [proj-label (JLabel. " project: ")
-            update-label! (fn []
-                            (.setText proj-label
-                                      (str " project: " (or (projects/project-name) "default") "  ")))
+      ;; project — a single toolbar button showing the current project name;
+      ;; clicking it opens the project manager.  (No "project:" prefix label.)
+      (let [proj-btn (widgets/styled-button (or (projects/project-name) "default"))
+            update-btn! (fn []
+                          (.setText proj-btn
+                                    (str (or (projects/project-name) "default") "  ")))
             switch-to! (fn [nm]
                          (when (and (seq nm) (not= nm (projects/project-name)))
                            (when @connected
@@ -1078,17 +1220,14 @@
                            (transcript/append-status! pane (str "Project: " nm))
                            (.setTitle frame (str "grog — " nm))
                            (connect-eca!))
-                         (update-label!))
-            proj-btn (widgets/styled-button "Projects…")]
-          (.setFont proj-label
-                    (doto (widgets/ui-font)
-                      (.deriveFont (float 13))))
-          (.setForeground proj-label (Color. 235 200 90))
-          (update-label!)
+                         (update-btn!))
+            open-project-manager! (fn []
+                                    (show-project-manager! frame switch-to!))]
+          (update-btn!)
+          (.setToolTipText proj-btn "Projects")
           (.addActionListener proj-btn
             (proxy [java.awt.event.ActionListener] []
-              (actionPerformed [_] (show-project-manager! frame switch-to!))))
-          (.add toolbar proj-label)
+              (actionPerformed [_] (open-project-manager!))))
           (.add toolbar proj-btn)
           (.add toolbar (Box/createHorizontalStrut 14)))
       ;; model — dainty, dim, small

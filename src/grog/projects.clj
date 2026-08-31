@@ -67,7 +67,7 @@
   ^File []
   (io/file (projects-home) ".active-project"))
 
-(declare ensure-project-dir!)
+(declare ensure-project-dir! subdir)
 
 (defn write-last-used!
   "Persist `name` as the last-used active project."
@@ -217,16 +217,35 @@
     d))
 
 (defn create-project!
-  "Create a new project named `name`: creates its dir under the projects home and
-  writes an initial `project.edn` manifest (with `:name` and `:created`). Returns
-  the created dir. If the project already exists, returns its dir unchanged."
-  ^File [name]
-  (let [d (ensure-project-dir! name)
-        f (manifest-file d)]
-    (when-not (.exists f)
-      (write-manifest! name {:name (str name)
-                             :created (System/currentTimeMillis)}))
-    d))
+  "Create a new project named `name`: writes a dir under the projects home and an
+  initial `project.edn` manifest (with `:name`, `:created`, and an optional
+  `:description`), and scaffolds the standard project subdirectories
+  (`notes/ dialog/ state/ scripts/`) plus a starter `notes/welcome.md`. Returns
+  the created dir. If the project already exists, returns its dir unchanged.
+  Arities: `[name]` creates with no description; `[name description]` records
+  the trimmed description in the manifest (optional, best-effort)."
+  (^File [name] (create-project! name nil))
+  (^File [name description]
+   (let [d (ensure-project-dir! name)
+         f (manifest-file d)
+         desc (let [v (str/trim (str description))]
+                (when (seq v) v))]
+     (when-not (.exists f)
+       (let [manifest (cond-> {:name (str name)
+                               :created (System/currentTimeMillis)}
+                        desc (assoc :description desc))]
+         (write-manifest! name manifest))
+      ;; scaffold the standard project layout so a fresh project is usable
+      (subdir name "notes")
+      (subdir name "dialog")
+      (subdir name "state")
+      (subdir name "scripts")
+      (let [welcome (io/file (subdir name "notes") "welcome.md")]
+        (when-not (.exists welcome)
+          (spit welcome (str "# " name "\n\nCreated by grog. Put notes, decisions, "
+                             "and handoffs here.\n")
+                :encoding "UTF-8"))))
+     d)))
 
 (defn delete-project!
   "Delete a project by name: remove its directory under the projects home.
