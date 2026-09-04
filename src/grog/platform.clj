@@ -11,16 +11,58 @@
   []
   (str/includes? (str/lower-case (System/getProperty "os.name" "unknown")) "win"))
 
+(defn user-home
+  "The user's home directory as a native (Windows or POSIX) path string.
+  On Windows this prefers the `USERPROFILE` env var (and falls back to
+  `HOMEDRIVE`+`HOMEPATH`, then `user.home`), because a JVM launched from Git
+  Bash / MSYS can otherwise report a `/c/Users/...` or `/home/...` POSIX-style
+  home that `WinNTFileSystem` cannot canonicalize. On POSIX it returns
+  `user.home` (optionally overridden by a `HOME` env var)."
+  ^String []
+  (if-let [h (or (when (windows?)
+                   (or (some-> (System/getenv "USERPROFILE") str str/trim not-empty)
+                       (some-> (System/getenv "HOMEDRIVE") str str/trim not-empty
+                               (str (or (some-> (System/getenv "HOMEPATH") str str/trim not-empty) "")))
+                       (some-> (System/getenv "HOME") str str/trim not-empty)))
+                 (some-> (System/getProperty "user.home") str str/trim not-empty))]
+    h
+    (str (System/getProperty "user.home"))))
+
+(defn msys-path->windows
+  "Translate a POSIX/MSYS style path (`/c/Users/foo` or `/c/Users/foo/bar`)
+  into a Windows form (`C:\\Users\\foo\\bar`). Leaves Windows-native paths and
+  plain relative paths untouched. Only meaningful on Windows; on POSIX the
+  input is returned unchanged. Mirrors the helper in `grog.eca`."
+  ^String [^String s]
+  (if (or (nil? s) (not (windows?))
+          (str/includes? s "\\")       ; already Windows-ish (the common native case)
+          (re-matches #"(?i)^[a-z]:[/\\]" s)  ; already drive-qualified
+          (not (re-matches #"(?i)^/[a-z]/.*$" (str s))))  ; not `/c/...`
+    s
+    (str (str/upper-case (subs s 1 2)) ":" (subs s 2))))
+
 (defn expand-home
   "Expand a leading `~` to the user's home dir (handles `~/…`, `~\\…`, and a
   bare `~`). Returns the string unchanged when it doesn't start with `~`.
   Separator-agnostic so Windows (`~\\grog-projects`) and POSIX (`~/grog-projects`)
-  home-relative paths both expand."
+  home-relative paths both expand. The expanded home is converted to a native
+  Windows path when running on Windows (MSYS `/c/...` -> `C:\\...`)."
   ^String [^String s]
   (if (and s (str/starts-with? s "~"))
-    (str/replace-first s #"^~(?=[/\\]|$)"
-                       (str (System/getProperty "user.home")))
+    (let [home (msys-path->windows (user-home))]
+      (str/replace-first s #"^~(?=[/\\]|$)" home))
     s))
+
+(defn canonical-file
+  "A canonical `File` for `f`, but resilient to the Windows JVM's surprising
+  `WinNTFileSystem.canonicalize0` failures on MSYS-derived paths: if
+  canonicalization throws, fall back to the plain absolute form so the caller
+  still gets a usable path instead of killing the app at startup."
+  ^File [^File f]
+  (try
+    (.getCanonicalFile f)
+    (catch Exception _
+      (when f (.getAbsoluteFile f)))))
 
 (defn config-home-dir
   "Where grog keeps its user-level config, generated ECA config, and the secret
@@ -34,9 +76,9 @@
                 (when (windows?)
                   (or (some-> (System/getenv "APPDATA") str str/trim not-empty
                               (str "/grog"))
-                      (str (System/getProperty "user.home") "/AppData/Roaming/grog")))
+                      (str (msys-path->windows (user-home)) "/AppData/Roaming/grog")))
                 (str/join "/" [(or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
-                                   (str (System/getProperty "user.home") "/.config"))
+                                   (str (user-home) "/.config"))
                                "grog"]))
         f (io/file (expand-home raw))]
-    (.getCanonicalFile f)))
+    (canonical-file f)))

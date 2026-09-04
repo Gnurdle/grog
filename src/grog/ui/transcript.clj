@@ -222,9 +222,9 @@
            baseline (+ (double yy) (double ascent))]
        (loop [rs line, xs 0.0]
          (when-let [r (first rs)]
-           (let [t (:text r)
-                 f (:font r)
-                 fm (.getFontMetrics g f)
+           (let [^String t (:text r)
+                 ^Font f (:font r)
+                 ^FontMetrics fm (.getFontMetrics g f)
                  w (.stringWidth fm t)]
              (.setFont g f)
              (.setColor g (or (:color r) Color/WHITE))
@@ -865,7 +865,7 @@
         msgs (:messages s)
         width (max 160 (:width s))
         inner (double (- width (* 2 outer-pad)))
-        g (:g s)
+        ^Graphics2D g (:g s)
         [hm ys total]
         (loop [rs msgs, hm (:heights s), ys [], y 0]
           (if-let [m (first rs)]
@@ -873,11 +873,11 @@
                   h (if (and prev (identical? (:msg prev) m))
                       (:h prev)
                       (message-height (make-ctx g) m inner))
-                  y0 y]
+                  y0 (long y)]
               (recur (rest rs)
                      (assoc hm (:id m) {:msg m :h (long h)})
                      (conj ys y0)
-                     (+ y0 (+ (long h) msg-gap))))
+                     (long (+ y0 (+ (long h) msg-gap)))))
             [hm ys y]))
         total' (if (seq ys) (- total msg-gap) 0)]
     (swap! st assoc :heights hm :ys ys :total total'))
@@ -959,7 +959,7 @@
   (let [now (System/currentTimeMillis)
         hint {:text (str label) :since (- now 50) :until (+ now 2200)}]
     (swap! st assoc :copy-hint hint)
-    (when-let [c (:component @st)]
+    (when-let [^JComponent c (:component @st)]
       (.repaint c)
       (doto (Timer. 2500
                     (reify ActionListener
@@ -990,7 +990,7 @@
   (let [s @st
         msgs (:messages s)
         ys (:ys s)
-        g (:g s)
+        ^Graphics2D g (:g s)
         width (max 160 (:width s))
         ctx {:g2 g :pal (palette) :fonts (fonts-map)}
         cache (or (:zones-cache s) {})]
@@ -1036,13 +1036,13 @@
 (defn- char-col-at-x
   "Column index (0..len) within `zone` for a view-x, using FontMetrics."
   ^long [st zone ^double x]
-  (let [text (str (:text zone))
+  (let [^String text (str (:text zone))
         len (count text)
-        g (:g @st)
+        ^Graphics2D g (:g @st)
         zone-x (double (:x0 zone))]
     (if (<= (double x) zone-x)
       0
-      (let [fm (.getFontMetrics g (or (:font zone) (Font. "Monospaced" Font/PLAIN 13)))
+      (let [^FontMetrics fm (.getFontMetrics g (or (:font zone) (Font. "Monospaced" Font/PLAIN 13)))
             w (.stringWidth fm text)
             rel (- (double x) zone-x)]
         (if (>= rel w)
@@ -1218,7 +1218,7 @@
 (defn- line->rows
   "Wrap `lines` (run-lines from wrap-runs) into geometry rows
   {:x0 :y :h :font :text} starting at (x, y)."
-  [g ^Font fallback-f lines x y]
+  [^Graphics2D g ^Font fallback-f lines x y]
   (loop [ls (seq lines) yy (double y) acc (transient [])]
     (if-let [ln (first ls)]
       (let [hdr (first ln)
@@ -1260,7 +1260,7 @@
   "Mirror paint-doc!/paint-node! and collect every drawn text row as
   {:x0 :y :h :font :text}. Returns [rows final-y]."
   [ctx ^Node n x y maxw]
-  (let [g (:g2 ctx)
+  (let [^Graphics2D g (:g2 ctx)
         pal (:pal ctx)]
     (condp instance? n
       Document
@@ -1359,7 +1359,7 @@
   [ctx m w]
   (let [inner (- w (* 2 outer-pad))
         y0 0.0
-        g (:g2 ctx)]
+        ^Graphics2D g (:g2 ctx)]
     (case (:type m)
       :user
       (let [fullw (+ inner (* 2 outer-pad))
@@ -1453,15 +1453,15 @@
     (.dispose g2)))
 
 (defn- make-view-st
-  [^clojure.lang.Atom st]
-  (let [view (proxy [JComponent] []
+  ^JComponent [^clojure.lang.Atom st]
+  (let [^JComponent view (proxy [JComponent] []
                (getPreferredSize []
                  (Dimension. (max 100 (:width @st)) (max 1 (:total @st))))
                (paintComponent [g]
                  (paint-view! this g st))
                ;; Dynamic per-item tooltips: thinking/tool headers say whether a
                ;; click expands or collapses, so the click affordance is obvious.
-               (getToolTipText [event]
+               (getToolTipText [^java.awt.event.MouseEvent event]
                  (when-let [a (hit-action st (.getPoint event))]
                    (case (:kind a)
                      :toggle
@@ -1863,7 +1863,7 @@
 (defn line-height-px
   "Current chat line height in px (for scroll unit increments)."
   ^long [c]
-  (let [g (or (:g (deref (st-of c)))
-              (create-metrics-g))]
+  (let [^Graphics2D g (or (:g (deref (st-of c)))
+                          (create-metrics-g))]
     (long (.getHeight (.getFontMetrics g (Font. (or (appearance/chat-font-family) "Monospaced")
                                                 Font/PLAIN (max 10 (appearance/chat-font-size))))))))

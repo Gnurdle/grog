@@ -111,11 +111,14 @@
   Resolution order: the `grog.home` system property, then the `GROG_HOME` env
   var (exported by grog-ui), then the process working directory. Used as ECA's
   `workspaceFolders` root and as the `/shell` working directory, so the tool
-  model can address files by plain paths in the repo (no workspace containment)."
+  model can address files by plain paths in the repo (no workspace containment).
+  Returns a native path string: on Windows an MSYS-style `GROG_HOME` (`/c/...`)
+  is translated to `C:\\...`."
   []
-  (or (some-> (System/getProperty "grog.home") str str/trim not-empty)
-      (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
-      "."))
+  (platform/msys-path->windows
+   (or (some-> (System/getProperty "grog.home") str str/trim not-empty)
+       (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
+       ".")))
 
 (def ^:private ^String default-projects-dir "~/grog-projects")
 
@@ -124,12 +127,13 @@
   tree. Resolved from `:projects {:dir …}` in grog.edn, defaulting to
   `~/grog-projects`. `~` is expanded to the user home (both `~/` and `~\\`
   forms); a relative path is resolved against the repo root. Returns a
-  canonical `File` (may not exist yet)."
+  canonical `File` (may not exist yet). Uses a resilient canonicalization so an
+  MSYS/Windows path quirk can never abort startup."
   ^File []
   (let [raw (or (some-> (get-in (grog) [:projects :dir]) str str/trim not-empty)
                 default-projects-dir)
         f (io/file (platform/expand-home raw))]
-    (.getCanonicalFile
+    (platform/canonical-file
      (if (.isAbsolute f)
        f
        (io/file (repo-root) (str f))))))

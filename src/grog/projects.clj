@@ -169,7 +169,7 @@
             f (if (.isAbsolute (io/file base))
                 (io/file base)
                 (io/file (projects-home) base))]
-        (.getCanonicalFile f))
+        (platform/canonical-file f))
       d)))
 
 (defn project-root-for-active
@@ -189,7 +189,7 @@
   (let [proj (or (resolve-active-project) (project-name) "default")
         root (or (project-root proj)
                  (ensure-project-dir! proj))]
-    [{:uri (str (.toURI (.getCanonicalFile root)))
+    [{:uri (str (.toURI (platform/canonical-file root)))
       :name proj}]))
 
 (defn manifest-for
