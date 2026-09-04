@@ -132,11 +132,12 @@
   ^File []
   (let [raw (or (some-> (get-in (grog) [:projects :dir]) str str/trim not-empty)
                 default-projects-dir)
-        f (io/file (platform/expand-home raw))]
+        expanded (platform/expand-home raw)
+        f (io/file expanded)]
     (platform/canonical-file
-     (if (.isAbsolute f)
+     (if (platform/native-absolute? (str f))
        f
-       (io/file (repo-root) (str f))))))
+       (io/file (repo-root) (platform/fix-drive-relative (str f)))))))
 
 (defn eca-model
   "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
