@@ -21,7 +21,8 @@
   ^File []
   (let [raw (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
                 (when (windows?)
-                  (or (some-> (System/getenv "APPDATA") str str/trim not-empty)
+                  (or (some-> (System/getenv "APPDATA") str str/trim not-empty
+                              (str "/grog"))
                       (str (System/getProperty "user.home") "/AppData/Roaming/grog")))
                 (str/join "/" [(or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
                                    (str (System/getProperty "user.home") "/.config"))
