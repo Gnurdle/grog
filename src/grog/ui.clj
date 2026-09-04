@@ -985,6 +985,7 @@
                                  init (eca/connect! ws
                                                     :event-handler event-handler
                                                     :request-handler (make-request-handler pane)
+                                                    :eca-binary (config/eca-binary)
                                                     :args ["--config-file" cfg]
                                                     :log-fn (fn [line] (dbg! "eca:" line))
                                                     :trace-fn (make-eca-tracer))]

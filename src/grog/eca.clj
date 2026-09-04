@@ -17,6 +17,7 @@
   pluggable request handler so it can answer `chat/askQuestion` / `editor/getDiagnostics`
   (responds with safe defaults if unset)."
   (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str])
   (:import [java.io ByteArrayOutputStream InputStream OutputStreamWriter]
            [java.lang ProcessBuilder Process ProcessHandle]
@@ -133,59 +134,100 @@
 ;; name isn't resolvable here. We therefore resolve the binary in order:
 ;;   1. an explicit `:eca-binary` path the caller supplied (if it exists),
 ;;   2. the bare name via the OS PATH lookup,
-;;   3. well-known install locations (VS Code extension dirs, ~/.local, /usr/local)
+;;   3. well-known install locations (VS Code extension dirs, scoop shims, npm
+;;      global, ~/.local, /usr/local)
 ;; so `clojure -M:gui` / grog-ui works on Windows too.
+
+(defn- windows?
+  "True when running on a Microsoft Windows OS."
+  []
+  (str/includes? (str/lower-case (System/getProperty "os.name" "unknown")) "win"))
+
+(defn- msys-path->windows
+  "Translate an MSYS/MinGW style path (`/c/Users/foo` or `/usr/bin`) into a form
+  the Windows JVM can address (`C:\\Users\\foo`). Leaves already-Windows paths and
+  POSIX absolute paths untouched. Used only when running on Windows: under
+  Git Bash the PATH seen by the JVM may still be colon-separated MSYS paths."
+  ^String [^String p]
+  (cond
+    (not (windows?)) p
+    (nil? p) p
+    (re-matches #"(?i)^/[a-z]($|/)" p)
+    (str (str/upper-case (subs p 1 2)) ":" (subs p 2))
+    :else p))
+
+(defn- path-dirs
+  "Directory entries from the OS PATH, normalized for the current platform.
+  Splits on BOTH the platform separator and `:` (so MSYS-style PATH works even
+  on a Windows JVM), translates MSYS roots, and drops blanks."
+  []
+  (->> (str/split (or (System/getenv "PATH") "") #"[:;]")
+       (map str/trim)
+       (remove str/blank?)
+       (map msys-path->windows)))
 
 (defn- path-executable?
   "True if `name` (optionally with a platform executable extension) resolves to
   an executable file on the OS PATH."
   [name]
   (try
-    (let [win? (str/includes? (str/lower-case (System/getProperty "os.name")) "win")
-          exts (if win? ["exe" "cmd" "bat" ""] [""])
-          sep  (System/getProperty "path.separator")
-          dirs (remove str/blank? (str/split (or (System/getenv "PATH") "") #(java.util.regex.Pattern/quote sep)))]
+    (let [win? (windows?)
+          exts (if win? ["exe" "cmd" "bat" ""] [""])]
       (boolean
         (some (fn [d]
                 (some (fn [ext]
                         (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
                           (and (.isFile f) (.canExecute f))))
                       exts))
-              dirs)))
+              (path-dirs))))
     (catch Throwable _ false)))
 
-(defn- vscode-extension-dirs
-  "Candidate ECA directories under a VS Code install (`.../data/extensions`):
-  every `editor-code-assistant.eca-*/` folder and its `bin/` subfolder."
-  [^java.io.File vscode-home]
+(defn- extension-eca-dirs
+  "Candidate ECA directories found in a VS Code `extensions` folder: every
+  `editor-code-assistant.eca-*/` directory and its `bin/` subfolder."
+  [^java.io.File extensions-dir]
   (try
-    (let [ext (java.io.File. vscode-home "data/extensions")]
-      (when (.isDirectory ext)
-        (->> (.listFiles ext)
-             (filter #(and (.isDirectory ^java.io.File %)
-                           (str/starts-with? (.getName ^java.io.File %) "editor-code-assistant")))
-             (mapcat (fn [^java.io.File d]
-                       [d (java.io.File. d "bin")])))))
+    (when (and extensions-dir (.isDirectory extensions-dir))
+      (->> (.listFiles extensions-dir)
+           (filter #(and (.isDirectory ^java.io.File %)
+                         (str/starts-with? (.getName ^java.io.File %) "editor-code-assistant")))
+           (mapcat (fn [^java.io.File d]
+                     [d (java.io.File. d "bin")]))))
     (catch Throwable _ nil)))
+
+(defn- candidate-dirs
+  "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary."
+  []
+  (let [home (System/getProperty "user.home")
+        userprofile (System/getenv "USERPROFILE")
+        appdata (System/getenv "APPDATA")]
+    (concat
+      ;; VS Code user extensions (Windows + POSIX): ~/.vscode/extensions
+      (extension-eca-dirs (io/file home ".vscode" "extensions"))
+      ;; VS Code scoop installs: %USERPROFILE%\scoop\apps\vscode\{version,current}
+      (when-let [scoop-vscode (when userprofile (io/file userprofile "scoop/apps/vscode"))]
+        (when (.isDirectory scoop-vscode)
+          (mapcat (fn [^java.io.File v] (extension-eca-dirs (io/file v "data/extensions")))
+                  (.listFiles scoop-vscode))))
+      ;; scoop shims: %USERPROFILE%\scoop\shims
+      (when userprofile [(io/file userprofile "scoop/shims")])
+      ;; npm global bin on Windows: %APPDATA%\npm
+      (when appdata [(io/file appdata "npm")])
+      ;; POSIX user/system bin dirs
+      [(java.io.File. home ".local/bin")
+       (java.io.File. home "bin")
+       (java.io.File. "/usr/local/bin")
+       (java.io.File. "/usr/bin")])))
 
 (defn- known-eca-candidates
   "Absolute File objects for likely ECA binaries across OSes."
   []
-  (let [home (System/getProperty "user.home")]
-    (sequence cat
-      (map (fn [d]
-             (when d
-               [(java.io.File. d "eca")
-                (java.io.File. d "eca.exe")]))
-           (concat
-             ;; VS Code: %USERPROFILE%\scoop\apps\vscode\{version,current}
-             (when-let [scoop-vscode (java.io.File. (System/getenv "USERPROFILE") "scoop/apps/vscode")]
-               (when (.isDirectory scoop-vscode)
-                 (mapcat vscode-extension-dirs (.listFiles scoop-vscode))))
-             ;; ~/.local/bin and /usr/local/bin on POSIX
-             [(java.io.File. home ".local/bin")
-              (java.io.File. "/usr/local/bin")
-              (java.io.File. "/usr/bin")])))))
+  (let [win? (windows?)
+        names (if win? ["eca.exe" "eca.cmd" "eca.bat" "eca"] ["eca"])]
+    (mapcat (fn [^java.io.File dir]
+              (when dir
+                (map (fn [n] (java.io.File. dir n)) names)))
+            (candidate-dirs))))
 
 (defn- resolve-eca-binary!
   "Resolve the ECA server binary to an absolute path (or a PATH-resolvable name).
@@ -196,18 +238,19 @@
   is inspected only to keep this simple — returns just the binary."
   [^String eca-binary]
   (let [explicit (when (seq eca-binary)
-                   (let [f (java.io.File. eca-binary)]
+                   (let [f (java.io.File. (msys-path->windows eca-binary))]
                      (and (.isFile f) f)))]
     (cond
       explicit (.getAbsolutePath explicit)
 
       (or (nil? (seq eca-binary)) (path-executable? eca-binary))
-      (if (seq eca-binary) eca-binary "eca")
+      (if (seq eca-binary) (msys-path->windows eca-binary) "eca")
 
       :else
-      (or (some (fn [^java.io.File f] (and (.isFile f) (.getAbsolutePath f)))
-                (known-eca-candidates))
-          (if (seq eca-binary) eca-binary "eca")))))
+      (or (when-let [f (some (fn [^java.io.File f] (and (.isFile f) (.getAbsolutePath f)))
+                             (known-eca-candidates))]
+            f)
+          (if (seq eca-binary) (msys-path->windows eca-binary) "eca")))))
 
 (defn- next-id! ^long [^AtomicLong al] (.incrementAndGet al))
 
@@ -292,6 +335,7 @@
                                 "chat/askQuestion" {:result {:answer nil :cancelled true}}
                                 "editor/getDiagnostics" {:result {:diagnostics []}}
                                 {:result {}})))
+        _ (when log-fn (log-fn (str "eca binary: " eca-binary)))
         pb (ProcessBuilder. ^java.util.List (into [eca-binary "server"] (map str (or args []))))
         pending (ConcurrentHashMap.)
         al (AtomicLong. 0)

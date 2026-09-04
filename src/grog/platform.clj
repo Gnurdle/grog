@@ -11,6 +11,17 @@
   []
   (str/includes? (str/lower-case (System/getProperty "os.name" "unknown")) "win"))
 
+(defn expand-home
+  "Expand a leading `~` to the user's home dir (handles `~/…`, `~\\…`, and a
+  bare `~`). Returns the string unchanged when it doesn't start with `~`.
+  Separator-agnostic so Windows (`~\\grog-projects`) and POSIX (`~/grog-projects`)
+  home-relative paths both expand."
+  ^String [^String s]
+  (if (and s (str/starts-with? s "~"))
+    (str/replace-first s #"^~(?=[/\\]|$)"
+                       (str (System/getProperty "user.home")))
+    s))
+
 (defn config-home-dir
   "Where grog keeps its user-level config, generated ECA config, and the secret
   store. Resolution order:
@@ -27,5 +38,5 @@
                 (str/join "/" [(or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
                                    (str (System/getProperty "user.home") "/.config"))
                                "grog"]))
-        f (io/file (str/replace-first raw #"^~(?=/|$)" (str (System/getProperty "user.home"))))]
+        f (io/file (expand-home raw))]
     (.getCanonicalFile f)))

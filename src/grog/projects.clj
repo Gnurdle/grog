@@ -24,7 +24,8 @@
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.platform :as platform])
   (:import (java.io File)))
 
 ;; ---------------------------------------------------------------------------
@@ -164,7 +165,7 @@
   (let [d (project-dir name)
         raw (some-> (read-manifest d) :root str str/trim not-empty)]
     (if raw
-      (let [base (str/replace-first raw #"^~(?=/|$)" (str (System/getProperty "user.home")))
+      (let [base (platform/expand-home raw)
             f (if (.isAbsolute (io/file base))
                 (io/file base)
                 (io/file (projects-home) base))]

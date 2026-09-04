@@ -1,4 +1,10 @@
-{:eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"}
+{:eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"
+       ;; Optional: explicit path/name of the ECA server binary (`eca server`).
+       ;; Needed on Windows when `eca` isn't on PATH (e.g. it lives inside the
+       ;; VS Code extension or a scoop/npm install grog can't find on its own).
+       ;; Supports ${ENV} interpolation and a leading ~ (home-relative).
+       ;; :binary "ECA_BINARY_PATH"  ; e.g. "C:\\Users\\you\\scoop\\shims\\eca.exe" or "C:\\Users\\you\\.vscode\\extensions\\editor-code-assistant.eca-0.x.y\\bin\\eca.exe"
+       }
  ;; Config location (user-level grog.edn) is platform-aware:
  ;;   Linux/macOS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
  ;;   Windows:     %APPDATA%\grog\grog.edn          (e.g. C:\Users\you\AppData\Roaming\grog)

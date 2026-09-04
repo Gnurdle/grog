@@ -80,7 +80,7 @@ Tool paths are taken as given — absolute, or relative to the repo/conversation
 - **Rich GUI transcript** — streaming assistant/thinking/tool cards, markdown, GFM tables, collapsible thinking, drag-to-select copy, and HTML preview/export.
 - **Session history** — `:cli :chat-history-turns` plus **`/clear`** / **`/fresh`**.
 - **Thinking streamed live** into collapsible sections; answer renders as markdown as it completes. (The old console ANSI streaming lives in the one-shot/background loop only.)
-- **On-the-fly model switching** — via the GUI model picker / footer, **`/eca-model <name>`**, or `:eca :model` in `grog.edn` (the active ECA model). The console `:llm :profiles` presets still exist for the one-shot/background loop.
+- **On-the-fly model switching** — via the GUI model picker / footer, **`/eca-model <name>`**, or `:eca :model` in `grog.edn` (the active ECA model). The console `:llm :profiles` presets still exist for the one-shot/background loop. If grog can't find the `eca` server binary on Windows, set **`:eca :binary`** in `grog.edn` to its full path (PATH / scoop shims / npm global / `~/.vscode/extensions` are auto-searched).
 - **One-shot** — `clojure -M:run "…"` uses the same tool stack, then exits (prints to stdout/stderr).
 - **GUI** — `clojure -M:gui` (or `./grog-ui`) opens a Swing desktop app with streaming transcript, Settings, integrated terminal, and export. This is the primary chat surface (the old console chat was removed).
 

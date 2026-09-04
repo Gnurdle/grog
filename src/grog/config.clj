@@ -122,16 +122,17 @@
 (defn projects-dir
   "The projects home: where per-project context lives, **outside** the source
   tree. Resolved from `:projects {:dir …}` in grog.edn, defaulting to
-  `~/grog-projects`. `~` is expanded to the user home; a relative path is
-  resolved against the repo root. Returns a canonical `File` (may not exist yet)."
+  `~/grog-projects`. `~` is expanded to the user home (both `~/` and `~\\`
+  forms); a relative path is resolved against the repo root. Returns a
+  canonical `File` (may not exist yet)."
   ^File []
   (let [raw (or (some-> (get-in (grog) [:projects :dir]) str str/trim not-empty)
                 default-projects-dir)
-        f (io/file (str/replace-first raw #"^~(?=/|$)" (str (System/getProperty "user.home"))))]
+        f (io/file (platform/expand-home raw))]
     (.getCanonicalFile
      (if (.isAbsolute f)
        f
-       (io/file (repo-root) raw)))))
+       (io/file (repo-root) (str f))))))
 
 (defn eca-model
   "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
@@ -139,6 +140,18 @@
   []
   (let [m (get-in (grog) [:eca :model])]
     (when (seq (str/trim (str m))) (str/trim (str m)))))
+
+(declare interpolate-env-var)
+
+(defn eca-binary
+  "`:eca :binary` from grog.edn — an explicit path or name of the ECA server
+  binary (`eca server`). When set, grog uses it directly; otherwise it falls
+  back to PATH + well-known install locations (see `grog.eca/resolve-eca-binary!`).
+  Supports `${ENV}` interpolation and a leading `~` (home-relative)."
+  []
+  (let [v (get-in (grog) [:eca :binary])]
+    (when-let [s (some-> v str str/trim not-empty interpolate-env-var not-empty)]
+      (platform/expand-home s))))
 
 (defn- interpolate-env-var
   "Replace `${ENV}` and `${ENV:-default}` in a string with environment variable values."

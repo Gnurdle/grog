@@ -190,6 +190,11 @@ That's all you need for any OpenAI-compatible cloud provider.
   `GROG_UI_LOG_KEEP` rotations (default 5) are kept; each is capped at `GROG_UI_LOG_MAX`
   bytes (default 5MB). The current file is always the freshest, so `tail -f ~/grog-ui.log`
   shows live debug output.
+- **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
+  PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
+  `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
+  `:eca :binary` in your `grog.edn` to the full path (e.g.
+  `C:\Users\you\scoop\shims\eca.exe`).
 - **Secret backend**: Windows Credential Manager; falls back to
   `%APPDATA%\grog\secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
