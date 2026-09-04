@@ -25,9 +25,9 @@
                      Point Rectangle RenderingHints Toolkit)
            (java.awt.datatransfer StringSelection)
            (java.awt.image BufferedImage)
-           (java.awt.event AdjustmentListener ComponentAdapter MouseAdapter MouseEvent InputEvent)
+           (java.awt.event ActionListener AdjustmentListener ComponentAdapter MouseAdapter MouseEvent InputEvent)
            (java.io Writer)
-           (javax.swing AbstractAction JComponent JScrollPane KeyStroke SwingUtilities)
+           (javax.swing AbstractAction JComponent JScrollPane KeyStroke SwingUtilities Timer)
            (org.commonmark.node BlockQuote BulletList Code Document Emphasis FencedCodeBlock
                                 HardLineBreak Heading HtmlBlock HtmlInline IndentedCodeBlock
                                 Link ListItem Node OrderedList Paragraph SoftLineBreak
@@ -48,6 +48,11 @@
 
 (defn- acolor ^Color [rgb]
   (let [[r g b] rgb] (Color. (int r) (int g) (int b))))
+
+(defn- color-or
+  "`(acolor rgb)` when `rgb` is set, otherwise `fallback`."
+  ^Color [rgb fallback]
+  (if rgb (acolor rgb) fallback))
 
 (defn- palette []
   (let [bg (appearance/rgb [:chat :background])
@@ -315,13 +320,85 @@
         [""]
         parts))))
 
-(defn- code-block-height [ctx ^Node n maxw]
+(defn- code-wrap
+  "Greedy-wrap mono code `text` to `max-w` px using `fm`. Prefers to break at
+  spaces; when a single token is wider than `max-w` it hard-breaks inside the
+  token so long code lines can never overflow the block. The space that causes
+  a break stays at the end of the previous fragment, so re-joining wrapped
+  fragments with \"\" restores the original text exactly."
+  [^FontMetrics fm ^String text ^double max-w]
+  (let [n (count text)]
+    (loop [i 0 line-start 0 last-space -1 lines (transient [])]
+      (cond
+        (>= i n)
+        (let [tail (subs text line-start)]
+          (if (seq tail)
+            (persistent! (conj! lines tail))
+            (persistent! lines)))
+
+        :else
+        (let [ch (.charAt text i)
+              w (double (.stringWidth fm (subs text line-start (inc i))))
+              last-space (if (Character/isWhitespace ch) i last-space)]
+          (if (or (<= w max-w) (= i line-start))
+            (recur (inc i) line-start last-space lines)
+            (if (>= last-space line-start)
+              ;; break after the last space: keep it in the fragment so copy
+              ;; re-joins exactly
+              (let [keep (subs text line-start (inc last-space))]
+                (recur (inc last-space) (inc last-space) -1
+                       (conj! lines keep)))
+              ;; hard break before the char that doesn't fit
+              (recur i i -1 (conj! lines (subs text line-start i))))))))))
+
+(defn- code-layout
+  "Single source of truth for code-block geometry, shared by measurement,
+  painting and zone-building so wrapped code lines paint, measure and select
+  identically.
+
+  Returns {:text full-source :visual [run-lines in paint order] :seps [per-row
+  join sep] :glyph-x :line-height :height}. A source line that wraps to several
+  visual rows gets one visual row per wrapped fragment; `:seps` is \"\" between
+  fragments of the same source line (so copying a wrapped code line re-joins it
+  exactly) and \"\\n\" between source lines."
+  [ctx ^Node n maxw]
   (let [^Graphics2D g (:g2 ctx)
         f (:mono (:fonts ctx))
         fm (.getFontMetrics g f)
         ln (.getHeight fm)
-        lines (code-lines (code-text n))]
-    (+ (* (max 1 (count lines)) ln) 14)))
+        text (code-text n)
+        src (code-lines text)
+        pad 10
+        bw (max 20 (- maxw (* 2 pad)))
+        text-w (max 8 (- bw 16))
+        glyph-x (+ pad 6.0)
+        color (:text (:pal ctx))
+        fragments
+        (mapv (fn [sl]
+                (mapv (fn [line-txt]
+                        {:text line-txt
+                         :font (display-font f line-txt)
+                         :color color})
+                      (code-wrap fm sl text-w)))
+              src)
+        visual (mapv vector (mapcat identity fragments))
+        seps
+        (into []
+              (mapcat (fn [fr]
+                        (let [n (count fr)]
+                          (concat (repeat (max 0 (dec n)) "")
+                                  (when (pos? n) ["\n"])))))
+              fragments)]
+    {:text text
+     :bw bw
+     :visual visual
+     :seps seps
+     :glyph-x glyph-x
+     :line-height ln
+     :height (+ (* (max 1 (count visual)) ln) 14)}))
+
+(defn- code-block-height [ctx ^Node n maxw]
+  (:height (code-layout ctx n maxw)))
 
 (defn- status-runs [ctx ^Color color ^String text]
   [{:text text :font (display-font (:base (:fonts ctx)) text) :color color}])
@@ -351,10 +428,45 @@
       (let [share (max 1 (long (/ (- total maxw) ncols)))]
         (mapv (fn [w] (max 30 (- w share))) widths)))))
 
-(defn- table-height [ctx rows maxw]
+(defn- table-layout
+  "Single source of truth for table geometry, shared by measurement, painting
+   and selection-zone building. Cells wrap at their column width, so a row can
+   span several visual lines; every consumer must use the same wrapped lines and
+   row heights or the painted table drifts from its allocated height (later
+   content paints on top of it)."
+  [ctx rows maxw]
   (let [^Graphics2D g (:g2 ctx)
-        fm (.getFontMetrics g (:base (:fonts ctx)))]
-    (+ 8 (* (max 1 (count rows)) (.getHeight fm)))))
+        pal (:pal ctx)
+        f (:base (:fonts ctx))
+        bold (:bold (:fonts ctx))
+        fm (.getFontMetrics g f)
+        lh (.getHeight fm)
+        widths (table-col-widths ctx rows maxw)
+        ncols (count widths)
+        rows-lines
+        (mapv (fn [row]
+                (let [cf (if (:header? row) bold f)
+                      cells (or (:cells row) [])]
+                  (mapv (fn [i]
+                          (wrap-text g {:font cf :color (:text pal)}
+                                     (or (nth cells i "") "")
+                                     (nth widths i)))
+                        (range ncols))))
+              rows)
+        rows-h
+        (mapv (fn [rls]
+                (max lh (apply max 0 (map #(lines-height g %) rls))))
+              rows-lines)]
+    {:widths widths
+     :rows-h rows-h
+     :rows-lines rows-lines
+     :line-height lh}))
+
+(defn- table-height [ctx rows maxw]
+  (let [{:keys [rows-h]} (table-layout ctx rows maxw)]
+    ;; Paint starts 4px in and appends 6px below, so the block height (matching
+    ;; paint-table!) is 4 + Σ row-height + 6.
+    (+ 10 (apply + 0 rows-h))))
 
 ;; --- block measurement ----------------------------------------------------
 
@@ -415,29 +527,17 @@
   [ctx m ^Node n x y maxw ^clojure.lang.Atom actions]
   (let [^Graphics2D g (:g2 ctx)
         pal (:pal ctx)
-        f (:mono (:fonts ctx))
-        fm (.getFontMetrics g f)
-        ln (.getHeight fm)
-        text (code-text n)
-        lines (code-lines text)
-        h (+ (* (max 1 (count lines)) ln) 14)
-        pad 10
-        bw (- maxw (* 2 pad))
-        bx (+ x pad)
-        text-w (- bw 16)]
+        {:keys [text bw glyph-x line-height visual height]} (code-layout ctx n maxw)]
     (.setColor g (:code-bg pal))
-    (.fillRoundRect g (int bx) (int y) (int bw) (int h) 8 8)
+    (.fillRoundRect g (int (+ x 10)) (int y) (int bw) (int height) 8 8)
+    ;; each visual (possibly wrapped) fragment gets its own baseline; the old
+    ;; code drew all wrapped fragments at the SAME y, overlapping each other.
     (loop [i 0, yy (+ y 7)]
-      (when (< i (count lines))
-        (let [cell-text (nth lines i)
-              runs (wrap-runs g [{:text cell-text :font (display-font f cell-text)
-                                  :color (:text pal)}]
-                               text-w)]
-          (doseq [line runs]
-            (draw-lines! g [line] (+ bx 6) (double yy))))
-        (recur (inc i) (+ yy ln))))
+      (when (< i (count visual))
+        (draw-lines! g [(nth visual i)] (+ x glyph-x) (double yy))
+        (recur (inc i) (+ yy line-height))))
     (let [pw 46
-          px (int (+ bx bw (- pw 8)))
+          px (int (+ x 10 bw (- pw 8)))
           py (int (+ y 5))]
       (.setColor g (:border pal))
       (.drawRoundRect g px py pw 20 10 10)
@@ -447,7 +547,7 @@
       (when actions
         (swap! actions conj {:rect (Rectangle. px py pw 20)
                              :kind :copy-code :payload text})))
-    (+ y h)))
+    (+ y height)))
 
 (defn- paint-list!
   [ctx m ^Node n x y maxw ordered? ^clojure.lang.Atom actions]
@@ -481,28 +581,16 @@
   [ctx m ^Node n x y maxw ^clojure.lang.Atom actions]
   (let [^Graphics2D g (:g2 ctx)
         pal (:pal ctx)
-        f (:base (:fonts ctx))
-        fm (.getFontMetrics g f)
-        lh (.getHeight fm)
         rows (table-rows-of n)
-        widths (table-col-widths ctx rows maxw)
-        ncols (count widths)
+        {:keys [widths rows-h rows-lines]} (table-layout ctx rows maxw)
         col-x (fn [i]
                 (double (+ x (apply + 0 (map long (take i widths))))))
         yy (atom (+ y 4))]
-    (doseq [row rows]
-      (let [cells (:cells row)
-            header? (:header? row)
-            cf (if header? (:bold (:fonts ctx)) f)
-            runs-vec (mapv (fn [i]
-                             (wrap-text g {:font cf :color (:text pal)}
-                                        (or (nth cells i "") "")
-                                        (nth widths i)))
-                           (range ncols))
-            row-h (max lh (apply max (map #(lines-height g %) runs-vec)))]
-        (doseq [i (range ncols)]
-          (draw-lines! g (nth runs-vec i) (col-x i) (double @yy)))
-        (swap! yy + row-h)))
+    (doseq [i (range (count rows))]
+      (let [rls (nth rows-lines i)]
+        (doseq [j (range (count rls))]
+          (draw-lines! g (nth rls j) (col-x j) (double @yy)))
+        (swap! yy + (nth rows-h i))))
     (.setColor g (:border pal))
     (.drawLine g (int x) (int @yy) (int (+ x (apply + widths))) (int @yy))
     (+ @yy 6)))
@@ -747,10 +835,16 @@
    :heights {}
    :hover-msg nil
    :actions []
-   :sel nil        ; {:from {:mi idx :row line} :to {:mi idx :row line}}
+   :sel nil        ; {:from {:zone i :col c} :to {:zone i :col c}}
    :zones []       ; flat cached row geometry, recomputed each paint:
                    ;   [{:mi idx :row line :y0 y :y1 y+h :text "..."} ...]
-   :g (create-metrics-g)})
+   :zones-cache {} ; msg-id -> {:msg <original message object> :rows <relative rows>}
+                   ;   so build-zones can skip re-wrapping unchanged messages
+   :g (create-metrics-g)
+   ;; streaming coalescing: ops queued from any thread, drained on the EDT by
+   ;; :drain-timer at a bounded rate (see with-state)
+   :pending []
+   :drain-timer nil})
 
 (defn- st-of ^clojure.lang.Atom [^JComponent c]
   (.getClientProperty c state-key))
@@ -786,16 +880,56 @@
                      (+ y0 (+ (long h) msg-gap))))
             [hm ys y]))
         total' (if (seq ys) (- total msg-gap) 0)]
-    (swap! st assoc :heights hm :ys ys :total total')
-    ;; keep the zone geometry in sync even before a repaint, so mouse events
-    ;; always hit-test against the current layout (not a stale previous frame)
-    (swap! st assoc :zones (build-zones st)))
+    (swap! st assoc :heights hm :ys ys :total total'))
   (when-let [^JComponent c (:component @st)]
     (.revalidate c)
     (.repaint c))
   (when (:follow? @st)
     (scroll-to-bottom! st))
   nil)
+
+;; --- streaming coalescing ---------------------------------------------------
+;; ECA delivers `chat/contentReceived` as a high-frequency stream of tiny
+;; chunks. Rendering every chunk with its own EDT dispatch (re-measure the whole
+;; reply + revalidate + repaint + scroll) floods the Event Dispatch Thread during
+;; a long generation, which is why the window froze to mouse input (scroll,
+;; expand/collapse, resize). Instead, ops are queued from any thread and drained
+;; by ONE single-shot Swing timer per ~33ms tick, so the EDT does at most one
+;; bounded relayout per tick no matter how fast chunks land.
+
+(def ^:private drain-interval-ms 33)
+
+(defn- drain-pending!
+  "Apply every queued op to `st` on the EDT, then do one layout/repaint/scroll."
+  [^clojure.lang.Atom st]
+  ;; swap-vals! takes-and-clears atomically: a chunk enqueued concurrently lands
+  ;; either in this batch or (with a fresh timer armed by with-state) the next —
+  ;; never lost in between.
+  (let [old-state (first (swap-vals! st assoc :pending []))
+        ops (vec (:pending old-state))]
+    (doseq [f ops]
+      (try
+        (f st)
+        (catch Throwable e
+          (.println System/err (str "[grog.ui.transcript] " (.getMessage e)))
+          (.printStackTrace ^Throwable e))))
+    (update-and-validate! st)))
+
+(defn- make-drain-timer
+  "Single-shot Swing timer that drains queued transcript ops on the EDT once per
+  tick. Re-armed by `with-state` on every enqueue, so a burst of stream chunks
+  coalesces into one relayout instead of N."
+  [^clojure.lang.Atom st]
+  (doto (Timer.
+         (int drain-interval-ms)
+         (reify ActionListener
+           (actionPerformed [_ _]
+             (try
+               (drain-pending! st)
+               (catch Throwable e
+                 (.println System/err (str "[grog.ui.transcript] drain: " (.getMessage e)))
+                 (.printStackTrace ^Throwable e))))))
+    (.setRepeats false)))
 
 (defn- hit-action
   [^clojure.lang.Atom st ^Point p]
@@ -809,6 +943,33 @@
                   (StringSelection. s)
                   nil)))
 
+(defn- desc-label
+  "Human summary of a text amount: 'N chars' or 'N chars · M lines'."
+  ^String [txt]
+  (let [chars (count txt)
+        lines (count (str/split txt #"\n" -1))]
+    (if (> lines 1)
+      (str chars " chars · " lines " lines")
+      (str chars " chars"))))
+
+(defn- note-copied!
+  "Record a 'Copied…' message for the transient on-screen pill, and repaint so
+  the user sees immediate feedback (this is what the transcript was missing)."
+  [st label]
+  (let [now (System/currentTimeMillis)
+        hint {:text (str label) :since (- now 50) :until (+ now 2200)}]
+    (swap! st assoc :copy-hint hint)
+    (when-let [c (:component @st)]
+      (.repaint c)
+      (doto (Timer. 2500
+                    (reify ActionListener
+                      (actionPerformed [_ _]
+                        (swap! st update :copy-hint
+                               (fn [h] (when (identical? h hint) nil)))
+                        (.repaint c))))
+        (.setRepeats false)
+        (.start)))))
+
 ;; --- selection -------------------------------------------------------------
 ;; The SINGLE source of truth for hit-testing and copy is `:zones`, a flat
 ;; geometry list rebuilt during paint (`{:mi idx :row j :y0 y :y1 y+h :text}`).
@@ -818,29 +979,43 @@
 (defn- build-zones
   "Recompute the flat zone vector from the current layout (messages/ys/heights).
   Zone y-coordinates are in view space (each message's rows positioned at its
-  real `:ys` entry)."
+  real `:ys` entry).
+
+  Per-message row geometry is cached by message id RELATIVE to the message top,
+  so an unchanged message skips re-parsing/re-wrapping its markdown on every
+  repaint. Absolute y positions are applied here, which keeps cached geometry
+  correct even when an earlier message's height changes (e.g. a thinking block
+  collapses / tool card expands) and everything below it shifts."
   [st]
   (let [s @st
         msgs (:messages s)
         ys (:ys s)
         g (:g s)
         width (max 160 (:width s))
-        ctx {:g2 g :pal (palette) :fonts (fonts-map)}]
-    (loop [i 0 out []]
+        ctx {:g2 g :pal (palette) :fonts (fonts-map)}
+        cache (or (:zones-cache s) {})]
+    (loop [i 0 out [] cache cache]
       (if (>= i (count msgs))
-        out
-        (let [y0 (double (nth ys i 0.0))
-              m (assoc (nth msgs i) :y-offset y0)
-              rows (rows-for-message ctx m width)
+        (do (swap! st assoc :zones-cache cache)
+            out)
+        (let [m (nth msgs i)
+              id (:id m)
+              prev (get cache id)
+              offset (double (nth ys i 0.0))
+              rows (if (and prev (identical? (:msg prev) m))
+                     (:rows prev)
+                     (rows-for-message ctx m width))
+              cache (assoc cache id {:msg m :rows rows})
               zones (mapv (fn [j r]
                             {:mi i :row j
                              :x0 (double (:x0 r))
-                             :y0 (double (:y r))
-                             :y1 (+ (double (:y r)) (double (:h r)))
+                             :y0 (+ offset (double (:y r)))
+                             :y1 (+ offset (+ (double (:y r)) (double (:h r))))
                              :font (:font r)
+                             :sep (or (:sep r) "\n")
                              :text (:text r)})
-                          (range (count (or rows []))) (or rows []))]
-          (recur (inc i) (into out zones)))))))
+                          (range (count rows)) rows)]
+          (recur (inc i) (into out zones) cache))))))
 
 (defn- zone-at-y
   "Zone index (or nil) at view-y. STRICT: only a y that actually falls inside a
@@ -889,43 +1064,156 @@
   (or (< a-zone b-zone)
       (and (= a-zone b-zone) (< a-col b-col))))
 
-(defn- selection-zone-range
-  "Inclusive [lo hi] zone indices covered by `:sel`, or nil."
-  [st]
-  (when-let [{:keys [from to]} (:sel @st)]
-    (when (and from to)
-      (let [lo (if (endpoint-order from to) from to)
-            hi (if (endpoint-order from to) to from)]
-        [(long (:zone lo)) (long (:zone hi))]))))
+(defn- span-parts
+  "Pieces [part sep part sep …] for the selection span, where `part` is the
+  visible text and `sep` the join separator (\"\\n\" normally, \"\" between
+  fragments of the same code line)."
+  [zones lo-zone hi-zone lo-col hi-col]
+  (loop [z lo-zone acc []]
+    (if (> z hi-zone)
+      acc
+      (let [zr (nth zones z)
+            t (str (:text zr))
+            len (count t)
+            part (cond
+                   (= z lo-zone) (if (< lo-col len)
+                                   (subs t lo-col)
+                                   "")
+                   (= z hi-zone) (subs t 0 (min hi-col len))
+                   :else t)]
+        (if (= z hi-zone)
+          (conj acc part)
+          (recur (inc z) (conj acc part (or (:sep zr) "\n"))))))))
 
 (defn- selection-text
-  "Text of the selected char span (plain text)."
+  "Text of the selected char span (plain text). Rows are joined with their
+  per-zone `:sep` (\"\\n\" normally, \"\" inside a wrapped code line) so copied
+  text matches the source. Endpoints are clamped to the current zone vector so
+  a stale selection can never throw on a shrunken layout."
   ^String [st]
   (when-let [{:keys [from to]} (:sel @st)]
     (when (and from to)
       (let [lo (if (endpoint-order from to) from to)
             hi (if (endpoint-order from to) to from)
             zones (:zones @st)
+            n (count zones)
             lo-zone (long (:zone lo))
-            hi-zone (long (:zone hi))
-            lo-col (max 0 (long (:col lo)))
-            hi-col (long (:col hi))]
-        (if (= lo-zone hi-zone)
-          (when (< lo-zone (count zones))
-            (subs (str (:text (nth zones lo-zone)))
-                  lo-col
-                  (min hi-col (count (str (:text (nth zones lo-zone)))))))
-          (str/join "\n"
-                    (loop [z lo-zone acc []]
-                      (if (> z hi-zone)
-                        acc
-                        (let [t (str (:text (nth zones z)))]
-                          (recur (inc z)
-                                 (conj acc
-                                       (cond
-                                         (= z lo-zone) (subs t lo-col)
-                                         (= z hi-zone) (subs t 0 (min hi-col (count t)))
-                                         :else t))))))))))))
+            hi-zone (long (:zone hi))]
+        (when (and (pos? n) (< lo-zone n))
+          (let [hi-zone (min hi-zone (dec n))
+                lo-col (max 0 (long (:col lo)))
+                hi-col (long (:col hi))]
+            (if (= lo-zone hi-zone)
+              (let [t (str (:text (nth zones lo-zone)))
+                    c1 (min hi-col (count t))]
+                (when (< lo-col c1)
+                  (subs t lo-col c1)))
+              (apply str (span-parts zones lo-zone hi-zone lo-col hi-col))))
+          )
+        )
+      )
+    )
+  )
+
+(defn- selection-summary
+  "Summary of the currently selected span, or nil when nothing is selected."
+  ^String [st]
+  (let [txt (selection-text st)]
+    (when (seq txt)
+      (desc-label txt))))
+
+(defn- paint-selection-zone!
+  "Paint one zone's selected char run as inverted text."
+  [^Graphics2D g2 zone c0 c1 inv-bg inv-fg]
+  (let [text (str (:text zone))
+        f (or (:font zone) (Font. "Monospaced" Font/PLAIN 13))
+        fm (.getFontMetrics g2 f)
+        c0 (min c0 (count text))
+        c1 (min c1 (count text))]
+    (when (< c0 c1)
+      (let [sub (subs text c0 c1)
+            x0 (+ (double (:x0 zone)) (.stringWidth fm (subs text 0 c0)))
+            y0 (double (:y0 zone))
+            h0 (max 2 (int (- (double (:y1 zone)) y0)))
+            baseline (+ y0 (double (.getAscent fm)))]
+        (.setColor g2 inv-bg)
+        (.fillRect g2 (int x0) (int y0)
+                   (max 1 (int (.stringWidth fm sub))) (int h0))
+        (.setFont g2 f)
+        (.setColor g2 inv-fg)
+        (.drawString g2 sub (float x0) (float baseline))))))
+
+(defn- paint-selection!
+  "Draw the selection highlight (inverse text) OVER the message rows. Must run
+  AFTER `paint-message!` — painting it earlier was exactly why selecting text
+  gave no visible feedback: the message text was drawn on top of the highlight."
+  [^Graphics2D g2 st]
+  (when-let [{:keys [from to]} (:sel @st)]
+    (when (and from to)
+      (let [zones (:zones @st)
+            n (count zones)]
+        (when (pos? n)
+          (let [lo (if (endpoint-order from to) from to)
+                hi (if (endpoint-order from to) to from)
+                lo-zone (long (:zone lo))
+                hi-zone (long (:zone hi))]
+            (when (< lo-zone n)
+              (let [hi-zone (min hi-zone (dec n))
+                    lo-col (max 0 (long (:col lo)))
+                    hi-col (long (:col hi))
+                    inv-bg (color-or (appearance/get-of [:chat :selection :rgb] nil)
+                                     (Color. 185 205 240))
+                    inv-fg (color-or (appearance/get-of [:chat :selection-fg :rgb] nil)
+                                     (Color. 15 20 28))]
+                (doseq [idx (range lo-zone (inc hi-zone))]
+                  (paint-selection-zone! g2 (nth zones idx)
+                                         (if (= idx lo-zone) lo-col 0)
+                                         (if (= idx hi-zone) hi-col Integer/MAX_VALUE)
+                                         inv-bg inv-fg))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+
+(defn- paint-hints!
+  "Draw a small bottom-right pill that tells the user what they have selected:
+  a live count while a selection is active, or a transient 'Copied N chars'
+  right after a copy. Positioned within the currently VISIBLE viewport (the
+  transcript is virtualized — its view is taller than the window)."
+  [^JComponent view ^Graphics2D g2 st]
+  (let [now (System/currentTimeMillis)
+        hint (:copy-hint @st)
+        in-window? (and hint
+                        (< (:since hint) now)
+                        (< now (:until hint)))
+        ^String label (if in-window? (:text hint) (selection-summary st))]
+    (when label
+      (let [f (:btn (fonts-map))
+            fm (.getFontMetrics g2 f)
+            pad-x 12 pad-y 7
+            pw (+ (.stringWidth fm label) (* 2 pad-x))
+            ph (+ (.getHeight fm) (* 2 pad-y))
+            ;; anchor to the visible viewport, not the tall virtual view
+            vr (if-let [^JScrollPane sp (:scrollpane @st)]
+                 (let [vp (.getViewport sp)]
+                   (if vp (.getViewRect vp) (Rectangle. 0 0 (.getWidth view) 800)))
+                 (Rectangle. 0 0 (.getWidth view) 800))
+            px (- (+ (.x vr) (.width vr)) pw 12)
+            py (- (+ (.y vr) (.height vr)) ph 14)
+            rr (java.awt.geom.RoundRectangle2D$Float. (float px) (float py)
+                                                       (float pw) (float ph) 14 14)]
+        (.setFont g2 f)
+        (.setColor g2 (Color. 12 15 20 210))
+        (.fill g2 rr)
+        (.setColor g2 (Color. 140 160 190 200))
+        (.draw g2 rr)
+        (.setColor g2 (Color. 226 234 246))
+        (.drawString g2 label (float (+ px pad-x))
+                     (float (+ py pad-y (.getAscent fm))))))))
 
 (defn- line->rows
   "Wrap `lines` (run-lines from wrap-runs) into geometry rows
@@ -944,6 +1232,27 @@
         (recur (next ls) (+ yy h)
                (conj! acc {:x0 (double x) :y yy :h h :font f :text txt})))
       (persistent! acc))))
+
+(defn- code-rows
+  "Zone rows for a code block laid out at (x, y), EXACTLY mirroring
+  paint-code-block!'s pixels (same glyph x, one row per visual/wrapped
+  fragment, same heights). Rows carry `:sep` (\"\" inside a wrapped source line,
+  \"\\n\" between source lines) so copying a wrapped code line re-joins it."
+  [_g ctx ^Node n x y maxw]
+  (let [{:keys [visual seps glyph-x line-height height]} (code-layout ctx n maxw)
+        fallback (:mono (:fonts ctx))]
+    [(loop [i 0 yy (+ (double y) 7) acc (transient [])]
+       (if (< i (count visual))
+         (let [line (nth visual i)
+               txt (apply str (map :text line))]
+           (recur (inc i) (+ yy line-height)
+                  (conj! acc {:x0 (+ (double x) (double glyph-x))
+                              :y yy :h line-height
+                              :font (or (:font (first line)) fallback)
+                              :sep (nth seps i)
+                              :text txt})))
+         (persistent! acc)))
+     (+ (double y) (double height))]))
 
 (declare doc-rows)
 
@@ -973,53 +1282,9 @@
         [(line->rows g f lines x y)
          (+ (double y) (lines-height g lines) block-gap 2)])
 
-      FencedCodeBlock
-      (let [f (:mono (:fonts ctx))
-            fm (.getFontMetrics g f)
-            ln (.getHeight fm)
-            lines (code-lines (code-text n))
-            h (+ (* (max 1 (count lines)) ln) 14)
-            x0 (+ x 16)
-            rows (loop [i 0 yy (+ y 7) acc (transient [])]
-                   (if (< i (count lines))
-                     (recur (inc i) (+ yy ln)
-                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
-                                        :font (:mono (:fonts ctx))
-                                        :text (nth lines i)}))
-                     (persistent! acc)))]
-        [rows (+ (double y) (double h))])
-
-      IndentedCodeBlock
-      (let [f (:mono (:fonts ctx))
-            fm (.getFontMetrics g f)
-            ln (.getHeight fm)
-            lines (code-lines (code-text n))
-            h (+ (* (max 1 (count lines)) ln) 14)
-            x0 (+ x 16)
-            rows (loop [i 0 yy (+ y 7) acc (transient [])]
-                   (if (< i (count lines))
-                     (recur (inc i) (+ yy ln)
-                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
-                                        :font (:mono (:fonts ctx))
-                                        :text (nth lines i)}))
-                     (persistent! acc)))]
-        [rows (+ (double y) (double h))])
-
-      HtmlBlock
-      (let [f (:mono (:fonts ctx))
-            fm (.getFontMetrics g f)
-            ln (.getHeight fm)
-            lines (code-lines (code-text n))
-            h (+ (* (max 1 (count lines)) ln) 14)
-            x0 (+ x 16)
-            rows (loop [i 0 yy (+ y 7) acc (transient [])]
-                   (if (< i (count lines))
-                     (recur (inc i) (+ yy ln)
-                            (conj! acc {:x0 (double (+ x0 6)) :y yy :h ln
-                                        :font (:mono (:fonts ctx))
-                                        :text (nth lines i)}))
-                     (persistent! acc)))]
-        [rows (+ (double y) (double h))])
+      FencedCodeBlock (code-rows g ctx n x y maxw)
+      IndentedCodeBlock (code-rows g ctx n x y maxw)
+      HtmlBlock (code-rows g ctx n x y maxw)
 
       BulletList
       (reduce (fn [[rows yy] ^ListItem li]
@@ -1063,17 +1328,21 @@
 
       TableBlock
       (let [rows (table-rows-of n)
-            f (:base (:fonts ctx))
-            fm (.getFontMetrics g f)
-            lh (.getHeight fm)
-            out (loop [rs rows idx 0 yy (+ y 4) acc (transient [])]
-                  (if-let [r (first rs)]
-                    (recur (next rs) (inc idx) (+ yy lh)
-                           (conj! acc {:x0 (double x) :y yy :h lh :font f
-                                       :text (str/join " | " (or (:cells r) []))}))
-                    (persistent! acc)))
-            h (apply + 0 (map :h out))]
-        [out (+ (double y) 8 (double h))])
+            {:keys [widths rows-h rows-lines]} (table-layout ctx rows maxw)
+            col-x (fn [i] (double (+ x (apply + 0 (map long (take i widths))))))
+            out (persistent!
+                 (loop [i 0 yy (+ y 4) acc (transient [])]
+                   (if (< i (count rows))
+                     (let [rls (nth rows-lines i)]
+                       (recur (inc i) (+ yy (nth rows-h i))
+                              (reduce (fn [a j]
+                                        (reduce conj! a (line->rows g (:base (:fonts ctx))
+                                                                    (nth rls j) (col-x j) yy)))
+                                      acc
+                                      (range (count rls)))))
+                     acc)))
+            h (apply + 0 rows-h)]
+        [out (+ (double y) 10 (double h))])
 
       (let [[rs yy2] (reduce (fn [[rows yy] c]
                                (let [[rs2 yy3] (doc-rows ctx c x yy maxw)]
@@ -1083,10 +1352,13 @@
         [rs yy2]))))
 
 (defn- rows-for-message
-  "All text rows for message `m` in the current view coordinate space."
+  "All text rows for message `m`, RELATIVE to the message's top (y=0).
+  build-zones adds the message's current `:ys` offset when flattening, so rows
+  cached for an unchanged message stay valid when earlier messages change
+  height (collapse/expand) or the list grows."
   [ctx m w]
   (let [inner (- w (* 2 outer-pad))
-        y0 (double (or (:y-offset m) 0.0))
+        y0 0.0
         g (:g2 ctx)]
     (case (:type m)
       :user
@@ -1150,48 +1422,11 @@
     ;; Rebuild the zone geometry used for hit-testing + highlight from the exact
     ;; layout just painted. This is the ONE place geometry is computed for
     ;; selection; mouse handlers and copy only read `:zones`.
-    (let [zones (build-zones st)
-          sel (selection-zone-range st)]
+    (let [zones (build-zones st)]
       (swap! st assoc :zones zones)
       (when-not (:splash? s)
         (.setColor g2 (:bg (palette)))
         (.fillRect g2 0 0 w (.getHeight view)))
-      (when sel
-        ;; paint the selection as inverted text: a solid light background bar over
-        ;; the selected characters, then re-draw those characters in the dark
-        ;; background color — a true text/background invert that's easy to see
-        (let [{:keys [from to]} (:sel @st)
-              lo (if (endpoint-order from to) from to)
-              hi (if (endpoint-order from to) to from)
-              lo-zone (long (:zone lo))
-              hi-zone (long (:zone hi))
-              lo-col (long (:col lo))
-              hi-col (long (:col hi))
-              inv-bg (Color. 235 238 245)      ; light bar
-              inv-fg (Color. 20 24 30)]         ; dark glyphs
-          (doseq [idx (range lo-zone (inc (min hi-zone (dec (count zones)))))]
-            (let [z (nth zones idx)
-                  text (str (:text z))
-                  f (or (:font z) (Font. "Monospaced" Font/PLAIN 13))
-                  fm (.getFontMetrics g2 f)
-                  c0 (if (= idx lo-zone) lo-col 0)
-                  c1 (if (= idx hi-zone) (min hi-col (count text)) (count text))
-                  sub (subs text c0 c1)
-                  x0 (+ (double (:x0 z)) (.stringWidth fm (subs text 0 c0)))
-                  y0 (double (:y0 z))
-                  y1 (double (:y1 z))
-                  h0 (max 2 (int (- y1 y0)))
-                  ascent (double (.getAscent fm))
-                  baseline (+ y0 ascent)]
-              (when (seq sub)
-                ;; invert bar
-                (.setColor g2 inv-bg)
-                (.fillRect g2 (int x0) (int y0)
-                           (max 1 (int (.stringWidth fm sub))) (int h0))
-                ;; re-draw the selected glyphs in the dark fg
-                (.setFont g2 f)
-                (.setColor g2 inv-fg)
-                (.drawString g2 sub (float x0) (float baseline)))))))
       (let [^JScrollPane sp (:scrollpane s)
             vp (when sp (.getViewport sp))
             vr (if vp (.getViewRect vp) (Rectangle. 0 0 (int w) 800))
@@ -1208,8 +1443,14 @@
                     hover? (= (:hover-msg s) (:id m))
                     m (assoc m :y-offset y :sel-h h)]
                 (paint-message! ctx m w hover? nil actions)))))
-        (swap! st assoc :actions (deref actions)))
-      (.dispose g2))))
+        (swap! st assoc :actions (deref actions))
+        ;; Selection highlight and selection feedback are painted AFTER the
+        ;; message rows so they are actually visible — the old code painted the
+        ;; highlight first and the messages drew straight over it, which is why
+        ;; selecting text produced no visible feedback at all.
+        (paint-selection! g2 st)
+        (paint-hints! view g2 st)))
+    (.dispose g2)))
 
 (defn- make-view-st
   [^clojure.lang.Atom st]
@@ -1252,9 +1493,10 @@
   "A scrollable, rich, virtualized chat log. See chat-pane for the inner view."
   ^JScrollPane []
   (let [st (atom (base-state))
+        drain-timer (make-drain-timer st)
         view (make-view-st st)
         sp (JScrollPane. view)]
-    (swap! st assoc :scrollpane sp)
+    (swap! st assoc :scrollpane sp :drain-timer drain-timer)
     ;; manual scroll-away disables follow mode; scrolling back to the bottom
     ;; re-enables it, so the transcript auto-follows whenever it's positioned at
     ;; the end (and stops following the moment you scroll up to read).
@@ -1297,9 +1539,17 @@
                           (.repaint view))))
                     (mouseReleased [^MouseEvent e]
                       (when @drag-pt
-                        (reset! drag-pt nil)
-                        (let [txt (selection-text st)]
-                          (when (seq txt) (copy-text! txt)))))
+                        (let [was-drag? @dragged]
+                          (reset! drag-pt nil)
+                          (if was-drag?
+                            (let [txt (selection-text st)]
+                              (when (seq txt)
+                                (copy-text! txt)
+                                (note-copied! st (str "Copied " (desc-label txt)))))
+                            ;; plain click without a drag clears the selection
+                            ;; (it used to leave a stale zero-length selection)
+                            (do (swap! st assoc :sel nil)
+                                (.repaint view))))))
                     (mouseClicked [^MouseEvent e]
                       ;; drag handled in mouseReleased; plain clicks dispatch to
                       ;; toggle/copy actions only when not a drag.
@@ -1319,8 +1569,14 @@
                                                  m))
                                              msgs)))
                               (update-and-validate! st))
-                            :copy-code (copy-text! (:payload a))
-                            :copy-message (copy-text! (:payload a))))))
+                            :copy-code
+                            (let [payload (:payload a)]
+                              (copy-text! payload)
+                              (note-copied! st (str "Copied " (desc-label payload))))
+                            :copy-message
+                            (let [payload (:payload a)]
+                              (copy-text! payload)
+                              (note-copied! st (str "Copied " (desc-label payload))))))))
                     (mouseMoved [^MouseEvent e]
                       (let [a (hit-action st (.getPoint e))
                             hover-msg (when a (:msg-id a))]
@@ -1352,13 +1608,15 @@
             (proxy [AbstractAction] []
               (actionPerformed [_]
                 (let [txt (selection-text st)]
-                  (when (seq txt) (copy-text! txt)))))))
+                  (when (seq txt)
+                    (copy-text! txt)
+                    (note-copied! st (str "Copied " (desc-label txt)))))))))
     (.addComponentListener view
       (proxy [ComponentAdapter] []
         (componentResized [e]
           (let [w (.getWidth view)]
             (when (pos? w)
-              (swap! st assoc :width w :heights {})
+              (swap! st assoc :width w :heights {} :zones-cache {})
               (update-and-validate! st))))))
     (SwingUtilities/invokeLater
      (fn []
@@ -1373,18 +1631,16 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- with-state
-  "Run `f` on the state atom on the EDT, then re-layout/repaint/scroll. Any
-   exception is reported to stderr (never leaves the EDT unhandled)."
+  "Queue `f` for a bounded-rate run on the EDT (see streaming coalescing above).
+  All ops queued within one tick are applied together followed by ONE relayout/
+  repaint/scroll, so a fast token stream no longer schedules a full layout per
+  chunk. Any exception is reported to stderr (never leaves the EDT unhandled)."
   [^JComponent c f]
-  (SwingUtilities/invokeLater
-   (fn []
-     (when-let [st (st-of c)]
-       (try
-         (f st)
-         (catch Throwable e
-           (.println System/err (str "[grog.ui.transcript] " (.getMessage e)))
-           (.printStackTrace ^Throwable e)))
-       (update-and-validate! st)))))
+  (when-let [st (st-of c)]
+    (swap! st update :pending (fnil conj []) f)
+    (when-let [^Timer t (:drain-timer @st)]
+      (.stop t)
+      (.start t))))
 
 (defn messages
   "Current message vector (newest last)."
@@ -1428,7 +1684,9 @@
   (with-state c
     (fn [st]
       (let [txt (selection-text st)]
-        (when (seq txt) (copy-text! txt))))))
+        (when (seq txt)
+          (copy-text! txt)
+          (note-copied! st (str "Copied " (desc-label txt))))))))
 
 (defn clear!
   "Wipe the transcript (keeps the offscreen metrics)."
@@ -1436,7 +1694,7 @@
   (with-state c
     (fn [st]
       (swap! st assoc :messages [] :heights {} :ys [] :total 0 :actions [] :hover-msg nil
-             :sel nil :zones [] :splash? true))))
+             :sel nil :zones [] :zones-cache {} :splash? true))))
 
 (defn follow!
   "Enable/disable follow-mode (viewport pinned to the bottom)."

@@ -27,7 +27,10 @@
           :code-bg   {:rgb [22 30 36]}
           :bubble-bg {:rgb [43 44 54]}
           :card-bg   {:rgb [26 29 35]}
-          :border    {:rgb [60 66 78]}}
+          :border    {:rgb [60 66 78]}
+          ;; transcript text selection (background bar + selected glyph colour)
+          :selection    {:rgb [185 205 240]}
+          :selection-fg {:rgb [15 20 28]}}
    :terminal {:font-family "Monospaced"
               :font-size 18
               :foreground {:rgb [40 230 90]}
