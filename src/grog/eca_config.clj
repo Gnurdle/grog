@@ -41,8 +41,7 @@
   config home. This file is the source of truth for Odoo connections — edit it
   directly (never put Odoo credentials in grog.edn)."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
+  (let [d (config/ensure-config-dir!)]
     (str d "/odoo-instances.edn")))
 
 (defn- interp-inst
@@ -169,14 +168,12 @@
 (defn generated-config-path
   "Where grog writes its merged ECA config."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
-    (str d "/eca-config.generated.json")))
+  (str (config/ensure-config-dir!) "/eca-config.generated.json"))
 
 (defn approved-tools-path
   "Persistent store of tool names grog has been asked to always allow."
   ^String []
-  (str (config/config-home-dir) "/approved-tools.edn"))
+  (str (config/ensure-config-dir!) "/approved-tools.edn"))
 
 (defn- shell-wrapped
   "An MCP stdio server spec that first `cd`s into `dir`, so `clojure -M:...`
@@ -198,8 +195,7 @@
 (defn imap-instances-path
   "Where grog writes the grog-imap MCP account metadata config (EDN)."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
+  (let [d (config/ensure-config-dir!)]
     (str d "/imap-accounts.edn")))
 
 (defn imap-project-config-file

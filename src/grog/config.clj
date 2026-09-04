@@ -3,8 +3,8 @@
 
   User-level config lives in a **platform-aware config home** (`config-home-dir`):
     * `$GROG_CONFIG_HOME/grog.edn` when that env var is set,
-    * Windows: `%APPDATA%\\grog\\grog.edn`,
-    * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn`.
+    * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` on every OS
+      (Windows included — matching ECA's own `~/.config/eca`).
 
   Merge order (later wins): classpath `resources/grog.edn` → user config home →
   legacy `~/.config/grog/grog.edn` (if present, for existing installs) →
@@ -26,6 +26,11 @@
   `grog.platform/config-home-dir`)."
   ^File []
   (platform/config-home-dir))
+
+(defn ensure-config-dir!
+  "The config home, created if missing (see `grog.platform/ensure-config-dir!`)."
+  ^File []
+  (platform/ensure-config-dir!))
 
 (defn deep-merge
   "Recursively merge maps; non-map values from `b` replace `a`."

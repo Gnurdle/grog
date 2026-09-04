@@ -6,8 +6,9 @@
        ;; :binary "ECA_BINARY_PATH"  ; e.g. "C:\\Users\\you\\scoop\\shims\\eca.exe" or "C:\\Users\\you\\.vscode\\extensions\\editor-code-assistant.eca-0.x.y\\bin\\eca.exe"
        }
  ;; Config location (user-level grog.edn) is platform-aware:
- ;;   Linux/macOS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
- ;;   Windows:     %APPDATA%\grog\grog.edn          (e.g. C:\Users\you\AppData\Roaming\grog)
+ ;;   every OS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
+ ;;   Windows example: C:\Users\you\.config\grog\grog.edn  (same as Linux —
+ ;;   the old %APPDATA%\grog default is no longer used)
  ;;   override:    $GROG_CONFIG_HOME/grog.edn
  ;; Merge order: bundled defaults → the file above → ./grog.edn in the run dir.
  ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)

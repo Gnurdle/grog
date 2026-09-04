@@ -142,10 +142,9 @@ Config merges in order:
 
 1. Code defaults — see `resources/grog.edn.example` for a full annotated template  
 2. `grog.edn` in your **user config home** (platform-aware):
-   - Linux/macOS: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn`
-   - Windows: `%APPDATA%\grog\grog.edn` (e.g. `C:\Users\you\AppData\Roaming\grog\grog.edn`)
-   - Override for both: `$GROG_CONFIG_HOME/grog.edn`
-   - Legacy `~/.config/grog/grog.edn` is still honored if present
+   - Every OS: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` (Windows: `C:\Users\you\.config\grog\grog.edn`)
+   - Override: `$GROG_CONFIG_HOME/grog.edn`
+   - Legacy `~/.config/grog/grog.edn` is still honored if present.
 3. `./grog.edn` — project overrides (in the run directory)  
 
 **Required:** `:llm {:url "…/v1" :model "…"}`. For local Ollama use `:url "http://localhost:11434/v1"`.
@@ -222,7 +221,7 @@ Each run loads **SOUL, skills, and recent project dialog** into the message list
 
 ## Example `grog.edn`
 
-Save as **`./grog.edn`** next to your project or under your user config home (Linux `~/.config/grog/grog.edn`, Windows `%APPDATA%\grog\grog.edn`, or `$GROG_CONFIG_HOME`). Adjust model names and paths; merge order is `resources/` → user config → this file.
+Save as **`./grog.edn`** next to your project or under your user config home (every OS: `~/.config/grog/grog.edn` — Windows uses the same `.config` path — or `$GROG_CONFIG_HOME`). Adjust model names and paths; merge order is `resources/` → user config → this file.
 
 **Secrets** (Brave, `with_api_key`, LLM key) normally live in the **OS keyring** — set with **`/secret set <ACCOUNT> <value>`** in chat, never in this file. If no OS secret backend is available (headless Linux, SSH/WSL, containers), grog automatically falls back to **`secrets.edn`** in your config home (created with owner-only permissions, outside the repo). `with_api_key` is gated by **`:with-api-key {:allowed-secrets […]}`**; additional named secrets that can be set with `/secret` are declared under **`:secrets {:accounts […]}`**.
 

@@ -861,7 +861,7 @@
    \newline
    ["Grog — simple chat via OpenAI-compatible /v1/chat/completions."
     ""
-    "Config merges: resources/grog.edn → user grog.edn (Linux ~/.config/grog/grog.edn or $XDG_CONFIG_HOME; Windows %APPDATA%\\grog\\grog.edn; override with $GROG_CONFIG_HOME) → ./grog.edn"
+    "Config merges: resources/grog.edn → user grog.edn (~/.config/grog/grog.edn or $XDG_CONFIG_HOME, Windows C:\\Users\\<you>\\.config\\grog\\grog.edn; override with $GROG_CONFIG_HOME) → ./grog.edn"
     "Required: :llm {:url \"…/v1\" :model \"…\"}"
     "Optional: :llm {:max-context-tokens N} — drop oldest non-system messages before each request; default 200000 (nil to disable); rough estimate (~4 chars/token)"
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"

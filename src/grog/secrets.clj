@@ -140,14 +140,12 @@
   "Persist the whole file map (add/update `account`, or drop it when `value` is
   nil). Creates the config home if needed, writes atomically, restricts perms."
   [^String account ^String value]
-  (let [dir (platform/config-home-dir)
-        f (secrets-file)
+  (let [f (secrets-file)
         cur (or (read-secret-file) {})
         next (cond-> cur
                (some? value) (assoc account value)
                (nil? value)  (dissoc account))
         tmp (io/file (str (.getPath f) ".tmp"))]
-    (.mkdirs dir)
     (harden-file! tmp)
     (spit tmp (pr-str (into (sorted-map) next)) :encoding "UTF-8")
     (io/copy tmp f)

@@ -103,17 +103,22 @@
   "Where grog keeps its user-level config, generated ECA config, and the secret
   store. Resolution order:
     1. `GROG_CONFIG_HOME` env var (absolute or home-relative path)
-    2. Windows: `%APPDATA%\\grog` (falls back to `~/AppData/Roaming/grog`)
-    3. Linux/macOS: `${XDG_CONFIG_HOME:-~/.config}/grog`
+    2. `${XDG_CONFIG_HOME:-~/.config}/grog` on every OS (Windows included) —
+       the same place ECA's own `~/.config/eca` lives.
   Returns a canonical File (may not exist yet)."
   ^File []
   (let [raw (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
-                (when (windows?)
-                  (or (some-> (System/getenv "APPDATA") str str/trim not-empty
-                              (str "/grog"))
-                      (str (msys-path->windows (user-home)) "/AppData/Roaming/grog")))
                 (str/join "/" [(or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
                                    (str (user-home) "/.config"))
                                "grog"]))
         f (io/file (fix-drive-relative (expand-home raw)))]
     (canonical-file f)))
+
+(defn ensure-config-dir!
+  "The config home, created if it doesn't exist yet. Used by writers that need
+  the directory to be present (secrets store, generated ECA config, Odoo/IMAP
+  metadata)."
+  ^File []
+  (let [d (config-home-dir)]
+    (.mkdirs d)
+    d))
