@@ -112,7 +112,10 @@ normal directory to ECA (no workspace-root semantics).
   (`transcript/copy-selection!`).
 - **`/clear` and the Clear tool-bar button wipe the transcript AND reset YOLO off.**
 - Window opened at **1350×1020** (~50% bigger both ways).
-- **`grog-ui` truncates `~/.grog-ui.log` on every launch** (fresh log per session).
+- **`grog-ui` rotates `grog-ui.log` on each launch** — the current file stays
+  `grog-ui.log` (Linux `~/grog-ui.log`, Windows `%USERPROFILE%\grog-ui.log`), the
+  old one is renamed to `<base>.<n>`, and only the newest `GROG_UI_LOG_KEEP`
+  (default 5) rotations are kept.
 
 ## Superseded grog loop / tool code
 - ✅ **Workspace-scoped tool loop pruned** from `grog.fs` / `grog.core`:

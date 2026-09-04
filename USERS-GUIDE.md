@@ -184,8 +184,12 @@ That's all you need for any OpenAI-compatible cloud provider.
 ### Windows
 
 - **Config home**: `%APPDATA%\grog\grog.edn` (or `$GROG_CONFIG_HOME`).
-- **Launch the GUI**: double-click `grog-ui.bat` (or `clojure -M:gui`), which
-  captures debug output to `grog-ui.log`.
+- **Log file**: grog-ui writes to a single current log — `~/grog-ui.log` (Linux) or
+  `%USERPROFILE%\grog-ui.log` (Windows) — unless `GROG_LOG` is set. On each launch the
+  previous log is rotated to `<base>.<n>` (next available number) and only the newest
+  `GROG_UI_LOG_KEEP` rotations (default 5) are kept; each is capped at `GROG_UI_LOG_MAX`
+  bytes (default 5MB). The current file is always the freshest, so `tail -f ~/grog-ui.log`
+  shows live debug output.
 - **Secret backend**: Windows Credential Manager; falls back to
   `%APPDATA%\grog\secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather

@@ -325,7 +325,7 @@
   "Write the full ECA config map to the grog debug log.
 
   Prints to `System/err` explicitly (NOT the bound `*err*`) so the dump always
-  lands in the real debug log (`~/.grog-ui.log` via grog-ui's tee), even when
+  lands in the real debug log (`grog-ui.log` via grog-ui's tee), even when
   called from a worker thread whose `*err*` is bound to the transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]

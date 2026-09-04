@@ -28,50 +28,59 @@ export GROG_HOME="$(pwd -P)"
 # desktop launches don't depend on a shell rc exporting it.
 
 # --- log management ---------------------------------------------------------
-# Each instance logs to its own file so multiple concurrent grog-ui processes
-# never fight over the same path. Base = $GROG_LOG or ~/.grog-ui.log; with a
-# per-instance suffix the common case is ~/.grog-ui.log (single instance).
-# The log is capped: if it would exceed $GROG_UI_LOG_MAX bytes (default 5MB) we
-# keep only the most recent tail. GW is best-effort and cheap (only pruned on
-# launch, not per line).
+# grog-ui always writes to a single current log file ($GROG_LOG or
+# $HOME/grog-ui.log). On each launch the previous log is rotated: capped to
+# the last MAX_LOG bytes, renamed to <base>.<next>, and only the newest
+# $GROG_UI_LOG_KEEP rotations are kept (older ones removed).
 if [ -n "${GROG_LOG:-}" ]; then
   LOG_BASE="$GROG_LOG"
 else
-  LOG_BASE="$HOME/.grog-ui.log"
+  LOG_BASE="$HOME/grog-ui.log"
 fi
 MAX_LOG="${GROG_UI_LOG_MAX:-5242880}"
-
-# Compute a stable per-instance suffix: the launcher's PID. ($$ is stable for
-# the lifetime of this shell and unique enough across concurrent launches.)
-LOG="${LOG_BASE%.log}.$$.log"
+KEEP="${GROG_UI_LOG_KEEP:-5}"
+LOG="$LOG_BASE"
 export GROG_LOG="$LOG"
 
-prune_log() {
-  local f="$1" max="$2" size tmp
-  if [ -f "$f" ]; then
-    size=$(wc -c < "$f" 2>/dev/null || echo 0)
-    size=${size// /}
-    if [ "$size" -gt "$max" ]; then
-      # keep the newest ~max bytes
-      tmp="$f.tmp"
-      tail -c "$max" "$f" > "$tmp" 2>/dev/null || return 0
-      mv -f "$tmp" "$f" 2>/dev/null || return 0
-      # clear any tmp left behind
-      rm -f "$f.tmp" 2>/dev/null || true
-    fi
+# rotate the previous log (best effort, only on launch)
+if [ -f "$LOG_BASE" ]; then
+  # keep the newest ~MAX_LOG bytes of the current log
+  size=$(wc -c < "$LOG_BASE" 2>/dev/null || echo 0)
+  size=${size// /}
+  if [ "$size" -gt "$MAX_LOG" ]; then
+    tmp="$LOG_BASE.tmp"
+    tail -c "$MAX_LOG" "$LOG_BASE" > "$tmp" 2>/dev/null || rm -f "$tmp"
+    [ -f "$tmp" ] && mv -f "$tmp" "$LOG_BASE"
   fi
-}
-
-mkdir -p "$(dirname "$LOG")"
-prune_log "$LOG" "$MAX_LOG"
-echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ$$ ===" >> "$LOG"
-# Also prune the legacy default path if it's our own (avoid unbounded growth
-# from earlier runs). Never touch a path belonging to another live instance —
-# the per-instance suffix already prevents collisions, so this only cleans up
-# the plain default leftover.
-if [ "$LOG" != "$LOG_BASE" ]; then
-  prune_log "$LOG_BASE" "$MAX_LOG"
+  # next available rotation number
+  next=1
+  for rot in "$LOG_BASE".*; do
+    [ -e "$rot" ] || continue
+    n="${rot##*.}"
+    case "$n" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$n" -ge "$next" ] && next=$((n + 1))
+  done
+  mv -f "$LOG_BASE" "$LOG_BASE.$next" 2>/dev/null || true
+  # keep only the newest $KEEP rotations
+  while [ "$(find "$(dirname "$LOG_BASE")" -maxdepth 1 -name "$(basename "$LOG_BASE").[0-9]*" 2>/dev/null | wc -l)" -gt "$KEEP" ]; do
+    oldest=""
+    for rot in "$LOG_BASE".*; do
+      [ -e "$rot" ] || continue
+      n="${rot##*.}"
+      case "$n" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      if [ -z "$oldest" ] || [ "$n" -lt "${oldest##*.}" ]; then
+        oldest="$rot"
+      fi
+    done
+    [ -n "$oldest" ] && rm -f "$oldest" 2>/dev/null || break
+  done
 fi
+
+echo "=== grog-ui launch: $(date '+%F %T') clj=$CLJ$$ ===" >> "$LOG"
 
 exec 3>&2
 "$CLJ" -M:gui "$@" > >(tee -a "$LOG") 2> >(tee -a "$LOG" >&3)

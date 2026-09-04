@@ -50,17 +50,18 @@
 (def ^:private chat-startup-snark-fallback
   "No snark pool — someone edited the wrong file. Pity.")
 
-;; Debug tracer: writes to the real stderr (so it lands in ~/.grog-ui.log
-;; via grog-ui's tee) regardless of the pane *out*/*err* rebindings.
+;; Debug tracer: writes to the real stderr (so it lands in grog-ui's rotated
+;; log — grog-ui.log or $GROG_LOG) regardless of the pane *out*/*err* rebindings.
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
 
 ;; --- ECA<->grog protocol tracing -------------------------------------------
 ;; Every JSON-RPC frame that crosses the stdio pipe to the `eca server` child is
 ;; summarized here (via eca.clj's :trace-fn). The launcher (./grog-ui /
-;; grog-ui.bat) tees stderr/stdout into a per-instance log file (default
-;; ~/.grog-ui.log, or $GROG_LOG), so these traces land there regardless of any
-;; *out*/*err* rebinding to the transcript pane.
+;; grog-ui.bat) tees stderr/stdout into a single rotated log file (default
+;; ~/grog-ui.log on Linux, %USERPROFILE%\grog-ui.log on Windows, or $GROG_LOG),
+;; so these traces land there regardless of any *out*/*err* rebinding to the
+;; transcript pane.
 
 (defn- trunc
   "Clip a string to `n` chars with an ellipsis; used to keep streamed text lines
@@ -669,7 +670,7 @@
             (catch Throwable e
               ;; Never let a hidden exception in the turn pipeline kill the
               ;; worker thread — that would silently swallow every message
-              ;; queued after it. Log it loudly so ~/.grog-ui.log shows what
+              ;; queued after it. Log it loudly so grog-ui's log shows what
               ;; actually failed instead of a dead, mute queue.
               (dbg! "worker turn error: " (.getMessage e))
               (dbg! (str (with-out-str (.printStackTrace e))))
@@ -998,7 +999,7 @@
                     (do (reset! running? false)
                         ;; ECA is down after a send attempt — don't silently
                         ;; swallow the user's message. Make it obvious both on
-                        ;; screen and in ~/.grog-ui.log (the log is the dif for
+                        ;; screen and in grog-ui.log (the log is the dif for
                         ;; reproducing what happened next).
                         (let [msg (str "[grog] not connected to ECA — message not sent: " text)]
                           (dbg! msg)
@@ -1313,7 +1314,7 @@
           (.requestFocusInWindow prompt)
           (catch Throwable _ nil))
         ;; Auto-connect ECA on startup (instead of lazily on the first send) so
-        ;; the initialize/initialized handshake lands in ~/.grog-ui.log right
+        ;; the initialize/initialized handshake lands in grog-ui.log right
         ;; away — a failed connect is visible in the log before you type a
         ;; single message.
         (connect-eca!)))
