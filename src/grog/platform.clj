@@ -84,7 +84,8 @@
   downstream `io/file` sees an absolute path."
   ^String [^String s]
   (if (and s (str/starts-with? s "~"))
-    (-> (str/replace-first s #"^~(?=[/\\]|$)" (msys-path->windows (user-home)))
+    (-> (str/replace-first s #"^~(?=[/\\]|$)"
+                           (fn [_] (msys-path->windows (user-home))))
         fix-drive-relative)
     s))
 

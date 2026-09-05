@@ -41,6 +41,13 @@
                   y))
               a b))
 
+(defn- config-debug!
+  "One-line config-loading trace written to the **real** stderr so it always
+  lands in the grog debug log (`grog-ui.log` via grog-ui's tee, or `$GROG_LOG`)
+  even when the caller's `*out*`/`*err*` are rebound to the transcript pane."
+  [& xs]
+  (.println System/err (str "[grog-config] " (apply str (interpose " " (map str xs))))))
+
 (defn- slurp-edn [^File f]
   (when (and f (.exists f) (.isFile f))
     (try (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
@@ -51,24 +58,57 @@
     (try (edn/read-string {:eof nil} (slurp r :encoding "UTF-8"))
          (catch Exception _ nil))))
 
+(defn- trace-fragment
+  "Emit one debug line describing a config fragment lookup and its result.
+  `label` is a short human name, `path` the File being inspected, `loaded?`
+  whether a value was obtained (found + parsed), and optional `extra` details.
+  ASCII-only (no em dashes) so the line is clean in any log/console."
+  [label ^File path loaded? & [extra]]
+  (config-debug! (str label
+                      " path=" (or (some-> path .getPath) "nil")
+                      " found=" (boolean (and path (.exists path)))
+                      " loaded=" (boolean (some? loaded?))
+                      " keys=" (when (map? loaded?) (count loaded?))
+                      (when extra (str " " extra)))))
+
+(defn- canonical-equal?
+  "Resilient `File` path equality (falls back to string compare on error)."
+  [^File a ^File b]
+  (and a b
+       (try (= (.getCanonicalPath a) (.getCanonicalPath b))
+            (catch Exception _ (= (str a) (str b))))))
+
 (defn load-merge!
-  "Load and deep-merge all config fragments (does not touch the cache atom)."
+  "Load and deep-merge all config fragments (does not touch the cache atom).
+  Writes a `[grog-config]` trace to the debug log for every fragment it looks
+  at (classpath resource, config-home grog.edn, legacy ~/.config/grog, ./grog.edn)."
   []
   (let [home-file (io/file (config-home-dir) "grog.edn")
         legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
         cwd-file (io/file "grog.edn")
-        fragments (remove nil?
-                    [(resource-edn "grog.edn")
-                     (slurp-edn home-file)
-                     ;; Legacy installs kept config under ~/.config/grog even on
-                     ;; Windows; keep honoring it (deduped against the new path).
-                     (when (and legacy-home-file
-                                (.exists legacy-home-file)
-                                (not (and (.exists home-file)
-                                          (= (.getCanonicalPath home-file)
-                                             (.getCanonicalPath legacy-home-file)))))
-                       (slurp-edn legacy-home-file))
-                     (slurp-edn cwd-file)])]
+        resource (resource-edn "grog.edn")
+        home (slurp-edn home-file)
+        legacy-same? (canonical-equal? home-file legacy-home-file)
+        legacy (when (and (.exists legacy-home-file)
+                          (not (and (.exists home-file) legacy-same?)))
+                 (slurp-edn legacy-home-file))
+        cwd (slurp-edn cwd-file)
+        fragments (remove nil? [resource home legacy cwd])]
+    (config-debug! "config-home-dir=" (some-> (config-home-dir) .getPath)
+                   " GROG_CONFIG_HOME=" (pr-str (System/getenv "GROG_CONFIG_HOME"))
+                   " XDG_CONFIG_HOME=" (pr-str (System/getenv "XDG_CONFIG_HOME"))
+                   " user.home=" (pr-str (System/getProperty "user.home")))
+    (trace-fragment "resource grog.edn" (some-> (io/resource "grog.edn") io/file) resource)
+    (trace-fragment "home grog.edn" home-file home)
+    (trace-fragment "legacy ~/.config/grog/grog.edn" legacy-home-file legacy
+                    (when legacy-same? "(same as home-file - skipped)"))
+    (trace-fragment "cwd ./grog.edn" cwd-file cwd)
+    (config-debug! "merged fragments=" (count fragments)
+                   " sources=" (pr-str (vec (keep identity
+                                                  [(when resource "classpath")
+                                                   (when home "home")
+                                                   (when legacy "legacy")
+                                                   (when cwd "cwd")]))))
     (reduce deep-merge {} fragments)))
 
 (defonce ^:private !cfg (atom nil))

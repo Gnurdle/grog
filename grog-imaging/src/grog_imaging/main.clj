@@ -117,7 +117,51 @@
                                           :dpi {:type :integer}
                                           :pad_px {:type :integer}}
                              :required [:source_path :out_path]})
-    :fn (fn [a] (tools/run-crop-workspace-image! a))}])
+    :fn (fn [a] (tools/run-crop-workspace-image! a))}
+
+   {:name "read_png_image"
+    :description "Decode a PNG/JPG at `path` and return metadata (dimensions, alpha, color depth, byte size) plus optional dominant-color statistics."
+    :schema (json/write-str {:type :object
+                             :properties {:path {:type :string}
+                                          :color_stats {:type :boolean}
+                                          :max_colors {:type :integer}}
+                             :required [:path]})
+    :fn (fn [a] (tools/run-read-png-image! a))}
+
+   {:name "ocr_image"
+    :description "OCR the pixels of a PNG/JPG at `path` (Tesseract). Returns plain text plus optional per-word bounding boxes + confidence via `with_boxes`."
+    :schema (json/write-str {:type :object
+                             :properties {:path {:type :string}
+                                          :dpi {:type :integer}
+                                          :language {:type :string}
+                                          :page_seg_mode {:type :integer}
+                                          :preprocess {:type :boolean}
+                                          :with_boxes {:type :boolean}}
+                             :required [:path]})
+    :fn (fn [a] (tools/run-ocr-image! a))}
+
+   {:name "analyze_image_shapes"
+    :description "BoofCV geometry on a PNG/JPG at `path`: line segments (RANSAC), rectangles, ellipses, blobs (threshold + contours), and heuristic arrow candidates. All geometry in source-image pixel coordinates (x right, y down)."
+    :schema (json/write-str {:type :object
+                             :properties {:path {:type :string}
+                                          :region_size {:type :integer}
+                                          :max_lines {:type :integer}
+                                          :max_rectangles {:type :integer}
+                                          :max_ellipses {:type :integer}
+                                          :max_blobs {:type :integer}
+                                          :max_arrows {:type :integer}
+                                          :min_blob_area {:type :number}}
+                             :required [:path]})
+    :fn (fn [a] (tools/run-analyze-image-shapes! a))}
+
+   {:name "draw_overlay_png"
+    :description "Draw overlay geometry (rectangles/lines/ellipses/text_boxes/blobs/arrows) from `overlays` onto the raster at `source_path` and write the annotated PNG to `out_path`."
+    :schema (json/write-str {:type :object
+                             :properties {:source_path {:type :string}
+                                          :out_path {:type :string}
+                                          :overlays {:type :object}}
+                             :required [:source_path :out_path]})
+    :fn (fn [a] (tools/run-draw-overlay-png! a))}])
 
 ;; --- server ----------------------------------------------------------------
 

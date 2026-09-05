@@ -23,6 +23,7 @@
             [grog.md-render :as md-render])
   (:import (java.awt Color Cursor Dimension Font FontMetrics Graphics Graphics2D
                      Point Rectangle RenderingHints Toolkit)
+           (java.awt Image)
            (java.awt.datatransfer StringSelection)
            (java.awt.image BufferedImage)
            (java.awt.event ActionListener AdjustmentListener ComponentAdapter MouseAdapter MouseEvent InputEvent)
@@ -823,11 +824,16 @@
 
 (defn- base-state []
   {:messages []
-   ;; splash? = conversation hasn't started yet. While true the transcriptview
-   ;; stays transparent so the window's logo background (grog.ui/background-panel)
-   ;; shows through as the splash screen; the first real message flips it false
-   ;; and the view starts painting its own opaque background.
+   ;; splash? = conversation hasn't started yet. While true the transcript view
+   ;; paints the chat background + centred splash logo itself (see paint-view!);
+   ;; the first real message flips it false and the view keeps painting its own
+   ;; opaque chat background (plus the message rows).
    :splash? true
+   ;; optional Image drawn centred over the chat background during splash.
+   ;; Painting it in the view (instead of relying on a transparent viewport +
+   ;; a parent background panel) is what keeps the logo working on Windows,
+   ;; where FlatLaf transparent viewports repaint as white.
+   :splash-img nil
    :follow? true
    :width 640
    :total 0
@@ -1424,9 +1430,29 @@
     ;; selection; mouse handlers and copy only read `:zones`.
     (let [zones (build-zones st)]
       (swap! st assoc :zones zones)
-      (when-not (:splash? s)
-        (.setColor g2 (:bg (palette)))
-        (.fillRect g2 0 0 w (.getHeight view)))
+      (if (:splash? s)
+        ;; Splash: paint the chat background + a centred logo DIRECTLY here,
+        ;; rather than leaving the view transparent and hoping the parent's
+        ;; background panel shows through. The parent chain is opaque on every
+        ;; OS now, so this keeps the logo on Windows too (transparent
+        ;; viewports repaint as white under FlatLaf on Windows).
+        (let [^Image img (:splash-img s)]
+          (.setColor g2 (:bg (palette)))
+          (.fillRect g2 0 0 w (.getHeight view))
+          (when img
+            (let [iw (.getWidth img view)
+                  ih (.getHeight img view)
+                  vh (.getHeight view)]
+              (when (and (pos? iw) (pos? ih) (pos? w) (pos? vh))
+                (let [scale (min (double (/ w iw)) (double (/ vh ih)))
+                      dw (int (* iw scale))
+                      dh (int (* ih scale))
+                      dx (int (/ (- w dw) 2))
+                      dy (int (/ (- vh dh) 2))]
+                  (.drawImage g2 img dx dy dw dh view))))))
+        (do
+          (.setColor g2 (:bg (palette)))
+          (.fillRect g2 0 0 w (.getHeight view))))
       (let [^JScrollPane sp (:scrollpane s)
             vp (when sp (.getViewport sp))
             vr (if vp (.getViewRect vp) (Rectangle. 0 0 (int w) 800))
@@ -1475,7 +1501,13 @@
                      :copy-message "Copy message"
                      nil))))]
     (swap! st assoc :component view)
-    (.setOpaque view false)
+    ;; OPAQUE chat background on every OS. paint-view! fills the whole view
+    ;; with the chat background (and the sighted splash logo while :splash?),
+    ;; so be opaque instead of transparent: an opaque component guarantees the
+    ;; repaint pipeline clears its area, which prevents flat-white repaints on
+    ;; Windows where FlatLaf transparent components show through as white.
+    (.setOpaque view true)
+    (.setBackground view (:bg (palette)))
     (.setFocusable view true)
     (.putClientProperty view state-key st)
     view))
@@ -1490,9 +1522,13 @@
   (when sp (.getView (.getViewport sp))))
 
 (defn make-chat-pane
-  "A scrollable, rich, virtualized chat log. See chat-pane for the inner view."
-  ^JScrollPane []
-  (let [st (atom (base-state))
+  "A scrollable, rich, virtualized chat log. See chat-pane for the inner view.
+  `splash-img` (optional) is an `Image` drawn centred on the chat background
+  while the pane is in its splash state (`:splash? true`, no conversation yet);
+  pass nil on platforms where the old transparent-parent splash is fine."
+  (^JScrollPane [] (make-chat-pane nil))
+  (^JScrollPane [splash-img]
+   (let [st (atom (assoc (base-state) :splash-img splash-img))
         drain-timer (make-drain-timer st)
         view (make-view-st st)
         sp (JScrollPane. view)]
@@ -1624,7 +1660,7 @@
          (when (pos? w)
            (swap! st assoc :width w)
            (update-and-validate! st)))))
-    sp))
+    sp)))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API

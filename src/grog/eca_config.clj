@@ -17,6 +17,7 @@
             [grog.config :as config]
             [grog.models :as models]
             [grog.projects :as projects]
+            [grog.secrets :as secrets]
             [grog.soul :as soul]))
 
 (declare generate-config!)
@@ -123,7 +124,11 @@
         f (io/file path)]
     (cond
       (.exists f)
-      {"GROG_ODOO_CONFIG" path}
+      (cond-> {"GROG_ODOO_CONFIG" path}
+        ;; Password comes from the OS keyring (/secret set ODOO_PASSWORD <value>),
+        ;; injected as a per-process env var — never a literal in the config file.
+        (some? (secrets/get-secret "ODOO_PASSWORD"))
+        (assoc "GROG_ODOO_PASSWORD" (secrets/get-secret "ODOO_PASSWORD")))
 
       (seq (odoo-instances-data))
       (do (spit f (with-out-str (pprint/pprint {:instances (odoo-instances-data)})))
@@ -318,17 +323,21 @@
                             (odoo-env))))))
 
 (defn debug-dump-config!
-  "Write the full ECA config map to the grog debug log.
+  "Log that the ECA config was (re)written to the grog debug log, **without**
+  dumping the config contents (the full JSON includes API keys and should never
+  be written to a log).
 
-  Prints to `System/err` explicitly (NOT the bound `*err*`) so the dump always
+  Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
   lands in the real debug log (`grog-ui.log` via grog-ui's tee), even when
   called from a worker thread whose `*err*` is bound to the transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]
   (.println System/err (str "==== grog: ECA config (re)written -> " path))
-  (.println System/err (str "==== model: " (or (:defaultModel merged) "(none)")))
-  (.println System/err (json/generate-string merged {:pretty true}))
-  (.println System/err "==== end grog: ECA config dump")
+  (.println System/err (str "==== model: " (or (:defaultModel merged) "(none)")
+                            ;; summary only — never dump the map itself
+                            " | mcpServers=" (count (:mcpServers merged {}))
+                            " | rules=" (count (:rules merged []))
+                            " | top-level keys=" (count merged)))
   path)
 
 ;; --- tool approval allowlist (permanent approval) --------------------------
@@ -425,15 +434,35 @@
     (update cfg :rules conj {:path rules-file})
     cfg))
 
+(defn- eca-config-debug! [& xs]
+  "One-line ECA-config trace written to the **real** stderr so it lands in the
+  grog debug log (`grog-ui.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
+  rebinding."
+  (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
+
 (defn generate-config!
   "Produce the merged ECA config map and write it to
   `(generated-config-path)`, dumping it to the debug log. Returns the written path."
   ([] (generate-config! (default-eca-config-path)))
   ([base-path]
-   (let [base  (if (.exists (io/file base-path))
-                 (try (json/parse-string (slurp (io/file base-path)) true)
-                      (catch Exception _ {}))
-                 {})
+   (let [base-file (io/file base-path)
+         base-exists? (.exists base-file)
+         base-parsed (when base-exists?
+                       (try (json/parse-string (slurp base-file) true)
+                            (catch Exception _ nil)))
+         base (if base-parsed base-parsed {})
+         _ (if-not base-exists?
+             (eca-config-debug! "base ECA config MISSING: " base-path
+                                " (empty base - NO providers/auth merged; expected at"
+                                " ~/.config/eca/config.json on POSIX,"
+                                " %APPDATA%/eca/config.json or ~/.config/eca/config.json on Windows)")
+             (if (nil? base-parsed)
+               (eca-config-debug! "base ECA config UNPARSEABLE (JSON error): " base-path
+                                  " - empty base used")
+               (eca-config-debug! "base ECA config loaded: " base-path
+                                  " top-level keys=" (count base)
+                                  " providers=" (count (:providers base {}))
+                                  " defaultModel=" (pr-str (:defaultModel base)))))
          raw-model (or (config/eca-model)
                        (when-let [m (:defaultModel base)] m))
          ;; ECA resolves models as `provider/name`, so the default model must be
@@ -443,6 +472,9 @@
          model (models/qualify-eca-model raw-model
                                          nil
                                          (try (config/llm-url) (catch Exception _ nil)))
+         _ (eca-config-debug! "raw model=" (pr-str raw-model)
+                              " qualified=" (pr-str model)
+                              " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
          merged (-> base
                     (assoc :mcpServers (grog-mcp-servers))
                     (cond-> model (assoc :defaultModel model))

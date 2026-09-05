@@ -20,12 +20,7 @@
            [org.apache.pdfbox.text PDFTextStripper]
            [org.apache.poi.ss.usermodel DataFormatter WorkbookFactory]
            [org.apache.poi.xwpf.usermodel XWPFDocument XWPFParagraph
-            XWPFTable XWPFTableCell XWPFTableRow]
-           [boofcv.factory.feature.detect.line ConfigLineRansac FactoryDetectLine]
-           [boofcv.abst.feature.detect.line DetectLineSegment]
-           [boofcv.io.image ConvertBufferedImage]
-           [boofcv.struct.image GrayU8]
-           [georegression.struct.line LineSegment2D_F32]))
+            XWPFTable XWPFTableCell XWPFTableRow]))
 
 (set! *warn-on-reflection* true)
 
@@ -428,7 +423,7 @@
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "image crop failed") :detail (str e)}))))
 
-;; --- analyze_pdf_line_drawings (BoofCV) -------------------------------------
+;; --- analyze_pdf_line_drawings (BoofCV, via shared grog-imaging.image kernel) -
 
 (def ^:private default-line-max-pages 15)
 (def ^:private line-max-pages-cap 40)
@@ -436,20 +431,6 @@
 (def ^:private min-line-dpi 100)
 (def ^:private default-max-segments-per-page 400)
 (def ^:private max-segments-per-page-cap 800)
-
-(defn- segment->map [^LineSegment2D_F32 s]
-  (let [a (.getA s) b (.getB s)]
-    {:x1 (float (.x a)) :y1 (float (.y a))
-     :x2 (float (.x b)) :y2 (float (.y b))
-     :length_px (float (.getLength s))}))
-
-(defn- make-line-detector ^DetectLineSegment [region-size-or-nil]
-  (let [^ConfigLineRansac cfg (ConfigLineRansac.)]
-    (when (number? region-size-or-nil)
-      (let [rs (max 20 (min 120 (long region-size-or-nil)))]
-        (set! (.regionSize cfg) (int rs))))
-    (.checkValidity cfg)
-    (FactoryDetectLine/lineRansac cfg GrayU8)))
 
 (defn- pdf-renderer ^org.apache.pdfbox.rendering.PDFRenderer [^PDDocument doc]
   (doto (org.apache.pdfbox.rendering.PDFRenderer. doc)
@@ -460,22 +441,6 @@
        (.put RenderingHints/KEY_RENDERING RenderingHints/VALUE_RENDER_QUALITY)
        (.put RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
        (.put RenderingHints/KEY_TEXT_ANTIALIASING RenderingHints/VALUE_TEXT_ANTIALIAS_ON)))))
-
-(defn- analyze-one-page!
-  [^DetectLineSegment detector ^org.apache.pdfbox.rendering.PDFRenderer renderer page-idx dpi max-per-page]
-  (let [^BufferedImage img (.renderImageWithDPI renderer (int page-idx) (float dpi)
-                                                org.apache.pdfbox.rendering.ImageType/RGB)
-        ^GrayU8 gray (ConvertBufferedImage/convertFromSingle img nil GrayU8)
-        found (.detect detector gray)
-        mapped (mapv segment->map found)
-        sorted (sort-by (comp - :length_px) mapped)
-        trimmed (vec (take max-per-page sorted))]
-    {:width_px (.getWidth gray)
-     :height_px (.getHeight gray)
-     :segment_count (count found)
-     :segments_returned (count trimmed)
-     :segments_truncated (> (count found) (count trimmed))
-     :segments trimmed}))
 
 (defn run-analyze-pdf-line-drawings!
   [arguments]
@@ -507,11 +472,13 @@
             (throw (ex-info "encrypted PDFs are not supported" {:path path-str})))
           (let [page-count (.getNumberOfPages doc)
                 end (int (min page-count max-pages))
-                ^DetectLineSegment detector (make-line-detector region-opt)
                 renderer (pdf-renderer doc)
                 pages (mapv (fn [pidx]
-                              (assoc (analyze-one-page! detector renderer pidx dpi max-seg)
-                                     :page (inc pidx)))
+                              (let [^BufferedImage rgb
+                                    (.renderImageWithDPI renderer (int pidx) (float dpi)
+                                                         org.apache.pdfbox.rendering.ImageType/RGB)]
+                                (assoc (img/raster-lines! rgb region-opt max-seg)
+                                       :page (inc pidx))))
                             (range 0 end))]
             (json/generate-string
              {:format "pdf_line_segments"
@@ -523,4 +490,194 @@
               :pages pages})))))
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "line drawing analysis failed")
+                             :detail (str e)}))))
+
+;; --- raster tools: read_png_image / ocr_image / analyze_image_shapes /
+;;     draw_overlay_png --------------------------------------------------------
+
+(defn- deep-keywordize
+  "Recursively convert string map keys to keywords (nested MCP JSON args)."
+  [x]
+  (cond
+    (map? x) (into {} (map (fn [[k v]]
+                             [(if (string? k) (keyword k) k) (deep-keywordize v)])
+                           x))
+    (vector? x) (mapv deep-keywordize x)
+    (seq? x) (map deep-keywordize x)
+    :else x))
+
+(defn- raster-kind-check
+  "Returns an error JSON string if the file is not a decodable raster, else nil."
+  [^File f path-str]
+  (cond
+    (str/blank? path-str) (json/generate-string {:error "path is required"})
+    (not (.exists f))     (json/generate-string {:error "file not found" :path path-str})
+    (not (.isFile f))     (json/generate-string {:error "not a regular file" :path path-str})
+    (= :unknown (img/file-kind-raster-or-pdf (.getName f)))
+    (json/generate-string {:error "path must be .png, .jpg, or .jpeg" :path path-str})
+    :else nil))
+
+(defn run-read-png-image!
+  "Decode a PNG/JPG and return metadata (dimensions, colorspace, alpha) and
+  optionally dominant-color statistics."
+  [arguments]
+  (try
+    (let [m (parse-args arguments)
+          path-str (fnum m)
+          want-stats (img/json-bool (or (:color_stats m) (get m "color_stats")) false)
+          max-colors (let [x (or (:max_colors m) (get m "max_colors"))]
+                       (cond (number? x) (min 24 (max 1 (long x))) :else 8))
+          ^File f (as-file path-str)]
+      (if-let [err (raster-kind-check f path-str)]
+        err
+        (let [^BufferedImage img (img/load-raster-image! f)
+              meta (img/image-metadata img f)]
+          (json/generate-string
+           (cond-> {:ok true
+                    :format "image_metadata"
+                    :path path-str
+                    :width (:width meta)
+                    :height (:height meta)
+                    :pixels (:pixels meta)
+                    :has_alpha (:has_alpha meta)
+                    :components (:components meta)
+                    :bits_per_pixel (:bits_per_pixel meta)
+                    :buffered_type (:buffered_type meta)
+                    :bytes (:bytes meta)}
+             want-stats (assoc :dominant_colors (img/dominant-colors img (long max-colors))))))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "image read failed")
+                             :detail (str e)}))))
+
+(defn run-ocr-image!
+  "OCR a PNG/JPG at `path`. Optional `with_boxes` returns per-word bounding
+  boxes + confidence for relating text to geometry."
+  [arguments]
+  (try
+    (let [m (parse-args arguments)
+          path-str (fnum m)
+          dpi (let [x (or (:dpi m) (get m "dpi"))]
+                (cond (number? x) (min img/max-pdf-raster-dpi (max img/min-ocr-dpi (long x)))
+                      :else img/default-ocr-dpi))
+          lang-out (or (some-> (:language m) str str/trim not-empty)
+                       (some-> (get m "language") str str/trim not-empty)
+                       "eng")
+          psm (img/parse-ocr-psm m)
+          preprocess? (img/json-bool (or (:preprocess m) (get m "preprocess")) true)
+          with-boxes (img/json-bool (or (:with_boxes m) (get m "with_boxes")) false)
+          ^File f (as-file path-str)
+          datapath (img/tessdata-path-or-nil)]
+      (cond
+        (str/blank? datapath)
+        (json/generate-string {:error "Tesseract tessdata not found"
+                               :path path-str
+                               :hint (str "Install tesseract-ocr + language packs, or set TESSDATA_PREFIX "
+                                          "so a tessdata dir contains *.traineddata files.")})
+
+        :else
+        (if-let [err (raster-kind-check f path-str)]
+          err
+          (let [^BufferedImage rgb (img/load-raster-image! f)
+                {:keys [text words]} (img/ocr-image! rgb datapath lang-out psm dpi
+                                                      preprocess? with-boxes)
+                ^String t text
+                text-truncated (> (count t) img/pdf-max-text-chars)
+                t-out (if text-truncated (subs t 0 (min (count t) img/pdf-max-text-chars)) t)]
+            (json/generate-string
+             (cond-> {:format "image_ocr"
+                      :path path-str
+                      :dpi dpi
+                      :language lang-out
+                      :page_seg_mode psm
+                      :preprocess preprocess?
+                      :ocr_engine "lstm"
+                      :text_truncated text-truncated
+                      :text_char_limit (when text-truncated img/pdf-max-text-chars)
+                      :text t-out}
+               with-boxes (assoc :words words)))))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "image OCR failed")
+                             :detail (str e)}))))
+
+(defn run-analyze-image-shapes!
+  "BoofCV geometry on a PNG/JPG: lines (RANSAC), rectangles (polygon
+  detector), ellipses, blobs (threshold + contours), and heuristic arrow
+  candidates. All geometry in source-image pixel coordinates."
+  [arguments]
+  (try
+    (let [m (parse-args arguments)
+          path-str (fnum m)
+          m' (fn [k d] (let [x (or (get m k) (get m (name k)))]
+                         (cond (nil? x) d
+                               (number? x) (long x)
+                               (and (string? x) (not (str/blank? x)))
+                               (try (Long/parseLong (str/trim x)) (catch NumberFormatException _ d))
+                               :else d)))
+          opts {:region_size (m' :region_size nil)
+                :max_lines (m' :max_lines 400)
+                :max_rectangles (m' :max_rectangles img/shape-max-items)
+                :max_ellipses (m' :max_ellipses img/shape-max-items)
+                :max_blobs (m' :max_blobs img/blob-max-items)
+                :max_arrows (m' :max_arrows img/arrow-max-items)
+                :min_blob_area (let [x (or (:min_blob_area m) (get m "min_blob_area"))]
+                                 (cond (nil? x) nil
+                                       (number? x) (double x)
+                                       (and (string? x) (not (str/blank? x)))
+                                       (try (Double/parseDouble (str/trim x)) (catch NumberFormatException _ nil))
+                                       :else nil))}
+          ^File f (as-file path-str)]
+      (if-let [err (raster-kind-check f path-str)]
+        err
+        (let [^BufferedImage rgb (img/load-raster-image! f)
+              {:keys [width_px height_px lines rectangles ellipses blobs arrows]}
+              (img/analyze-image-shapes! rgb opts)]
+          (json/generate-string
+           {:format "image_shapes"
+            :library "BoofCV"
+            :path path-str
+            :width_px width_px
+            :height_px height_px
+            :lines lines
+            :rectangles rectangles
+            :ellipses ellipses
+            :blobs blobs
+            :arrows arrows
+            :arrow_hint "arrow detection is heuristic — check :confidence"}))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "image shape analysis failed")
+                             :detail (str e)}))))
+
+(defn run-draw-overlay-png!
+  "Draw overlay geometry (rectangles/lines/ellipses/text_boxes/blobs/arrows)
+  onto a raster source and write the annotated PNG to `out_path`."
+  [arguments]
+  (try
+    (let [m (parse-args arguments)
+          src (or (some-> (:source_path m) str str/trim not-empty)
+                  (some-> (get m "source_path") str str/trim not-empty))
+          out (or (some-> (:out_path m) str str/trim not-empty)
+                  (some-> (get m "out_path") str str/trim not-empty))
+          overlays (deep-keywordize (or (:overlays m) (get m "overlays")))
+          ^File src-f (as-file src)]
+      (cond
+        (or (str/blank? src) (str/blank? out))
+        (json/generate-string {:error "source_path and out_path are required"})
+
+        (not (img/png-extension? out))
+        (json/generate-string {:error "out_path must end with .png" :out_path out})
+
+        :else
+        (if-let [err (raster-kind-check src-f src)]
+          err
+          (let [^BufferedImage base (img/load-raster-image! src-f)
+                out-path (img/save-png! (img/draw-overlay! base (or overlays {}))
+                                        (as-file out))]
+            (json/generate-string {:format "image_overlay"
+                                   :source_path src
+                                   :out_path out-path
+                                   :ok true
+                                   :width (.getWidth base)
+                                   :height (.getHeight base)})))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "overlay draw failed")
                              :detail (str e)}))))

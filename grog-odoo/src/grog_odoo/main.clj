@@ -70,7 +70,9 @@
 
 (defn- read-config-file!
   "Load instances from the config file at `path`. Accepts EDN (the current grog
-  writer format, `*` `.edn`) or legacy JSON. Returns a vector of instance maps."
+  writer format, `*` `.edn`) or legacy JSON. Returns a vector of instance maps.
+  `${ENV}` / `${ENV:-default}` references in string fields are interpolated from
+  the process environment (so credentials can be injected per-process)."
   [path]
   (let [raw (slurp (java.io.File. path))
         data (try
@@ -81,17 +83,25 @@
         insts (if (sequential? raw-insts) (vec raw-insts) [])]
     (when-not (seq insts)
       (throw (ex-info "GROG_ODOO_CONFIG contains no instances" {:path path})))
-    (mapv (fn [i]
-            (let [name (str (or (:name i) "default"))
-                  url  (normalize-url (or (:url i) (throw (ex-info (str "instance '" name "' missing :url") {}))))
-                  db   (str (or (:db i) (throw (ex-info (str "instance '" name "' missing :db") {}))))]
-              {:name name
-               :url url
-               :db db
-               :user (str (or (:user i) (throw (ex-info (str "instance '" name "' missing :user") {}))))
-               :password (str (or (:password i) ""))
-               :sql (:sql i)}))
-          insts)))
+    (letfn [(interp [v]
+              (if (string? v)
+                (str/replace v #"\$\{([^}]+)\}"
+                             (fn [[_ spec]]
+                               (let [[var-name default-val] (str/split spec #":-" 2)]
+                                 (or (System/getenv var-name) default-val ""))))
+                v))]
+      (mapv (fn [i]
+              (let [name (str (or (:name i) "default"))
+                    url  (normalize-url (interp (or (:url i) (throw (ex-info (str "instance '" name "' missing :url") {})))))
+                    db   (str (interp (or (:db i) (throw (ex-info (str "instance '" name "' missing :db") {})))))]
+                {:name name
+                 :url url
+                 :db db
+                 :user (str (interp (or (:user i) (throw (ex-info (str "instance '" name "' missing :user") {})))))
+                 :password (str (or (interp (:password i)) ""))
+                 :sql (when-let [s (:sql i)]
+                        (into {} (map (fn [[k v]] [k (interp v)])) s))}))
+            insts))))
 
 (defn- load-config!
   "Populate `config*` from GROG_ODOO_CONFIG (EDN or legacy JSON) else legacy
