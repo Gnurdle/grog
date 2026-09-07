@@ -1,89 +1,78 @@
-{:eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"
-       ;; Optional: explicit path/name of the ECA server binary (`eca server`).
-       ;; Needed on Windows when `eca` isn't on PATH (e.g. it lives inside the
-       ;; VS Code extension or a scoop/npm install grog can't find on its own).
-       ;; Supports ${ENV} interpolation and a leading ~ (home-relative).
-       ;; :binary "ECA_BINARY_PATH"  ; e.g. "C:\\Users\\you\\scoop\\shims\\eca.exe" or "C:\\Users\\you\\.vscode\\extensions\\editor-code-assistant.eca-0.x.y\\bin\\eca.exe"
-       }
- ;; Config location (user-level grog.edn) is platform-aware:
- ;;   every OS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
- ;;   Windows example: C:\Users\you\.config\grog\grog.edn  (same as Linux —
- ;;   the old %APPDATA%\grog default is no longer used)
- ;;   override:    $GROG_CONFIG_HOME/grog.edn
- ;; Merge order: bundled defaults → the file above → ./grog.edn in the run dir.
- ;; LLM: any OpenAI-compatible /v1/chat/completions endpoint (Ollama, OpenRouter, OpenAI, etc.)
- ;; Default below is DeepSeek via OpenRouter (match the ECA model above).
- ;; For local Ollama swap to: :url "http://localhost:11434/v1" and a local model.
- :llm {:url "https://openrouter.ai/api/v1"
-       :model "deepseek/deepseek-v4-flash-0731"
-       ;; Optional: inline API key (not recommended). Prefer OS keyring account LLM_API_KEY set via /secret.
-       ;; :api-key "${OPENROUTER_API_KEY}"
-       ;; Optional: debug request payload and/or raw response content to stderr.
-       ;; :debug-payload true
-       ;; :debug-response true
-       ;; Optional: token budget. Oldest non-system messages are dropped before each request.
-       ;; Rough estimate (~4 chars/token). Default 200000; set to nil to disable.
-       ;; :max-context-tokens 200000
-       ;; Optional: cap individual tool result length. Default 50000; set to nil to disable.
-       ;; :max-tool-result-chars 50000
-       ;; Optional: temperature (provider default when omitted).
-       ;; :temperature 0.7
-       ;; Optional: max output tokens (provider default when omitted).
-       ;; :max-tokens 4096
-       ;; Optional: connection/read timeouts in seconds (defaults: conn 60, socket 300).
-       ;; :conn-timeout-sec 60
-       ;; :socket-timeout-sec 300
-       ;; Optional: human-readable label for status lines.
-       ;; :provider-name "OpenRouter · DeepSeek"
-       ;; Optional: provider-specific fields merged into every request payload.
-       ;; E.g. OpenRouter context compression: :extra-payload {:transforms ["middle-out"]}
-       ;; :extra-payload {:transforms ["middle-out"]}
-       ;; Optional: named presets for /model. Each profile overrides base :llm keys for the session.
-       ;; :profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
-       ;;            :remote {:url "https://openrouter.ai/api/v1" :model "deepseek/deepseek-v4-flash-0731"}}
-       }
+;; grog.edn.example — a real, copy-paste-starting config.
+;;
+;; Install: place this as ./grog.edn (or the user-level grog.edn per the location
+;; notes below), tweak the model URL/key, and run `grog`.
+;;
+;; Config location is platform-aware:
+;;   every OS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
+;;   Windows:  C:\Users\you\.config\grog\grog.edn   (same path as Linux;
+;;             the old %APPDATA%\grog default is no longer used)
+;;   override: $GROG_CONFIG_HOME/grog.edn
+;; Merge order (later wins): bundled defaults → the file above → ./grog.edn in the run dir.
+
+;; If the `eca` server binary isn't on PATH (e.g. it lives inside a VS Code
+;; extension or a scoop/npm install), point at it explicitly. ${ENV} + leading ~
+;; are supported. Omit if `eca` is already on PATH.
+;; :binary "C:\\Users\\you\\scoop\\shims\\eca.exe"
+
+{:llm
+  ;; Any OpenAI-compatible /v1/chat/completions endpoint: OpenRouter, OpenAI,
+  ;; Ollama (use :url "http://localhost:11434/v1" + a local :model), etc.
+  {:url "https://openrouter.ai/api/v1"
+   :model "deepseek/deepseek-v4-flash-0731"
+
+   ;; --- commonly-tuned knobs -------------------------------------------------
+   ;; Prefer an API key via the OS keyring (`/secret`, account LLM_API_KEY).
+   ;; Inline is allowed but not recommended. Omit if the keyring holds it.
+   ;:api-key "${OPENROUTER_API_KEY}"
+   ;:temperature 0.7
+   ;:max-tokens 4096
+   ;:max-context-tokens 200000     ;; token budget; oldest messages dropped first
+   ;:max-tool-result-chars 50000   ;; cap tool-result length
+   ;:conn-timeout-sec 60
+   ;:socket-timeout-sec 300
+   ;:provider-name "OpenRouter · DeepSeek"
+   ;:extra-payload {:transforms ["middle-out"]}   ;; provider-specific fields
+   ;:profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
+   ;           :remote {:url "https://openrouter.ai/api/v1"   :model "deepseek/deepseek-v4-flash-0731"}}}
+
+ :eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"}
+
  :soul {:path "SOUL.md"}
- ;; Skills: each subdir of these roots must contain skill.edn + SKILL.md
- :skills {:roots ["skills"]
-          ;; :max-body-chars 65536
-          ;; :prompt-skill-lines 16
-          }
- ;; Babashka is always enabled (a given) — run_babashka is always exposed to the model.
- ;; The only knob is the `bb` command; override with :command (or env GROG_BABASHKA_CMD).
- :babashka {;; :command "bb"
-            }
- ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs (relative path).
- ;; :edn-store {:root "edn-store"}
+
+ ;; Skills: each immediate subdir of these roots must contain skill.edn + SKILL.md.
+ :skills {:roots ["skills"]}
+
+ ;; Babashka is always enabled; only the `bb` command is overridable.
+ :babashka {}
+
+ ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs.
+ ;:edn-store {:root "edn-store"}
+
  ;; Project home — where per-project context lives, OUTSIDE the source tree.
- ;; Each immediate subdir is a project (GUI picker or /project lists/switches). Default ~/grog-projects.
- ;; A project may hold project.edn with :description, :model, :mcp, :appearance, and :root (an
- ;; absolute/~-expanded path to override the working dir, e.g. point a "grog" project at the repo).
- ;; :projects {:dir "~/grog-projects" :default "gmail-cleanup"}
- ;; Optional: additional named secrets for /secret and the with_api_key tool.
- ;; Each map adds a known account you can set/unset via /secret (values never printed).
- ;; Built-ins are BRAVE_SEARCH_API and LLM_API_KEY.
- ;; :secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}
- ;;                       {:account "PHANTOM_X" :description "Another API token"}]}
- ;; Optional: Appearance theming. Edit via the GUI Settings panel or directly.
- ;; :appearance {:chat {:font-family "Monospaced" :font-size 18
- ;;                     :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
- ;;                     :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
- ;;              :terminal {:font-family "Monospaced" :font-size 18}}
- :cli {:verbose-steps false
-       ;; Prior user/assistant pairs prepended to each chat message. `0` = stateless (no old replies).
-       ;; Omit key = unlimited (grows forever; use /clear or /fresh in chat to reset).
-       :chat-history-turns 12
-       ;; When true/false: always/never print model `:thinking` in chat (pale green). Omit: only if JVM has a console.
+ ;; Each immediate subdir is a project. Default ~/grog-projects.
+ ;:projects {:dir "~/grog-projects" :default "gmail-cleanup"}
+
+ ;; Optional: extra named secret accounts for /secret + with_api_key.
+ ;; Built-ins: BRAVE_SEARCH_API, LLM_API_KEY.
+ ;:secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}]}
+
+ ;; Appearance — normally edited via the GUI Settings panel.
+ ;:appearance {:chat {:font-family "Monospaced" :font-size 18
+ ;                    :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
+ ;                    :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
+ ;            :terminal {:font-family "Monospaced" :font-size 18}}
+
+ :cli {:chat-history-turns 12
        :chat-show-thinking true
-       ;; Streaming options.
        :chat-stream-live-thinking true
        :chat-stream-live-content true
        :chat-stream-live-markdown false
        :format-markdown true}
- ;; Optional: recurring feed monitor. The agent can call the MCP `fetch_feed`
- ;; tool (grog-rss) itself, so a chron task just tells it which feeds to watch:
- ;; :chron {:enabled true
- ;;         :tasks [{:id "rss-tech"
- ;;                  :every-minutes 240
- ;;                  :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
- }
+
+ ;; Optional: recurring feed monitor. The agent can call grog-rss's fetch_feed
+ ;; itself, so a chron task only tells it which feeds to watch.
+ ;:chron {:enabled true
+ ;        :tasks [{:id "rss-tech"
+ ;                 :every-minutes 240
+ ;                 :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}}
