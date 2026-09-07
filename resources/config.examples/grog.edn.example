@@ -8,71 +8,65 @@
 ;;   Windows:  C:\Users\you\.config\grog\grog.edn   (same path as Linux;
 ;;             the old %APPDATA%\grog default is no longer used)
 ;;   override: $GROG_CONFIG_HOME/grog.edn
-;; Merge order (later wins): bundled defaults → the file above → ./grog.edn in the run dir.
+;; Merge order (later wins): bundled defaults -> the file above -> ./grog.edn in the run dir.
 
 ;; If the `eca` server binary isn't on PATH (e.g. it lives inside a VS Code
 ;; extension or a scoop/npm install), point at it explicitly. ${ENV} + leading ~
 ;; are supported. Omit if `eca` is already on PATH.
 ;; :binary "C:\\Users\\you\\scoop\\shims\\eca.exe"
 
-{:llm
-  ;; Any OpenAI-compatible /v1/chat/completions endpoint: OpenRouter, OpenAI,
-  ;; Ollama (use :url "http://localhost:11434/v1" + a local :model), etc.
-  {:url "https://openrouter.ai/api/v1"
-   :model "deepseek/deepseek-v4-flash-0731"
-
-   ;; --- commonly-tuned knobs -------------------------------------------------
-   ;; Prefer an API key via the OS keyring (`/secret`, account LLM_API_KEY).
-   ;; Inline is allowed but not recommended. Omit if the keyring holds it.
-   ;:api-key "${OPENROUTER_API_KEY}"
-   ;:temperature 0.7
-   ;:max-tokens 4096
-   ;:max-context-tokens 200000     ;; token budget; oldest messages dropped first
-   ;:max-tool-result-chars 50000   ;; cap tool-result length
-   ;:conn-timeout-sec 60
-   ;:socket-timeout-sec 300
-   ;:provider-name "OpenRouter · DeepSeek"
-   ;:extra-payload {:transforms ["middle-out"]}   ;; provider-specific fields
-   ;:profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
-   ;           :remote {:url "https://openrouter.ai/api/v1"   :model "deepseek/deepseek-v4-flash-0731"}}}
+{:llm {:url "https://openrouter.ai/api/v1"
+       :model "deepseek/deepseek-v4-flash-0731"}
 
  :eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"}
 
  :soul {:path "SOUL.md"}
 
- ;; Skills: each immediate subdir of these roots must contain skill.edn + SKILL.md.
  :skills {:roots ["skills"]}
 
- ;; Babashka is always enabled; only the `bb` command is overridable.
  :babashka {}
-
- ;; Optional: edn-store for memory_* tools, MCP persistence, and /jobs.
- ;:edn-store {:root "edn-store"}
-
- ;; Project home — where per-project context lives, OUTSIDE the source tree.
- ;; Each immediate subdir is a project. Default ~/grog-projects.
- ;:projects {:dir "~/grog-projects" :default "gmail-cleanup"}
-
- ;; Optional: extra named secret accounts for /secret + with_api_key.
- ;; Built-ins: BRAVE_SEARCH_API, LLM_API_KEY.
- ;:secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}]}
-
- ;; Appearance — normally edited via the GUI Settings panel.
- ;:appearance {:chat {:font-family "Monospaced" :font-size 18
- ;                    :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
- ;                    :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
- ;            :terminal {:font-family "Monospaced" :font-size 18}}
 
  :cli {:chat-history-turns 12
        :chat-show-thinking true
        :chat-stream-live-thinking true
        :chat-stream-live-content true
        :chat-stream-live-markdown false
-       :format-markdown true}
- ;; Optional: recurring feed monitor. The agent can call the MCP `fetch_feed`
- ;; tool (grog-rss) itself, so a chron task just tells it which feeds to watch:
- ;; :chron {:enabled true
- ;;         :tasks [{:id "rss-tech"
- ;;                  :every-minutes 240
- ;;                  :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
- }
+       :format-markdown true}}
+
+;; ----------------------------------------------------------------------------
+;; Commonly-tuned knobs (uncomment in your ./grog.edn to use):
+;;
+;;   ;:api-key "${OPENROUTER_API_KEY}"       ; prefer /secret keyring over inline
+;;   ;:temperature 0.7
+;;   ;:max-tokens 4096
+;;   ;:max-context-tokens 200000             ; token budget; oldest msgs dropped
+;;   ;:max-tool-result-chars 50000           ; cap tool-result length
+;;   ;:conn-timeout-sec 60
+;;   ;:socket-timeout-sec 300
+;;   ;:provider-name "OpenRouter · DeepSeek"
+;;   ;:extra-payload {:transforms ["middle-out"]}
+;;   ;:profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}}
+;;
+;; Optional: edn-store for memory_* tools, MCP persistence, /jobs.
+;;   ;:edn-store {:root "edn-store"}
+;;
+;; Project home — where per-project context lives, OUTSIDE the source tree.
+;; Each immediate subdir is a project. Default ~/grog-projects.
+;;   ;:projects {:dir "~/grog-projects" :default "gmail-cleanup"}
+;;
+;; Optional: extra named secret accounts for /secret + with_api_key.
+;; Built-ins: BRAVE_SEARCH_API, LLM_API_KEY.
+;;   ;:secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}]}
+;;
+;; Appearance — normally edited via the GUI Settings panel.
+;;   ;:appearance {:chat {:font-family "Monospaced" :font-size 18
+;;                        :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
+;;                        :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
+;;               :terminal {:font-family "Monospaced" :font-size 18}}
+;;
+;; Optional: recurring feed monitor. The agent can call grog-rss's fetch_feed
+;; itself, so a chron task only tells it which feeds to watch.
+;;   ;:chron {:enabled true
+;;            :tasks [{:id "rss-tech"
+;;                     :every-minutes 240
+;;                     :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
