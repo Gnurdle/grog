@@ -1,5 +1,17 @@
 # GROG - Gnurdle Reasoning Orchestration Gateway (shameless forced acronym)
 
+> **One-line pitch:** because the job isn't a chat session — it's a working relationship
+> that persists. Grog turns an LLM into a companion that lives inside your projects,
+> keeps your tools and rules, remembers what you taught it across reboots, and does real
+> work on your machine — recurring, on demand. It's modular (projects depend on reusable
+> skills), so a teammate inherits the capability without inheriting your secrets. You
+> stop re-teaching an agent every morning and start watching a system compound what it
+> knows. Your assistant, your rules, your state — portable, persistent, genuinely yours.
+
+> **New here?** Start with the [documentation map](#documentation-map), and read
+> [`operating-model.md`](operating-model.md) for what this whole thing is *for*
+> (the friend, projects, skills, and how a teammate inherits the capability).
+
 # Why
 I started this project about the time Openclaw came out, out of curiosity as to 
 discovering what was possible in that era.
@@ -51,8 +63,26 @@ required.
 - [Example `grog.edn`](#example-grogedn)
 - [Quick start](#quick-start)
 - [CLI usage](#cli-usage)
+- [Documentation map](#documentation-map)
 
 ---
+
+## Documentation map
+
+If you're trying to answer a question, start here. The repo intentionally splits docs by
+audience so nobody has to read everything.
+
+| I want to… | Read this |
+|---|---|
+| Understand the *point* — friend / projects / skills / transfer | [`operating-model.md`](operating-model.md) |
+| See every built-in MCP server + its tools (the full surface area) | [`mcp-servers.md`](mcp-servers.md) |
+| Configure grog (config, secrets, providers) | [`USERS-GUIDE.md`](USERS-GUIDE.md) |
+| Enable the grog MCP servers inside ECA on a teammate's box | [`eca-users-guide.md`](eca-users-guide.md) |
+| Build a reusable skill | [`skills/SKILL-TEMPLATE.md`](skills/SKILL-TEMPLATE.md) |
+| Know the agent's rules of behavior | [`SOUL.md`](SOUL.md) |
+| Understand the internals / session history | [`state.md`](state.md) |
+
+The rest of this README is the mechanics reference (commands, config, examples).
 
 ## Overview
 
@@ -159,6 +189,39 @@ MCP is **not** configured in `grog.edn`. With **`:edn-store`**, the server list 
 
 - **Filesystem (Node):** `@modelcontextprotocol/server-filesystem` via **`npx`** — example entry: **`{:id "fs" :command ["npx" "-y" "@modelcontextprotocol/server-filesystem" "/abs/path"]}`**.
 - **DataScript (Clojure):** [xlisp/datascript-mcp-server](https://github.com/xlisp/datascript-mcp-server) — clone the repo, set **`:cwd`** to that root, and run **`clojure -M -m datascript-mcp.core`** (needs **`clojure`** on `PATH` and a first-run dependency download). Tools include **`init_db`**, **`query`**, **`load_db`**, **`add_data`**, etc.
+
+### Baked-in MCP servers
+
+The repo ships MCP servers under `grog-*` directories. Each is a self-contained
+stdio server with its own small toolset; `state.md` has the implementation detail.
+Most are optional — the model only sees servers that reach `running`, and the
+minimal useful set is `grog-memory` + `grog-babashka`. **For the complete
+per-server + per-tool inventory, see [`mcp-servers.md`](mcp-servers.md).**
+
+<text/markdown>
+| Server | Stack | Tools (representative) | Needs |
+|---|---|---|---|
+| `grog-babashka` | Clojure | `run_babashka` — sandboxed Clojure transform | `bb` on PATH |
+| `grog-search` | Clojure | `brave_web_search` | Brave API key in keyring |
+| `grog-fetch` | Clojure | `fetch_url` | — |
+| `grog-rss` | Clojure | `fetch_feed` | — |
+| `grog-project-search` | Clojure | `project_search` (current project's notes + dialog) | active project |
+| `grog-big` | Clojure | `big_model_ask` — delegate to a stronger model | provider URL/key |
+| `grog-imaging` | Clojure | `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings`, `read_office_document`, `crop_workspace_image` | Tesseract, JVM deps |
+| `grog-office` | Clojure | `import_document`, `list_blocks`, `get_text`, `find_text`, `replace_text`, `render`, `save` | LibreOffice (optional) |
+| `grog-memory` | Python | `assoc_store / assoc_get / assoc_keys / assoc_delete / assoc_search` | `python` (pinned `mcp<2`) |
+| `grog-odoo` | Clojure | `odoo_search_read`, `odoo_execute_sql`, … | Odoo creds in your instance config |
+| `grog-imap` | — | email account commands | IMAP creds |
+<text/markdown/>
+
+- `grog-babashka` is **always enabled**. `grog-memory` is the project-state store.
+- Wire them into ECA via the generated config: `grog.eca-config/generate-config!`
+  merges the server list + tool-approval allowlist + default model into
+  `~/.config/grog/eca-config.generated.json`; the GUI launches
+  `eca server --config-file <that>`.
+- The model sees each server's tools as **`<id>_<tool>`** (e.g. `grog-odoo__odoo_search_read`).
+- A teammate that only wants Odoo can grab just `grog-odoo/` and follow
+  [`eca-users-guide.md`](eca-users-guide.md).
 
 ### Persistent text
 

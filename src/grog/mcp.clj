@@ -310,13 +310,21 @@
             (recur (str nxt) acc2)
             {:ok acc2}))))))
 
+(def ^:private mcp-idle-timeout-ms
+  "Stop a running MCP server if it has seen no tools/call for this long (lazy broker lifecycle)."
+  (Long/parseLong (or (System/getenv "GROG_MCP_IDLE_TIMEOUT_MS") "900000"))) ; default 15 min
+
+(def ^:private now-ms
+  "Wall clock in ms (used for idle accounting)."
+  (fn ^long [] (System/currentTimeMillis)))
+
 (defn- stop-server! [srv]
   (when srv
     (try (.destroy (:process srv)) (catch Exception _))
     (try (.interrupt ^Thread (:reader-thread srv)) (catch Exception _))))
 
 (defn stop-all!
-  "Kill MCP subprocesses (e.g. when leaving chat)."
+  "Kill MCP subprocesses (e.g. when leaving chat). Also clears any stale idle timestamps."
   []
   (locking registry-lock
     (doseq [[_ srv] (:servers @!state)]
@@ -355,7 +363,7 @@
         (if (:error tools)
           (do (stop-server! srv)
               (throw (ex-info "MCP tools/list failed" {:id sid :mcp (:error tools)})))
-          (let [srv2 (assoc srv :tools (:ok tools))]
+          (let [srv2 (assoc srv :tools (:ok tools) :last-used (now-ms))]
             (swap! !state update :servers assoc sid srv2)
             srv2))))))
 
@@ -368,6 +376,21 @@
           (when-not cfg
             (throw (ex-info "unknown MCP server id" {:id sid})))
           (start-new-mcp-server! sid cfg)))))
+
+(defn reap-idle-servers!
+  "Stop MCP subprocesses whose :last-used is older than the idle timeout. Call from the
+  chat loop between turns (or on demand) so long-lived servers don't pile up."
+  []
+  (let [cutoff (- (now-ms) mcp-idle-timeout-ms)]
+    (locking registry-lock
+      (doseq [[sid srv] (:servers @!state)
+              :let [last-used (long (or (:last-used srv) 0))]
+              :when (< last-used cutoff)]
+        (when (and (:process srv) (pos? last-used))
+          (binding [*out* *err*]
+            (println (str "grog mcp: reaping idle " sid)))
+          (stop-server! srv)
+          (swap! !state update :servers dissoc sid))))))
 
 (defn configured?
   "True when at least one valid server is declared in memory (disk may differ until load)."
@@ -452,6 +475,7 @@
   (if-let [[sid tname] (parse-mcp-tool-fn-name fn-name)]
     (try
       (let [srv (ensure-server-running! sid)
+            _ (swap! !state update-in [:servers sid] assoc :last-used (now-ms))
             args (cond
                    (map? arguments) arguments
                    (string? arguments) (try (json/parse-string arguments true)

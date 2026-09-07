@@ -4,6 +4,7 @@
   `:soul :path` is resolved as given — absolute, or relative to the repo root
   (`grog.home` / `GROG_HOME` / process cwd)."
   (:require [clojure.java.io :as io]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [grog.config :as cfg]
             [grog.projects :as projects])
@@ -139,13 +140,9 @@
    "babashka's fine; pretending you're a data scientist is not."
    "deps.edn is not a suggestion box."
    ;; python / enterprise jabs
-   "Python's in the other building — next to the Collins badge readers."
+   "Python's in the other building — next to the badge readers."
    "If you wanted Jupyter, you opened the wrong REPL."
    "PEP 8 won't save your architecture."
-   "Innovative Advantage called. They want their slide deck back."
-   "Alto says hi. Citadel says calculate risk. I say both."
-   "Westar sends regards. I send stderr."
-   "Collins would have put this in a 400-page ICD. Don't."
    ;; soul / config
    "Bold of you to assume I read the whole SOUL.md before judging you anyway."
    "I can read SOUL.md again, but I can't unread your last prompt."
@@ -200,12 +197,43 @@
    "Good morning. Or whatever we're calling this timezone."
    "Less meeting, more `clojure -M:chat`."])
 
+;; ---------------------------------------------------------------------------
+;; pick-on.edn — user-configured people/organizations to riff on
+;;
+;; A user-owned config at ~/.config/grog/pick-on.edn lets YOU decide who gets
+;; poked (instead of hardcoding companies in source). Format:
+;;   {:pick-on [{:name "Acme Corp" :shade "their support queue is a parking lot"}
+;;              {:name "Bob"        :shade "said 'it works on my machine'"}]}
+;; Each entry becomes a startup snark line. Missing/empty file => no pick-on lines.
+;; ---------------------------------------------------------------------------
+
+(defn- pick-on-file
+  ^File []
+  (io/file (cfg/config-home-dir) "pick-on.edn"))
+
+(defn pick-on-snarks
+  "Snark lines generated from ~/.config/grog/pick-on.edn — one per configured target."
+  []
+  (let [f (pick-on-file)]
+    (if (and f (.exists f))
+      (try
+        (let [c (edn/read-string (slurp f))
+              targets (get c :pick-on)]
+          (->> targets
+               (keep (fn [{:keys [name shade]}]
+                       (when (and name shade)
+                         (str name " " shade))))
+               vec))
+        (catch Exception _ []))
+      [])))
+
 (defn startup-snark-line
   "One randomly chosen banner line: every entry under `## Startup snark` in SOUL.md (one per line or
   `-` bullets) plus a built-in pool. Different each launch (uniform random)."
   []
   (let [from-soul (or (startup-snark-lines-from-soul) [])
-        pool (vec (concat from-soul builtin-startup-snarks))]
+        from-pick-on (pick-on-snarks)
+        pool (vec (concat from-soul from-pick-on builtin-startup-snarks))]
     (when (seq pool)
       (rand-nth pool))))
 

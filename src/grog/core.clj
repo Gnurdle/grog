@@ -753,6 +753,7 @@
      (loop [msgs messages
             n 0
             last-thinking nil]
+       (mcp/reap-idle-servers!)
        (if (and tool-limit (> n tool-limit))
          {:ok false
           :error (str "Tool loop limit exceeded (" tool-limit " rounds). Set :cli :chat-tool-loop-limit higher or remove it for no limit.")
@@ -793,6 +794,35 @@
          handle-mcp-command! handle-project-command! handle-secret-command!
          handle-soul-command! handle-model-command! handle-tasks-command!)
 
+(defn- kv-save-state!
+  "Persist a JSON snapshot of current session state to the KV restore key
+  (`grog/restore-on-start` in the per-project default store) so the next startup
+  resumes with it. Returns a short status string; never throws."
+  [snapshot]
+  (try
+    (let [payload (json/generate-string snapshot)]
+      (assoc-memory/run-assoc-store! (json/encode {:key "grog/restore-on-start"
+                                                   :value payload}))
+      (str "kv state saved (" (count payload) " bytes)"))
+    (catch Exception e
+      (str "kv save failed: " (.getMessage e)))))
+
+(defn- handle-shutdown-command!
+  "Save current session state to the KV restore spot, then signal the app to quit.
+  Snapshot includes active project, chat history tail, timestamps, and a note; the
+  next `kv-startup-restore` will print it at boot so state is not lost."
+  [history]
+  (let [snapshot {:saved-at (str (java.time.Instant/now))
+                  :project (config/active-project-name)
+                  :hist-turns (count history)
+                  :hist-tail (vec (take-last 8 (map #(if (string? %) %
+                                                        (str (pr-str %))) history)))
+                  :note "Saved by /shutdown. Replaced at next /shutdown."}
+        status (kv-save-state! snapshot)]
+    (println status)
+    (println "Goodbye — state saved to grog/restore-on-start.")
+    ::quit))
+
 (defn route-slash-command!
   "Route a chat line that is a slash command (or quit/exit) to its handler,
   printing any output to `*out*` (the caller should bind it to the GUI pane).
@@ -806,6 +836,9 @@
     (cond
       (#{"quit" "exit" "/quit" "/exit"} lc)
       ::quit
+
+      (= "/shutdown" lc)
+      (handle-shutdown-command! [])
 
       (= "/paste" lc)
       (do (binding [*out* *err*]
@@ -1339,7 +1372,8 @@
         (do (println "SOUL: /soul show | path | add <markdown> | reload")
             (println "     Optional `## Startup snark` in SOUL.md — add lines or bullets; one snark picked at random each chat launch (plus built-ins)."))
         (= "reload" rest)
-        (try (mcp/stop-all!)
+        (try (mcp/reap-idle-servers!)
+             (mcp/stop-all!)
              (config/reload!)
              (mcp/try-load-declared-config!)
              (println "Config reloaded.")
@@ -1436,7 +1470,35 @@
         (config/print-llm-failure-hint! e)
         (System/exit 1))
       (finally
+        (mcp/reap-idle-servers!)
         (mcp/stop-all!)))))
+
+(defn- kv-startup-restore
+  "On startup, read the designated KV restore key (json `:value` under
+  `grog/restore-on-start` in the per-project default store) and print it so the
+  session inherits saved context. No-op when absent."
+  []
+  (try
+    (let [k "grog/restore-on-start"
+          r (assoc-memory/run-assoc-get! (json/encode {:key k}))]
+      (when (and (string? r) (not (str/includes? r (str "\"found\"" ":" "false"))))
+        (try
+          (let [parsed (json/parse-string r true)
+                val (str (or (:value parsed) ""))
+                obj (when (seq val) (try (json/parse-string val true) (catch Exception _ nil)))]
+            (when (or (seq val) (some? obj))
+              (println)
+              (println (str ansi-hot-pink "kv-restore [" k "]:" ansi-reset))
+              (println (if (map? obj)
+                         (with-out-str
+                           (doseq [[kk vv] obj]
+                             (println (str "  " kk ": " vv))))
+                         (str val)))
+              (println)))
+          (catch Exception _ nil))))
+    (catch Exception e
+          (binding [*out* *err*] (println "kv-restore:" (.getMessage e))))))
+
 
 (defn run-chat! []
   (println "grog chat —" (chat-history-hint (config/chat-history-turns)))
@@ -1454,6 +1516,7 @@
     (mcp/try-load-declared-config!)
     (println (mcp-status-line))
     (println (chron/status-line))
+    (kv-startup-restore)
     (println "grog: active :cli"
              (pr-str {:chat-history-turns (config/chat-history-turns)
                       :chat-tool-loop-limit (config/chat-tool-loop-limit)}))
@@ -1481,6 +1544,8 @@
               (cond
                 (#{"quit" "exit" "/quit" "/exit"} (str/lower-case line))
                 nil
+                (= "/shutdown" (str/lower-case line))
+                (handle-shutdown-command! history)
                 (= "/help" (str/lower-case line))
                 (do (println (help-text)) (println) (recur history))
             (handle-tools-command! line)
