@@ -69,10 +69,10 @@
        :chat-stream-live-content true
        :chat-stream-live-markdown false
        :format-markdown true}
-
- ;; Optional: recurring feed monitor. The agent can call grog-rss's fetch_feed
- ;; itself, so a chron task only tells it which feeds to watch.
- ;:chron {:enabled true
- ;        :tasks [{:id "rss-tech"
- ;                 :every-minutes 240
- ;                 :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}}
+ ;; Optional: recurring feed monitor. The agent can call the MCP `fetch_feed`
+ ;; tool (grog-rss) itself, so a chron task just tells it which feeds to watch:
+ ;; :chron {:enabled true
+ ;;         :tasks [{:id "rss-tech"
+ ;;                  :every-minutes 240
+ ;;                  :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
+ }
