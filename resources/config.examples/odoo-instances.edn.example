@@ -1,0 +1,33 @@
+;; grog-odoo instances — ~/.config/grog/odoo-instances.edn
+;;
+;; Source of truth for the grog-odoo MCP server (GROG_ODOO_CONFIG env points at
+;; this file; grog also rewrites it from grog.edn's legacy :odoo block once).
+;; Credentials live HERE, in the config home — never in grog.edn / git.
+;;
+;; - `:name` is the only identifier the model may use. Selection is locked to
+;;   these names; no tool accepts a URL/host/db from the model.
+;; - `:sql` is optional per instance. Two backends:
+;;     "postgres" (default)   — direct JDBC to the Odoo Postgres
+;;     "odoo-method"          — run SQL inside Odoo via a method you expose
+;; - Everything is strictly read-only (odoo_execute_sql only allows SELECT /
+;;   WITH / SHOW / EXPLAIN / DESCRIBE / VALUES / TABLE statements).
+{:instances
+ [{:name "stage"
+   :url "https://exclave.cmsaero.com"
+   :db "odoo18_stage"
+   :user "admin"
+   :password "secret-or-api-key"
+   :sql {:type "postgres"
+         :host "127.0.0.1"
+         :port 5432
+         :db "odoo18_stage"
+         :user "odoo"
+         :password "..."}}
+
+  {:name "prod"
+   :url "https://odoo.example.com"
+   :db "odoo18"
+   :user "admin"
+   :password "..."
+   ;; :sql {:type "odoo-method" :model "custom.sql.runner" :method "run_sql"}
+   }]}

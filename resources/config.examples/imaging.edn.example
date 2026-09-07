@@ -1,0 +1,13 @@
+{:tessdata "C:/Users/<you>/.config/grog/tessdata"}
+;; ^- Tesseract traineddata directory for grog-imaging OCR tools
+;;    (read_pdf_document's OCR, ocr_image, ocr_pdf_document).
+;;
+;; The directory must contain <lang>.traineddata files (e.g. eng.traineddata).
+;; Download them from the tesseract-ocr repos:
+;;   tessdata_fast:  https://github.com/tesseract-ocr/tessdata_fast
+;;   tessdata_best:  https://github.com/tesseract-ocr/tessdata_best
+;; (add grog-imaging's own default candidate dirs checked when this key is
+;;  absent: Unix /usr/share/tessdata & friends, and %ProgramFiles%\Tesseract-OCR\tessdata)
+;;
+;; Leading `~` is expanded; both / and \ separators work. No env vars are read
+;; for this file (TESSDATA_PREFIX is deliberately ignored here).

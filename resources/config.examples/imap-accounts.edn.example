@@ -1,0 +1,24 @@
+;; grog-imap account metadata — ~/.config/grog/imap-accounts.edn
+;;
+;; Account *metadata only* — never secrets/passwords (the IMAP server resolves
+;; the secret itself, typically from the OS keyring per account). grog writes
+;; this file from the live accounts when it starts the grog-imap server, but
+;; you can also pre-create it to have accounts ready.
+;;
+;; A legacy JSON shape is also accepted ({"accounts": [...]}).
+{:accounts
+ [{:name "gmail"
+   :host "imap.gmail.com"
+   :port 993
+   :tls true
+   :user "you@gmail.com"
+   :sasl false
+   ;; :oauth {...} ; OAuth config if the account uses it
+   :read-only false}
+
+  {:name "work"
+   :host "mail.example.com"
+   :port 993
+   :tls true
+   :user "you@example.com"
+   :read-only true}]}

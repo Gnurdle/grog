@@ -170,7 +170,10 @@ These are **user** commands, not model tools.
 
 Config merges in order:
 
-1. Code defaults — see `resources/grog.edn.example` for a full annotated template  
+1. Code defaults — see `resources/config.examples/grog.edn.example` for a full annotated template
+   (and `resources/config.examples/` for prototype configs of **every** server:
+   imaging tessdata, gitlab, odoo, imap, secrets — copy the whole directory into
+   your config home and hack).  
 2. `grog.edn` in your **user config home** (platform-aware):
    - Every OS: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` (Windows: `C:\Users\you\.config\grog\grog.edn`)
    - Override: `$GROG_CONFIG_HOME/grog.edn`
@@ -364,7 +367,7 @@ Save as **`./grog.edn`** next to your project or under your user config home (ev
 
 1. Run an **OpenAI-compatible server** (e.g., Ollama at `/v1`); pull a **tool-capable** model and name it in `grog.edn`.  
 2. **JDK 21+** (see `deps.edn` / `:run` `:jvm-opts` if needed).  
-3. Copy `resources/grog.edn.example` to `grog.edn` and edit — it has annotated examples of every option.
+3. Copy `resources/config.examples/` (the whole directory — grog.edn, imaging, gitlab, odoo, imap, secrets prototypes) into your config home and edit the ones you need; `grog.edn.example` has annotated examples of every option. See `resources/config.examples/README.md`.
 
 ```bash
 cd grog

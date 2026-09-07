@@ -16,7 +16,7 @@ grog merges several sources. **Later sources win.**
 
 | Pick | File | Purpose |
 |---|---|---|
-| 1 | bundled defaults (`resources/grog.edn.example`) | built-in defaults / template |
+| 1 | bundled defaults (`resources/config.examples/grog.edn.example`) | built-in defaults / template |
 | 2 | **user `grog.edn`** (see table below) | your personal setup |
 | 3 | `./grog.edn` in the run directory | project/override config |
 
@@ -69,8 +69,11 @@ machine is "copy one folder + set one env var".
 
 ## 3. Full annotated config
 
-Copy `resources/grog.edn.example` to your user config path, then edit. Everything
-is optional except `:llm :url` and `:llm :model`.
+Copy `resources/config.examples/grog.edn.example` to your user config path, then
+edit. Everything is optional except `:llm :url` and `:llm :model`. For a complete
+starter bundle (imaging tessdata, gitlab, odoo, imap, secrets prototypes), copy
+the whole `resources/config.examples/` directory into your config home — see its
+`README.md`.
 
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
@@ -281,4 +284,5 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 ---
 
 *See also:* the `README.md` (full feature listing, quick start, MCP) and
-`resources/grog.edn.example` (annotated template with every option).
+`resources/config.examples/grog.edn.example` (annotated template with every
+option).
