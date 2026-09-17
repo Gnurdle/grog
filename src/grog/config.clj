@@ -3,8 +3,8 @@
 
   User-level config lives in a **platform-aware config home** (`config-home-dir`):
     * `$GROG_CONFIG_HOME/grog.edn` when that env var is set,
-    * Windows: `%APPDATA%\\grog\\grog.edn`,
-    * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn`.
+    * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` on every OS
+      (Windows included — matching ECA's own `~/.config/eca`).
 
   Merge order (later wins): classpath `resources/grog.edn` → user config home →
   legacy `~/.config/grog/grog.edn` (if present, for existing installs) →
@@ -27,6 +27,11 @@
   ^File []
   (platform/config-home-dir))
 
+(defn ensure-config-dir!
+  "The config home, created if missing (see `grog.platform/ensure-config-dir!`)."
+  ^File []
+  (platform/ensure-config-dir!))
+
 (defn deep-merge
   "Recursively merge maps; non-map values from `b` replace `a`."
   [a b]
@@ -35,6 +40,13 @@
                   (deep-merge x y)
                   y))
               a b))
+
+(defn- config-debug!
+  "One-line config-loading trace written to the **real** stderr so it always
+  lands in the grog debug log (`grog-ui.log` via grog-ui's tee, or `$GROG_LOG`)
+  even when the caller's `*out*`/`*err*` are rebound to the transcript pane."
+  [& xs]
+  (.println System/err (str "[grog-config] " (apply str (interpose " " (map str xs))))))
 
 (defn- slurp-edn [^File f]
   (when (and f (.exists f) (.isFile f))
@@ -46,24 +58,57 @@
     (try (edn/read-string {:eof nil} (slurp r :encoding "UTF-8"))
          (catch Exception _ nil))))
 
+(defn- trace-fragment
+  "Emit one debug line describing a config fragment lookup and its result.
+  `label` is a short human name, `path` the File being inspected, `loaded?`
+  whether a value was obtained (found + parsed), and optional `extra` details.
+  ASCII-only (no em dashes) so the line is clean in any log/console."
+  [label ^File path loaded? & [extra]]
+  (config-debug! (str label
+                      " path=" (or (some-> path .getPath) "nil")
+                      " found=" (boolean (and path (.exists path)))
+                      " loaded=" (boolean (some? loaded?))
+                      " keys=" (when (map? loaded?) (count loaded?))
+                      (when extra (str " " extra)))))
+
+(defn- canonical-equal?
+  "Resilient `File` path equality (falls back to string compare on error)."
+  [^File a ^File b]
+  (and a b
+       (try (= (.getCanonicalPath a) (.getCanonicalPath b))
+            (catch Exception _ (= (str a) (str b))))))
+
 (defn load-merge!
-  "Load and deep-merge all config fragments (does not touch the cache atom)."
+  "Load and deep-merge all config fragments (does not touch the cache atom).
+  Writes a `[grog-config]` trace to the debug log for every fragment it looks
+  at (classpath resource, config-home grog.edn, legacy ~/.config/grog, ./grog.edn)."
   []
   (let [home-file (io/file (config-home-dir) "grog.edn")
         legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
         cwd-file (io/file "grog.edn")
-        fragments (remove nil?
-                    [(resource-edn "grog.edn")
-                     (slurp-edn home-file)
-                     ;; Legacy installs kept config under ~/.config/grog even on
-                     ;; Windows; keep honoring it (deduped against the new path).
-                     (when (and legacy-home-file
-                                (.exists legacy-home-file)
-                                (not (and (.exists home-file)
-                                          (= (.getCanonicalPath home-file)
-                                             (.getCanonicalPath legacy-home-file)))))
-                       (slurp-edn legacy-home-file))
-                     (slurp-edn cwd-file)])]
+        resource (resource-edn "grog.edn")
+        home (slurp-edn home-file)
+        legacy-same? (canonical-equal? home-file legacy-home-file)
+        legacy (when (and (.exists legacy-home-file)
+                          (not (and (.exists home-file) legacy-same?)))
+                 (slurp-edn legacy-home-file))
+        cwd (slurp-edn cwd-file)
+        fragments (remove nil? [resource home legacy cwd])]
+    (config-debug! "config-home-dir=" (some-> (config-home-dir) .getPath)
+                   " GROG_CONFIG_HOME=" (pr-str (System/getenv "GROG_CONFIG_HOME"))
+                   " XDG_CONFIG_HOME=" (pr-str (System/getenv "XDG_CONFIG_HOME"))
+                   " user.home=" (pr-str (System/getProperty "user.home")))
+    (trace-fragment "resource grog.edn" (some-> (io/resource "grog.edn") io/file) resource)
+    (trace-fragment "home grog.edn" home-file home)
+    (trace-fragment "legacy ~/.config/grog/grog.edn" legacy-home-file legacy
+                    (when legacy-same? "(same as home-file - skipped)"))
+    (trace-fragment "cwd ./grog.edn" cwd-file cwd)
+    (config-debug! "merged fragments=" (count fragments)
+                   " sources=" (pr-str (vec (keep identity
+                                                  [(when resource "classpath")
+                                                   (when home "home")
+                                                   (when legacy "legacy")
+                                                   (when cwd "cwd")]))))
     (reduce deep-merge {} fragments)))
 
 (defonce ^:private !cfg (atom nil))
@@ -111,27 +156,33 @@
   Resolution order: the `grog.home` system property, then the `GROG_HOME` env
   var (exported by grog-ui), then the process working directory. Used as ECA's
   `workspaceFolders` root and as the `/shell` working directory, so the tool
-  model can address files by plain paths in the repo (no workspace containment)."
+  model can address files by plain paths in the repo (no workspace containment).
+  Returns a native path string: on Windows an MSYS-style `GROG_HOME` (`/c/...`)
+  is translated to `C:\\...`."
   []
-  (or (some-> (System/getProperty "grog.home") str str/trim not-empty)
-      (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
-      "."))
+  (platform/msys-path->windows
+   (or (some-> (System/getProperty "grog.home") str str/trim not-empty)
+       (some-> (System/getenv "GROG_HOME") str str/trim not-empty)
+       ".")))
 
 (def ^:private ^String default-projects-dir "~/grog-projects")
 
 (defn projects-dir
   "The projects home: where per-project context lives, **outside** the source
   tree. Resolved from `:projects {:dir …}` in grog.edn, defaulting to
-  `~/grog-projects`. `~` is expanded to the user home; a relative path is
-  resolved against the repo root. Returns a canonical `File` (may not exist yet)."
+  `~/grog-projects`. `~` is expanded to the user home (both `~/` and `~\\`
+  forms); a relative path is resolved against the repo root. Returns a
+  canonical `File` (may not exist yet). Uses a resilient canonicalization so an
+  MSYS/Windows path quirk can never abort startup."
   ^File []
   (let [raw (or (some-> (get-in (grog) [:projects :dir]) str str/trim not-empty)
                 default-projects-dir)
-        f (io/file (str/replace-first raw #"^~(?=/|$)" (str (System/getProperty "user.home"))))]
-    (.getCanonicalFile
-     (if (.isAbsolute f)
+        expanded (platform/expand-home raw)
+        f (io/file expanded)]
+    (platform/canonical-file
+     (if (platform/native-absolute? (str f))
        f
-       (io/file (repo-root) raw)))))
+       (io/file (repo-root) (platform/fix-drive-relative (str f)))))))
 
 (defn eca-model
   "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
@@ -139,6 +190,18 @@
   []
   (let [m (get-in (grog) [:eca :model])]
     (when (seq (str/trim (str m))) (str/trim (str m)))))
+
+(declare interpolate-env-var)
+
+(defn eca-binary
+  "`:eca :binary` from grog.edn — an explicit path or name of the ECA server
+  binary (`eca server`). When set, grog uses it directly; otherwise it falls
+  back to PATH + well-known install locations (see `grog.eca/resolve-eca-binary!`).
+  Supports `${ENV}` interpolation and a leading `~` (home-relative)."
+  []
+  (let [v (get-in (grog) [:eca :binary])]
+    (when-let [s (some-> v str str/trim not-empty interpolate-env-var not-empty)]
+      (platform/expand-home s))))
 
 (defn- interpolate-env-var
   "Replace `${ENV}` and `${ENV:-default}` in a string with environment variable values."

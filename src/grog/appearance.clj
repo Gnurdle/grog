@@ -6,7 +6,8 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.edn :as edn]
-            [clojure.pprint :as pp]))
+            [clojure.pprint :as pp]
+            [grog.platform :as platform]))
 
 (defn windows?
   "True when running on a Microsoft Windows OS (os.name contains 'win')."
@@ -37,11 +38,18 @@
               :background {:rgb [0 0 0]}}})
 
 (defn- deep-merge
-  "Merge maps recursively (later wins)."
+  "Merge maps recursively (later wins). Nil-safe: a nil argument leaves the
+  other side untouched, so `(deep-merge defaults nil)` keeps defaults instead
+  of collapsing the whole map to nil (which would make every `rgb` lookup fall
+  back to white)."
   [& ms]
   (letfn [(mrg [a b]
-            (if (and (map? a) (map? b)) (merge-with mrg a b) b))]
-    (reduce mrg {} ms)))
+            (cond
+              (nil? b) a
+              (nil? a) b
+              (and (map? a) (map? b)) (merge-with mrg a b)
+              :else b))]
+    (reduce mrg nil ms)))
 
 (defn- deep-merge-at
   "Build {k1 {k2 ... v}} from a keyword path and a value."
@@ -60,14 +68,26 @@
 (defn- grogedn-file ^java.io.File []
   (io/file "grog.edn"))
 
-(defn- read-grogedn-map
-  "Read the whole grog.edn map (best effort); nil if unreadable/missing."
-  []
+(defn- slurp-edn-map
+  "Read `f` as a whole EDN map (best effort); nil if unreadable/missing."
+  [^java.io.File f]
   (try
-    (let [f (grogedn-file)]
-      (when (.exists f)
-        (edn/read-string {:readers *data-readers*} (slurp f))))
+    (when (and f (.exists f) (.isFile f))
+      (let [m (edn/read-string {:readers *data-readers*} (slurp f))]
+        (when (map? m) m)))
     (catch Throwable _ nil)))
+
+(defn- read-grogedn-map
+  "Read the whole grog.edn map (best effort); nil if unreadable/missing.
+  Checks the user config home (`~/.config/grog/grog.edn`, same place the rest
+  of grog reads its user config) first, then `./grog.edn` in the working
+  directory — CWD wins when both exist (matching `grog.config`'s merge order)."
+  []
+  (let [home-file (io/file (platform/config-home-dir) "grog.edn")
+        cwd-file (grogedn-file)
+        home (slurp-edn-map home-file)
+        cwd (slurp-edn-map cwd-file)]
+    (or cwd home)))
 
 (defn load!
   "Load :appearance from grog.edn into the live state (merged over defaults)."
@@ -78,9 +98,11 @@
 
 (defn save!
   "Persist current appearance into grog.edn atomically, preserving all other
-  top-level keys and values in the file."
+  top-level keys and values in the working-directory file. Only the CWD file
+  is consulted here: a save from the settings GUI should never materialise a
+  full copy of the user's config-home file into the repo."
   []
-  (let [existing (or (read-grogedn-map) {})
+  (let [existing (or (slurp-edn-map (grogedn-file)) {})
         updated (assoc existing :appearance (current))
         f (grogedn-file)
         tmp (io/file (str f ".tmp"))]

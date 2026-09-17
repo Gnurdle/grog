@@ -36,7 +36,7 @@
 - Use **`run_babashka`** (via the `grog-babashka` MCP server — always enabled, a given) to
   write and execute short Clojure/Babashka scripts that read input from **stdin** and write the
   answer to **stdout**. This sandbox must not mutate the host; treat it as a pure data transform.
-  Prefer Babashka/Clojure. Do not reach for Python — that is what the Collins badge readers are for.
+  Prefer Babashka/Clojure. Do not reach for Python — that is what the badge readers are for.
 
 - **When a task is too hard, escalate to the big model** via the `big_model_ask` tool (the
   `grog-big` MCP server). You are a small local model; for deep reasoning, tricky analysis,

@@ -16,7 +16,7 @@ grog merges several sources. **Later sources win.**
 
 | Pick | File | Purpose |
 |---|---|---|
-| 1 | bundled defaults (`resources/grog.edn.example`) | built-in defaults / template |
+| 1 | bundled defaults (`resources/config.examples/grog.edn.example`) | built-in defaults / template |
 | 2 | **user `grog.edn`** (see table below) | your personal setup |
 | 3 | `./grog.edn` in the run directory | project/override config |
 
@@ -26,9 +26,13 @@ The location is **platform-aware** and can be overridden with **`GROG_CONFIG_HOM
 
 | OS | Default user config path |
 |---|---|
-| Linux / macOS | `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` → usually `~/.config/grog/grog.edn` |
-| Windows | `%APPDATA%\grog\grog.edn` → usually `C:\Users\you\AppData\Roaming\grog\grog.edn` |
+| All (Linux / macOS / Windows) | `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` → usually `~/.config/grog/grog.edn` (Windows: `C:\Users\you\.config\grog\grog.edn`) |
 | Any (override) | `$GROG_CONFIG_HOME/grog.edn` |
+
+> **Windows:** grog uses `~/.config/grog` (same as ECA's own `~/.config/eca`).
+> The old `%APPDATA%\grog` location is no longer supported; if you have files
+> there, move them (e.g. `grog.edn`, `secrets.edn`, `odoo-instances.edn`) to
+> `C:\Users\you\.config\grog\` yourself.
 
 Secrets and generated files (ECA config, IMAP/Odoo metadata, approved-tools,
 `secrets.edn`) live **in the same config home directory**, so moving to a new
@@ -65,8 +69,11 @@ machine is "copy one folder + set one env var".
 
 ## 3. Full annotated config
 
-Copy `resources/grog.edn.example` to your user config path, then edit. Everything
-is optional except `:llm :url` and `:llm :model`.
+Copy `resources/config.examples/grog.edn.example` to your user config path, then
+edit. Everything is optional except `:llm :url` and `:llm :model`. For a complete
+starter bundle (imaging tessdata, gitlab, odoo, imap, secrets prototypes), copy
+the whole `resources/config.examples/` directory into your config home — see its
+`README.md`.
 
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
@@ -124,8 +131,8 @@ an automatic **file fallback** for headless/remote systems.
    unreachable — headless Linux, SSH/WSL sessions, containers — grog reads and
    writes `<config-home>/secrets.edn`. The file is created with owner-only
    permissions where the OS supports it and lives **outside the repo**
-   (default `~/.config/grog/secrets.edn` on Linux, `%APPDATA%\grog\secrets.edn`
-   on Windows).
+   (default `~/.config/grog/secrets.edn` on every OS; Windows uses the same
+   `.config` path).
 
 You never choose which backend — grog tries the keyring first and falls back
 automatically if it can't answer in ~4s.
@@ -183,11 +190,21 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 ### Windows
 
-- **Config home**: `%APPDATA%\grog\grog.edn` (or `$GROG_CONFIG_HOME`).
-- **Launch the GUI**: double-click `grog-ui.bat` (or `clojure -M:gui`), which
-  captures debug output to `grog-ui.log`.
+- **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
+  or `$GROG_CONFIG_HOME`). The old `%APPDATA%\grog` location is no longer used.
+- **Log file**: grog-ui writes to a single current log — `~/grog-ui.log` (Linux) or
+  `%USERPROFILE%\grog-ui.log` (Windows) — unless `GROG_LOG` is set. On each launch the
+  previous log is rotated to `<base>.<n>` (next available number) and only the newest
+  `GROG_UI_LOG_KEEP` rotations (default 5) are kept; each is capped at `GROG_UI_LOG_MAX`
+  bytes (default 5MB). The current file is always the freshest, so `tail -f ~/grog-ui.log`
+  shows live debug output.
+- **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
+  PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
+  `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
+  `:eca :binary` in your `grog.edn` to the full path (e.g.
+  `C:\Users\you\scoop\shims\eca.exe`).
 - **Secret backend**: Windows Credential Manager; falls back to
-  `%APPDATA%\grog\secrets.edn` automatically if needed.
+  `~/.config/grog/secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
   keep config in a single folder you copy around.
 
@@ -229,7 +246,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | "OS keyring did not respond within 4s" | On Linux: ensure a Secret Service is running. The file store takes over automatically. |
 | `with_api_key` says "secret not set in store" | Store it with `/secret set <ACCOUNT> …` and confirm the account is in `:with-api-key :allowed-secrets`. |
 | Config changes "not applied" | grog reads config at startup. After editing `grog.edn`, restart (or use `/soul reload` where applicable). |
-| Windows: no config found | Your user `grog.edn` should be under `%APPDATA%\grog\`. |
+| Windows: no config found | Your user `grog.edn` should be under `C:\Users\you\.config\grog\` (not AppData). |
 | Where's my `secrets.edn`? | `/secret file` prints its absolute path. |
 
 ---
@@ -254,7 +271,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 
 ## 9. Related files generated per machine
 
-In your config home (Linux `~/.config/grog`, Windows `%APPDATA%\grog`):
+In your config home (every OS: `~/.config/grog` — Windows is the same):
 
 | File | Purpose |
 |---|---|
@@ -267,4 +284,5 @@ In your config home (Linux `~/.config/grog`, Windows `%APPDATA%\grog`):
 ---
 
 *See also:* the `README.md` (full feature listing, quick start, MCP) and
-`resources/grog.edn.example` (annotated template with every option).
+`resources/config.examples/grog.edn.example` (annotated template with every
+option).

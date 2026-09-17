@@ -1,0 +1,19 @@
+;; grog-gitlab config — ~/.config/grog/gitlab.edn
+;;
+;; Two shapes (see grog-gitlab/src/grog_gitlab/main.clj):
+;;
+;;   A) Point at a multi-instance file (recommended):
+;;      {:config "~/.config/grog/gitlab-instances.edn"}
+;;
+;;   B) Single "default" instance inline:
+;;      {:url "https://gitlab.example.com/api/v4"
+;;       :token-file "~/.config/grog/keys/gitlab.token"}
+;;
+;; When gitlab.edn is absent (or has neither :config nor :url), the server
+;; falls back to the default instances file ~/.config/grog/gitlab-instances.edn
+;; (see gitlab-instances.edn.example).
+;;
+;; Tokens are read from per-instance files referenced by :token-file — they are
+;; never stored in this file, never in tool output. ${ENV} / ${ENV:-default}
+;; interpolation is honored inside the instances file.
+{ :config "~/.config/grog/gitlab-instances.edn" }

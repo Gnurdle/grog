@@ -23,6 +23,7 @@
             [grog.md-render :as md-render])
   (:import (java.awt Color Cursor Dimension Font FontMetrics Graphics Graphics2D
                      Point Rectangle RenderingHints Toolkit)
+           (java.awt Image)
            (java.awt.datatransfer StringSelection)
            (java.awt.image BufferedImage)
            (java.awt.event ActionListener AdjustmentListener ComponentAdapter MouseAdapter MouseEvent InputEvent)
@@ -222,9 +223,9 @@
            baseline (+ (double yy) (double ascent))]
        (loop [rs line, xs 0.0]
          (when-let [r (first rs)]
-           (let [t (:text r)
-                 f (:font r)
-                 fm (.getFontMetrics g f)
+           (let [^String t (:text r)
+                 ^Font f (:font r)
+                 ^FontMetrics fm (.getFontMetrics g f)
                  w (.stringWidth fm t)]
              (.setFont g f)
              (.setColor g (or (:color r) Color/WHITE))
@@ -412,21 +413,31 @@
              :cells   (mapv (fn [c] (get-in c [:text])) (:cells r))})
           rows)))
 
+(def ^:private table-cell-pad 26)
+
 (defn- table-col-widths [ctx rows maxw]
   (let [^Graphics2D g (:g2 ctx)
-        fm (.getFontMetrics g (:base (:fonts ctx)))
+        base (:base (:fonts ctx))
+        bold (:bold (:fonts ctx))
         ncols (apply max 1 (map (comp count :cells) rows))
         widths (vec (for [i (range ncols)]
-                      (apply max 30
+                      (apply max 36
                              (map (fn [r]
                                     (when-let [c (nth (:cells r) i nil)]
-                                      (+ (.stringWidth fm c) 18)))
+                                      ;; measure with the cell's *actual* paint
+                                      ;; font: bold headers are wider than the
+                                      ;; base font, so sizing them with base
+                                      ;; metrics let the header text crowd the
+                                      ;; next column.
+                                      (let [f (if (:header? r) bold base)
+                                            fm (.getFontMetrics g f)]
+                                        (+ (.stringWidth fm c) table-cell-pad))))
                                   rows))))
         total (apply + widths)]
     (if (<= total maxw)
       widths
       (let [share (max 1 (long (/ (- total maxw) ncols)))]
-        (mapv (fn [w] (max 30 (- w share))) widths)))))
+        (mapv (fn [w] (max 36 (- w share))) widths)))))
 
 (defn- table-layout
   "Single source of truth for table geometry, shared by measurement, painting
@@ -585,12 +596,26 @@
         {:keys [widths rows-h rows-lines]} (table-layout ctx rows maxw)
         col-x (fn [i]
                 (double (+ x (apply + 0 (map long (take i widths))))))
+        header? (boolean (some :header? rows))
         yy (atom (+ y 4))]
     (doseq [i (range (count rows))]
-      (let [rls (nth rows-lines i)]
+      (let [rls (nth rows-lines i)
+            r1 (long (+ (double @yy) (nth rows-h i)))]
         (doseq [j (range (count rls))]
           (draw-lines! g (nth rls j) (col-x j) (double @yy)))
+        ;; hairline under the header row so the eye can separate it
+        (when (and header? (zero? i))
+          (.setColor g (:border pal))
+          (.drawLine g (int x) r1 (int (+ x (apply + widths))) r1))
         (swap! yy + (nth rows-h i))))
+    ;; hairline separators between columns: keeps adjacent cells from reading
+    ;; as one mashed-together run, especially when a narrow first column sits
+    ;; right next to a long second column.
+    (when (> (count widths) 1)
+      (.setColor g (:border pal))
+      (doseq [i (range 1 (count widths))]
+        (let [sx (int (- (col-x i) (/ table-cell-pad 2.0)))]
+          (.drawLine g sx (int (+ y 4)) sx (int @yy)))))
     (.setColor g (:border pal))
     (.drawLine g (int x) (int @yy) (int (+ x (apply + widths))) (int @yy))
     (+ @yy 6)))
@@ -823,11 +848,16 @@
 
 (defn- base-state []
   {:messages []
-   ;; splash? = conversation hasn't started yet. While true the transcriptview
-   ;; stays transparent so the window's logo background (grog.ui/background-panel)
-   ;; shows through as the splash screen; the first real message flips it false
-   ;; and the view starts painting its own opaque background.
+   ;; splash? = conversation hasn't started yet. While true the transcript view
+   ;; paints the chat background + centred splash logo itself (see paint-view!);
+   ;; the first real message flips it false and the view keeps painting its own
+   ;; opaque chat background (plus the message rows).
    :splash? true
+   ;; optional Image drawn centred over the chat background during splash.
+   ;; Painting it in the view (instead of relying on a transparent viewport +
+   ;; a parent background panel) is what keeps the logo working on Windows,
+   ;; where FlatLaf transparent viewports repaint as white.
+   :splash-img nil
    :follow? true
    :width 640
    :total 0
@@ -865,7 +895,7 @@
         msgs (:messages s)
         width (max 160 (:width s))
         inner (double (- width (* 2 outer-pad)))
-        g (:g s)
+        ^Graphics2D g (:g s)
         [hm ys total]
         (loop [rs msgs, hm (:heights s), ys [], y 0]
           (if-let [m (first rs)]
@@ -873,11 +903,11 @@
                   h (if (and prev (identical? (:msg prev) m))
                       (:h prev)
                       (message-height (make-ctx g) m inner))
-                  y0 y]
+                  y0 (long y)]
               (recur (rest rs)
                      (assoc hm (:id m) {:msg m :h (long h)})
                      (conj ys y0)
-                     (+ y0 (+ (long h) msg-gap))))
+                     (long (+ y0 (+ (long h) msg-gap)))))
             [hm ys y]))
         total' (if (seq ys) (- total msg-gap) 0)]
     (swap! st assoc :heights hm :ys ys :total total'))
@@ -959,7 +989,7 @@
   (let [now (System/currentTimeMillis)
         hint {:text (str label) :since (- now 50) :until (+ now 2200)}]
     (swap! st assoc :copy-hint hint)
-    (when-let [c (:component @st)]
+    (when-let [^JComponent c (:component @st)]
       (.repaint c)
       (doto (Timer. 2500
                     (reify ActionListener
@@ -990,7 +1020,7 @@
   (let [s @st
         msgs (:messages s)
         ys (:ys s)
-        g (:g s)
+        ^Graphics2D g (:g s)
         width (max 160 (:width s))
         ctx {:g2 g :pal (palette) :fonts (fonts-map)}
         cache (or (:zones-cache s) {})]
@@ -1036,13 +1066,13 @@
 (defn- char-col-at-x
   "Column index (0..len) within `zone` for a view-x, using FontMetrics."
   ^long [st zone ^double x]
-  (let [text (str (:text zone))
+  (let [^String text (str (:text zone))
         len (count text)
-        g (:g @st)
+        ^Graphics2D g (:g @st)
         zone-x (double (:x0 zone))]
     (if (<= (double x) zone-x)
       0
-      (let [fm (.getFontMetrics g (or (:font zone) (Font. "Monospaced" Font/PLAIN 13)))
+      (let [^FontMetrics fm (.getFontMetrics g (or (:font zone) (Font. "Monospaced" Font/PLAIN 13)))
             w (.stringWidth fm text)
             rel (- (double x) zone-x)]
         (if (>= rel w)
@@ -1218,7 +1248,7 @@
 (defn- line->rows
   "Wrap `lines` (run-lines from wrap-runs) into geometry rows
   {:x0 :y :h :font :text} starting at (x, y)."
-  [g ^Font fallback-f lines x y]
+  [^Graphics2D g ^Font fallback-f lines x y]
   (loop [ls (seq lines) yy (double y) acc (transient [])]
     (if-let [ln (first ls)]
       (let [hdr (first ln)
@@ -1260,7 +1290,7 @@
   "Mirror paint-doc!/paint-node! and collect every drawn text row as
   {:x0 :y :h :font :text}. Returns [rows final-y]."
   [ctx ^Node n x y maxw]
-  (let [g (:g2 ctx)
+  (let [^Graphics2D g (:g2 ctx)
         pal (:pal ctx)]
     (condp instance? n
       Document
@@ -1359,7 +1389,7 @@
   [ctx m w]
   (let [inner (- w (* 2 outer-pad))
         y0 0.0
-        g (:g2 ctx)]
+        ^Graphics2D g (:g2 ctx)]
     (case (:type m)
       :user
       (let [fullw (+ inner (* 2 outer-pad))
@@ -1424,9 +1454,29 @@
     ;; selection; mouse handlers and copy only read `:zones`.
     (let [zones (build-zones st)]
       (swap! st assoc :zones zones)
-      (when-not (:splash? s)
-        (.setColor g2 (:bg (palette)))
-        (.fillRect g2 0 0 w (.getHeight view)))
+      (if (:splash? s)
+        ;; Splash: paint the chat background + a centred logo DIRECTLY here,
+        ;; rather than leaving the view transparent and hoping the parent's
+        ;; background panel shows through. The parent chain is opaque on every
+        ;; OS now, so this keeps the logo on Windows too (transparent
+        ;; viewports repaint as white under FlatLaf on Windows).
+        (let [^Image img (:splash-img s)]
+          (.setColor g2 (:bg (palette)))
+          (.fillRect g2 0 0 w (.getHeight view))
+          (when img
+            (let [iw (.getWidth img view)
+                  ih (.getHeight img view)
+                  vh (.getHeight view)]
+              (when (and (pos? iw) (pos? ih) (pos? w) (pos? vh))
+                (let [scale (min (double (/ w iw)) (double (/ vh ih)))
+                      dw (int (* iw scale))
+                      dh (int (* ih scale))
+                      dx (int (/ (- w dw) 2))
+                      dy (int (/ (- vh dh) 2))]
+                  (.drawImage g2 img dx dy dw dh view))))))
+        (do
+          (.setColor g2 (:bg (palette)))
+          (.fillRect g2 0 0 w (.getHeight view))))
       (let [^JScrollPane sp (:scrollpane s)
             vp (when sp (.getViewport sp))
             vr (if vp (.getViewRect vp) (Rectangle. 0 0 (int w) 800))
@@ -1453,15 +1503,15 @@
     (.dispose g2)))
 
 (defn- make-view-st
-  [^clojure.lang.Atom st]
-  (let [view (proxy [JComponent] []
+  ^JComponent [^clojure.lang.Atom st]
+  (let [^JComponent view (proxy [JComponent] []
                (getPreferredSize []
                  (Dimension. (max 100 (:width @st)) (max 1 (:total @st))))
                (paintComponent [g]
                  (paint-view! this g st))
                ;; Dynamic per-item tooltips: thinking/tool headers say whether a
                ;; click expands or collapses, so the click affordance is obvious.
-               (getToolTipText [event]
+               (getToolTipText [^java.awt.event.MouseEvent event]
                  (when-let [a (hit-action st (.getPoint event))]
                    (case (:kind a)
                      :toggle
@@ -1475,7 +1525,13 @@
                      :copy-message "Copy message"
                      nil))))]
     (swap! st assoc :component view)
-    (.setOpaque view false)
+    ;; OPAQUE chat background on every OS. paint-view! fills the whole view
+    ;; with the chat background (and the sighted splash logo while :splash?),
+    ;; so be opaque instead of transparent: an opaque component guarantees the
+    ;; repaint pipeline clears its area, which prevents flat-white repaints on
+    ;; Windows where FlatLaf transparent components show through as white.
+    (.setOpaque view true)
+    (.setBackground view (:bg (palette)))
     (.setFocusable view true)
     (.putClientProperty view state-key st)
     view))
@@ -1490,9 +1546,13 @@
   (when sp (.getView (.getViewport sp))))
 
 (defn make-chat-pane
-  "A scrollable, rich, virtualized chat log. See chat-pane for the inner view."
-  ^JScrollPane []
-  (let [st (atom (base-state))
+  "A scrollable, rich, virtualized chat log. See chat-pane for the inner view.
+  `splash-img` (optional) is an `Image` drawn centred on the chat background
+  while the pane is in its splash state (`:splash? true`, no conversation yet);
+  pass nil on platforms where the old transparent-parent splash is fine."
+  (^JScrollPane [] (make-chat-pane nil))
+  (^JScrollPane [splash-img]
+   (let [st (atom (assoc (base-state) :splash-img splash-img))
         drain-timer (make-drain-timer st)
         view (make-view-st st)
         sp (JScrollPane. view)]
@@ -1624,7 +1684,7 @@
          (when (pos? w)
            (swap! st assoc :width w)
            (update-and-validate! st)))))
-    sp))
+    sp)))
 
 ;; ---------------------------------------------------------------------------
 ;; Public API
@@ -1863,7 +1923,7 @@
 (defn line-height-px
   "Current chat line height in px (for scroll unit increments)."
   ^long [c]
-  (let [g (or (:g (deref (st-of c)))
-              (create-metrics-g))]
+  (let [^Graphics2D g (or (:g (deref (st-of c)))
+                          (create-metrics-g))]
     (long (.getHeight (.getFontMetrics g (Font. (or (appearance/chat-font-family) "Monospaced")
                                                 Font/PLAIN (max 10 (appearance/chat-font-size))))))))

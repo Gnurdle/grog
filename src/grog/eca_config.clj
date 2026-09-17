@@ -4,7 +4,8 @@
   ECA is normally configured by `~/.config/eca/config.json`. Rather than rebuild
   the provider/auth setup from scratch, `generate-config!` starts from that file
   (which already has working providers + keys), then:
-    * merges in the three grog MCP servers (imaging / memory / odoo), and
+    * merges in the grog MCP servers (imaging / memory / office / search / big /
+      babashka / fetch / rss / project-search / imap / odoo / gitlab), and
     * sets `defaultModel` to grog's `:eca :model` (so prompts resolve).
 
   The result is written to a separate generated file (never overwriting the
@@ -17,6 +18,7 @@
             [grog.config :as config]
             [grog.models :as models]
             [grog.projects :as projects]
+            [grog.secrets :as secrets]
             [grog.soul :as soul]))
 
 (declare generate-config!)
@@ -41,8 +43,7 @@
   config home. This file is the source of truth for Odoo connections — edit it
   directly (never put Odoo credentials in grog.edn)."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
+  (let [d (config/ensure-config-dir!)]
     (str d "/odoo-instances.edn")))
 
 (defn- interp-inst
@@ -124,7 +125,11 @@
         f (io/file path)]
     (cond
       (.exists f)
-      {"GROG_ODOO_CONFIG" path}
+      (cond-> {"GROG_ODOO_CONFIG" path}
+        ;; Password comes from the OS keyring (/secret set ODOO_PASSWORD <value>),
+        ;; injected as a per-process env var — never a literal in the config file.
+        (some? (secrets/get-secret "ODOO_PASSWORD"))
+        (assoc "GROG_ODOO_PASSWORD" (secrets/get-secret "ODOO_PASSWORD")))
 
       (seq (odoo-instances-data))
       (do (spit f (with-out-str (pprint/pprint {:instances (odoo-instances-data)})))
@@ -146,6 +151,47 @@
                      ["GROG_ODOO_USER" :user]
                      ["GROG_ODOO_PASSWORD" :password]])]
         (when (seq m) m)))))
+
+(defn gitlab-config-path
+  "Path to the **user-maintained** grog-gitlab config (EDN), in the grog config
+  home. This file is the source of truth for the GitLab instance — edit it
+  directly (never put a GitLab token here; use `/secret set GITLAB_TOKEN`)."
+  ^String []
+  (let [d (config/ensure-config-dir!)]
+    (str d "/gitlab.edn")))
+
+(defn- read-gitlab-config
+  "Read `gitlab.edn` if present; nil when absent/unreadable."
+  []
+  (let [f (io/file (gitlab-config-path))]
+    (when (.exists f)
+      (try (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
+           (catch Exception _ nil)))))
+
+(defn gitlab-configured?
+  "True when GitLab is configured: `~/.config/grog/gitlab.edn` carries a
+  single-instance config (`:url` / `:token` / `:token-file`) or a `:config`
+  instances file exists."
+  []
+  (let [home (or (System/getenv "HOME") (System/getProperty "user.home"))
+        cfg (read-gitlab-config)
+        cfg-file (some-> cfg :config str str/trim)
+        cfg-file (when cfg-file (str/replace-first cfg-file #"^~(?=/|$)" home))
+        inst-file (io/file (or cfg-file
+                               (str home "/.config/grog/gitlab-instances.edn")))]
+    (boolean
+     (or (and cfg (or (:url cfg) (:token cfg) (:token-file cfg)))
+         (.exists inst-file)))))
+
+(defn- gitlab-env
+  "Env map for the grog-gitlab MCP server.
+
+  The token comes from the OS keyring (`/secret set GITLAB_TOKEN <value>`),
+  injected as a per-process env var — never a literal in the config file. The
+  server interpolates `${GROG_GITLAB_TOKEN}` in its `:token` field."
+  []
+  (let [tok (some-> (secrets/get-secret "GITLAB_TOKEN") str str/trim not-empty)]
+    (when tok {"GROG_GITLAB_TOKEN" tok})))
 
 (defn- grog-root
   "The grog project root (where deps.edn and the grog-* sibling dirs live)."
@@ -169,14 +215,12 @@
 (defn generated-config-path
   "Where grog writes its merged ECA config."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
-    (str d "/eca-config.generated.json")))
+  (str (config/ensure-config-dir!) "/eca-config.generated.json"))
 
 (defn approved-tools-path
   "Persistent store of tool names grog has been asked to always allow."
   ^String []
-  (str (config/config-home-dir) "/approved-tools.edn"))
+  (str (config/ensure-config-dir!) "/approved-tools.edn"))
 
 (defn- shell-wrapped
   "An MCP stdio server spec that first `cd`s into `dir`, so `clojure -M:...`
@@ -198,8 +242,7 @@
 (defn imap-instances-path
   "Where grog writes the grog-imap MCP account metadata config (EDN)."
   ^String []
-  (let [d (config/config-home-dir)]
-    (.mkdirs d)
+  (let [d (config/ensure-config-dir!)]
     (str d "/imap-accounts.edn")))
 
 (defn imap-project-config-file
@@ -319,20 +362,29 @@
       (assoc "grog-odoo"
              (shell-wrapped (str root "/grog-odoo")
                             "clojure -M:mcp"
-                            (odoo-env))))))
+                            (odoo-env)))
+      (gitlab-configured?)
+      (assoc "grog-gitlab"
+             (shell-wrapped (str root "/grog-gitlab")
+                            "clojure -M:mcp"
+                            (gitlab-env))))))
 
 (defn debug-dump-config!
-  "Write the full ECA config map to the grog debug log.
+  "Log that the ECA config was (re)written to the grog debug log, **without**
+  dumping the config contents (the full JSON includes API keys and should never
+  be written to a log).
 
-  Prints to `System/err` explicitly (NOT the bound `*err*`) so the dump always
-  lands in the real debug log (`~/.grog-ui.log` via grog-ui's tee), even when
+  Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
+  lands in the real debug log (`grog-ui.log` via grog-ui's tee), even when
   called from a worker thread whose `*err*` is bound to the transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]
   (.println System/err (str "==== grog: ECA config (re)written -> " path))
-  (.println System/err (str "==== model: " (or (:defaultModel merged) "(none)")))
-  (.println System/err (json/generate-string merged {:pretty true}))
-  (.println System/err "==== end grog: ECA config dump")
+  (.println System/err (str "==== model: " (or (:defaultModel merged) "(none)")
+                            ;; summary only — never dump the map itself
+                            " | mcpServers=" (count (:mcpServers merged {}))
+                            " | rules=" (count (:rules merged []))
+                            " | top-level keys=" (count merged)))
   path)
 
 ;; --- tool approval allowlist (permanent approval) --------------------------
@@ -429,15 +481,35 @@
     (update cfg :rules conj {:path rules-file})
     cfg))
 
+(defn- eca-config-debug! [& xs]
+  "One-line ECA-config trace written to the **real** stderr so it lands in the
+  grog debug log (`grog-ui.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
+  rebinding."
+  (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
+
 (defn generate-config!
   "Produce the merged ECA config map and write it to
   `(generated-config-path)`, dumping it to the debug log. Returns the written path."
   ([] (generate-config! (default-eca-config-path)))
   ([base-path]
-   (let [base  (if (.exists (io/file base-path))
-                 (try (json/parse-string (slurp (io/file base-path)) true)
-                      (catch Exception _ {}))
-                 {})
+   (let [base-file (io/file base-path)
+         base-exists? (.exists base-file)
+         base-parsed (when base-exists?
+                       (try (json/parse-string (slurp base-file) true)
+                            (catch Exception _ nil)))
+         base (if base-parsed base-parsed {})
+         _ (if-not base-exists?
+             (eca-config-debug! "base ECA config MISSING: " base-path
+                                " (empty base - NO providers/auth merged; expected at"
+                                " ~/.config/eca/config.json on POSIX,"
+                                " %APPDATA%/eca/config.json or ~/.config/eca/config.json on Windows)")
+             (if (nil? base-parsed)
+               (eca-config-debug! "base ECA config UNPARSEABLE (JSON error): " base-path
+                                  " - empty base used")
+               (eca-config-debug! "base ECA config loaded: " base-path
+                                  " top-level keys=" (count base)
+                                  " providers=" (count (:providers base {}))
+                                  " defaultModel=" (pr-str (:defaultModel base)))))
          raw-model (or (config/eca-model)
                        (when-let [m (:defaultModel base)] m))
          ;; ECA resolves models as `provider/name`, so the default model must be
@@ -447,6 +519,9 @@
          model (models/qualify-eca-model raw-model
                                          nil
                                          (try (config/llm-url) (catch Exception _ nil)))
+         _ (eca-config-debug! "raw model=" (pr-str raw-model)
+                              " qualified=" (pr-str model)
+                              " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
          merged (-> base
                     (assoc :mcpServers (grog-mcp-servers))
                     (cond-> model (assoc :defaultModel model))

@@ -2,7 +2,7 @@
 
 Backed by Python's built-in `sqlite3` (no native/system deps, no JDBC/babashka).
 It is the `assoc_*` associative-memory store — a persistent key->value SQL store
-that an ECA-driven agent loop can read/write. (No EDN-file store emulation.)
+that an ECA-driven agent loop can read/write.  (No EDN-file store emulation.)
 
 Stores are **files the LLM can direct**: `assoc_open_store("<path>")` opens (or
 creates) a SQLite store at an arbitrary filesystem path and returns a *handle*
@@ -10,21 +10,22 @@ creates) a SQLite store at an arbitrary filesystem path and returns a *handle*
 instead of the default. A small LRU keeps a few stores open concurrently to avoid
 re-opening the same file on every call; `assoc_close_store(handle)` closes one.
 
-Connection / default DB location:
-  - env GROG_MEMORY_DB  -> path to the default SQLite db file (default ./grog-memory.db)
-  - env GROG_MEMORY_MAX_OPEN -> max concurrently open stores (default 8)
+Configuration is file-based: ~/.config/grog/memory.edn
+  {:db "grog-memory.db" :max-open 8}
+The db is the path to the default SQLite store; max-open caps concurrently open
+stores. env vars (GROG_MEMORY_DB / GROG_MEMORY_MAX_OPEN) are intentionally NOT
+read — file-config normalization, like the grog Clojure servers. The .edn is
+parsed with a tiny EDN-subset regex (no Python EDN lib); values are strings and
+integers of the form above.
 
 Run:  python -m grog_memory.server   (MCP over stdio)
-Wire into ECA (per-project isolation = point GROG_MEMORY_DB at a per-project file):
-  { "mcpServers": { "grog-memory": {
-      "command": "python", "args": ["-m", "grog_memory.server"],
-      "env": { "GROG_MEMORY_DB": "/path/to/project/.grog-memory.db" } } } }
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from collections import OrderedDict
@@ -32,8 +33,33 @@ from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-DEFAULT_DB = os.environ.get("GROG_MEMORY_DB", "grog-memory.db")
-MAX_OPEN = int(os.environ.get("GROG_MEMORY_MAX_OPEN", "8"))
+
+def _read_config_edn() -> dict:
+    """Read ~/.config/grog/memory.edn with an EDN-subset regex parse.
+
+    The file is expected to contain a map like:
+        {:db "grog-memory.db" :max-open 8}
+    Returns {"db": str, "max_open": int} overlaid on the built-in defaults.
+    Missing/invalid file -> {} (never crashes the server at boot)."""
+    cfg = {}
+    path = os.path.expanduser("~/.config/grog/memory.edn")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return cfg
+    m = re.search(r":db\s+[\"']([^\"']+)[\"']", text)
+    if m:
+        cfg["db"] = m.group(1)
+    m = re.search(r":max-open\s+(\d+)", text)
+    if m:
+        cfg["max_open"] = int(m.group(1))
+    return cfg
+
+
+_CFG = _read_config_edn()
+DEFAULT_DB = _CFG.get("db") or "grog-memory.db"
+MAX_OPEN = _CFG.get("max_open", 8)
 
 mcp = FastMCP("grog-memory")
 

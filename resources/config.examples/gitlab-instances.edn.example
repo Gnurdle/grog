@@ -1,0 +1,14 @@
+;; grog-gitlab instances — ~/.config/grog/gitlab-instances.edn
+;;
+;; The model can ONLY select one of the pre-configured instance :name values
+;; (never an arbitrary URL). Tokens are per-instance, read from files
+;; referenced by :token-file (relative paths resolve against the config dir;
+;; a leading ~ is home-relative). ${ENV} / ${ENV:-default} interpolate.
+{:instances
+ [{:name "prod"
+   :url "https://gitlab.example.com/api/v4"
+   :token-file "~/.config/grog/keys/gitlab-prod.token"}
+
+  {:name "stage"
+   :url "https://stage.example.com/api/v4"
+   :token-file "~/.config/grog/keys/gitlab-stage.token"}]}

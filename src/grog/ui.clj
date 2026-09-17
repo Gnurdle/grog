@@ -25,6 +25,7 @@
             [grog.models :as models]
             [grog.appearance :as appearance]
             [grog.projects :as projects]
+            [grog.secrets :as secrets]
             [grog.project-dialog :as project-dialog]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
@@ -50,17 +51,32 @@
 (def ^:private chat-startup-snark-fallback
   "No snark pool — someone edited the wrong file. Pity.")
 
-;; Debug tracer: writes to the real stderr (so it lands in ~/.grog-ui.log
-;; via grog-ui's tee) regardless of the pane *out*/*err* rebindings.
+;; Provider API keys are read from the OS keyring (/secret) and injected into
+;; the ECA child process env at launch — ECA config references them only as
+;; `${env:...}` (no literal keys, no persistent Windows env vars).
+(def ^:private provider-env-accounts
+  ["OPENROUTER_API_KEY" "MOONSHOT_API_KEY" "XAI_API_KEY"])
+
+(defn- provider-env
+  "Per-process env vars for the ECA server, pulled from the OS keyring."
+  []
+  (into {} (keep (fn [acct]
+                   (when-let [v (secrets/get-secret acct)]
+                     [acct v])))
+        provider-env-accounts))
+
+;; Debug tracer: writes to the real stderr (so it lands in grog-ui's rotated
+;; log — grog-ui.log or $GROG_LOG) regardless of the pane *out*/*err* rebindings.
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
 
 ;; --- ECA<->grog protocol tracing -------------------------------------------
 ;; Every JSON-RPC frame that crosses the stdio pipe to the `eca server` child is
 ;; summarized here (via eca.clj's :trace-fn). The launcher (./grog-ui /
-;; grog-ui.bat) tees stderr/stdout into a per-instance log file (default
-;; ~/.grog-ui.log, or $GROG_LOG), so these traces land there regardless of any
-;; *out*/*err* rebinding to the transcript pane.
+;; grog-ui.bat) tees stderr/stdout into a single rotated log file (default
+;; ~/grog-ui.log on Linux, %USERPROFILE%\grog-ui.log on Windows, or $GROG_LOG),
+;; so these traces land there regardless of any *out*/*err* rebinding to the
+;; transcript pane.
 
 (defn- trunc
   "Clip a string to `n` chars with an ellipsis; used to keep streamed text lines
@@ -233,10 +249,98 @@
     (.setOpaque ^JComponent c false))
   c)
 
-(defn- make-viewport-transparent! [^JScrollPane sp]
-  (transparent! sp)
-  (transparent! (.getViewport sp))
-  sp)
+(defn- chat-bg-color
+  "The chat background as a `Color` (from `:appearance :chat :background`)."
+  ^Color []
+  (let [[r g b] (appearance/rgb [:chat :background])]
+    (Color. (int r) (int g) (int b))))
+
+(defn- darken-tree!
+  "Force `comp` and every descendant JComponent to OPAQUE with `color`. Used on
+  Windows where FlatLaf transparent components repaint as white: by making every
+  pixel of a region owned by an opaque component, the repaint pipeline can never
+  show the default light background through."
+  [^java.awt.Component comp ^Color color]
+  (when (instance? JComponent comp)
+    (doto ^JComponent comp
+      (.setOpaque true)
+      (.setBackground color)))
+  (when (instance? java.awt.Container comp)
+    (doseq [child (.getComponents ^java.awt.Container comp)]
+      (darken-tree! child color)))
+  comp)
+
+(defn- darken-toolbar!
+  "On Windows, force the JToolBar and everything inside it (including the
+  LAF's internal content panel that actually holds the buttons) to opaque with
+  the chat background. The JToolBar's internal panel is not guaranteed to follow
+  the toolbar's background, and a transparent/light panel there shows up as a
+  light band across the bottom of the chat window."
+  [^JToolBar tb]
+  (darken-tree! tb (chat-bg-color))
+  tb)
+
+(defn- component-tree-lines
+  "One line per JComponent in `comp`'s subtree, describing class, opacity,
+  background RGB, visibility and size — used to audit exactly which component
+  could possibly render as white on Windows."
+  [^java.awt.Component comp]
+  (let [lines (atom [])]
+    (letfn [(walk! [^java.awt.Component c depth]
+              (when (instance? JComponent c)
+                (let [^JComponent jc c
+                      bg (.getBackground jc)
+                      bg-s (if bg
+                             (str (.getRed bg) "," (.getGreen bg) "," (.getBlue bg))
+                             "null")
+                      name (try (.getName (class jc)) (catch Throwable _ "?"))]
+                  (swap! lines conj
+                         (str (apply str (repeat (* 2 depth) " "))
+                              name
+                              " opaque=" (.isOpaque jc)
+                              " bg=" bg-s
+                              " vis=" (.isShowing jc)
+                              " " (.getWidth jc) "x" (.getHeight jc)))))
+              (when (instance? java.awt.Container c)
+                (doseq [ch (.getComponents ^java.awt.Container c)]
+                  (walk! ch (inc depth)))))]
+      (walk! comp 0))
+    @lines))
+
+(defn- snapshot-frame!
+  "Render the frame's component tree offscreen into a PNG in the OS temp dir.
+  Returns the absolute path of the saved file (or nil on failure)."
+  [^JFrame f]
+  (try
+    (let [w (.getWidth f)
+          h (.getHeight f)
+          img (java.awt.image.BufferedImage. w h java.awt.image.BufferedImage/TYPE_INT_RGB)
+          g (.createGraphics img)]
+      (try
+        (.printAll ^java.awt.Component f ^Graphics2D g)
+        (catch Throwable _
+          (.print ^java.awt.Component f ^Graphics2D g))
+        (finally (.dispose g)))
+      (let [file (java.io.File. (System/getProperty "java.io.tmpdir") "grog-ui-frame.png")]
+        (javax.imageio.ImageIO/write img "png" file)
+        (.getAbsolutePath file)))
+    (catch Throwable _ nil)))
+
+(defn- darken-viewport!
+  "Make a scroll-pane + viewport OPAQUE chat-background. The chat scroll area is
+  never transparent: the transcript view paints its own background (and, while
+  in splash state, the centred logo) so there is no reliance on parent repainting
+  — which is what produces the white boxes under FlatLaf on Windows."
+  [^JScrollPane sp]
+  (let [c (chat-bg-color)]
+    (doto sp
+      (.setOpaque true)
+      (.setBackground c))
+    (when-let [vp (.getViewport sp)]
+      (doto vp
+        (.setOpaque true)
+        (.setBackground c)))
+    sp))
 
 (defn- with-copy-menu!
   "Add a right-click popup menu to `c`. Each item is either `[label text-fn]`
@@ -669,7 +773,7 @@
             (catch Throwable e
               ;; Never let a hidden exception in the turn pipeline kill the
               ;; worker thread — that would silently swallow every message
-              ;; queued after it. Log it loudly so ~/.grog-ui.log shows what
+              ;; queued after it. Log it loudly so grog-ui's log shows what
               ;; actually failed instead of a dead, mute queue.
               (dbg! "worker turn error: " (.getMessage e))
               (dbg! (str (with-out-str (.printStackTrace e))))
@@ -781,12 +885,28 @@
                                                 (Color. 235 200 90)
                                                 (Color. 225 228 232)))
                               (.setText (if active? (str nm "  ← active") nm))))))
+        all-names (atom [])
+        search-field (doto (JTextField. 30)
+                       (.setFont (widgets/ui-font))
+                       (.setToolTipText
+                        "Type to filter projects (case-insensitive). Enter opens the best match."))
+        apply-filter! (fn []
+                        (let [q (str/lower-case (str/trim (.getText search-field)))
+                              filtered (if (str/blank? q)
+                                         @all-names
+                                         (filterv #(str/includes? (str/lower-case %) q)
+                                                  @all-names))]
+                          (.removeAllElements list-model)
+                          (doseq [n filtered]
+                            (.addElement list-model n))
+                          (when-let [sel (.getSelectedValue proj-list)]
+                            (when (some #(= % sel) filtered)
+                              (.setSelectedValue proj-list sel true)))
+                          (when-not (seq filtered)
+                            (.clearSelection proj-list))))
         refresh! (fn []
-                   (.removeAllElements list-model)
-                   (doseq [n (projects/list-project-names)]
-                     (.addElement list-model n))
-                   (when-let [cur (projects/project-name)]
-                     (.setSelectedValue proj-list cur true)))
+                   (reset! all-names (vec (projects/list-project-names)))
+                   (apply-filter!))
         open-btn (widgets/styled-button "Open")
         del-btn  (widgets/styled-button "Delete")
         close-btn (widgets/styled-button "Close")
@@ -844,8 +964,8 @@
                           (refresh!))))))
         dialog (doto (JDialog. frame "Projects — grog" true)
                  (.setLayout (BorderLayout.))
-                 (.setSize 480 560)
-                 (.setMinimumSize (java.awt.Dimension. 420 480))
+                 (.setSize 640 760)
+                 (.setMinimumSize (java.awt.Dimension. 520 600))
                  (.setLocationRelativeTo frame))]
     (reset! dialog-ref dialog)
     (let [name-label (doto (JLabel. "Name")
@@ -863,6 +983,12 @@
                        (.setFont (widgets/ui-font)))
           proj-scroll (doto (JScrollPane. proj-list)
                         (widgets/boost-horizontal-wheel!))
+          filter-panel (doto (JPanel. (java.awt.BorderLayout.))
+                         (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 0 8))
+                         (.add search-field java.awt.BorderLayout/NORTH))
+          center (doto (JPanel. (java.awt.BorderLayout.))
+                   (.add filter-panel java.awt.BorderLayout/NORTH)
+                   (.add proj-scroll java.awt.BorderLayout/CENTER))
           btn-row (doto (JPanel. (java.awt.FlowLayout. java.awt.FlowLayout/LEFT 8 8))
                      (.add open-btn)
                      (.add del-btn)
@@ -924,9 +1050,27 @@
                        (= java.awt.event.MouseEvent/BUTTON1 (.getButton e))
                        (seq (.getSelectedValue proj-list)))
               (open-selected!)))))
+      ;; ---- filter bar: type to prune the project list; Enter opens ---- 
+      (.addDocumentListener (.getDocument search-field)
+        (reify javax.swing.event.DocumentListener
+          (insertUpdate [_ _] (apply-filter!))
+          (removeUpdate [_ _] (apply-filter!))
+          (changedUpdate [_ _] (apply-filter!))))
+      (.addActionListener search-field
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [_]
+            ;; Enter in the filter opens the best match: the active selection
+            ;; if still visible, else the first filtered entry.
+            (let [filtered (vec (for [i (range (.getModelSize proj-list))]
+                                  (.getElementAt (.getModel proj-list) i)))]
+              (if (seq filtered)
+                (do (when-not (.getSelectedValue proj-list)
+                      (.setSelectedIndex proj-list 0))
+                    (open-selected!))
+                (set-error! "No project matches the filter."))))))
       (doto dialog
         (.add form BorderLayout/NORTH)
-        (.add proj-scroll BorderLayout/CENTER)
+        (.add center BorderLayout/CENTER)
         (.add south BorderLayout/SOUTH)
         (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
       ;; focus the name field so creating a project is one keystroke away
@@ -941,7 +1085,7 @@
 (defn- build-chat-frame
   "Build the chat frame (not yet shown). Returns the JFrame."
   ^JFrame []
-  (let [transcript-scroll (transcript/make-chat-pane)
+  (let [transcript-scroll (transcript/make-chat-pane @logo-image)
         pane (transcript/chat-pane transcript-scroll)
         prompt (JTextArea. 4 84)
         prompt-scroll (JScrollPane. prompt)
@@ -984,7 +1128,9 @@
                                  init (eca/connect! ws
                                                     :event-handler event-handler
                                                     :request-handler (make-request-handler pane)
+                                                    :eca-binary (config/eca-binary)
                                                     :args ["--config-file" cfg]
+                                                    :env (provider-env)
                                                     :log-fn (fn [line] (dbg! "eca:" line))
                                                     :trace-fn (make-eca-tracer))]
                              (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
@@ -998,7 +1144,7 @@
                     (do (reset! running? false)
                         ;; ECA is down after a send attempt — don't silently
                         ;; swallow the user's message. Make it obvious both on
-                        ;; screen and in ~/.grog-ui.log (the log is the dif for
+                        ;; screen and in grog-ui.log (the log is the dif for
                         ;; reproducing what happened next).
                         (let [msg (str "[grog] not connected to ECA — message not sent: " text)]
                           (dbg! msg)
@@ -1105,8 +1251,12 @@
     ;; larger fonts
     (doto pane
       (.setFont (ui-monospace-font))
-      ;; keep the transcript transparent over the logo background
-      (.setOpaque false))
+      ;; the transcript view is custom-painted and OPAQUE (it paints its own
+      ;; chat background + splash logo in paint-view!), so keep it opaque with
+      ;; the chat background — a transparent pane is what repaints as white
+      ;; under FlatLaf on Windows.
+      (.setOpaque true)
+      (.setBackground (chat-bg-color)))
     (doto prompt (.setFont (ui-monospace-font)))
     ;; all footer buttons are widgets/styled-button and already get the compact
     ;; system-derived button font via style!; no per-button setFont needed here.
@@ -1190,11 +1340,19 @@
     (.start (chat-worker! pane queue history-ref send-fn set-model-fn set-yolo-fn))
     ;; layout over the logo background
     (let [root (:panel bg)
-          toolbar (doto (JToolBar.)
-                    (.setFloatable false)
-                    (.setRollover true)
-                    (.setOpaque false)
-                    (.setBorder nil))]
+          toolbar (let [tb (doto (JToolBar.)
+                             (.setFloatable false)
+                             (.setRollover true)
+                             (.setBorder nil))]
+                    ;; Windows: FlatLaf transparent components paint as white —
+                    ;; make the toolbar an opaque chat-background strip instead.
+                    ;; darken-toolbar! also forces the toolbar's internal content
+                    ;; panel + every child (buttons, fillers, labels) opaque so
+                    ;; no transparent pixel can repaint as white.
+                    (if (appearance/windows?)
+                      (darken-toolbar! tb)
+                      (doto tb (.setOpaque false)))
+                    tb)]
       ;; left: operation buttons (icons + hover tooltips set by `toolbar-button`)
       (doseq [b [send stop term settings export view-html clear]]
         (.add toolbar b)
@@ -1249,6 +1407,11 @@
         (.setOpaque trust-label false)
         (.add toolbar (uifooter/register-trust-label! trust-label))
         (uifooter/set-trust-indicator! @yolo-ref))
+      ;; Windows: re-assert opaque+dark on the toolbar and every child now that
+      ;; all buttons/labels have been added — the LAF can lazily create its
+      ;; internal content panel on first layout, so a second walk catches it.
+      (when (appearance/windows?)
+        (darken-toolbar! toolbar))
       ;; readable prompt box: dark + light text; surrounding panes transparent
       (doto prompt
         ;; NON-OPAQUE: FlatLaf's JTextArea UI paints an opaque WHITE fill on
@@ -1269,14 +1432,36 @@
       (when-let [vp (.getViewport prompt-scroll)]
         (.setOpaque vp true)
         (.setBackground vp (Color. 18 18 18)))
-      ;; transcript transparent so the logo shows behind the conversation
-      (make-viewport-transparent! transcript-scroll)
-      (transparent! pane)
-      (transparent! toolbar)
+      ;; transcript: OPAQUE chat-background on every OS. The splash logo is painted
+      ;; by the view itself (see transcript/paint-view!), so no transparency is
+      ;; needed — and transparent viewports repaint as white under FlatLaf on
+      ;; Windows.
+      (darken-viewport! transcript-scroll)
+      (doto pane
+        (.setOpaque true)
+        (.setBackground (chat-bg-color)))
+      ;; toolbar opacity is set at creation (opaque chat-background on Windows);
+      ;; only make it transparent where the parent repaint reliably shows through.
+      (when-not (appearance/windows?)
+        (transparent! toolbar))
+      ;; Windows: kill LAF default component borders — they interpret the dark
+      ;; theme differently and can appear as light seams. The transcript gets a
+      ;; seamless empty border; the prompt box keeps a hairline dark divider.
+      (when (appearance/windows?)
+        (.setBorder transcript-scroll
+                    (javax.swing.BorderFactory/createEmptyBorder))
+        (.setBorder prompt-scroll
+                    (javax.swing.BorderFactory/createLineBorder
+                      (Color. 50 53 63))))
       (.setLayout root (BorderLayout.))
       (.add root transcript-scroll BorderLayout/CENTER)
-      (let [south (JPanel. (BorderLayout.))]
-        (transparent! south)
+      (let [south (JPanel. (BorderLayout.))
+            opaque-south? (appearance/windows?)]
+        (if opaque-south?
+          (doto south
+            (.setOpaque true)
+            (.setBackground (chat-bg-color)))
+          (transparent! south))
         (.add south prompt-scroll BorderLayout/CENTER)
         (.add south toolbar BorderLayout/SOUTH)
         (.add root south BorderLayout/SOUTH))
@@ -1313,7 +1498,7 @@
           (.requestFocusInWindow prompt)
           (catch Throwable _ nil))
         ;; Auto-connect ECA on startup (instead of lazily on the first send) so
-        ;; the initialize/initialized handshake lands in ~/.grog-ui.log right
+        ;; the initialize/initialized handshake lands in grog-ui.log right
         ;; away — a failed connect is visible in the log before you type a
         ;; single message.
         (connect-eca!)))
@@ -1349,6 +1534,26 @@
                        "TextPane.background" (Color. 18 18 18)
                        "TextPane.foreground" (Color. 230 230 230)}]
           (javax.swing.UIManager/put k v))
+        ;; Windows: FlatLaf scrollbars/toolbars/viewports can fall back to a
+        ;; light track/background; pin every such key to the chat background (or
+        ;; a dark thumb) so nothing scroll-related can repaint white. Harmless
+        ;; on other platforms (never applied).
+        (when (appearance/windows?)
+          (let [cb (chat-bg-color)
+                thumb (Color. 90 94 110)
+                thumb-light (Color. 105 110 128)]
+            (doseq [[k v] {"ScrollBar.background" cb
+                           "ScrollBar.track" cb
+                           "ScrollBar.trackHighlight" cb
+                           "ScrollBar.thumb" thumb
+                           "ScrollBar.thumbHighlight" thumb-light
+                           "ScrollBar.thumbDarkShadow" thumb
+                           "ScrollBar.foreground" thumb
+                           "ScrollPane.background" cb
+                           "Viewport.background" cb
+                           "ToolBar.background" cb
+                           "ToolBar.border" (javax.swing.BorderFactory/createEmptyBorder)}]
+              (javax.swing.UIManager/put k v))))
         ;; enlarge the L&F's base UI fonts from the desktop's system font so
         ;; dialogs (settings, model picker, approvals) and labels read larger
         (widgets/scale-ui-fonts!)
@@ -1364,9 +1569,21 @@
                 (dbg! "UIManager TextArea.background=" (javax.swing.UIManager/get "TextArea.background")
                       " TextArea.foreground=" (javax.swing.UIManager/get "TextArea.foreground")
                       " LAF=" (or (some-> (javax.swing.UIManager/getLookAndFeel) .getName) "?")
+                      " chat-bg-color=" (chat-bg-color)
                       " d3d=" (System/getProperty "sun.java2d.d3d")
                       " noddraw=" (System/getProperty "sun.java2d.noddraw"))
-                (catch Throwable e (dbg! "diag err:" (.getMessage e))))))
+                (catch Throwable e (dbg! "diag err:" (.getMessage e))))
+              ;; Windows-only audit: dump the real component tree (opacity +
+              ;; background per component) and an offscreen render, so a
+              ;; stubborn white pixel can be pinned to the exact component.
+              (when (appearance/windows?)
+                (try
+                  (dbg! "--- chat frame component tree (Windows audit) ---")
+                  (doseq [line (component-tree-lines f)]
+                    (dbg! line))
+                  (when-let [shot (snapshot-frame! f)]
+                    (dbg! "offscreen screenshot:" shot))
+                  (catch Throwable e (dbg! "frame audit err:" (.getMessage e)))))))
           f)
         (catch Throwable t
           (println "grog.ui failed:" t)))))

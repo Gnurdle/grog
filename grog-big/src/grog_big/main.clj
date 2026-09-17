@@ -26,6 +26,8 @@
   "
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clj-http.client :as http])
   (:import [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
            [io.modelcontextprotocol.server McpServer]
@@ -45,9 +47,31 @@
 (defn- env [k default]
   (or (some-> (System/getenv k) str str/trim not-empty) default))
 
-(defn- base-url [] (env "GROG_BIG_URL" "http://localhost:4000/v1"))
-(defn- model-name [] (env "GROG_BIG_MODEL" "big"))
-(defn- api-key [] (env "GROG_BIG_API_KEY" "sk-dummy"))
+;; Configuration is file-based (per-server ~/.config/grog/<name>.edn);
+;; env vars are intentionally NOT read (dropped in the file-config normalization).
+;; Big's config lives in ~/.config/grog/big.edn:
+;;   {:url "http://localhost:4000/v1"
+;;    :model "big"
+;;    :api-key-file "~/.config/grog/keys/grog-big.key"}
+(defn- config-file []
+  (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
+           ".config/grog/big.edn"))
+
+(defn- load-config []
+  (if-let [f (config-file)]
+    (if (.exists ^java.io.File f)
+      (try (edn/read-string (slurp f))
+           (catch Exception e (binding [*out* *err*] (println "big config load error:" (.getMessage e))) {}))
+      (binding [*out* *err*] (println "big config missing: " f) {}))))
+
+(defn- cfg [] (load-config))
+(defn- base-url [] (or (:url (cfg)) "http://localhost:4000/v1"))
+(defn- model-name [] (or (:model (cfg)) "big"))
+(defn- api-key []
+  (if-let [kf (:api-key-file (cfg))]
+    (let [p (str/replace (str kf) "~" (or (System/getenv "HOME") ""))]
+      (try (str/trim (slurp p)) (catch Exception _ "sk-dummy")))
+    "sk-dummy"))
 
 (def ^:private default-system
   (str "You are the 'big model' specialist consulted by a small local agent. "
@@ -154,7 +178,7 @@
                                   (str "Error executing tool " name ": "
                                        (or (:message (ex-data t)) (.getMessage t))))))))))))))
 
-(defn- tool-spec []
+(defn tool-spec []
   {:name "big_model_ask"
    :description (str "Ask a large, high-quality remote model (e.g. DeepSeek) for a self-contained "
                      "response. Use this when the task needs deeper reasoning, more knowledge, or "

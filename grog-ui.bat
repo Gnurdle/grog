@@ -13,12 +13,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem --- per-instance log with a size cap -------------------------------------
-rem Each instance writes to its own file: base = %GROG_LOG% or ~/.grog-ui.log,
-rem suffixed with the process id, so multiple instances don't clobber each other.
-rem The file is capped at %GROG_UI_LOG_MAX% bytes (default 5MB) keeping the tail.
+rem --- log rotation ----------------------------------------------------------
+rem grog-ui always writes to a single current log file (%GROG_LOG% or
+rem %USERPROFILE%\grog-ui.log). On each launch the previous log is rotated:
+rem capped to the last MAX_LOG bytes, renamed to <base>.<next>, and only the
+rem newest %GROG_UI_LOG_KEEP% rotations are kept (older ones removed) — see
+rem scripts/rotate-log.ps1. Set GROG_LOG to redirect to a different base.
 if "%GROG_LOG%"=="" (
-  set "LOG_BASE=%USERPROFILE%\.grog-ui.log"
+  set "LOG_BASE=%USERPROFILE%\grog-ui.log"
 ) else (
   set "LOG_BASE=%GROG_LOG%"
 )
@@ -27,11 +29,16 @@ if "%GROG_UI_LOG_MAX%"=="" (
 ) else (
   set "MAX_LOG=%GROG_UI_LOG_MAX%"
 )
-set "LOG=%LOG_BASE:%.log=%.%RANDOM%.log"
+if "%GROG_UI_LOG_KEEP%"=="" (
+  set "KEEP=5"
+) else (
+  set "KEEP=%GROG_UI_LOG_KEEP%"
+)
+set "LOG=%LOG_BASE%"
 set "GROG_LOG=%LOG%"
 
-rem prune the log to the last MAX_LOG bytes (best effort, only on launch)
-if exist "%LOG%" powershell -NoProfile -Command "if((Get-Item -LiteralPath '%LOG%').Length -gt %MAX_LOG%){$b=New-Object byte[] %MAX_LOG%;$s=[IO.File]::Open('%LOG%','Open','Read','ReadWrite');$s.Seek(-%MAX_LOG%,[IO.SeekOrigin]::End) | Out-Null;$s.Read($b,0,%MAX_LOG%) | Out-Null;$s.Dispose();[IO.File]::WriteAllBytes('%LOG%',$b)}" 2>nul
+rem rotate the previous log (best effort, only on launch)
+if exist "%LOG_BASE%" powershell -NoProfile -File "%~dp0scripts\rotate-log.ps1" "%LOG_BASE%" %MAX_LOG% %KEEP%
 
 echo === grog-ui launch: %date% %time% log=%LOG% ===>> "%LOG%"
 
