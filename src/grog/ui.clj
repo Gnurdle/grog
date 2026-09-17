@@ -885,12 +885,28 @@
                                                 (Color. 235 200 90)
                                                 (Color. 225 228 232)))
                               (.setText (if active? (str nm "  ← active") nm))))))
+        all-names (atom [])
+        search-field (doto (JTextField. 30)
+                       (.setFont (widgets/ui-font))
+                       (.setToolTipText
+                        "Type to filter projects (case-insensitive). Enter opens the best match."))
+        apply-filter! (fn []
+                        (let [q (str/lower-case (str/trim (.getText search-field)))
+                              filtered (if (str/blank? q)
+                                         @all-names
+                                         (filterv #(str/includes? (str/lower-case %) q)
+                                                  @all-names))]
+                          (.removeAllElements list-model)
+                          (doseq [n filtered]
+                            (.addElement list-model n))
+                          (when-let [sel (.getSelectedValue proj-list)]
+                            (when (some #(= % sel) filtered)
+                              (.setSelectedValue proj-list sel true)))
+                          (when-not (seq filtered)
+                            (.clearSelection proj-list))))
         refresh! (fn []
-                   (.removeAllElements list-model)
-                   (doseq [n (projects/list-project-names)]
-                     (.addElement list-model n))
-                   (when-let [cur (projects/project-name)]
-                     (.setSelectedValue proj-list cur true)))
+                   (reset! all-names (vec (projects/list-project-names)))
+                   (apply-filter!))
         open-btn (widgets/styled-button "Open")
         del-btn  (widgets/styled-button "Delete")
         close-btn (widgets/styled-button "Close")
@@ -948,8 +964,8 @@
                           (refresh!))))))
         dialog (doto (JDialog. frame "Projects — grog" true)
                  (.setLayout (BorderLayout.))
-                 (.setSize 480 560)
-                 (.setMinimumSize (java.awt.Dimension. 420 480))
+                 (.setSize 640 760)
+                 (.setMinimumSize (java.awt.Dimension. 520 600))
                  (.setLocationRelativeTo frame))]
     (reset! dialog-ref dialog)
     (let [name-label (doto (JLabel. "Name")
@@ -967,6 +983,12 @@
                        (.setFont (widgets/ui-font)))
           proj-scroll (doto (JScrollPane. proj-list)
                         (widgets/boost-horizontal-wheel!))
+          filter-panel (doto (JPanel. (java.awt.BorderLayout.))
+                         (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 0 8))
+                         (.add search-field java.awt.BorderLayout/NORTH))
+          center (doto (JPanel. (java.awt.BorderLayout.))
+                   (.add filter-panel java.awt.BorderLayout/NORTH)
+                   (.add proj-scroll java.awt.BorderLayout/CENTER))
           btn-row (doto (JPanel. (java.awt.FlowLayout. java.awt.FlowLayout/LEFT 8 8))
                      (.add open-btn)
                      (.add del-btn)
@@ -1028,9 +1050,27 @@
                        (= java.awt.event.MouseEvent/BUTTON1 (.getButton e))
                        (seq (.getSelectedValue proj-list)))
               (open-selected!)))))
+      ;; ---- filter bar: type to prune the project list; Enter opens ---- 
+      (.addDocumentListener (.getDocument search-field)
+        (reify javax.swing.event.DocumentListener
+          (insertUpdate [_ _] (apply-filter!))
+          (removeUpdate [_ _] (apply-filter!))
+          (changedUpdate [_ _] (apply-filter!))))
+      (.addActionListener search-field
+        (proxy [java.awt.event.ActionListener] []
+          (actionPerformed [_]
+            ;; Enter in the filter opens the best match: the active selection
+            ;; if still visible, else the first filtered entry.
+            (let [filtered (vec (for [i (range (.getModelSize proj-list))]
+                                  (.getElementAt (.getModel proj-list) i)))]
+              (if (seq filtered)
+                (do (when-not (.getSelectedValue proj-list)
+                      (.setSelectedIndex proj-list 0))
+                    (open-selected!))
+                (set-error! "No project matches the filter."))))))
       (doto dialog
         (.add form BorderLayout/NORTH)
-        (.add proj-scroll BorderLayout/CENTER)
+        (.add center BorderLayout/CENTER)
         (.add south BorderLayout/SOUTH)
         (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
       ;; focus the name field so creating a project is one keystroke away

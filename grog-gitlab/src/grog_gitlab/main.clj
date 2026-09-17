@@ -13,6 +13,12 @@
   Config is file-based: ~/.config/grog/gitlab.edn
     {:config \"~/.config/grog/gitlab-instances.edn\"}  → load an instances file
     {:url ... :token-file ...}                          → single \"default\" instance
+    {:url ... :token \"${GROG_GITLAB_TOKEN}\"}          → token injected per-process
+
+  The token is resolved per instance as: an explicit `:token` (env-interpolated,
+  e.g. `${GROG_GITLAB_TOKEN}` — preferred; grog injects it from the OS keyring
+  via `/secret set GITLAB_TOKEN <value>`) first, else the legacy `:token-file`
+  (slurped). Tokens NEVER appear in tool output or in source.
 
   where the instances file is EDN:
 
@@ -26,8 +32,8 @@
   default instances file ~/.config/grog/gitlab-instances.edn is used.
   ${ENV} / ${ENV:-default} interpolation inside the instances file is honored.
 
-  Auth is PRIVATE-TOKEN (read from the active instance's :token-file). Every tool
-  is read-only. A model sees the tools as `grog-gitlab__<tool>`."
+  Auth is PRIVATE-TOKEN (resolved per instance — see above). Every tool is
+  read-only. A model sees the tools as `grog-gitlab__<tool>`."
 
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
@@ -115,6 +121,7 @@
                   url  (normalize-url (interp (or (:url i) (throw (ex-info (str "instance '" name "' missing :url") {})))))]
               {:name name
                :url url
+               :token (str (interp (or (:token i) "")))
                :token-file (str (expand-home (str (interp (or (:token-file i) "")))))}))
           insts)))
 
@@ -131,13 +138,14 @@
         instances
         (cond
           (and (not (:config cfg))
-               (or (:url cfg) (:token-file cfg)))
+               (or (:url cfg) (:token cfg) (:token-file cfg)))
           (let [missing (remove (fn [k] (not (str/blank? (str (get cfg k))))) [:url])]
             (when (seq missing)
               (throw (ex-info (str "gitlab.edn single-instance config is missing: "
                                    (str/join ", " (map name missing))) {})))
             [{:name "default"
               :url (normalize-url (interp (:url cfg)))
+              :token (str (interp (or (:token cfg) "")))
               :token-file (str (expand-home (str (interp (or (:token-file cfg) "")))))}])
 
           :else
@@ -161,18 +169,28 @@
     (or (get by-name name)
         (throw (ex-info "No GitLab instance selected — call gitlab_use_instance first" {})))))
 
+(defn- instance-token
+  "Resolve the auth token for `inst`: an explicit `:token` (env-interpolated,
+  e.g. `${GROG_GITLAB_TOKEN}` — injected by grog from the OS keyring) wins;
+  otherwise fall back to the legacy `:token-file` (slurped)."
+  [inst]
+  (let [t (str/trim (or (:token inst) ""))]
+    (if-not (str/blank? t)
+      t
+      (if-let [tf (:token-file inst)]
+        (try (str/trim (slurp (expand-home (str tf))))
+             (catch Exception _ ""))
+        ""))))
+
 (defn- instance-auth!
   "Resolve the auth for `inst` lazily (cached) and return {:url :token}. The raw
-  token is read from the instance's :token-file and kept only in the internal
-  `auth*` cache — never returned to the model."
+  token is resolved via `instance-token` and kept only in the internal `auth*`
+  cache — never returned to the model."
   [inst]
   (let [name (:name inst)]
     (if-let [c (get @auth* name)]
       c
-      (let [token (if-let [tf (:token-file inst)]
-                    (try (str/trim (slurp (expand-home (str tf))))
-                         (catch Exception _ ""))
-                    "")]
+      (let [token (instance-token inst)]
         (let [c {:url (:url inst) :token token :name name}]
           (swap! auth* assoc name c)
           c)))))

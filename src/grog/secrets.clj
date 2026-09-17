@@ -29,12 +29,16 @@
 
 (def llm-api-account "LLM_API_KEY")
 
+(def gitlab-token-account "GITLAB_TOKEN")
+
 (def ^:private base-known-secret-defs
   "Accounts Grog knows about out of the box; used for `/secret` list and validation."
   [{:account brave-search-api-account
     :description "Brave Search API subscription token (header X-Subscription-Token)"}
    {:account llm-api-account
-    :description "LLM API key for OpenAI-compatible providers (OpenRouter, OpenAI, Groq, etc.)"}])
+    :description "LLM API key for OpenAI-compatible providers (OpenRouter, OpenAI, Groq, etc.)"}
+   {:account gitlab-token-account
+    :description "GitLab Personal Access Token (header PRIVATE-TOKEN) for the grog-gitlab MCP"}])
 
 (def ^:private !extra-secret-defs
   "User-registered account defs (from grog.edn `:secrets {:accounts […]}`), added

@@ -413,21 +413,31 @@
              :cells   (mapv (fn [c] (get-in c [:text])) (:cells r))})
           rows)))
 
+(def ^:private table-cell-pad 26)
+
 (defn- table-col-widths [ctx rows maxw]
   (let [^Graphics2D g (:g2 ctx)
-        fm (.getFontMetrics g (:base (:fonts ctx)))
+        base (:base (:fonts ctx))
+        bold (:bold (:fonts ctx))
         ncols (apply max 1 (map (comp count :cells) rows))
         widths (vec (for [i (range ncols)]
-                      (apply max 30
+                      (apply max 36
                              (map (fn [r]
                                     (when-let [c (nth (:cells r) i nil)]
-                                      (+ (.stringWidth fm c) 18)))
+                                      ;; measure with the cell's *actual* paint
+                                      ;; font: bold headers are wider than the
+                                      ;; base font, so sizing them with base
+                                      ;; metrics let the header text crowd the
+                                      ;; next column.
+                                      (let [f (if (:header? r) bold base)
+                                            fm (.getFontMetrics g f)]
+                                        (+ (.stringWidth fm c) table-cell-pad))))
                                   rows))))
         total (apply + widths)]
     (if (<= total maxw)
       widths
       (let [share (max 1 (long (/ (- total maxw) ncols)))]
-        (mapv (fn [w] (max 30 (- w share))) widths)))))
+        (mapv (fn [w] (max 36 (- w share))) widths)))))
 
 (defn- table-layout
   "Single source of truth for table geometry, shared by measurement, painting
@@ -586,12 +596,26 @@
         {:keys [widths rows-h rows-lines]} (table-layout ctx rows maxw)
         col-x (fn [i]
                 (double (+ x (apply + 0 (map long (take i widths))))))
+        header? (boolean (some :header? rows))
         yy (atom (+ y 4))]
     (doseq [i (range (count rows))]
-      (let [rls (nth rows-lines i)]
+      (let [rls (nth rows-lines i)
+            r1 (long (+ (double @yy) (nth rows-h i)))]
         (doseq [j (range (count rls))]
           (draw-lines! g (nth rls j) (col-x j) (double @yy)))
+        ;; hairline under the header row so the eye can separate it
+        (when (and header? (zero? i))
+          (.setColor g (:border pal))
+          (.drawLine g (int x) r1 (int (+ x (apply + widths))) r1))
         (swap! yy + (nth rows-h i))))
+    ;; hairline separators between columns: keeps adjacent cells from reading
+    ;; as one mashed-together run, especially when a narrow first column sits
+    ;; right next to a long second column.
+    (when (> (count widths) 1)
+      (.setColor g (:border pal))
+      (doseq [i (range 1 (count widths))]
+        (let [sx (int (- (col-x i) (/ table-cell-pad 2.0)))]
+          (.drawLine g sx (int (+ y 4)) sx (int @yy)))))
     (.setColor g (:border pal))
     (.drawLine g (int x) (int @yy) (int (+ x (apply + widths))) (int @yy))
     (+ @yy 6)))

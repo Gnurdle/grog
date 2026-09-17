@@ -4,7 +4,8 @@
   ECA is normally configured by `~/.config/eca/config.json`. Rather than rebuild
   the provider/auth setup from scratch, `generate-config!` starts from that file
   (which already has working providers + keys), then:
-    * merges in the three grog MCP servers (imaging / memory / odoo), and
+    * merges in the grog MCP servers (imaging / memory / office / search / big /
+      babashka / fetch / rss / project-search / imap / odoo / gitlab), and
     * sets `defaultModel` to grog's `:eca :model` (so prompts resolve).
 
   The result is written to a separate generated file (never overwriting the
@@ -150,6 +151,47 @@
                      ["GROG_ODOO_USER" :user]
                      ["GROG_ODOO_PASSWORD" :password]])]
         (when (seq m) m)))))
+
+(defn gitlab-config-path
+  "Path to the **user-maintained** grog-gitlab config (EDN), in the grog config
+  home. This file is the source of truth for the GitLab instance — edit it
+  directly (never put a GitLab token here; use `/secret set GITLAB_TOKEN`)."
+  ^String []
+  (let [d (config/ensure-config-dir!)]
+    (str d "/gitlab.edn")))
+
+(defn- read-gitlab-config
+  "Read `gitlab.edn` if present; nil when absent/unreadable."
+  []
+  (let [f (io/file (gitlab-config-path))]
+    (when (.exists f)
+      (try (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
+           (catch Exception _ nil)))))
+
+(defn gitlab-configured?
+  "True when GitLab is configured: `~/.config/grog/gitlab.edn` carries a
+  single-instance config (`:url` / `:token` / `:token-file`) or a `:config`
+  instances file exists."
+  []
+  (let [home (or (System/getenv "HOME") (System/getProperty "user.home"))
+        cfg (read-gitlab-config)
+        cfg-file (some-> cfg :config str str/trim)
+        cfg-file (when cfg-file (str/replace-first cfg-file #"^~(?=/|$)" home))
+        inst-file (io/file (or cfg-file
+                               (str home "/.config/grog/gitlab-instances.edn")))]
+    (boolean
+     (or (and cfg (or (:url cfg) (:token cfg) (:token-file cfg)))
+         (.exists inst-file)))))
+
+(defn- gitlab-env
+  "Env map for the grog-gitlab MCP server.
+
+  The token comes from the OS keyring (`/secret set GITLAB_TOKEN <value>`),
+  injected as a per-process env var — never a literal in the config file. The
+  server interpolates `${GROG_GITLAB_TOKEN}` in its `:token` field."
+  []
+  (let [tok (some-> (secrets/get-secret "GITLAB_TOKEN") str str/trim not-empty)]
+    (when tok {"GROG_GITLAB_TOKEN" tok})))
 
 (defn- grog-root
   "The grog project root (where deps.edn and the grog-* sibling dirs live)."
@@ -320,7 +362,12 @@
       (assoc "grog-odoo"
              (shell-wrapped (str root "/grog-odoo")
                             "clojure -M:mcp"
-                            (odoo-env))))))
+                            (odoo-env)))
+      (gitlab-configured?)
+      (assoc "grog-gitlab"
+             (shell-wrapped (str root "/grog-gitlab")
+                            "clojure -M:mcp"
+                            (gitlab-env))))))
 
 (defn debug-dump-config!
   "Log that the ECA config was (re)written to the grog debug log, **without**

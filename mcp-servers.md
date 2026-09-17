@@ -137,7 +137,10 @@ Email account setup, read/search, flag, move/copy/append, with OAuth.
 
 ### grog-gitlab — GitLab REST API (read-only)
 Co-opted from `bbutils/gitlab.clj` (babashka). Wraps the GitLab v4 API; read-only.
-Config in `~/.config/grog/gitlab.edn` (`:url`, `:token-file`).
+Config in `~/.config/grog/gitlab.edn` (`:url` + `:token "${GROG_GITLAB_TOKEN}"`).
+The token is a **system secret**: stored with `/secret set GITLAB_TOKEN <value>`
+(OS keyring), injected per-process by grog as `GROG_GITLAB_TOKEN`, and never
+written to disk in plaintext. Legacy `:token-file` still supported as a fallback.
 
 | Tool | Description |
 |---|---|
