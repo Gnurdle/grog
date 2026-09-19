@@ -18,9 +18,11 @@ Key decisions locked in (all done):
   `workspaceFolders` (declared at `initialize`) pointed at the repo root
   (`grog.config/repo-root` → `grog.home` / `GROG_HOME` / cwd). MCP servers take paths
   **as given**; grog tool paths are plain absolute/repo-root-relative. → doc §6.7.
-- **Memory is Python/SQLite** (EDN-store idea dropped): `grog-memory` = associative
-  `assoc_*` store keyed on `GROG_MEMORY_DB`. No `memory_*` EDN-file emulation.
-- **Language split**: imaging = JVM Clojure; memory = Python (sqlite3); odoo = JVM Clojure.
+- **Memory is Clojure/SQLite (JVM)** (EDN-store idea dropped): `grog-memory` =
+  associative `assoc_*` store keyed on `~/.config/grog/memory.edn` (`:db`),
+  served by the `grog-mcp` bundle (`--server grog-memory`). No `memory_*` EDN-file
+  emulation. (The Python server is kept only as legacy reference.)
+- **Language split**: imaging = JVM Clojure; memory = JVM Clojure (SQLite via JDBC); odoo = JVM Clojure.
 
 ## What exists now (under `/d/gni/grog/`)
 Self-contained MCP servers over stdio, all implemented & verified. The generated ECA
@@ -41,12 +43,14 @@ grog-odoo, grog-office, grog-search.
      so `parse-args` must handle `java.util.Map`/Jackson nodes.
    - Run: `clojure -M:mcp` (alias `:mcp`).
 
-2. **`grog-memory/`** (Python, `mcp>=1.9,<2.0`)
-   - `src/grog_memory/server.py` — FastMCP stdio server; SQLite `assoc` store:
-     `assoc_store/get/keys/delete/search`. DB via `GROG_MEMORY_DB`.
-   - **Verified**: initialize + assoc_store→assoc_get persisted.
-   - Note: pinned `mcp<2` because `FastMCP` was removed in the mcp 2.x rewrite.
-   - Run: `PYTHONPATH=src .venv/bin/python -m grog_memory.server`.
+2. **`grog_mcp/` (memory tools) — the default `grog-memory`** (Clojure, SQLite via JDBC)
+   - `src/grog_mcp/memory.clj` — byte-compatible Clojure re-implementation of the
+     Python `assoc_*` server (same 7 tools, same schema, same `memory.edn`
+     `:db`); served by the bundle restricted to one server:
+     `clojure -M:mcp --server grog-memory`. Existing `mem.db` files work as-is.
+   - **Verified**: MCP `initialize` + `tools/list` (7 tools) + store→get→delete.
+   - **`grog-memory/` (Python, legacy)** — the original FastMCP server; no longer
+     wired (kept as reference only).
 
 3. **`grog-odoo/`** (JVM Clojure)
    - `src/grog_odoo/xmlrpc.clj` — self-contained XML-RPC client (clj-http + clojure.xml),
@@ -59,7 +63,7 @@ grog-odoo, grog-office, grog-search.
 
 4. **`grog-office/`** (JVM Clojure)
    - `src/grog_office/core.clj` — Apache POI docx manipulation (import/block model,
-     find/replace/delete-table-row; optional LibreOffice render via `GROG_OFFICE_BIN`).
+     find/replace/delete-table-row; optional LibreOffice render via `office.edn` `:bin`).
    - `src/grog_office/main.clj` — MCP server: `import_document`, `list_handles`,
      `list_blocks`, `get_text`, `find_text`, `replace_text`, `delete_table_row`,
      `render`, `save`, `close_document`.
@@ -89,11 +93,9 @@ Example shape:
 ```json
 { "mcpServers": {
     "grog-imaging": { "command": "clojure", "args": ["-M:mcp", "-m", "grog-imaging.main"] },
-    "grog-memory":  { "command": "python", "args": ["-m", "grog_memory.server"],
-                      "env": { "GROG_MEMORY_DB": "/abs/path/.grog-memory.db" } },
+    "grog-memory":  { "command": "bash", "args": ["-lc", "cd '<repo>/grog_mcp' && clojure -M:mcp --server grog-memory"] },
     "grog-odoo":    { "command": "clojure", "args": ["-M:mcp", "-m", "grog-odoo.main"],
-                      "env": { "GROG_ODOO_URL": "...", "GROG_ODOO_DB": "...",
-                               "GROG_ODOO_USER": "...", "GROG_ODOO_PASSWORD": "..." } }
+                      "env": { "GROG_ODOO_CONFIG": "~/.config/grog/odoo-instances.edn" } }
 } }
 ```
 Note: grog's old subfolder `workspace/` + data (e2-csv, PDFs, memory) are now just a
@@ -112,10 +114,13 @@ normal directory to ECA (no workspace-root semantics).
   (`transcript/copy-selection!`).
 - **`/clear` and the Clear tool-bar button wipe the transcript AND reset YOLO off.**
 - Window opened at **1350×1020** (~50% bigger both ways).
-- **`grog-ui` rotates `grog-ui.log` on each launch** — the current file stays
-  `grog-ui.log` (Linux `~/grog-ui.log`, Windows `%USERPROFILE%\grog-ui.log`), the
-  old one is renamed to `<base>.<n>`, and only the newest `GROG_UI_LOG_KEEP`
-  (default 5) rotations are kept.
+- **Logging is per-instance and in-process** (`grog.log`): each running grog writes
+  its own `<base>.<pid>.log` (`~/grog-ui.<pid>.log` on Linux,
+  `%USERPROFILE%\grog-ui.<pid>.log` on Windows) so concurrent instances never
+  interleave. On startup the oldest instance logs are pruned, keeping
+  `GROG_UI_LOG_KEEP` (default 5). The JVM tees `System.out`/`System.err` to the
+  console **and** the file — no shell redirection, no rotation scripts, no
+  platform-specific PID logic.
 
 ## Superseded grog loop / tool code
 - ✅ **Workspace-scoped tool loop pruned** from `grog.fs` / `grog.core`:
@@ -140,3 +145,23 @@ expose steering yet; that's a candidate next step).
 The canonical analysis doc — includes the keep/drop tool table (§6.5), MCP granularity
 (§6.6), and the workspace-model change (§6.7). Sections 1–5 are the "rebuild instead"
 comparison; §6+ is the "attach to ECA" path being pursued.
+
+## Fix: chat log was fed back as standing context (runaway context)
+**Symptom:** prompts appeared to go in but nothing happened — the model stalled /
+rambled / quoted the whole conversation. Standing context (`eca-rules.md`) had grown
+to **~1 MB**, and the project's `dialog/thread.edn` was **~1 MB and doubling**.
+**Root cause:** `grog.projects/load-context` walked the project's `dialog/` dir and
+`list-context-files` treated `.edn` as context text, so it slurped the **entire chat
+log** (`dialog/thread.edn`) back in as "project context". `grog.eca-config/project-rules-file`
+embeds `load-context` into the ECA `rules` file, and `grog.chat-context` embeds it as a
+system message — so every prompt contained the full, unbounded history **in addition to**
+the actual conversation. The model's replies then quoted that history, which got appended
+to `thread.edn`, which was re-embedded even bigger next turn (exponential growth → stall).
+**Fix** (`src/grog/projects.clj`):
+- `list-context-files` now excludes the chat log via `context-text-file?` /
+  `chat-log-filename` (`thread.edn`); `notes/` context is unaffected. Bounded dialog
+  replay still happens where intended, via `grog.project-dialog/thread-as-system-appendix`.
+- `read-text-file` gained a `max-context-file-bytes` (256 KB) cap as defense-in-depth.
+**Verified:** `load-context` 1 MB → 7.9 KB; regenerated `eca-rules.md` 1,048 KB → 12.6 KB
+and contains no `:turns`; CLI `-M:run` replies cleanly again. The stale ~1 MB
+`thread.edn` files remain on disk (user data) but no longer feed the prompt.

@@ -6,7 +6,8 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pp]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.config :as config])
   (:import (java.net URL)))
 
 (defn- grogedn-file ^java.io.File [] (io/file "grog.edn"))
@@ -92,7 +93,7 @@
   isn't running)."
   []
   (try
-    (let [base (or (System/getenv "OLLAMA_HOST") "http://localhost:11434")
+    (let [base (config/ollama-host)
           resp (http/get (str base "/api/tags")
                          {:as :json :throw-exceptions false :socket-timeout 5000 :conn-timeout 3000})]
       (->> (:models (:body resp))

@@ -192,12 +192,13 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
   or `$GROG_CONFIG_HOME`). The old `%APPDATA%\grog` location is no longer used.
-- **Log file**: grog-ui writes to a single current log — `~/grog-ui.log` (Linux) or
-  `%USERPROFILE%\grog-ui.log` (Windows) — unless `GROG_LOG` is set. On each launch the
-  previous log is rotated to `<base>.<n>` (next available number) and only the newest
-  `GROG_UI_LOG_KEEP` rotations (default 5) are kept; each is capped at `GROG_UI_LOG_MAX`
-  bytes (default 5MB). The current file is always the freshest, so `tail -f ~/grog-ui.log`
-  shows live debug output.
+- **Log files**: each running grog writes its own log — `<base>.<pid>.log` — so
+  concurrent instances never share a file. `<base>` defaults to `~/grog-ui`
+  (`%USERPROFILE%\grog-ui` on Windows) and is set by `:log {:dir … :keep …}` in
+  `grog.edn` (`GROG_LOG` / `GROG_UI_LOG_KEEP` override for one-off runs). On
+  startup the oldest instance logs are pruned, keeping `:keep` (default 5).
+  Logging is in-process (`grog.log`), which tees stdout/stderr to both the console
+  and the file, so `tail -f ~/grog-ui.<pid>.log` shows live output.
 - **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
   PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
   `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set

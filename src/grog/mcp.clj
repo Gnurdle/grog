@@ -12,6 +12,7 @@
             [clojure.string :as str]
             [clojure.walk :as walk]
             [grog.edn-store :as store]
+            [grog.config :as config]
             [grog.mcp-store :as mcp-store])
   (:import [java.io ByteArrayOutputStream InputStream OutputStreamWriter]
            [java.lang ProcessBuilder]
@@ -310,9 +311,11 @@
             (recur (str nxt) acc2)
             {:ok acc2}))))))
 
-(def ^:private mcp-idle-timeout-ms
-  "Stop a running MCP server if it has seen no tools/call for this long (lazy broker lifecycle)."
-  (Long/parseLong (or (System/getenv "GROG_MCP_IDLE_TIMEOUT_MS") "900000"))) ; default 15 min
+(defn- mcp-idle-timeout-ms
+  "Stop a running MCP server if it has seen no tools/call for this long (lazy
+  broker lifecycle). Configured via `:mcp :idle-timeout-ms` (default 15 min)."
+  []
+  (long (config/mcp-idle-timeout-ms)))
 
 (def ^:private now-ms
   "Wall clock in ms (used for idle accounting)."
@@ -381,7 +384,7 @@
   "Stop MCP subprocesses whose :last-used is older than the idle timeout. Call from the
   chat loop between turns (or on demand) so long-lived servers don't pile up."
   []
-  (let [cutoff (- (now-ms) mcp-idle-timeout-ms)]
+  (let [cutoff (- (now-ms) (mcp-idle-timeout-ms))]
     (locking registry-lock
       (doseq [[sid srv] (:servers @!state)
               :let [last-used (long (or (:last-used srv) 0))]

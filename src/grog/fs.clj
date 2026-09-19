@@ -139,7 +139,7 @@
              (seq fs))))))
 
 (defn- tessdata-candidate-dirs []
-  (let [pfx (System/getenv "TESSDATA_PREFIX")]
+  (let [pfx (cfg/tessdata-dir)]
     (remove nil?
             (concat
              (when-not (str/blank? pfx)

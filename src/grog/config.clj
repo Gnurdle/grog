@@ -43,8 +43,9 @@
 
 (defn- config-debug!
   "One-line config-loading trace written to the **real** stderr so it always
-  lands in the grog debug log (`grog-ui.log` via grog-ui's tee, or `$GROG_LOG`)
-  even when the caller's `*out*`/`*err*` are rebound to the transcript pane."
+  lands in the grog debug log (`grog-ui.<pid>.log`, or `$GROG_LOG`, via
+  grog.log's in-process tee) even when the caller's `*out*`/`*err*` are rebound
+  to the transcript pane."
   [& xs]
   (.println System/err (str "[grog-config] " (apply str (interpose " " (map str xs))))))
 
@@ -598,3 +599,68 @@
               (println "       :llm :model" (pr-str m) "— :url" url)))
         (println "")))
     (catch Exception _ nil)))
+
+;; ---------------------------------------------------------------------------
+;; Operational knobs — configured in grog.edn (env vars remain explicit
+;; overrides for one-off runs; the config file is the source of truth).
+;; ---------------------------------------------------------------------------
+
+(defn- mcp-cfg [] (:mcp (grog) {}))
+
+(defn mcp-idle-timeout-ms
+  "Stop a running MCP server after this much idle time (`:mcp :idle-timeout-ms`,
+  default 900000 = 15 min). Env override: `GROG_MCP_IDLE_TIMEOUT_MS`."
+  []
+  (or (some-> (System/getenv "GROG_MCP_IDLE_TIMEOUT_MS") str str/trim parse-long)
+      (let [v (:idle-timeout-ms (mcp-cfg))]
+        (when (and (number? v) (pos? (long v))) (long v)))
+      900000))
+
+(defn- log-cfg [] (:log (grog) {}))
+
+(defn log-base
+  "Base path (no extension) for the per-instance GUI logs (`:log :dir`, default
+  `~/grog-ui`). `~` is expanded and a legacy `*.log` value is stripped.
+  Env override: `GROG_LOG`."
+  ^String []
+  (let [raw (or (some-> (System/getenv "GROG_LOG") str str/trim not-empty)
+                (some-> (:dir (log-cfg)) str str/trim not-empty)
+                "~/grog-ui")
+        s   (platform/expand-home raw)]
+    (if (str/ends-with? (str/lower-case s) ".log")
+      (subs s 0 (- (count s) 4))
+      s)))
+
+(defn log-keep
+  "How many per-instance logs to keep (`:log :keep`, default 5).
+  Env override: `GROG_UI_LOG_KEEP`."
+  []
+  (or (some-> (System/getenv "GROG_UI_LOG_KEEP") str str/trim parse-long)
+      (let [v (:keep (log-cfg))]
+        (when (and (number? v) (pos? (long v))) (long v)))
+      5))
+
+(defn- terminal-cfg [] (:terminal (grog) {}))
+
+(defn shell-command
+  "Shell for the terminal window and `/shell` (`:terminal :shell`).
+  Default: `$SHELL`, else `bash`."
+  ^String []
+  (or (some-> (:shell (terminal-cfg)) str str/trim not-empty)
+      (some-> (System/getenv "SHELL") str str/trim not-empty)
+      "bash"))
+
+(defn ollama-host
+  "Ollama base URL used to list local models (`:llm :ollama-host`).
+  Default: `$OLLAMA_HOST`, else `http://localhost:11434`."
+  ^String []
+  (or (some-> (get-in (grog) [:llm :ollama-host]) str str/trim not-empty)
+      (some-> (System/getenv "OLLAMA_HOST") str str/trim not-empty)
+      "http://localhost:11434"))
+
+(defn tessdata-dir
+  "Tesseract data dir override (`:imaging :tessdata`), or nil to use the
+  default/`$TESSDATA_PREFIX`."
+  []
+  (or (some-> (get-in (grog) [:imaging :tessdata]) str str/trim not-empty)
+      (some-> (System/getenv "TESSDATA_PREFIX") str str/trim not-empty)))

@@ -979,7 +979,7 @@
 
 (defn- run-interactive-shell! []
   (try
-    (let [sh-bin (or (not-empty (System/getenv "SHELL")) "/bin/sh")
+    (let [sh-bin (config/shell-command)
           pb (doto (ProcessBuilder. [sh-bin])
                (.directory (shell-cwd-file))
                (.inheritIO))]

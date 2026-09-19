@@ -20,12 +20,14 @@
             [clojure.string :as str]
             [grog.config :as config]
             [grog.core :as core]
+            [grog.log :as glog]
             [grog.eca :as eca]
             [grog.eca-config :as ecacfg]
             [grog.models :as models]
             [grog.appearance :as appearance]
             [grog.projects :as projects]
             [grog.secrets :as secrets]
+            [grog.session :as session]
             [grog.project-dialog :as project-dialog]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
@@ -37,6 +39,7 @@
             [grog.ui.shell :as uishell]
             [grog.ui.transcript :as transcript]
             [grog.ui.widgets :as widgets]
+            [grog.voice :as voice]
             [grog.soul :as soul])
   (:import (java.awt Color Component Font Graphics Graphics2D Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
@@ -65,18 +68,18 @@
                      [acct v])))
         provider-env-accounts))
 
-;; Debug tracer: writes to the real stderr (so it lands in grog-ui's rotated
-;; log — grog-ui.log or $GROG_LOG) regardless of the pane *out*/*err* rebindings.
+;; Debug tracer: writes to the real stderr (so it lands in the per-instance log
+;; `grog-ui.<pid>.log` / $GROG_LOG, via grog.log's in-process tee) regardless of
+;; the pane *out*/*err* rebindings.
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
 
 ;; --- ECA<->grog protocol tracing -------------------------------------------
 ;; Every JSON-RPC frame that crosses the stdio pipe to the `eca server` child is
-;; summarized here (via eca.clj's :trace-fn). The launcher (./grog-ui /
-;; grog-ui.bat) tees stderr/stdout into a single rotated log file (default
-;; ~/grog-ui.log on Linux, %USERPROFILE%\grog-ui.log on Windows, or $GROG_LOG),
-;; so these traces land there regardless of any *out*/*err* rebinding to the
-;; transcript pane.
+;; summarized here (via eca.clj's :trace-fn). grog.log tees stderr/stdout in
+;; process into the per-instance log (default ~/grog-ui.<pid>.log on Linux,
+;; %USERPROFILE%\grog-ui.<pid>.log on Windows, or $GROG_LOG), so these traces
+;; land there regardless of any *out*/*err* rebinding to the transcript pane.
 
 (defn- trunc
   "Clip a string to `n` chars with an ellipsis; used to keep streamed text lines
@@ -859,6 +862,47 @@
             (proxy [AbstractAction] []
               (actionPerformed [_] (scroll-to-top!)))))))
 
+(defn- generic-project
+  "Fallback for a session that can't take the project it wanted: the configured
+  `:projects :default`, else a project literally named \"Generic\", else
+  \"default\"."
+  ^String []
+  (or (some-> (get-in (config/grog) [:projects :default]) str str/trim not-empty)
+      (when (projects/project-exists? "Generic") "Generic")
+      "default"))
+
+(defn- choose-project-dialog!
+  "Modal chooser shown when `blocked` is already open in another session.
+  Returns the chosen project name, or nil if the user cancels. Call on the EDT."
+  [^Component owner ^String blocked ^String reason]
+  (let [names (vec (remove #(= % blocked) (projects/list-project-names)))]
+    (when (seq names)
+      (some-> (JOptionPane/showInputDialog
+               owner
+               (str "Project \"" blocked "\" is already open in another grog session"
+                    (when reason (str " (" reason ")")) ".\n\n"
+                    "Pick a different project for THIS session:")
+               "Project already open"
+               JOptionPane/WARNING_MESSAGE
+               nil
+               (into-array Object names)
+               (first names))
+              str not-empty))))
+
+(defn- resolve-exclusive-project!
+  "If the active project is already open in another session, offer alternatives
+  (or fall back to the generic/default project), then claim the lock for the
+  project this session will use. Returns the project name. Call on the EDT."
+  ^String []
+  (let [proj (projects/project-name)]
+    (if-let [h (session/holder proj)]
+      (let [choice (or (choose-project-dialog! nil proj (session/holder-desc h))
+                       (generic-project))]
+        (projects/set-project! choice)
+        (session/claim! choice)
+        choice)
+      (do (session/claim! proj) proj))))
+
 (defn- show-project-manager!
   "A modal dialog to manage projects: **create** (the primary action, with an
   optional description), switch, or delete one. A dedicated 'New project' form
@@ -1096,6 +1140,67 @@
         export (widgets/toolbar-button :export "Export transcript")
         view-html (widgets/toolbar-button :html "Open transcript as HTML")
         clear (widgets/toolbar-button :clear "Clear")
+        ;; Voice input: click to start recording, click again to stop and
+        ;; transcribe (push-to-talk *toggle*, not hold).
+        mic (widgets/toolbar-button :mic "Voice input — click to record, click again to stop")
+        voice-handle (atom nil)
+        voice-busy (atom false)
+        mic-reset! (fn []
+                     (.setIcon mic (widgets/action-icon :mic))
+                     (.setToolTipText mic "Voice input — click to record, click again to stop"))
+        mic-recording! (fn []
+                         (.setIcon mic (widgets/action-icon :stop :color (Color. 235 70 70)))
+                         (.setToolTipText mic "Recording… click to stop"))
+        mic-busy! (fn []
+                    (.setIcon mic (widgets/action-icon :stop :color (Color. 160 160 170)))
+                    (.setToolTipText mic "Transcribing…"))
+        voice-stop! (fn []
+                      (let [h @voice-handle]
+                        (reset! voice-handle nil)
+                        (mic-busy!)
+                        (future
+                          (try
+                            (let [wav (voice/stop! h)
+                                  txt (when (and wav (seq (voice/command)))
+                                        (voice/transcribe! wav))]
+                              (SwingUtilities/invokeLater
+                               (fn []
+                                 (reset! voice-busy false)
+                                 (if (seq txt)
+                                   (do (.insert prompt (str txt) (.getCaretPosition prompt))
+                                       (.requestFocusInWindow prompt)
+                                       (mic-reset!))
+                                   (do (mic-reset!)
+                                       (transcript/append-status!
+                                        pane "[voice] no transcript (no audio captured, or :voice :command unset)"))))))
+                            (catch Throwable e
+                              (SwingUtilities/invokeLater
+                               (fn []
+                                 (reset! voice-busy false)
+                                 (mic-reset!)
+                                 (transcript/append-status! pane (str "[voice] " (.getMessage e))))))))))
+        voice-start! (fn []
+                       (try
+                         (reset! voice-handle (voice/start!))
+                         (mic-recording!)
+                         (transcript/append-status! pane "[voice] recording… click the mic again to stop")
+                         (catch Throwable e
+                           (reset! voice-handle nil)
+                           (transcript/append-status! pane (str "[voice] cannot record: " (.getMessage e))))))
+        toggle-voice! (fn []
+                        ;; Config is loaded once at startup (`grog.config` caches
+                        ;; it), so a `:voice` block added while grog is running
+                        ;; would otherwise read as "disabled" until a full
+                        ;; restart. Re-read it here so the mic always sees the
+                        ;; current grog.edn.
+                        (try (config/reload!) (catch Throwable _))
+                        (cond
+                          @voice-handle (voice-stop!)
+                          @voice-busy nil
+                          (not (voice/enabled?))
+                          (transcript/append-status!
+                           pane "[voice] disabled — add :voice {:enabled true :command [\"whisper-cli\" \"-m\" \"model.bin\" \"-f\" \"{wav}\" \"-nt\"]} to grog.edn")
+                          :else (voice-start!)))
         frame (JFrame. (str "grog — " (or (projects/project-name) "default")))
         queue (LinkedBlockingQueue.)
         running? (atom false)
@@ -1327,6 +1432,10 @@
     (.addActionListener view-html (reify java.awt.event.ActionListener
                                     (actionPerformed [_ _]
                                       (uiexport/show-transcript-html! frame pane))))
+    ;; Voice: toggle record/stop (push-to-talk toggle).
+    (.addActionListener mic (reify java.awt.event.ActionListener
+                              (actionPerformed [_ _]
+                                (toggle-voice!))))
     ;; Clear button routes through the same behavior as /clear: wipe the
     ;; transcript and drop trust (yolo) auto-approve, without echoing "/clear".
     (let [do-clear! (fn []
@@ -1354,7 +1463,7 @@
                       (doto tb (.setOpaque false)))
                     tb)]
       ;; left: operation buttons (icons + hover tooltips set by `toolbar-button`)
-      (doseq [b [send stop term settings export view-html clear]]
+      (doseq [b [send stop mic term settings export view-html clear]]
         (.add toolbar b)
         (.add toolbar (Box/createHorizontalStrut 4)))
       ;; right: model / status / trust indicators
@@ -1367,17 +1476,27 @@
                           (.setText proj-btn
                                     (str (or (projects/project-name) "default") "  ")))
             switch-to! (fn [nm]
-                         (when (and (seq nm) (not= nm (projects/project-name)))
-                           (when @connected
-                             (eca/disconnect!)
-                             (reset! connected false))
-                           (projects/set-project! nm)
-                           ;; new project -> new stable chat identity
-                           (reset! chat-id (projects/active-project-chat-id))
-                           (transcript/clear! pane)
-                           (transcript/append-status! pane (str "Project: " nm))
-                           (.setTitle frame (str "grog — " nm))
-                           (connect-eca!))
+                         (loop [nm nm, tries 0]
+                           (when (and (seq nm) (not= nm (projects/project-name)) (< tries 6))
+                             (if-let [h (session/holder nm)]
+                               ;; already open in another session -> offer another
+                               (do (transcript/append-status!
+                                    pane (str "[project] \"" nm "\" is open in another grog session"
+                                              " (" (session/holder-desc h) ") — pick a different one."))
+                                   (when-let [alt (choose-project-dialog! frame nm (session/holder-desc h))]
+                                     (recur alt (inc tries))))
+                               (do (session/release! (projects/project-name))
+                                   (when @connected
+                                     (eca/disconnect!)
+                                     (reset! connected false))
+                                   (projects/set-project! nm)
+                                   (session/claim! nm)
+                                   ;; new project -> new stable chat identity
+                                   (reset! chat-id (projects/active-project-chat-id))
+                                   (transcript/clear! pane)
+                                   (transcript/append-status! pane (str "Project: " nm))
+                                   (.setTitle frame (str "grog — " nm))
+                                   (connect-eca!)))))
                          (update-btn!))
             open-project-manager! (fn []
                                     (show-project-manager! frame switch-to!))]
@@ -1507,9 +1626,14 @@
 (defn -main
   "Entry point: `clojure -M -m grog.ui`, `./grog-ui`, or `grog-ui.bat`."
   [& _]
-  ;; cleanly shut down the ECA subprocess (if any) on JVM exit
+  ;; Per-instance log first, so everything below (and the ECA tracer) lands in
+  ;; <base>.<pid>.log as well as the console. Done here, in-process, so the
+  ;; launchers need no redirection/rotation and no platform-specific PID logic.
+  (glog/install!)
+  ;; cleanly shut down the ECA subprocess (if any) on JVM exit, and drop our
+  ;; project session lock so the next launch doesn't see us as a live holder
   (.addShutdownHook (Runtime/getRuntime)
-                    (Thread. (fn [] (eca/disconnect!))))
+                    (Thread. (fn [] (session/release-all!) (eca/disconnect!))))
   (SwingUtilities/invokeLater
     (fn []
       (try
@@ -1558,6 +1682,9 @@
         ;; dialogs (settings, model picker, approvals) and labels read larger
         (widgets/scale-ui-fonts!)
         (projects/resolve-active-project)
+        ;; One session per project: if it's already open elsewhere, pick another
+        ;; (or the generic/default project) and take the lock.
+        (resolve-exclusive-project!)
         (let [^javax.swing.JFrame f (build-chat-frame)]
           (.setVisible f true)
           ;; DIAGNOSTIC: report what the JVM actually computed for the prompt's

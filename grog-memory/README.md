@@ -1,5 +1,11 @@
 # grog-memory
 
+> **⚠️ Legacy.** The default `grog-memory` is now the **Clojure/SQLite** server in
+> `grog_mcp/src/grog_mcp/memory.clj` (served by the `grog-mcp` bundle:
+> `clojure -M:mcp --server grog-memory`). It is byte-compatible (same 7 tools,
+> same SQLite schema, same `memory.edn` `:db`), so existing stores work as-is and
+> no Python is needed. This Python server is kept for reference only.
+
 An **MCP server** (over stdio) exposing grog's **associative memory** — a
 persistent key→value SQL store an ECA-driven agent loop can read/write.
 
@@ -20,26 +26,30 @@ Speaks MCP over **stdio**. Wire into ECA:
 { "mcpServers": {
     "grog-memory": {
       "command": "python",
-      "args": ["-m", "grog_memory.server"],
-      "env": { "GROG_MEMORY_DB": "/path/to/project/.grog-memory.db" }
+      "args": ["-m", "grog_memory.server"]
     }
 } }
 ```
 
-Point `GROG_MEMORY_DB` at a per-project file for per-project isolation (replaces
-grog's old per-workspace memory scoping).
+The default store's path comes from the **file config**, not env. grog writes that
+file to point at the **active project's** store, giving per-project isolation.
 
-## Configuration (env)
+## Configuration (file)
 
-| Env | Default | Meaning |
-|-----|---------|---------|
-| `GROG_MEMORY_DB` | `./grog-memory.db` | path to the **default** SQLite db file |
-| `GROG_MEMORY_MAX_OPEN` | `8` | max concurrently-open stores (LRU eviction) |
+`~/.config/grog/memory.edn`:
+
+```clojure
+{:db "/abs/path/to/project/state/mem.db"   ;; the default SQLite store
+ :max-open 8}                              ;; max concurrently-open stores (LRU)
+```
+
+(Env vars are intentionally **not** read — file-config normalization, like the
+other grog servers.)
 
 ## Tools
 
 Every `assoc_*` tool (except `assoc_open_store`/`assoc_close_store`) takes an
-optional `handle`. Omit it to use the default store (`GROG_MEMORY_DB`); pass a
+optional `handle`. Omit it to use the default store (`:db`); pass a
 store's handle to target a specific database.
 
 | Tool | Purpose |
@@ -62,10 +72,10 @@ assoc_close_store("/home/you/memory/notes.db")
 ```
 
 - The `handle` is the **absolute path**; opening the same path reuses the cached
-  connection (no thrashing), and a small LRU (`GROG_MEMORY_MAX_OPEN`, default 8)
-  keeps a few stores open concurrently, evicting the least-recently-used one.
+  connection (no thrashing), and a small LRU (`:max-open`, default 8) keeps a few
+  stores open concurrently, evicting the least-recently-used one.
 - Closing a store closes its connection; it re-opens lazily if used again.
-- Without a `handle`, everything targets the default store (`GROG_MEMORY_DB`).
+- Without a `handle`, everything targets the default store (`:db`).
 
 ## Status
 

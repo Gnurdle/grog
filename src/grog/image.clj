@@ -1,7 +1,8 @@
 (ns grog.image
   "Image processing utilities including OCR, PNG handling, and image manipulation."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.config :as config])
   (:import [java.awt Graphics2D RenderingHints]
            [java.awt.image BufferedImage RescaleOp]
            [java.io File]
@@ -44,7 +45,7 @@
              (seq fs))))))
 
 (defn- tessdata-candidate-dirs []
-  (let [pfx (System/getenv "TESSDATA_PREFIX")]
+  (let [pfx (config/tessdata-dir)]
     (remove nil?
             (concat
              (when-not (str/blank? pfx)

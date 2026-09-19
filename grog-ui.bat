@@ -13,33 +13,11 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem --- log rotation ----------------------------------------------------------
-rem grog-ui always writes to a single current log file (%GROG_LOG% or
-rem %USERPROFILE%\grog-ui.log). On each launch the previous log is rotated:
-rem capped to the last MAX_LOG bytes, renamed to <base>.<next>, and only the
-rem newest %GROG_UI_LOG_KEEP% rotations are kept (older ones removed) — see
-rem scripts/rotate-log.ps1. Set GROG_LOG to redirect to a different base.
-if "%GROG_LOG%"=="" (
-  set "LOG_BASE=%USERPROFILE%\grog-ui.log"
-) else (
-  set "LOG_BASE=%GROG_LOG%"
-)
-if "%GROG_UI_LOG_MAX%"=="" (
-  set "MAX_LOG=5242880"
-) else (
-  set "MAX_LOG=%GROG_UI_LOG_MAX%"
-)
-if "%GROG_UI_LOG_KEEP%"=="" (
-  set "KEEP=5"
-) else (
-  set "KEEP=%GROG_UI_LOG_KEEP%"
-)
-set "LOG=%LOG_BASE%"
-set "GROG_LOG=%LOG%"
+rem --- logging ---------------------------------------------------------------
+rem Handled in-process by grog itself (grog.log): each instance writes its own
+rem <base>.<pid>.log and prunes the oldest. No redirection or PID lookup here —
+rem the JVM tees its own stdout/stderr. Set GROG_LOG to change the log base
+rem (default %USERPROFILE%\grog-ui); GROG_UI_LOG_KEEP to change how many
+rem instance logs are kept (default 5).
 
-rem rotate the previous log (best effort, only on launch)
-if exist "%LOG_BASE%" powershell -NoProfile -File "%~dp0scripts\rotate-log.ps1" "%LOG_BASE%" %MAX_LOG% %KEEP%
-
-echo === grog-ui launch: %date% %time% log=%LOG% ===>> "%LOG%"
-
-clojure -M:gui %* >>"%LOG%" 2>&1
+clojure -M:gui %*

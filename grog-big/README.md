@@ -21,13 +21,18 @@ MCP server turns that big model into an ordinary tool the local agent can
 Returns the big model's text (falls back to its `reasoning` field for models
 that emit reasoning traces).
 
-## Environment
+## Configuration (file)
 
-| Var | Default | Meaning |
-|---|---|---|
-| `GROG_BIG_URL` | `http://localhost:4000/v1` | OpenAI-compatible base URL (LiteLLM relay) |
-| `GROG_BIG_MODEL` | `big` | Model name on that endpoint |
-| `GROG_BIG_API_KEY` | `sk-dummy` | Bearer key (matches the default LiteLLM master key) |
+`~/.config/grog/big.edn`:
+
+```clojure
+{:url "http://localhost:4000/v1"          ;; OpenAI-compatible base URL (LiteLLM relay)
+ :model "big"                             ;; model name on that endpoint
+ :api-key-file "~/.config/grog/keys/grog-big.key"}  ;; bearer key (optional)
+```
+
+Defaults: `http://localhost:4000/v1`, `big`, `sk-dummy`. (Env vars are
+intentionally **not** read — file-config normalization, like the other servers.)
 
 ## Quick start (with LiteLLM as the relay)
 
@@ -50,7 +55,8 @@ that emit reasoning traces).
    ```
 
 2. grog wires `grog-big` into the ECA config automatically
-   (`grog-mcp-servers` in `grog.eca-config`), passing the env vars above.
+   (`grog-mcp-servers` in `grog.eca-config`); the server reads its settings from
+   `~/.config/grog/big.edn`.
 
 3. The local agent sees `big_model_ask` as a tool and per SOUL.md will escalate
    hard tasks to it. You can also call it from the GUI/console if you want to
@@ -59,8 +65,7 @@ that emit reasoning traces).
 ## Testing without ECA
 
 ```bash
-GROG_BIG_URL=http://localhost:4000/v1 GROG_BIG_MODEL=big \
-clojure -M:mcp -m grog-big.main   # then speak MCP over stdio
+clojure -M:mcp -m grog-big.main   # reads ~/.config/grog/big.edn; speak MCP over stdio
 ```
 
 Or point it straight at any OpenAI-compatible endpoint (e.g. Ollama) to smoke-test:

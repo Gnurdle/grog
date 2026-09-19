@@ -131,8 +131,7 @@ Then in `config.json`:
   },
   "grog-memory": {
     "command": "bash",
-    "args": ["-lc", "cd '<REPO>/grog-memory' && PYTHONPATH=src .venv/bin/python -m grog_memory.server"],
-    "env": { "GROG_MEMORY_DB": "<REPO>/.grog-memory.db" }
+    "args": ["-lc", "cd '<REPO>/grog_mcp' && clojure -M:mcp --server grog-memory"]
   }
 }
 ```

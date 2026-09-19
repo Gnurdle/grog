@@ -54,6 +54,27 @@
 ;; Each immediate subdir is a project. Default ~/grog-projects.
 ;;   ;:projects {:dir "~/grog-projects" :default "gmail-cleanup"}
 ;;
+;; Optional: voice input (push-to-talk). The toolbar mic button records the
+;; microphone (no extra deps — JVM audio) and transcribes via :command, which
+;; must read a WAV and print the text on stdout. {wav} is substituted with the
+;; recorded file. Examples:
+;;   whisper.cpp : ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
+;;   whisper     : ["whisper" "{wav}" "--model" "base" "--output_format" "txt"]
+;;   cloud CLI   : ["your-cli" "--file" "{wav}"]
+;; :voice {:enabled true
+;;         :command ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
+;;         :sample-rate 16000
+;;         :max-seconds 60}
+
+;; Operational knobs (all optional; env vars remain overrides for one-off runs):
+;;   ;:log {:dir "~/grog-ui" :keep 5}          ; per-instance GUI logs (<dir>.<pid>.log)
+;;   ;:mcp {:idle-timeout-ms 900000}           ; stop idle MCP servers after 15 min
+;;   ;:terminal {:shell "bash"}                ; terminal + /shell (default $SHELL)
+;;   ;:imaging {:tessdata "/usr/share/tesseract-ocr/5/tessdata"}
+;;
+;; Ollama host used to list local models (default http://localhost:11434):
+;;   ;:llm {:url "…" :model "…" :ollama-host "http://localhost:11434"}
+
 ;; Optional: extra named secret accounts for /secret + with_api_key.
 ;; Built-ins: BRAVE_SEARCH_API, LLM_API_KEY.
 ;;   ;:secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}]}

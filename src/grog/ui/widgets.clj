@@ -174,70 +174,96 @@
 
 (defn action-icon
   "A small monochrome `ImageIcon` for toolbar operation buttons.
-  `kind` is one of :send :stop :terminal :settings :export :clear.
-  Draws a simple stroked glyph in the given `color` (default button text color)."
+  `kind` is one of :send :stop :terminal :settings :export :html :clear :mic.
+  Glyphs are designed on an 18×18 grid and scaled to `size` px, drawn in
+  `color` (default button text color). Solid shapes for send/stop/mic read
+  better than hairlines at toolbar sizes."
   ^ImageIcon [kind & {:keys [color size]
                       :or {color (Color. 235 238 245) size 18}}]
-  (let [img (BufferedImage. (int size) (int size) BufferedImage/TYPE_INT_ARGB)
-        g2 (doto (.createGraphics img)
-             (.setRenderingHint RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
-             (.setColor color)
-             (.setStroke (BasicStroke. 1.6)))]
-    (letfn [(line! [x1 y1 x2 y2] (.drawLine g2 (int x1) (int y1) (int x2) (int y2)))
-            (stroke! [p] (.draw g2 p))]
-      (case kind
-        :send
-        (let [p (Path2D$Double.)]
-          (.moveTo p 2 3)
-          (.lineTo p 16 9)
-          (.lineTo p 2 15)
-          (.lineTo p 6 9)
-          (.closePath p)
-          (stroke! p))
+  (let [size (int (max 12 (long size)))
+        s    (/ (double size) 18.0)
+        img  (BufferedImage. size size BufferedImage/TYPE_INT_ARGB)
+        g2   (doto (.createGraphics img)
+               (.setRenderingHint RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
+               (.setRenderingHint RenderingHints/KEY_STROKE_CONTROL RenderingHints/VALUE_STROKE_PURE)
+               (.setColor color)
+               (.setStroke (BasicStroke. (float (* 1.7 s))
+                                         BasicStroke/CAP_ROUND
+                                         BasicStroke/JOIN_ROUND)))
+        X    (fn [v] (* s (double v)))
+        line! (fn [x1 y1 x2 y2]
+                (.draw g2 (java.awt.geom.Line2D$Double. (X x1) (X y1) (X x2) (X y2))))
+        fill-oval! (fn [cx cy r]
+                     (.fill g2 (java.awt.geom.Ellipse2D$Double.
+                                (- (X cx) (X r)) (- (X cy) (X r))
+                                (X (* 2 r)) (X (* 2 r)))))
+        fill-round! (fn [x y w h arc]
+                      (.fill g2 (java.awt.geom.RoundRectangle2D$Double.
+                                 (X x) (X y) (X w) (X h) (X arc) (X arc))))]
+    (case kind
+      ;; paper plane, solid
+      :send
+      (let [p (Path2D$Double.)]
+        (.moveTo p (X 2) (X 3))
+        (.lineTo p (X 16.5) (X 9))
+        (.lineTo p (X 2) (X 15))
+        (.lineTo p (X 6.5) (X 9))
+        (.closePath p)
+        (.fill g2 p))
 
-        :stop
-        (do (line! 5 5 13 5)
-            (line! 13 5 13 13)
-            (line! 13 13 5 13)
-            (line! 5 13 5 5))
+      ;; solid rounded square — the universal stop
+      :stop
+      (fill-round! 5 5 8 8 2)
 
-        :terminal
-        (do (line! 3 5 9 9)
-            (line! 9 9 3 13)
-            (line! 11 11 15 11))
+      ;; ">_" shell prompt
+      :terminal
+      (do (line! 4 5 9 9)
+          (line! 9 9 4 13)
+          (line! 11.5 13.5 15 13.5))
 
-        :settings
-        (let [p (Path2D$Double.)]
-          ;; crude cog: four bars around a center hub
-          (.moveTo p 9 2) (.lineTo p 9 7)
-          (.moveTo p 9 11) (.lineTo p 9 16)
-          (.moveTo p 2 9) (.lineTo p 7 9)
-          (.moveTo p 11 9) (.lineTo p 16 9)
-          (stroke! p)
-          (.fillOval g2 6 6 6 6))
+      ;; sliders (modern "settings/tune"): three tracks with knobs
+      :settings
+      (do (line! 3 5 15 5)
+          (line! 3 9 15 9)
+          (line! 3 13 15 13)
+          (fill-oval! 7 5 2)
+          (fill-oval! 12 9 2)
+          (fill-oval! 6 13 2))
 
-        :export
-        (do (line! 9 2 9 11)
-            (line! 5 8 9 11)
-            (line! 13 8 9 11)
-            (line! 3 15 15 15))
+      ;; download into a tray
+      :export
+      (do (line! 9 3 9 11)
+          (line! 5 7 9 11)
+          (line! 13 7 9 11)
+          (line! 4 12 4 15)
+          (line! 4 15 14 15)
+          (line! 14 15 14 12))
 
-        :html
-        (do
-          ;; "< >" code glyph: a chevron pair inside a document-ish box
-          (line! 5 5 5 15)
-          (line! 5 15 15 15)
-          (line! 15 15 15 5)
-          (line! 15 5 5 5)
-          (line! 6 8 9 10)
-          (line! 9 10 6 12)
-          (line! 11 8 14 10)
-          (line! 14 10 11 12))
+      ;; "</>" code glyph
+      :html
+      (do (line! 7 6 4 9)
+          (line! 4 9 7 12)
+          (line! 11 6 14 9)
+          (line! 14 9 11 12)
+          (line! 10 5 8 13))
 
-        :clear
-        (do (line! 5 5 13 13)
-            (line! 13 5 5 13))))
+      ;; clear — bold X
+      :clear
+      (do (line! 5 5 13 13)
+          (line! 13 5 5 13))
 
+      ;; microphone (push-to-talk)
+      :mic
+      (do (fill-round! 7 2.5 4 8 2)
+          (let [p (Path2D$Double.)]
+            (.moveTo p (X 4.5) (X 8.5))
+            (.curveTo p (X 4.5) (X 13) (X 13.5) (X 13) (X 13.5) (X 8.5))
+            (.draw g2 p))
+          (line! 9 12.5 9 15.5)
+          (line! 6.5 15.5 11.5 15.5))
+
+      ;; fallback: a dash (never throws on an unknown kind)
+      (line! 4 9 14 9))
     (.dispose g2)
     (ImageIcon. img)))
 

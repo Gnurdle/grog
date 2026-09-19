@@ -207,6 +207,40 @@
   (or (projects/active-memory-db-path)
       (str root "/.grog-memory.db")))
 
+(defn memory-config-path
+  "Path to the grog-memory server's file config (`~/.config/grog/memory.edn`)."
+  ^String []
+  (str (config/ensure-config-dir!) "/memory.edn"))
+
+(defn- write-memory-config!
+  "Point the grog-memory server at the ACTIVE project's store (or the repo-root
+  default) by writing its file config. The server reads this file, not env — and
+  grog (not the server) resolves the path, so per-project memory works and paths
+  stay native on Windows. Preserves a user-set `:max-open`."
+  ^String []
+  (let [p   (memory-config-path)
+        cur (try (edn/read-string (slurp (io/file p))) (catch Exception _ nil))
+        m   (merge {:max-open 8} (when (map? cur) cur)
+                   {:db (memory-db-path (grog-root))})]
+    (spit (io/file p) (with-out-str (pprint/pprint m)))
+    p))
+
+(defn project-search-config-path
+  "Path to the grog-project-search server's file config."
+  ^String []
+  (str (config/ensure-config-dir!) "/project-search.edn"))
+
+(defn- write-project-search-config!
+  "Point the grog-project-search server at the projects home + the ACTIVE project
+  by writing its file config (the server reads this, not env). grog resolves the
+  path, so Windows paths stay correct."
+  ^String []
+  (let [p (project-search-config-path)
+        m (cond-> {:projects-dir (.getPath (config/projects-dir))}
+            (projects/project-name) (assoc :project (projects/project-name)))]
+    (spit (io/file p) (with-out-str (pprint/pprint m)))
+    p))
+
 (defn default-eca-config-path
   "The standard ECA config file this generator starts from."
   ^String []
@@ -304,16 +338,26 @@
   "The grog MCP server specs, keyed by server id."
   []
   (let [root (grog-root)
+        ;; These servers take their config from FILES in the grog config home
+        ;; (they ignore env). grog writes them here, resolving paths itself —
+        ;; so project scoping works and Windows paths stay native.
+        _ (write-memory-config!)
+        _ (write-project-search-config!)
         servers
         {"grog-imaging"
      (shell-wrapped (str root "/grog-imaging")
                     "clojure -M:mcp"
                     nil)
 
+     ;; JVM memory (Clojure/SQLite), served by the grog-mcp bundle restricted to
+     ;; its memory tools — no Python/venv. Reads the same `memory.edn` and uses a
+     ;; byte-compatible schema, so existing mem.db files work as-is. The server
+     ;; KEY stays "grog-memory" so ECA tool names (grog-memory__assoc_*) don't
+     ;; change and existing allowlists keep working.
      "grog-memory"
-     (shell-wrapped (str root "/grog-memory")
-                    "PYTHONPATH=src .venv/bin/python -m grog_memory.server"
-                    {"GROG_MEMORY_DB" (memory-db-path root)})
+     (shell-wrapped (str root "/grog_mcp")
+                    "clojure -M:mcp --server grog-memory"
+                    nil)
 
      "grog-office"
      (shell-wrapped (str root "/grog-office")
@@ -328,9 +372,7 @@
      "grog-big"
      (shell-wrapped (str root "/grog-big")
                     "clojure -M:mcp"
-                    {"GROG_BIG_URL" "http://localhost:4000/v1"
-                     "GROG_BIG_MODEL" "big"
-                     "GROG_BIG_API_KEY" "sk-dummy"})
+                    nil)
 
      "grog-babashka"
      (shell-wrapped (str root "/grog-babashka")
@@ -350,8 +392,7 @@
      "grog-project-search"
      (shell-wrapped (str root "/grog-project-search")
                     "clojure -M:mcp"
-                    {"GROG_PROJECTS_DIR" (.getPath (config/projects-dir))
-                     "GROG_PROJECT" (or (projects/project-name) "")})}]
+                    nil)}]
     (cond-> servers
       (imap-configured?)
       (assoc "grog-imap"
@@ -375,8 +416,9 @@
   be written to a log).
 
   Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
-  lands in the real debug log (`grog-ui.log` via grog-ui's tee), even when
-  called from a worker thread whose `*err*` is bound to the transcript pane.
+  lands in the real debug log (`grog-ui.<pid>.log`, via grog.log's in-process
+  tee), even when called from a worker thread whose `*err*` is bound to the
+  transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]
   (.println System/err (str "==== grog: ECA config (re)written -> " path))
@@ -483,7 +525,7 @@
 
 (defn- eca-config-debug! [& xs]
   "One-line ECA-config trace written to the **real** stderr so it lands in the
-  grog debug log (`grog-ui.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
+  grog debug log (`grog-ui.<pid>.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
   rebinding."
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 

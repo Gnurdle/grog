@@ -7,6 +7,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
   (:require [grog.appearance :as appearance]
+            [grog.config :as config]
             [grog.ui.fonts :as uifonts])
   (:import (java.awt BorderLayout Font)
            (java.awt.event WindowAdapter)
@@ -24,7 +25,7 @@
   "Resolve the [binary & args] to run in the PTY: $SHELL (fallback bash),
   launched with a clean rc so JediTerm renders a clean, single-echo shell."
   ^"[Ljava.lang.String;" []
-  (let [sh (or (not-empty (System/getenv "SHELL")) "bash")]
+  (let [sh (config/shell-command)]
     (into-array String [sh])))
 
 (defn- empty-zdotdir!
@@ -79,7 +80,7 @@
   Closing the frame closes the connector and destroys the process. Call on the
   EDT."
   ^JFrame []
-  (let [sh-name (or (not-empty (System/getenv "SHELL")) "bash")
+  (let [sh-name (config/shell-command)
         ^PtyProcess proc (start-pty)]
     (if (nil? proc)
       (doto (JFrame. (str "grog terminal — failed to start PTY (" sh-name ")"))

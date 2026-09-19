@@ -89,9 +89,11 @@ Optional LibreOffice for rendering.
 | `close_document` | Free a document handle |
 
 ### grog-memory — associative key/value store
-Persistent SQLite key/value memory. **Python/sqlite3 + FastMCP.** Per-project
-isolation by pointing `GROG_MEMORY_DB` at a per-project file. (A Clojure/SQLite
-re-implementation exists for the consolidated bundle.)
+Persistent SQLite key/value memory. **Clojure/SQLite (JVM)** — served by the
+`grog-mcp` bundle (`--server grog-memory`), no Python. Per-project isolation via
+`~/.config/grog/memory.edn` (`:db` points at the active project's store; grog
+writes it). Byte-compatible with the original Python server (same schema), so
+existing `mem.db` files work as-is. The `grog-memory/` Python server is legacy.
 
 | Tool | Description |
 |---|---|
@@ -186,7 +188,7 @@ The bundle delivers ~52 tools including the SQLite `assoc_*` memory store.
 | grog-big | Clojure | 1 | `big_model_ask` |
 | grog-imaging | Clojure | 10 | pdf/ocr/vision |
 | grog-office | Clojure | 10 | docx editing |
-| grog-memory | Python | 7 | assoc kv-store |
+| grog-memory | Clojure/SQLite | 7 | assoc kv-store |
 | grog-odoo | Clojure | 6 | read-only Odoo |
 | grog-imap | Clojure | 13 | email |
 | grog-gitlab | Clojure | 15 | GitLab REST (read-only) |

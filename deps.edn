@@ -1,5 +1,8 @@
 {:paths ["src" "resources"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        ;; portable filesystem helpers (pure Clojure, JVM + bb) — used for
+        ;; per-instance log management so no shell/PowerShell is needed
+        babashka/fs {:mvn/version "0.5.34"}
         clj-http/clj-http {:mvn/version "3.13.0"}
         cheshire/cheshire {:mvn/version "5.13.0"}
         org.jline/jline {:mvn/version "3.29.0"}

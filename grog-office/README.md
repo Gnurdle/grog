@@ -45,7 +45,8 @@ the `.map.edn` calibration rows.
 - **Format:** only `.docx` (POI). Convert `.doc`/`.odt` first.
 - **Replace** only changes character data; the replacement is placed entirely in
   the first matched run so its `rPr` (the pixel-critical style) is preserved.
-- **Render** shells out to headless `soffice`/`libreoffice` (set `GROG_OFFICE_BIN`),
-  and PNG pages via `pdftoppm` (set `GROG_PDFTOPM`). POI has no layout engine, so
-  this is the pragmatic ground-truth proxy — authoritative-but-approximate.
+- **Render** shells out to headless `soffice`/`libreoffice` (override with
+  `:bin` in `~/.config/grog/office.edn`), and PNG pages via `pdftoppm` (override
+  with `:pdftoppm`). POI has no layout engine, so this is the pragmatic
+  ground-truth proxy — authoritative-but-approximate.
 - Row addresses and cell addresses are **0-based**.

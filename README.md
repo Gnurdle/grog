@@ -212,7 +212,7 @@ per-server + per-tool inventory, see [`mcp-servers.md`](mcp-servers.md).**
 | `grog-big` | Clojure | `big_model_ask` — delegate to a stronger model | provider URL/key |
 | `grog-imaging` | Clojure | `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings`, `read_office_document`, `crop_workspace_image` | Tesseract, JVM deps |
 | `grog-office` | Clojure | `import_document`, `list_blocks`, `get_text`, `find_text`, `replace_text`, `render`, `save` | LibreOffice (optional) |
-| `grog-memory` | Python | `assoc_store / assoc_get / assoc_keys / assoc_delete / assoc_search` | `python` (pinned `mcp<2`) |
+| `grog-memory` | Clojure/SQLite (JVM) | `assoc_store / assoc_get / assoc_keys / assoc_delete / assoc_search` | none (served by the `grog-mcp` bundle) |
 | `grog-odoo` | Clojure | `odoo_search_read`, `odoo_execute_sql`, … | Odoo creds in your instance config |
 | `grog-imap` | — | email account commands | IMAP creds |
 <text/markdown/>

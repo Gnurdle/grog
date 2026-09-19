@@ -277,17 +277,42 @@
   "Extensions treated as readable context text (lowercased)."
   #{".md" ".txt" ".edn" ".json" ".adoc" ".markdown"})
 
+(def ^:private max-context-file-bytes
+  "Per-file cap for loaded project context (notes). Larger files are skipped so a
+  runaway log/export can never blow up the prompt context."
+  (* 256 1024))
+
 (defn- read-text-file
-  "Best-effort slurp of a (small) text file; nil on any failure."
+  "Best-effort slurp of a (small) text file; nil on any failure or when the file
+  exceeds `max-context-file-bytes`."
   ^String [^File f]
   (try
-    (let [s (slurp f :encoding "UTF-8")]
-      (when (seq (str/trim s)) (str/trim s)))
+    (when (<= (.length f) max-context-file-bytes)
+      (let [s (slurp f :encoding "UTF-8")]
+        (when (seq (str/trim s)) (str/trim s))))
     (catch Exception _ nil)))
+
+(def ^:private chat-log-filename
+  "The per-project chat-log filename under `dialog/`. It IS the conversation, so
+  it must never be loaded as standing context: doing so re-embeds the entire
+  (unbounded, growing) history into every prompt, duplicating the chat and
+  eventually stalling the model."
+  "thread.edn")
+
+(defn- context-text-file?
+  "True for a text-ish context file, excluding the project chat log
+  (`dialog/thread.edn`)."
+  [^File f]
+  (let [nm (str/lower-case (.getName f))]
+    (and (not= nm chat-log-filename)
+         (boolean (some #(str/ends-with? nm %) text-extensions)))))
 
 (defn list-context-files
   "Text-ish files under a project's `notes/` and `dialog/` subdirs, as `File`s
-  (relative to the project dir). Used to decide what counts as \"relevant context\"."
+  (relative to the project dir). Used to decide what counts as \"relevant context\".
+  The project chat log (`dialog/thread.edn`) is excluded — it is the conversation
+  itself, replayed (bounded) by `grog.project-dialog/thread-as-system-appendix`
+  where wanted, never re-embedded as raw standing context."
   [^File proj-dir]
   (letfn [(walk [^File base]
             (when (.isDirectory base)
@@ -297,8 +322,7 @@
                                        (mapcat (fn [^File f]
                                                 (cond
                                                   (.isDirectory f) (walk f)
-                                                  (some #(str/ends-with? (str/lower-case (.getName f)) %)
-                                                        text-extensions) [f]
+                                                  (context-text-file? f) [f]
                                                   :else []))))))]
     (vec (mapcat (fn [root] (walk (io/file proj-dir root)))
                  ["notes" "dialog"]))))
@@ -320,8 +344,8 @@
 (defn load-context
   "Load a project's relevant context as a markdown string: a short header with the
   project path, manifest description (if any), and top-level layout, then the
-  contents of its `notes/` and `dialog/` text files (best effort). Returns nil when
-  no active project / no dir."
+  contents of its `notes/` text files (best effort; the `dialog/thread.edn` chat
+  log is deliberately excluded). Returns nil when no active project / no dir."
   ^String []
   (when-let [proj-dir (project-dir-for-active)]
     (let [proj (project-name)]
