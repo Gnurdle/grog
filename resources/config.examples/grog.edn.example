@@ -64,7 +64,12 @@
 ;; :voice {:enabled true
 ;;         :command ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
 ;;         :sample-rate 16000
-;;         :max-seconds 60}
+;;         :max-seconds 60
+;;         ;; hold-to-talk chord (press = record, release = transcribe). Default
+;;         ;; "ctrl shift SPACE"; change it if that clashes on your box, e.g.
+;;         ;; "F9" or "ctrl shift V". (Avoid alt+SPACE = window menu and
+;;         ;; ctrl+SPACE = Linux IME toggle.)
+;;         :push-to-talk-key "ctrl shift SPACE"}
 
 ;; Operational knobs (all optional; env vars remain overrides for one-off runs):
 ;;   ;:log {:dir "~/grog-ui" :keep 5}          ; per-instance GUI logs (<dir>.<pid>.log)

@@ -54,6 +54,20 @@
   (let [v (:max-seconds (voice-cfg))]
     (if (and (number? v) (pos? (long v))) (long v) 60)))
 
+(defn push-to-talk-key
+  "KeyStroke string for hold-to-talk (`:voice :push-to-talk-key`; default
+  \"ctrl shift SPACE\"). Swing KeyStroke syntax, e.g. \"ctrl shift SPACE\",
+  \"F9\", \"ctrl alt M\".
+
+  Default avoids the usual collisions: Alt+Space is the WM window menu,
+  Ctrl+Space is the Linux IME toggle, and Ctrl+Alt+* can be AltGr on many
+  layouts."
+  ^String []
+  (let [v (:push-to-talk-key (voice-cfg))]
+    (if (and (string? v) (seq (str/trim v)))
+      (str/trim v)
+      "ctrl shift SPACE")))
+
 (defn- audio-format ^AudioFormat [^long rate]
   ;; 16-bit signed little-endian mono — the de-facto STT input format.
   (AudioFormat. (float rate) 16 1 true false))

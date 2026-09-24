@@ -14,6 +14,14 @@ grog-memory.db
 grog-memory/*.db
 grog-memory/gmail-cleanup
 
+# Stray assoc stores the BUNDLE's memory server drops in its cwd. It resolves
+# `path` as a literal cwd-relative filename with NO .db suffix and no reserved
+# -name handling, so a caller passing "global" (or a nil stringified to "null")
+# lands an extensionless SQLite file in grog_mcp/. Not alpaca, not real config.
+grog_mcp/global
+grog_mcp/null
+grog_mcp/*.db
+
 # clj-kondo / clojure-lsp / classpath caches
 .clj-kondo/
 .lsp/

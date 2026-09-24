@@ -199,47 +199,55 @@
   (abs-path (System/getProperty "user.dir" ".")))
 
 (defn memory-db-path
-  "The grog-memory SQLite DB path. When a project is active it is the project's own
-  state store (`~/grog-projects/<proj>/state/mem.db`); otherwise the repo-root
-  default (`.grog-memory.db`). The GUI reconnects ECA with a fresh generated config
-  on project switch, so the memory server follows the active project."
-  ^String [root]
+  "The grog-memory SQLite store for the ACTIVE project:
+  `~/grog-projects/<proj>/state/mem.db`. grog is always in a project
+  (`resolve-active-project` guarantees one), so there is no repo-root fallback."
+  ^String []
   (or (projects/active-memory-db-path)
-      (str root "/.grog-memory.db")))
+      (throw (ex-info "no active project for memory store" {}))))
 
 (defn memory-config-path
-  "Path to the grog-memory server's file config (`~/.config/grog/memory.edn`)."
+  "Per-project grog-memory server config: `<project>/state/memory.edn`. Never a
+  global file — two sessions on different projects can't clobber each other."
   ^String []
-  (str (config/ensure-config-dir!) "/memory.edn"))
+  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/memory.edn"))
 
 (defn- write-memory-config!
-  "Point the grog-memory server at the ACTIVE project's store (or the repo-root
-  default) by writing its file config. The server reads this file, not env — and
-  grog (not the server) resolves the path, so per-project memory works and paths
-  stay native on Windows. Preserves a user-set `:max-open`."
+  "Write this project's grog-memory config (`{:db … :max-open …}`) and return its
+  path (handed to the server via `GROG_MEMORY_CONFIG`). Preserves a user-set
+  `:max-open`."
   ^String []
   (let [p   (memory-config-path)
         cur (try (edn/read-string (slurp (io/file p))) (catch Exception _ nil))
         m   (merge {:max-open 8} (when (map? cur) cur)
-                   {:db (memory-db-path (grog-root))})]
+                   {:db (memory-db-path)})]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
+
+(defn- memory-env
+  "Env for the grog-memory server: point it at this project's config file."
+  []
+  {"GROG_MEMORY_CONFIG" (write-memory-config!)})
 
 (defn project-search-config-path
-  "Path to the grog-project-search server's file config."
+  "Per-project grog-project-search config: `<project>/state/project-search.edn`."
   ^String []
-  (str (config/ensure-config-dir!) "/project-search.edn"))
+  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/project-search.edn"))
 
 (defn- write-project-search-config!
-  "Point the grog-project-search server at the projects home + the ACTIVE project
-  by writing its file config (the server reads this, not env). grog resolves the
-  path, so Windows paths stay correct."
+  "Write this project's grog-project-search config (projects home + active project)
+  and return its path (handed to the server via `GROG_PROJECT_SEARCH_CONFIG`)."
   ^String []
   (let [p (project-search-config-path)
-        m (cond-> {:projects-dir (.getPath (config/projects-dir))}
-            (projects/project-name) (assoc :project (projects/project-name)))]
+        m {:projects-dir (.getPath (config/projects-dir))
+           :project (projects/project-name)}]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
+
+(defn- project-search-env
+  "Env for the grog-project-search server: point it at this project's config file."
+  []
+  {"GROG_PROJECT_SEARCH_CONFIG" (write-project-search-config!)})
 
 (defn default-eca-config-path
   "The standard ECA config file this generator starts from."
@@ -250,6 +258,16 @@
   "Where grog writes its merged ECA config."
   ^String []
   (str (config/ensure-config-dir!) "/eca-config.generated.json"))
+
+(defn session-config-path
+  "Per-session generated ECA config path — one file per project/tab — so
+  concurrent sessions never overwrite each other's config."
+  ^String [project]
+  (let [d (io/file (config/ensure-config-dir!) "sessions")
+        safe (-> (str (or (some-> project str str/trim not-empty) "default"))
+                 (str/replace #"[^A-Za-z0-9._-]" "_"))]
+    (.mkdirs d)
+    (str (.getPath d) "/" safe ".json")))
 
 (defn approved-tools-path
   "Persistent store of tool names grog has been asked to always allow."
@@ -338,11 +356,6 @@
   "The grog MCP server specs, keyed by server id."
   []
   (let [root (grog-root)
-        ;; These servers take their config from FILES in the grog config home
-        ;; (they ignore env). grog writes them here, resolving paths itself —
-        ;; so project scoping works and Windows paths stay native.
-        _ (write-memory-config!)
-        _ (write-project-search-config!)
         servers
         {"grog-imaging"
      (shell-wrapped (str root "/grog-imaging")
@@ -357,7 +370,7 @@
      "grog-memory"
      (shell-wrapped (str root "/grog_mcp")
                     "clojure -M:mcp --server grog-memory"
-                    nil)
+                    (memory-env))
 
      "grog-office"
      (shell-wrapped (str root "/grog-office")
@@ -391,6 +404,11 @@
 
      "grog-project-search"
      (shell-wrapped (str root "/grog-project-search")
+                    "clojure -M:mcp"
+                    (project-search-env))
+
+     "grog-alpaca"
+     (shell-wrapped (str root "/grog-alpaca")
                     "clojure -M:mcp"
                     nil)}]
     (cond-> servers
@@ -533,7 +551,8 @@
   "Produce the merged ECA config map and write it to
   `(generated-config-path)`, dumping it to the debug log. Returns the written path."
   ([] (generate-config! (default-eca-config-path)))
-  ([base-path]
+  ([base-path] (generate-config! base-path (generated-config-path)))
+  ([base-path out-path]
    (let [base-file (io/file base-path)
          base-exists? (.exists base-file)
          base-parsed (when base-exists?
@@ -569,7 +588,7 @@
                     (cond-> model (assoc :defaultModel model))
                     (add-approval!)
                     (add-rules!))
-         out (generated-config-path)]
+         out (or out-path (generated-config-path))]
      (spit (io/file out) (json/generate-string merged {:pretty true}))
      (debug-dump-config! out merged)
      out)))

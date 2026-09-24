@@ -37,8 +37,11 @@
 ;; (env vars are intentionally NOT read — file-config normalization, like the
 ;; Python grog-memory server. GROG_MEMORY_DB / GROG_MEMORY_MAX_OPEN are gone.)
 (defn- config-file ^java.io.File []
-  (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
-           ".config/grog/memory.edn"))
+  ;; grog hands the PER-PROJECT config path via GROG_MEMORY_CONFIG; fall back to
+  ;; the config-home default only when run standalone.
+  (or (some-> (System/getenv "GROG_MEMORY_CONFIG") str str/trim not-empty io/file)
+      (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
+               ".config/grog/memory.edn")))
 
 (defn- load-config []
   (let [f (config-file)]
@@ -47,11 +50,25 @@
            (catch Exception e (binding [*out* *err*] (println "memory config load error:" (.getMessage e))) {}))
       {})))
 
+(defn- ^String expand-tilde [s]
+  (str/replace-first (str s) #"^~(?=/|$)" (System/getProperty "user.home")))
+
 (defn- cfg [] (load-config))
 (defn- default-db []
-  (let [db (or (:db (cfg)) "grog-memory.db")]
-    (str/replace-first (str db) #"^~(?=/|$)" (System/getProperty "user.home"))))
+  (expand-tilde (or (:db (cfg)) "grog-memory.db")))
 (defn- max-open [] (long (or (:max-open (cfg)) 8)))
+
+(defn- ^String config-home-dir
+  "Mirror grog.platform/config-home-dir so both surfaces resolve `global` to the
+  same file: GROG_CONFIG_HOME, else ${XDG_CONFIG_HOME:-~/.config}/grog."
+  []
+  (let [home (or (some-> (System/getenv "HOME") str not-empty)
+                 (System/getProperty "user.home"))
+        raw (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
+                (str (or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
+                         (str home "/.config"))
+                     "/grog"))]
+    (expand-tilde raw)))
 
 ;; ---------------------------------------------------------------------------
 ;; Store registry: abs-path -> {:conn java.sql.Connection :u long}
@@ -65,10 +82,60 @@
   (str (java.time.OffsetDateTime/now)))
 
 (defn- abs-path
-  "Resolve a possibly-relative path to absolute (returns a java String)."
+  "Resolve a possibly-relative path to absolute (returns a java String).
+  A leading `~/` is expanded first — `Paths/get` alone would have made
+  `~/.config/grog/global-mem.db` a literal `~` directory under the process cwd."
   [p]
-  (let [^java.nio.file.Path path (Paths/get (str p) (make-array String 0))]
+  (let [^java.nio.file.Path path (Paths/get (expand-tilde p) (make-array String 0))]
     (str (.toAbsolutePath path))))
+
+;; --- store addressing -------------------------------------------------------
+;; grog's assoc tools address a store by `name` (see grog.assoc-memory, the CLI
+;; twin): the reserved label `global` ALWAYS means the cross-project store at
+;; <config-home>/global-mem.db, any other label is a `<name>.db` beside the
+;; default store, and no label means the default — the active project's
+;; state/mem.db when grog exported GROG_MEMORY_CONFIG.
+;;
+;; Without this the MCP dropped `name` on the floor: a caller asking for
+;; "global" silently hit the default (project) store, so writes landed there
+;; AND reads of them succeeded there too — a false-positive round trip that
+;; left global-mem.db unreachable while a project was active.
+
+(defn- store-label
+  "The store label a caller passed (`name`/`store`/`Namespace`), or nil."
+  [args]
+  (some-> (or (:name args) (:store args) (:Namespace args)) str str/trim not-empty))
+
+(defn- reserved-global? [label]
+  (boolean (and label (re-matches #"(?i)global" label))))
+
+(defn- safe-label? [label]
+  (and (re-matches #"[A-Za-z0-9._-]+" label)
+       (not (str/starts-with? label "."))
+       (not (str/ends-with? label "."))
+       (not (str/includes? label ".."))))
+
+(defn- effective-store
+  "Absolute path of the store this call addresses.
+  Precedence: `handle` (a store already opened) > `name` (a store label;
+  reserved `global` always wins over the active project) > configured default."
+  ^String [args]
+  (let [h (some-> (:handle args) str str/trim not-empty)
+        l (store-label args)]
+    (cond
+      h (abs-path h)
+
+      (some? l)
+      (if (reserved-global? l)
+        (abs-path (str (config-home-dir) java.io.File/separator "global-mem.db"))
+        (do (when-not (safe-label? l)
+              (throw (ex-info (str "invalid store name \"" l
+                                   "\" — use only letters, digits, '_', '-', '.'; a store maps to <name>.db")
+                              {:name l})))
+            (abs-path (str (java.io.File. (.getParentFile (java.io.File. ^String (default-db)))
+                                          (str l ".db"))))))
+
+      :else (abs-path (default-db)))))
 
 (defn- open-conn! [^String abs]
   (doto (DriverManager/getConnection (str "jdbc:sqlite:" abs))
@@ -111,10 +178,16 @@
 ;; Tools (same contract as the Python server)
 ;; ---------------------------------------------------------------------------
 
-(defn assoc-open-store [path]
-  (let [h (connection path)
-        _ h]
-    (abs-path path)))
+(defn assoc-open-store
+  "Open a store (creating parents/file as needed) and return its absolute path
+  as a `handle`. Address it by explicit `path`, by a `name` label (reserved
+  `global` = the cross-project store), or by neither (the configured default)."
+  [args]
+  (let [target (if-let [p (some-> (:path args) str str/trim not-empty)]
+                 (abs-path p)
+                 (effective-store args))]
+    (connection target)
+    target))
 
 (defn assoc-close-store [handle]
   (locking lock
@@ -126,8 +199,8 @@
         "closed")
       (if conn "closed" "absent"))))
 
-(defn assoc-store [key value handle]
-  (let [conn (connection handle)]
+(defn assoc-store [key value store]
+  (let [conn (connection (effective-store store))]
     (locking lock
       (with-open [st (.prepareStatement ^Connection conn
                      "INSERT INTO assoc(key,value,updated_at) VALUES(?,?,?)
@@ -138,8 +211,8 @@
         (.executeUpdate st)))
     (str key)))
 
-(defn assoc-get [key handle]
-  (let [conn (connection handle)]
+(defn assoc-get [key store]
+  (let [conn (connection (effective-store store))]
     (locking lock
       (with-open [st (.prepareStatement ^Connection conn "SELECT value FROM assoc WHERE key=?")]
         (.setString st 1 (str key))
@@ -148,8 +221,8 @@
             (.getString rs 1)
             ""))))))
 
-(defn assoc-keys [handle]
-  (let [conn (connection handle)]
+(defn assoc-keys [store]
+  (let [conn (connection (effective-store store))]
     (locking lock
       (with-open [st (.prepareStatement ^Connection conn "SELECT key FROM assoc ORDER BY key")]
         (with-open [rs (.executeQuery st)]
@@ -158,16 +231,16 @@
               (conj! acc (.getString rs 1)))
             (pr-str (persistent! acc))))))))
 
-(defn assoc-delete [key handle]
-  (let [conn (connection handle)]
+(defn assoc-delete [key store]
+  (let [conn (connection (effective-store store))]
     (locking lock
       (with-open [st (.prepareStatement ^Connection conn "DELETE FROM assoc WHERE key=?")]
         (.setString st 1 (str key))
         (let [n (.executeUpdate st)]
           (if (pos? n) "deleted" "absent"))))))
 
-(defn assoc-search [substring handle]
-  (let [conn (connection handle)
+(defn assoc-search [substring store]
+  (let [conn (connection (effective-store store))
         like (str "%" substring "%")]
     (locking lock
       (with-open [st (.prepareStatement ^Connection conn "SELECT key,value FROM assoc WHERE key LIKE ? OR value LIKE ? ORDER BY key")]
@@ -196,31 +269,52 @@
 
 (def tools
   [{:name "assoc_open_store"
-    :description "Open an associative-memory store at `path` (absolute or relative; parent directories are created as needed). The file is created if it doesn't exist. Returns a handle - pass it as the `handle` argument to the other assoc_* tools to use this database (omit `handle` to use the default store)."
-    :schema "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
-    :fn (fn [a] (let [{:keys [path]} (parse-args a)] (assoc-open-store (str (or path "")))))}
+    :description (str "Open an associative-memory store and return its absolute path as a `handle`. "
+                      "Address it with `path` (absolute or relative, `~` expanded; parents are created as needed), "
+                      "or with `name` (reserved `global` = the cross-project store at <config-home>/global-mem.db; any "
+                      "other name = <name>.db beside the default store), or with neither (the default store — the active "
+                      "project's state/mem.db when grog set GROG_MEMORY_CONFIG). "
+                      "Pass the returned handle as `handle` to the other assoc_* tools (omit `handle` to use the default).")
+    :schema "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}}}"
+    :fn (fn [a] (let [m (parse-args a)] (assoc-open-store m)))}
    {:name "assoc_close_store"
     :description "Close and release the store opened by `assoc_open_store(handle)`. Returns 'closed' or 'absent'."
     :schema "{\"type\":\"object\",\"properties\":{\"handle\":{\"type\":\"string\"}},\"required\":[\"handle\"]}"
     :fn (fn [a] (let [{:keys [handle]} (parse-args a)] (assoc-close-store (str (or handle "")))))}
    {:name "assoc_store"
-    :description "Store a key->value entry in associative memory. Value is stored as a string; use JSON text for structured data. `handle` (optional) is a store returned by `assoc_open_store`; omit it to use the default store. Returns the key."
-    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"}},\"required\":[\"key\",\"value\"]}"
-    :fn (fn [a] (let [{:keys [key value handle]} (parse-args a)]
-                   (assoc-store (str (or key "")) (str (or value "")) (str (or handle "")))))}
+    :description (str "Store a key->value entry in associative memory. Value is stored as a string; use JSON text for structured data. "
+                      "`handle` (optional) is a store returned by `assoc_open_store`; `name` (optional) picks a store by label — reserved "
+                      "`global` = the cross-project store at <config-home>/global-mem.db (regardless of active project), any other name = "
+                      "<name>.db beside the default store. With neither, the default (active project's) store is used. "
+                      "Precedence: handle > name > default. Returns the key.")
+    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"key\",\"value\"]}"
+    :fn (fn [a] (let [m (parse-args a)]
+                  (assoc-store (str (or (:key m) "")) (str (or (:value m) "")) m)))}
    {:name "assoc_get"
-    :description "Return the value for `key`, or '' if absent. `handle` is an optional store from `assoc_open_store`; omit it to use the default store."
-    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"}},\"required\":[\"key\"]}"
-    :fn (fn [a] (let [{:keys [key handle]} (parse-args a)] (assoc-get (str (or key "")) (str (or handle "")))))}
+    :description (str "Return the value for `key`, or '' if absent. `handle` (optional) is a store from `assoc_open_store`; "
+                      "`name` (optional) picks a store by label — reserved `global` = the cross-project store at "
+                      "<config-home>/global-mem.db, any other name = <name>.db beside the default store. With neither, the "
+                      "default (active project's) store is used. Precedence: handle > name > default.")
+    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"key\"]}"
+    :fn (fn [a] (let [m (parse-args a)] (assoc-get (str (or (:key m) "")) m)))}
    {:name "assoc_keys"
-    :description "List all keys as a JSON array. `handle` is an optional store from `assoc_open_store`; omit it to use the default store."
-    :schema "{\"type\":\"object\",\"properties\":{\"handle\":{\"type\":\"string\"}}}"
-    :fn (fn [a] (let [{:keys [handle]} (parse-args a)] (assoc-keys (str (or handle "")))))}
+    :description (str "List all keys as a JSON array. `handle` (optional) is a store from `assoc_open_store`; `name` (optional) picks a "
+                      "store by label — reserved `global` = the cross-project store at <config-home>/global-mem.db (regardless of active "
+                      "project), any other name = <name>.db beside the default store. With neither, the default (active project's) store "
+                      "is used. Precedence: handle > name > default.")
+    :schema "{\"type\":\"object\",\"properties\":{\"handle\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}}}"
+    :fn (fn [a] (let [m (parse-args a)] (assoc-keys m)))}
    {:name "assoc_delete"
-    :description "Delete the entry for `key`. Returns 'deleted' or 'absent'. `handle` is an optional store from `assoc_open_store`; omit it to use the default store."
-    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"}},\"required\":[\"key\"]}"
-    :fn (fn [a] (let [{:keys [key handle]} (parse-args a)] (assoc-delete (str (or key "")) (str (or handle "")))))}
+    :description (str "Delete the entry for `key`. Returns 'deleted' or 'absent'. `handle` (optional) is a store from `assoc_open_store`; "
+                      "`name` (optional) picks a store by label — reserved `global` = the cross-project store at "
+                      "<config-home>/global-mem.db, any other name = <name>.db beside the default store. With neither, the default "
+                      "(active project's) store is used. Precedence: handle > name > default.")
+    :schema "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"key\"]}"
+    :fn (fn [a] (let [m (parse-args a)] (assoc-delete (str (or (:key m) "")) m)))}
    {:name "assoc_search"
-    :description "Return all (key, value) pairs whose key or value contains `substring`, as a JSON object. `handle` is an optional store from `assoc_open_store`; omit it to use the default store."
-    :schema "{\"type\":\"object\",\"properties\":{\"substring\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"}},\"required\":[\"substring\"]}"
-    :fn (fn [a] (let [{:keys [substring handle]} (parse-args a)] (assoc-search (str (or substring "")) (str (or handle "")))))}])
+    :description (str "Return all (key, value) pairs whose key or value contains `substring`, as a JSON object. `handle` (optional) is a "
+                      "store from `assoc_open_store`; `name` (optional) picks a store by label — reserved `global` = the cross-project "
+                      "store at <config-home>/global-mem.db, any other name = <name>.db beside the default store. With neither, the "
+                      "default (active project's) store is used. Precedence: handle > name > default.")
+    :schema "{\"type\":\"object\",\"properties\":{\"substring\":{\"type\":\"string\"},\"handle\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"substring\"]}"
+    :fn (fn [a] (let [m (parse-args a)] (assoc-search (str (or (:substring m) "")) m)))}])

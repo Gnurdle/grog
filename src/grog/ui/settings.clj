@@ -4,7 +4,6 @@
   (:require [clojure.string :as str]
             [grog.appearance :as appearance]
             [grog.config :as config]
-            [grog.eca :as eca]
             [grog.models :as models]
             [grog.secrets :as secrets]
             [grog.ui.fonts :as uifonts]
@@ -227,21 +226,29 @@
 ;; --- Models tab ------------------------------------------------------------
 
 (defn- apply-eca-model!
-  "Apply a newly chosen model to the whole GUI: update the session model (so
-  future `chat/prompt` calls use it), persist it as `:eca :model`, refresh the
-  config and footer, and notify the running ECA child to switch — so the change
-  shows up as `chat/selectedModelChanged` traffic in the debug log."
-  [m]
+  "Apply a newly chosen model to the whole GUI: persist it as `:eca :model`,
+  refresh the config, and update the footer.
+
+  `on-model` is the owning session's setter (see `grog.ui/build-session!`) and
+  is the authoritative path when present: it updates that session's own `:model`
+  atom — which is what BOTH the shared status bar renders and `chat/prompt`
+  reads — and notifies that session's ECA child with the correct arity/session.
+
+  Without it all we can do is poke the global footer refs, and the next
+  `render-bar!` pass re-renders from the still-stale session atom, clobbering
+  the label; prompts likewise keep using the old model until a restart reseeds
+  the atom from `:eca :model`."
+  [m on-model]
   (let [id (models/qualify-eca-model m
                                      nil
                                      (try (config/llm-url) (catch Exception _ nil)))]
     (when id
-      (uifooter/set-model-ref! id)
-      (models/save-eca-model! id)
-      (config/reload!)
-      (uifooter/set-model! id)
-      (when (eca/connected?)
-        (eca/selected-model! id)))
+      (if on-model
+        (on-model id)
+        (do (uifooter/set-model-ref! id)
+            (models/save-eca-model! id)
+            (config/reload!)
+            (uifooter/set-model! id))))
     id))
 
 (defn- to-eca-id
@@ -276,9 +283,16 @@
     row))
 
 (defn- build-models-tab
-  "Default provider + a fully-editable list of named models (profiles)."
-  ^JPanel []
-  (let [llm (models/llm-config)
+  "Default provider + a fully-editable list of named models (profiles).
+
+  `opts` carries the owning session's callbacks:
+
+    :on-model   apply a chosen ECA model to that session + the status bar
+    :on-refresh re-render the shared status bar (config-only edits)"
+  ^JPanel [opts]
+  (let [on-model   (:on-model opts)
+        on-refresh (:on-refresh opts)
+        llm (models/llm-config)
         model-tf (JTextField. (str (or (:model llm) "")))
         url-tf   (JTextField. (str (or (:url llm) "")))
         max-sp   (JSpinner. (SpinnerNumberModel. (int (or (:max-tokens llm) 0)) 0 131072 256))
@@ -399,7 +413,11 @@
                                 :max-tokens (int (.getValue max-sp))
                                 :temperature (double (.getValue temp-sp))})
           (config/clear-llm-override!)
-          (config/reload!))))
+          (config/reload!)
+          ;; The status bar falls back to config/model when the session has no
+          ;; ECA model of its own — re-render so an edited default shows up
+          ;; now instead of after a restart.
+          (when on-refresh (on-refresh)))))
     (.addActionListener pick-btn
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
@@ -411,7 +429,7 @@
                 (.setText url-tf (:url r))
                 (models/save-fields! (merge {:model (:model r)} (when (:url r) {:url (:url r)})))
                 (config/clear-llm-override!)
-                (apply-eca-model! eca-id)))))))
+                (apply-eca-model! eca-id on-model)))))))
     (.addActionListener save-prof
       (reify java.awt.event.ActionListener
         (actionPerformed [_ _]
@@ -479,25 +497,31 @@
       (.add vbox BorderLayout/NORTH))))
 
 (defn show-settings!
-  "Open a modal tabbed settings dialog owned by `owner` (a JFrame)."
-  [^JFrame owner]
-  (let [dlg (JDialog. ^JFrame owner "grog settings" true)
-        tabs (JTabbedPane.)
-        close-btn (widgets/styled-button "Close")
-        bottom (JPanel. (FlowLayout. FlowLayout/RIGHT))]
-    (.addTab tabs "General" (build-general-tab))
-    (.addTab tabs "Appearance" (build-appearance-tab))
-    (.addTab tabs "Models" (build-models-tab))
-    (.addTab tabs "Terminal" (build-terminal-tab))
-    (.addTab tabs "About" (stub-tab "grog — an AI chat plus terminal."))
-    (.addActionListener close-btn
-      (reify java.awt.event.ActionListener
-        (actionPerformed [_ _] (.dispose dlg))))
-    (.add bottom close-btn)
-    (.setLayout dlg (BorderLayout.))
-    (.add dlg tabs BorderLayout/CENTER)
-    (.add dlg bottom BorderLayout/SOUTH)
-    (.setSize dlg 620 520)
-    (.setLocationRelativeTo dlg owner)
-    (.setVisible dlg true)
-    dlg))
+  "Open a modal tabbed settings dialog owned by `owner` (a JFrame).
+
+  `opts` is forwarded to the Models tab. The owning session passes
+  `{:on-model … :on-refresh …}` so a model change lands on that session's
+  `:model` atom — the value the shared status bar renders and `chat/prompt`
+  reads — rather than only the global footer refs."
+  ([owner] (show-settings! owner nil))
+  ([^JFrame owner opts]
+   (let [dlg (JDialog. ^JFrame owner "grog settings" true)
+         tabs (JTabbedPane.)
+         close-btn (widgets/styled-button "Close")
+         bottom (JPanel. (FlowLayout. FlowLayout/RIGHT))]
+     (.addTab tabs "General" (build-general-tab))
+     (.addTab tabs "Appearance" (build-appearance-tab))
+     (.addTab tabs "Models" (build-models-tab opts))
+     (.addTab tabs "Terminal" (build-terminal-tab))
+     (.addTab tabs "About" (stub-tab "grog — an AI chat plus terminal."))
+     (.addActionListener close-btn
+       (reify java.awt.event.ActionListener
+         (actionPerformed [_ _] (.dispose dlg))))
+     (.add bottom close-btn)
+     (.setLayout dlg (BorderLayout.))
+     (.add dlg tabs BorderLayout/CENTER)
+     (.add dlg bottom BorderLayout/SOUTH)
+     (.setSize dlg 620 520)
+     (.setLocationRelativeTo dlg owner)
+     (.setVisible dlg true)
+     dlg)))

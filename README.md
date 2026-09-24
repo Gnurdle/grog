@@ -201,7 +201,6 @@ Most are optional — the model only sees servers that reach `running`, and the
 minimal useful set is `grog-memory` + `grog-babashka`. **For the complete
 per-server + per-tool inventory, see [`mcp-servers.md`](mcp-servers.md).**
 
-<text/markdown>
 | Server | Stack | Tools (representative) | Needs |
 |---|---|---|---|
 | `grog-babashka` | Clojure | `run_babashka` — sandboxed Clojure transform | `bb` on PATH |
@@ -215,7 +214,6 @@ per-server + per-tool inventory, see [`mcp-servers.md`](mcp-servers.md).**
 | `grog-memory` | Clojure/SQLite (JVM) | `assoc_store / assoc_get / assoc_keys / assoc_delete / assoc_search` | none (served by the `grog-mcp` bundle) |
 | `grog-odoo` | Clojure | `odoo_search_read`, `odoo_execute_sql`, … | Odoo creds in your instance config |
 | `grog-imap` | — | email account commands | IMAP creds |
-<text/markdown/>
 
 - `grog-babashka` is **always enabled**. `grog-memory` is the project-state store.
 - Wire them into ECA via the generated config: `grog.eca-config/generate-config!`

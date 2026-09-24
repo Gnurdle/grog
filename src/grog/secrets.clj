@@ -38,7 +38,11 @@
    {:account llm-api-account
     :description "LLM API key for OpenAI-compatible providers (OpenRouter, OpenAI, Groq, etc.)"}
    {:account gitlab-token-account
-    :description "GitLab Personal Access Token (header PRIVATE-TOKEN) for the grog-gitlab MCP"}])
+    :description "GitLab Personal Access Token (header PRIVATE-TOKEN) for the grog-gitlab MCP"}
+   {:account "ALPACA_API_KEY"
+    :description "Alpaca API key id (grog-alpaca; APCA-API-KEY-ID)"}
+   {:account "ALPACA_SECRET_KEY"
+    :description "Alpaca API secret (grog-alpaca; APCA-API-SECRET-KEY)"}])
 
 (def ^:private !extra-secret-defs
   "User-registered account defs (from grog.edn `:secrets {:accounts […]}`), added

@@ -20,7 +20,8 @@
   read accessors are intended for the EDT."
   (:require [clojure.string :as str]
             [grog.appearance :as appearance]
-            [grog.md-render :as md-render])
+            [grog.md-render :as md-render]
+            [grog.tool-args :as tool-args])
   (:import (java.awt Color Cursor Dimension Font FontMetrics Graphics Graphics2D
                      Point Rectangle RenderingHints Toolkit)
            (java.awt Image)
@@ -117,6 +118,39 @@
                 unicode-fallback-families)
           base))))
 
+(defn- font-for-char
+  "The font to draw the single-character string `s` with: `base` when it can,
+  else the first composite logical fallback that can, else `base`."
+  ^Font [^Font base ^String s]
+  (if (<= (.canDisplayUpTo base s) -1)
+    base
+    (or (some (fn [fam]
+                (let [c (Font. fam (.getStyle base) (.getSize base))]
+                  (when (<= (.canDisplayUpTo c s) -1) c)))
+              unicode-fallback-families)
+        base)))
+
+(defn- runs-with-fallback
+  "Split `text` into styled runs, picking a font PER CHARACTER that can render
+  it: the chat font where it can, a composite logical font for characters it
+  lacks (emoji, exotic symbols). `display-font` swaps a whole run at once, which
+  is fine for a paragraph but wrong for a table cell like `\"✅ `code`\"` — here
+  the ASCII keeps Fira Code and only the emoji falls back, instead of the whole
+  cell losing its monospace face (or dropping to a `[?]` tofu box)."
+  [^Font base ^String text color]
+  (if (str/blank? text)
+    []
+    (loop [i 0, runs []]
+      (if (>= i (count text))
+        runs
+        (let [f (font-for-char base (subs text i (inc i)))
+              j (loop [k (inc i)]
+                  (if (and (< k (count text))
+                           (= f (font-for-char base (subs text k (inc k)))))
+                    (recur (inc k))
+                    k))]
+          (recur (long j) (conj runs {:text (subs text i j) :font f :color color})))))))
+
 (defn- runs-text ^String [runs]
   (apply str (map :text runs)))
 
@@ -199,14 +233,52 @@
                         (Font. "Monospaced" Font/PLAIN 13))
             fm (.getFontMetrics g f)
             lines (wrap-text-plain fm text max-w)]
-        (loop [lines lines, off 0, acc (transient [])]
-          (if-let [ln (first lines)]
-            (let [len (count ln)]
-              (if (zero? len)
-                (recur (rest lines) off acc)
-                (recur (rest lines) (+ off len)
-                       (conj! acc (slice-runs runs off (+ off len))))))
-            (persistent! acc)))))))
+        ;; `lines` from wrap-text-plain is a FLAT element stream whose
+        ;; concatenation equals the source text: paragraph chunks interleaved
+        ;; with literal "\n" marker elements. The markers exist purely so char
+        ;; offsets stay aligned for slice-runs. Two wrong readings, each visible
+        ;; as broken vertical rhythm:
+        ;;   * drawing every marker as its own row added a phantom blank line
+        ;;     after EVERY newline — thinking/status read as double-spaced;
+        ;;   * dropping markers entirely swallowed real paragraph breaks
+        ;;     ("a\n\nb" collapsed from 3 lines to 2) and lost the "\n" chars.
+        ;; Correct reading: a marker TERMINATES the row being accumulated and
+        ;; belongs to it (its char keeps the row at full font height). Two
+        ;; consecutive markers therefore yield a genuine blank row, while a
+        ;; trailing newline yields none.
+        (loop [ls lines, off 0, start 0, acc (transient [])]
+          (if-let [ln (first ls)]
+            (let [len (count ln)
+                  end (+ off len)
+                  nxt (second ls)]
+              (cond
+                ;; A marker closes whatever row is open, absorbing its own
+                ;; char — so the row keeps full font height. A marker that
+                ;; follows an EMPTY paragraph is therefore exactly a real
+                ;; blank line, while a marker after a line of text just ends
+                ;; that line.
+                (= ln "\n")
+                (recur (rest ls) end end (conj! acc (slice-runs runs start end)))
+
+                (zero? len)
+                (recur (rest ls) off start acc)
+
+                ;; A wrapped element IS a display line and normally closes its
+                ;; own row — but if a marker follows, defer, so the newline is
+                ;; absorbed into this row instead of earning a phantom row of
+                ;; its own. (Closing every element unconditionally was the
+                ;; original double-spacing bug; closing none collapsed an
+                ;; entire wrapped paragraph into one row.)
+                (not= nxt "\n")
+                (if (< start end)
+                  (recur (rest ls) end end (conj! acc (slice-runs runs start end)))
+                  (recur (rest ls) end start acc))
+
+                :else
+                (recur (rest ls) end start acc)))
+            (if (< start off)
+              (persistent! (conj! acc (slice-runs runs start off)))
+              (persistent! acc))))))))
 
 (defn- wrap-text
   "Single-style text → wrapped lines (one run each)."
@@ -414,6 +486,35 @@
           rows)))
 
 (def ^:private table-cell-pad 26)
+(def ^:private table-min-col 36)
+
+(defn- fit-widths
+  "Shrink `widths` so they total at most `maxw`, never below `table-min-col`.
+  Water-fills: it repeatedly takes the current overflow from the columns that
+  still have slack above the floor, in proportion to that slack — so a long
+  column gives up its length before a short one is squeezed to the minimum.
+  The previous single uniform shave floored every column at once and could leave
+  the table still wider than the pane (e.g. 300px available, 450px of columns)."
+  [widths ^double maxw]
+  (let [ws0 (mapv long widths)]
+    (if (<= (apply + ws0) maxw)
+      ws0
+      (loop [ws ws0]
+        (let [total (apply + ws)
+              slack (mapv #(- % table-min-col) ws)
+              tot-slack (apply + slack)]
+          (if (or (<= total maxw) (<= tot-slack 0))
+            ws
+            (let [over (- total maxw)
+                  ws' (mapv (fn [w s]
+                              (if (pos? s)
+                                (max table-min-col
+                                     (long (Math/floor (- (double w)
+                                                          (* (double over)
+                                                             (/ (double s) (double tot-slack)))))))
+                                w))
+                            ws slack)]
+              (if (= ws' ws) ws (recur ws')))))))))
 
 (defn- table-col-widths [ctx rows maxw]
   (let [^Graphics2D g (:g2 ctx)
@@ -421,23 +522,22 @@
         bold (:bold (:fonts ctx))
         ncols (apply max 1 (map (comp count :cells) rows))
         widths (vec (for [i (range ncols)]
-                      (apply max 36
+                      (apply max table-min-col
                              (map (fn [r]
                                     (when-let [c (nth (:cells r) i nil)]
                                       ;; measure with the cell's *actual* paint
-                                      ;; font: bold headers are wider than the
-                                      ;; base font, so sizing them with base
-                                      ;; metrics let the header text crowd the
-                                      ;; next column.
+                                      ;; font(s): bold headers are wider than the
+                                      ;; base font, and a fallback glyph (emoji)
+                                      ;; is wider than the base `.notdef` — so
+                                      ;; measure each run with its own font.
                                       (let [f (if (:header? r) bold base)
-                                            fm (.getFontMetrics g f)]
-                                        (+ (.stringWidth fm c) table-cell-pad))))
-                                  rows))))
-        total (apply + widths)]
-    (if (<= total maxw)
-      widths
-      (let [share (max 1 (long (/ (- total maxw) ncols)))]
-        (mapv (fn [w] (max 36 (- w share))) widths)))))
+                                            w (reduce (fn [acc {:keys [text font]}]
+                                                        (+ acc (.stringWidth (.getFontMetrics g font) text)))
+                                                      0.0
+                                                      (runs-with-fallback f c nil))]
+                                        (+ w table-cell-pad))))
+                                  rows))))]
+    (fit-widths widths maxw)))
 
 (defn- table-layout
   "Single source of truth for table geometry, shared by measurement, painting
@@ -459,8 +559,10 @@
                 (let [cf (if (:header? row) bold f)
                       cells (or (:cells row) [])]
                   (mapv (fn [i]
-                          (wrap-text g {:font cf :color (:text pal)}
-                                     (or (nth cells i "") "")
+                          ;; per-character font fallback so emoji the chat font
+                          ;; lacks (Fira Code has no ✅/⛔) render as real glyphs
+                          ;; instead of a `[?]` tofu box.
+                          (wrap-runs g (runs-with-fallback cf (or (nth cells i "") "") (:text pal))
                                      (nth widths i)))
                         (range ncols))))
               rows)
@@ -681,8 +783,53 @@
         hdr (+ (.getHeight (.getFontMetrics g (:base (:fonts ctx)))) 8)]
     (if open?
       (+ hdr 8
-         (lines-height g (wrap-runs g (status-runs ctx (:thinking (:pal ctx)) text) maxw)))
+         ;; MUST wrap at the same width paint-thinking! draws and
+         ;; rows-for-message lays out (maxw - 20: card text sits 10px in from
+         ;; each edge). Measuring at plain maxw yielded FEWER lines than were
+         ;; actually painted, so the card came up short and the text ran past
+         ;; its bottom border.
+         (lines-height g (wrap-runs g (status-runs ctx (:thinking (:pal ctx)) text)
+                                    (max 40 (- maxw 20)))))
       (+ hdr 2))))
+
+(defn- ^String clip-to-width
+  "Truncate `s` so it fits `w` px under `fm`, marking the cut with `…`.
+  Returns `s` unchanged when it already fits. Avoids splitting a surrogate
+  pair so a cut never leaves half a code point on the end."
+  [^FontMetrics fm ^String s ^long w]
+  (if (<= (.stringWidth fm s) (int w))
+    s
+    (let [tail "…"]
+      (loop [i (count s)]
+        (if (pos? i)
+          (let [cut (if (Character/isHighSurrogate (.charAt s (dec i))) (dec i) i)
+                cand (str (subs s 0 cut) tail)]
+            (if (<= (.stringWidth fm cand) (int w))
+              cand
+              (recur (dec i))))
+          tail)))))
+
+(defn- ^String tool-header-str
+  "The collapsed tool-card header: status icon, tool name, a one-line preview
+  of the call's PARAMETERS (falling back to ECA's `:summary` when it carries
+  none), duration and server — clipped to `maxw` px so a long command can't
+  spill past the card's rounded edge.
+
+  Without this the collapsed card showed the tool name alone, so every call
+  read as just \"shell\" with no idea what was actually run.
+
+  `font` must be the font the caller measures and draws with, so the clip
+  computed here agrees with what lands on screen."
+  [^Graphics2D g ^Font font {:keys [name args summary status ms server]} ^long maxw]
+  (let [fm (.getFontMetrics g font)
+        icon (case status :done "ok" :error "!!" :rejected "no" "...")
+        prev (or (tool-args/preview args)
+                 (tool-args/preview summary))
+        raw (str "  " icon " " name
+                 (when prev (str "  " prev))
+                 (when ms (str "  " ms "ms"))
+                 (when (seq server) (str "  [" server "]")))]
+    (clip-to-width fm raw (max 20 (- (long maxw) 24)))))
 
 (defn- tool-card-h [ctx {:keys [args summary expanded?] :as m} maxw]
   (let [^Graphics2D g (:g2 ctx)
@@ -766,10 +913,7 @@
                        :error (Color. 235 94 94)
                        :rejected (:status pal)
                        (:tool pal))
-        icon (case status :done "ok" :error "!!" :rejected "no" "...")
-        header (str "  " icon " " name
-                    (when-let [ms ms] (str "  " ms "ms"))
-                    (when (seq server) (str "  [" server "]")))
+        ^String header (tool-header-str g (:base (:fonts ctx)) m maxw)
         y0 (+ y (.getHeight fm) 12)]
     (.setColor g (:card pal))
     (.fillRoundRect g (int outer-pad) (int y) (int maxw) (int h) corner corner)
@@ -1414,10 +1558,9 @@
       (let [hdr-h (double (.getHeight (.getFontMetrics g (:base (:fonts ctx)))))
             hdr-row {:x0 (+ outer-pad 10.0) :y (+ y0 4.0) :h hdr-h
                      :font (:base (:fonts ctx))
-                     :text (str (case (:status m) :done "ok" :error "!!" :rejected "no" "...")
-                                " " (:name m)
-                                (when-let [ms (:ms m)] (str "  " ms "ms"))
-                                (when (seq (:server m)) (str "  [" (:server m) "]")))}
+                     ;; exactly the clipped, parameter-bearing header that
+                     ;; paint-tool! draws, so selection matches what's on screen
+                     :text (tool-header-str g (:base (:fonts ctx)) m inner)}
             args-str (pr-str (:args m))
             args-lines (wrap-runs g [{:text args-str :font (:mono (:fonts ctx))}] (max 40 (- inner 20)))
             args-rows (line->rows g (:mono (:fonts ctx)) args-lines (+ outer-pad 10)
@@ -1507,6 +1650,13 @@
   (let [^JComponent view (proxy [JComponent] []
                (getPreferredSize []
                  (Dimension. (max 100 (:width @st)) (max 1 (:total @st))))
+               ;; A scrollable view's MINIMUM must be tiny: JComponent defaults
+               ;; getMinimumSize to getPreferredSize, which here grows with the
+               ;; whole conversation — that would make the window unable to be
+               ;; resized smaller once the transcript is long (and, through the
+               ;; tabbed pane, would propagate the same floor to the frame).
+               (getMinimumSize []
+                 (Dimension. 120 80))
                (paintComponent [g]
                  (paint-view! this g st))
                ;; Dynamic per-item tooltips: thinking/tool headers say whether a
@@ -1519,7 +1669,14 @@
                        (when m
                          (case (:type m)
                            :thinking (if (:open? m) "Collapse thinking" "Expand thinking")
-                           :tool (if (:expanded? m) "Collapse tool call" "Expand tool call")
+                           :tool (let [prev (or (tool-args/preview (:args m) 400)
+                                                (tool-args/preview (:summary m) 400))]
+                                   (str (if (:expanded? m)
+                                          "Collapse tool call"
+                                          "Expand tool call")
+                                        ;; parameters on hover, beyond the
+                                        ;; header's clip — the full picture
+                                        (when prev (str "\n" prev))))
                            "Toggle")))
                      :copy-code "Copy code block"
                      :copy-message "Copy message"

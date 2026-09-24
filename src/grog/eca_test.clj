@@ -48,14 +48,14 @@
                     (binding [*out* *err*]
                       (println "  [event] " line))))
         logfn (fn [line] (binding [*out* *err*] (println "  [eca-stderr] " line)))
-        init (eca/connect! [{:uri (file-uri root) :name (str "grog-" (System/currentTimeMillis))}]
+        init (eca/connect! :eca-test [{:uri (file-uri root) :name (str "grog-" (System/currentTimeMillis))}]
                            :event-handler handler
                            :log-fn logfn
                            ;; quiet eca's own logging so stdout stays clean
                            :args ["--log-level" "warn"])]
     (println "== initialize ok:" init)
     (println "== sending chat/prompt: " message "  model=" model)
-    (let [resp (eca/prompt! message {:model model})]
+    (let [resp (eca/prompt! :eca-test message {:model model})]
       (println "== chat/prompt response:" resp)
       (when-let [chat-id (get-in resp [:ok :chatId])]
         (println "== chatId:" chat-id)
@@ -71,5 +71,5 @@
               (recur))))
         (println "== total events:")
         (doseq [e @seen] (println "   " e))))
-    (eca/disconnect!)
+    (eca/disconnect! :eca-test)
     (println "== disconnected")))

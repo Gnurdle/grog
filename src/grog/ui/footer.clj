@@ -7,7 +7,7 @@
   The status and trust indicators are *icons* (coloured dots) with tooltips,
   in the style of a desktop toolbar status area."
   (:require [clojure.string :as str])
-  (:import (java.awt Color RenderingHints)
+  (:import (java.awt BasicStroke Color RenderingHints)
            (java.awt.image BufferedImage)
            (javax.swing ImageIcon JLabel SwingUtilities)))
 
@@ -108,6 +108,34 @@
           (.setIcon l ic)
           (.setToolTipText l (str "status: " s)))))))
 
+(defn ^ImageIcon status-dot-icon
+  "The status dot as a standalone icon, using EXACTLY the footer's mode mapping
+  and colours — so a per-tab dot reads identically to the shared indicator.
+  `s` is an ECA status string/keyword (`\"idle\"`, `:executing`, …)."
+  [s]
+  (dot-icon (status-mode-color (status-mode s)) 14))
+
+(defn ^ImageIcon close-icon
+  "A drawn ✕ glyph in `size` px. Font-independent: the tab close control used to
+  be a JButton labelled with the literal U+2715 MULTIPLICATION X, which renders
+  as tofu in any font lacking that codepoint. Drawing it means it can never
+  depend on the look-and-feel font again."
+  ^ImageIcon [^Color color ^long size]
+  (let [sz (int size)
+        inset (int (max 2 (Math/round (* 0.28 (double sz)))))
+        img (BufferedImage. sz sz BufferedImage/TYPE_INT_ARGB)
+        g (.createGraphics img)]
+    (.setRenderingHint g RenderingHints/KEY_ANTIALIASING RenderingHints/VALUE_ANTIALIAS_ON)
+    (.setRenderingHint g RenderingHints/KEY_STROKE_CONTROL RenderingHints/VALUE_STROKE_PURE)
+    (.setColor g color)
+    (.setStroke g (BasicStroke. (float (max 1.4 (/ (double sz) 7.0)))
+                                BasicStroke/CAP_ROUND
+                                BasicStroke/JOIN_ROUND))
+    (.drawLine g inset inset (- sz inset) (- sz inset))
+    (.drawLine g (- sz inset) inset inset (- sz inset))
+    (.dispose g)
+    (ImageIcon. img)))
+
 ;; --- trust (YOLO) mode indicator --------------------------------------------
 
 (defonce trust-label-ref (atom nil))
@@ -130,3 +158,55 @@
               (.setToolTipText l "TRUST ON — tools auto-approved"))
           (do (.setIcon l (dot-icon (Color. 110 120 130) 14))
               (.setToolTipText l "trust off")))))))
+
+;; --- usage (tokens + cost) indicator ----------------------------------------
+;; Fed by ECA `usage` content events (see grog.ui/usage-event!). Shows the last
+;; prompt's totals plus the running session totals. Cost strings come from ECA
+;; already formatted to 2 decimals, so very cheap (local/free/OpenRouter-flash)
+;; models legitimately render as $0.00 — the token counts are the honest signal
+;; there.
+
+(defonce usage-label-ref (atom nil))
+
+(defn register-usage-label!
+  "Record the chat window's footer usage JLabel."
+  [^JLabel l]
+  (reset! usage-label-ref l)
+  l)
+
+(defn- fmt-tokens
+  "Compact token count: 950, 1.2k, 3.4M."
+  [n]
+  (let [n (long (or n 0))]
+    (cond
+      (>= n 1000000) (format "%.1fM" (/ n 1.0e6))
+      (>= n 1000)    (format "%.1fk" (/ n 1.0e3))
+      :else          (str n))))
+
+(defn- fmt-cost
+  "ECA cost string/number to `$0.00`, or `—` when unknown (no price table)."
+  [f]
+  (if (number? f) (format "$%.2f" (double f)) "—"))
+
+(defn set-usage!
+  "Update the footer usage label from `u`, a map of the last prompt's totals:
+
+    {:turn-tokens n :turn-cost f|nil :session-tokens n :session-cost f|nil}
+
+  `:turn-cost`/`:session-cost` are numbers (parsed from ECA's 2-dp strings) or
+  nil. Renders on the EDT; no-op if the label isn't registered. Empty text until
+  there's been a turn with tokens."
+  [u]
+  (when-let [l @usage-label-ref]
+    (SwingUtilities/invokeLater
+      (fn []
+        (let [txt (if (and u (pos? (long (or (:turn-tokens u) 0))))
+                    (str "last: " (fmt-tokens (:turn-tokens u)) " tok · " (fmt-cost (:turn-cost u))
+                         "  |  session: " (fmt-cost (:session-cost u))
+                         " · " (fmt-tokens (:session-tokens u)) " tok")
+                    "")]
+          (.setText l txt)
+          (.setToolTipText l
+            (str "Tokens/cost reported by ECA usage events. Cost is 2-dp "
+                 "(cheap models read $0.00). \"last\" covers the whole turn, "
+                 "including tool-loop round-trips. — = no price table for the model.")))))))

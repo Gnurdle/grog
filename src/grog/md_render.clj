@@ -24,53 +24,9 @@
 (def ^:private quote-style "\u001B[38;2;80;185;215m")
 (def ^:private link-url "\u001B[2m\u001B[38;2;70;175;205m")
 
-(def ^:private ^String open-marker "<text/markdown>")
-(def ^:private ^String close-std "</text/markdown>")
-(def ^:private ^String close-alt "<text/markdown/>")
-
-(defn- normalize-legacy-markdown-tags
-  "Map old <text-markdown> delimiters to <text/markdown> (order matters: self-close before open tag)."
-  ^String [^String s]
-  (-> s
-      (str/replace "<text-markdown/>" close-alt)
-      (str/replace "</text-markdown>" close-std)
-      (str/replace "<text-markdown>" open-marker)))
-
 (defn- make-parser []
   (let [exts (Arrays/asList (into-array [(TablesExtension/create)]))]
     (.build (.extensions (Parser/builder) exts))))
-
-(defn- next-close-index [^String s ^long from]
-  (let [a (str/index-of s close-std from)
-        b (str/index-of s close-alt from)]
-    (cond (and a b) (min a b)
-          a a
-          b b
-          :else nil)))
-
-(defn- close-tag-len [^String s ^long idx]
-  (cond (str/starts-with? (subs s idx) close-std) (count close-std)
-        (str/starts-with? (subs s idx) close-alt) (count close-alt)
-        :else (count close-std)))
-
-(defn- split-text-markdown-segments
-  "Returns a vector of plain or markdown segments in document order."
-  [^String s]
-  (let [n (count s)]
-    (loop [i 0, acc []]
-      (if (>= i n)
-        acc
-        (let [open-idx (str/index-of s open-marker i)]
-          (if (nil? open-idx)
-            (conj acc [:plain (subs s i)])
-            (let [acc1 (if (> open-idx i) (conj acc [:plain (subs s i open-idx)]) acc)
-                  content-start (+ open-idx (count open-marker))
-                  close-idx (next-close-index s content-start)]
-              (if (nil? close-idx)
-                (conj acc1 [:md (str/trim (subs s content-start))])
-                (let [inner (str/trim (subs s content-start close-idx))
-                      j (+ close-idx (long (close-tag-len s close-idx)))]
-                  (recur j (conj acc1 [:md inner])))))))))))
 
 (defn- iter-children [^Node parent walk-fn]
   (loop [^Node c (.getFirstChild parent)]
@@ -97,6 +53,16 @@
                #"(?i)</?text[-/]markdown/?>|</text[-/]markdown>"
                ""))
 
+(defn- delimiter-row?
+  "True when `line` is a GFM table delimiter row: an optional leading `|`, then
+  one or more `:?-{3,}:?` cells separated by `|`, and an optional trailing `|`.
+  Matches multi-cell rows like `|---|---|` — the previous single-cell pattern
+  did NOT, which made every well-formed table look delimiter-less and grow a
+  bogus `---` data row."
+  [^String line]
+  (boolean (re-matches #"(?i)\|?\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)*\s*\|?"
+                       (str/trim (or line "")))))
+
 (defn- delimiter-width-line
   "Given a `|`-delimited header line, produce a GFM `|---|` separator row with
   the same number of cells."
@@ -108,33 +74,49 @@
          (str/join "|" (repeat n "---"))
          "|")))
 
+(def ^:private fence-marker? #"^(?:```|~~~)")
+
 (defn- normalize-pipe-tables
   "Repair tables the model wrote without a delimiter row: when a contiguous
-  block of `|`-lines parses as a paragraph (no GFM table), insert a `---|---`
-  separator after the first line so CommonMark upgrades it to a TableBlock.
-  Only acts when the block clearly has no delimiter already (conservative)."
+  block of `|`-lines would otherwise parse as a plain paragraph, insert a
+  `---|---` separator after the first line so CommonMark upgrades it to a
+  TableBlock.
+
+  Conservative on three counts: it never touches lines inside a fenced code
+  block (a code sample showing a table must stay literal), it never inserts a
+  separator when the next line is already a valid delimiter row, and it only
+  acts on the FIRST line of a pipe block."
   ^String [^String s]
   (let [lines (str/split (or s "") #"\n")
-        out (loop [i 0 out (transient [])]
+        out (loop [i 0 in-fence? false out (transient [])]
               (if (>= i (count lines))
                 (persistent! out)
                 (let [line (nth lines i)
-                      is-pipe? (str/starts-with? (str/trim line) "|")
-                      has-delim? (re-matches #"(?i)\|?\s*:?-{3,}(?:\s*:?)\s*\|?" (str/trim line))]
+                      trimmed (str/trim line)
+                      fence-line? (boolean (re-matches fence-marker? trimmed))
+                      ;; an opening fence turns it on, a closing fence turns it off
+                      in-fence? (if fence-line? (not in-fence?) in-fence?)
+                      next-line (when (< (inc i) (count lines)) (nth lines (inc i)))
+                      prev-line (when (pos? i) (nth lines (dec i)))]
                   (cond
-                    (and is-pipe?
-                         (not has-delim?)
-                         (< (inc i) (count lines))
-                         (str/starts-with? (str/trim (nth lines (inc i))) "|")
+                    ;; never rewrite anything inside a fenced code block
+                    in-fence?
+                    (recur (inc i) in-fence? (conj! out line))
+
+                    (and (str/starts-with? trimmed "|")
+                         (not (delimiter-row? line))
+                         next-line
+                         (str/starts-with? (str/trim next-line) "|")
+                         (not (delimiter-row? next-line))
                          (or (zero? i)
-                             (not (str/starts-with? (str/trim (nth lines (dec i))) "|"))))
-                    (recur (inc i)
+                             (not (str/starts-with? (str/trim prev-line) "|"))))
+                    (recur (inc i) in-fence?
                            (-> out
                                (conj! line)
                                (conj! (delimiter-width-line line))))
 
                     :else
-                    (recur (inc i) (conj! out line))))))]
+                    (recur (inc i) in-fence? (conj! out line))))))]
     (str/join "\n" out)))
 
 (declare rewrite-single-backtick-code-with-newlines table-block-rows normalize-row-widths)
@@ -511,31 +493,26 @@
                 (recur (inc i) acc))))))))
 
 (defn- render-md-chunk
+  "Render one Markdown chunk to ANSI. Uses the same `parse!` pipeline as the GUI
+  (`strip-markdown-tags` → single-backtick repair → pipe-table normalization), so
+  the terminal and the GUI can never diverge on how a message is interpreted."
   ^String [^String markdown]
-  (let [parser (make-parser)
-        ^Document doc (.parse parser (rewrite-single-backtick-code-with-newlines markdown))
+  (let [^Document doc (parse! markdown)
         sb (StringBuilder.)]
     (.append sb body)
     (walk doc sb)
     (str sb)))
 
-(defn- render-segment [[kind payload]]
-  (case kind
-    :plain (str body payload)
-    :md (render-md-chunk payload)))
-
 (defn render-to-ansi
-  "Parse `markdown` as CommonMark (with GFM tables). If the string contains `<text/markdown>`,
-  only the regions up to `</text/markdown>` or `<text/markdown/>` are parsed as Markdown;
-  outside text is shown in the default body color. Legacy `<text-markdown>` tags are accepted.
-  On failure, returns the original text in the default body color."
+  "Render `markdown` as ANSI for the terminal. The whole string is parsed as
+  Markdown. The legacy `<text/markdown> … </text/markdown>` region markers are
+  still accepted (and stripped) for backward compatibility, but are no longer
+  needed — assistant output is Markdown end to end. On failure, returns the
+  original text in the default body color."
   ^String [^String markdown]
   (if (str/blank? markdown)
     ""
     (try
-      (let [s (normalize-legacy-markdown-tags markdown)]
-        (if (str/includes? s open-marker)
-          (str/join "" (map render-segment (split-text-markdown-segments s)))
-          (render-md-chunk s)))
+      (render-md-chunk markdown)
       (catch Exception _
         (str body markdown)))))

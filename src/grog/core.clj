@@ -25,6 +25,7 @@
             [grog.secrets :as secrets]
             [grog.skills :as skills]
             [grog.soul :as soul]
+            [grog.tool-args :as tool-args]
             [grog.with-api-key :as wkey]
             [grog.appearance :as appearance]
             [grog.assoc-memory :as assoc-memory]))
@@ -614,9 +615,13 @@
           (when-let [s (mcp/tool-log-summary nm args)]
             (tool-call-println! "grog: tool" nm (pr-str s)))
           (mcp/tool-name-mcp? nm)
-          (when-let [s (mcp/tool-log-summary nm args)]
-            (tool-call-println! "grog: tool" nm (pr-str s)))
-          :else (tool-call-println! "grog: tool" nm))
+                        (when-let [s (mcp/tool-log-summary nm args)]
+                      (tool-call-println! "grog: tool" nm (pr-str s)))
+                    ;; no summarizer for this tool: fall back to the raw parameters, so
+                    ;; the line says WHAT ran, not just which tool ran it.
+                    :else (if-let [p (tool-args/preview args 200)]
+                            (tool-call-println! "grog: tool" nm p)
+                            (tool-call-println! "grog: tool" nm)))
         (cond
           (= nm "brave_web_search") (brave/run-web-search! args)
           (= nm "read_office_document") (fs/run-read-office-document! args)

@@ -54,6 +54,7 @@
    :grog-odoo           {:name "grog-odoo" :version "0.3.0" :tools 'grog-odoo.main/build-tools}
    :grog-imap           {:name "grog-imap" :version "0.1.0" :tools 'grog-imap.main/build-tools}
    :grog-gitlab         {:name "grog-gitlab" :version "0.2.0" :tools 'grog-gitlab.main/build-tools}
+   :grog-alpaca         {:name "grog-alpaca" :version "0.1.0" :tools 'grog-alpaca.main/build-tools}
    :grog-memory         {:name "grog-memory" :version "1.30.0" :tools 'grog-mcp.memory/tools}})
 
 (def server-ids (set (keys servers)))

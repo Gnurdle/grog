@@ -42,7 +42,7 @@ def _read_config_edn() -> dict:
     Returns {"db": str, "max_open": int} overlaid on the built-in defaults.
     Missing/invalid file -> {} (never crashes the server at boot)."""
     cfg = {}
-    path = os.path.expanduser("~/.config/grog/memory.edn")
+    path = os.path.expanduser(os.environ.get("GROG_MEMORY_CONFIG") or "~/.config/grog/memory.edn")
     try:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()

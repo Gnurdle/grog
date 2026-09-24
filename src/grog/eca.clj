@@ -370,39 +370,39 @@
 ;; Public connection API
 ;; ---------------------------------------------------------------------------
 
-(defonce ^:private !conn (atom nil))
+(defonce ^:private !conns (atom {}))   ; session-id -> conn
 
-(defn connected? [] (boolean @!conn))
+(defn connected?
+  "True when ANY session is connected (0-arity), or when `id` is connected."
+  ([] (boolean (seq @!conns)))
+  ([id] (boolean (get @!conns id))))
 
-(defn process []
-  (:process @!conn))
+(defn process [id] (some-> (get @!conns id) :process))
 
 (defn alive?
-  "True if the ECA subprocess is running and we hold a connection."
-  []
-  (let [p (when-let [c @!conn] (:process c))]
+  "True if session `id`'s ECA subprocess is running and we hold a connection."
+  [id]
+  (let [p (some-> (get @!conns id) :process)]
     (and p (.isAlive ^Process p))))
 
-(defn- check-conn!
-  "Return the live connection or throw."
-  []
-  (or (when (alive?) @!conn)
-      (throw (ex-info "ECA client not connected" {}))))
+(defn- conn-of [id]
+  (or (when (alive? id) (get @!conns id))
+      (throw (ex-info "ECA client not connected" {:id id}))))
 
 (defn send-request!
-  "Send a JSON-RPC request `method`/`params` and wait for its response.
-  Returns {:ok result} or {:error err}."
-  [method params]
-  (let [conn (check-conn!)
-        id   (long (next-id! (:req-seq conn)))
-        kid  (str id)
+  "Send a JSON-RPC request `method`/`params` on session `id` and wait for its
+  response. Returns {:ok result} or {:error err}."
+  [id method params]
+  (let [conn (conn-of id)
+        rid  (long (next-id! (:req-seq conn)))
+        kid  (str rid)
         p    (promise)
         _    (.put ^ConcurrentHashMap (:pending conn) kid p)]
     (try
       (write-frame! (:out conn) (:write-lock conn)
-                    (cond-> {:jsonrpc "2.0" :id id :method method}
+                    (cond-> {:jsonrpc "2.0" :id rid :method method}
                       params (assoc :params params)))
-      (trace-frame! conn :out (cond-> {:jsonrpc "2.0" :id id :method method}
+      (trace-frame! conn :out (cond-> {:jsonrpc "2.0" :id rid :method method}
                                 params (assoc :params params)))
       (let [res (deref p rpc-timeout-ms ::timeout)]
         (if (= ::timeout res)
@@ -414,9 +414,9 @@
         (.remove ^ConcurrentHashMap (:pending conn) kid)))))
 
 (defn send-notify!
-  "Fire-and-forget JSON-RPC notification."
-  [method params]
-  (let [conn (check-conn!)]
+  "Fire-and-forget JSON-RPC notification on session `id`."
+  [id method params]
+  (let [conn (conn-of id)]
     (write-frame! (:out conn) (:write-lock conn)
                   (cond-> {:jsonrpc "2.0" :method method}
                     params (assoc :params params)))
@@ -442,39 +442,47 @@
     :cwd            working directory
 
   Returns the initialize response map on success, or throws."
-  [workspace-folders & {:as opts}]
-  (when @!conn
-    (throw (ex-info "ECA client already connected; disconnect! first" {})))
+  [id workspace-folders & {:as opts}]
+  (when (get @!conns id)
+    (throw (ex-info (str "ECA already connected for session " (pr-str id)
+                         "; disconnect! first")
+                    {:id id})))
   (let [conn (make-connection! opts)]
     ;; Register the connection before the handshake so send-request! / send-notify!
     ;; (which require a live connection) work during connect!.
-    (reset! !conn conn)
+    (swap! !conns assoc id conn)
     (try
-      (let [init (send-request! "initialize"
+      (let [init (send-request! id "initialize"
                                 {:processId (long (try (.pid (ProcessHandle/current)) (catch Exception _ 0)))
                                  :clientInfo {:name "grog" :version "0.1.0"}
                                  :capabilities {:codeAssistant {:chat true :rewrite false}}
                                  :workspaceFolders (vec workspace-folders)})]
         (if (:error init)
-          (do (disconnect!)
-              (throw (ex-info (str "ECA initialize failed: " (:error init)) {})))
-          (do (send-notify! "initialized" {})
+          (do (disconnect! id)
+              (throw (ex-info (str "ECA initialize failed: " (:error init)) {:id id})))
+          (do (send-notify! id "initialized" {})
               init)))
       (catch Exception e
-        (disconnect!)
+        (disconnect! id)
         (throw e)))))
 
 (defn disconnect!
-  "Politely shut down (shutdown -> exit) and kill the child process."
-  []
-  (when-let [conn @!conn]
-    (try (send-request! "shutdown" nil)
+  "Politely shut down session `id`'s ECA child (shutdown -> exit) and kill it."
+  [id]
+  (when-let [conn (get @!conns id)]
+    (try (send-request! id "shutdown" nil)
          (catch Exception _))
-    (try (send-notify! "exit" {})
+    (try (send-notify! id "exit" {})
          (catch Exception _))
     (try (.destroy ^Process (:process conn))
          (catch Exception _))
-    (reset! !conn nil))
+    (swap! !conns dissoc id))
+  nil)
+
+(defn disconnect-all!
+  "Tear down every session connection (process exit)."
+  []
+  (doseq [id (keys @!conns)] (disconnect! id))
   nil)
 
 ;; ---------------------------------------------------------------------------
@@ -482,11 +490,11 @@
 ;; ---------------------------------------------------------------------------
 
 (defn prompt!
-  "Start/continue a chat. `message` is required; opts may include :chatId,
-  :model, :agent, :variant, :trust, :contexts. Returns {:ok map} or {:error err}."
-  ([message] (prompt! message {}))
-  ([message {:keys [chatId model agent variant trust contexts]}]
-   (send-request! "chat/prompt"
+  "Start/continue a chat on session `id`. `message` is required; opts may include
+  :chatId, :model, :agent, :variant, :trust, :contexts. Returns {:ok map} or {:error err}."
+  ([id message] (prompt! id message {}))
+  ([id message {:keys [chatId model agent variant trust contexts]}]
+   (send-request! id "chat/prompt"
                   (cond-> {:message message}
                     chatId   (assoc :chatId chatId)
                     model    (assoc :model model)
@@ -496,39 +504,39 @@
                     contexts (assoc :contexts contexts)))))
 
 (defn stop!
-  "Stop the running prompt for `chatId`."
-  [chatId] (send-notify! "chat/promptStop" {:chatId chatId}))
+  "Stop the running prompt for `chatId` on session `id`."
+  [id chatId] (send-notify! id "chat/promptStop" {:chatId chatId}))
 
 (defn approve!
-  "Approve a tool call (toolCallRun with manualApproval)."
-  ([chatId toolCallId] (approve! chatId toolCallId {}))
-  ([chatId toolCallId {:keys [save]}]
-   (send-notify! "chat/toolCallApprove"
+  "Approve a tool call (toolCallRun with manualApproval) on session `id`."
+  ([id chatId toolCallId] (approve! id chatId toolCallId {}))
+  ([id chatId toolCallId {:keys [save]}]
+   (send-notify! id "chat/toolCallApprove"
                  (cond-> {:chatId chatId :toolCallId toolCallId}
                    save (assoc :save save)))))
 
 (defn reject!
-  "Reject a tool call."
-  [chatId toolCallId]
-  (send-notify! "chat/toolCallReject" {:chatId chatId :toolCallId toolCallId}))
+  "Reject a tool call on session `id`."
+  [id chatId toolCallId]
+  (send-notify! id "chat/toolCallReject" {:chatId chatId :toolCallId toolCallId}))
 
-(defn steer! [chatId message]
-  (send-notify! "chat/promptSteer" {:chatId chatId :message message}))
+(defn steer! [id chatId message]
+  (send-notify! id "chat/promptSteer" {:chatId chatId :message message}))
 
-(defn selected-model! [model & {:keys [chatId variant]}]
-  (send-notify! "chat/selectedModelChanged"
+(defn selected-model! [id model & {:keys [chatId variant]}]
+  (send-notify! id "chat/selectedModelChanged"
                 (cond-> {:model model}
                   chatId  (assoc :chatId chatId)
                   variant (assoc :variant variant))))
 
-(defn selected-agent! [agent & {:keys [chatId]}]
-  (send-notify! "chat/selectedAgentChanged"
+(defn selected-agent! [id agent & {:keys [chatId]}]
+  (send-notify! id "chat/selectedAgentChanged"
                 (cond-> {:agent agent}
                   chatId (assoc :chatId chatId))))
 
 (defn set-trust!
-  "Persist trust (yolo) mode for `chatId`: when on, tool calls that would
-  normally require manual approval are auto-accepted (deny rules still win).
-  Applies immediately to subsequent tool calls in the active prompt."
-  [chatId on?]
-  (send-request! "chat/update" {:chatId chatId :trust (boolean on?)}))
+  "Persist trust (yolo) mode for `chatId` on session `id`: when on, tool calls
+  that would normally require manual approval are auto-accepted (deny rules still
+  win). Applies immediately to subsequent tool calls in the active prompt."
+  [id chatId on?]
+  (send-request! id "chat/update" {:chatId chatId :trust (boolean on?)}))

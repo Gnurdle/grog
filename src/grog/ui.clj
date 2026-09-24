@@ -28,6 +28,7 @@
             [grog.projects :as projects]
             [grog.secrets :as secrets]
             [grog.session :as session]
+            [grog.tool-args :as tool-args]
             [grog.project-dialog :as project-dialog]
             [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
@@ -43,9 +44,10 @@
             [grog.soul :as soul])
   (:import (java.awt Color Component Font Graphics Graphics2D Image Toolkit BorderLayout FlowLayout Point)
            (javax.imageio ImageIO)
-           (javax.swing AbstractAction Box BoxLayout JComponent JDialog JFrame JLabel JList
+           (javax.swing AbstractAction Box BoxLayout JButton JComponent JDialog JFrame JLabel JList
                         JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
-                        JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities)
+                        JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities
+                        JTabbedPane)
            (java.util.concurrent LinkedBlockingQueue)
            (java.awt.datatransfer StringSelection)
            (java.awt.event KeyEvent MouseAdapter)))
@@ -88,6 +90,15 @@
   (let [s (str s)]
     (if (> (count s) n) (str (subs s 0 n) "…") s)))
 
+(defn- tool-args-str
+  "One-line `args=…` fragment for a tool content event's parameters, or nil.
+  ECA sends the parameters as a map (`:arguments`) or as text
+  (`:argumentsText`); both read fine as-is on a single debug line."
+  [c]
+  (when-let [p (or (tool-args/preview (:arguments c) 160)
+                   (tool-args/preview (:argumentsText c) 160))]
+    (str " args=" p)))
+
 (defn- summarize-content
   "A compact one-line summary of a `chat/contentReceived` content object."
   [c]
@@ -97,16 +108,20 @@
       "reasonText"      (str "type=" t " text=" (pr-str (trunc (:text c) 120)))
       "reasonStarted"   (str "type=" t " (thinking start)")
       "reasonFinished"  (str "type=" t " (thinking end)")
-      "toolCallPrepare" (str "type=" t " tool=" (:name c) (when-let [s (:summary c)] (str " — " (trunc s 80))))
+      "toolCallPrepare" (str "type=" t " tool=" (:name c)
+                             (tool-args-str c)
+                             (when-let [s (:summary c)] (str " — " (trunc s 80))))
       "toolCallRun"     (str "type=" t " tool=" (:name c)
+                             (tool-args-str c)
                              (when (true? (:manualApproval c)) " [manual approval]")
                              (when-let [s (:summary c)] (str " — " (trunc s 80))))
-      "toolCallRunning" (str "type=" t " tool=" (:name c))
+      "toolCallRunning" (str "type=" t " tool=" (:name c) (tool-args-str c))
       "toolCalled"      (str "type=" t " tool=" (:name c)
+                             (tool-args-str c)
                              (if (:error c) " ERR" "")
                              (when-let [ms (:totalTimeMs c)] (str " " ms "ms"))
                              (when-let [s (:summary c)] (str " — " (trunc s 80))))
-      "toolCallRejected" (str "type=" t " tool=" (:name c))
+      "toolCallRejected" (str "type=" t " tool=" (:name c) (tool-args-str c))
       "metadata"        (str "type=" t (when-let [ti (:title c)] (str " title=" (pr-str ti))))
       "flag"            (str "type=" t (when-let [tx (:text c)] (str " text=" (pr-str tx))))
       "usage"           (str "type=" t " usage=" (pr-str (dissoc c :type)))
@@ -386,6 +401,13 @@
 
 ;; (file-uri removed — ECA workspace URIs are built robustly in grog.projects/workspace-folders)
 
+(defn- parse-cost
+  "Parse an ECA cost string (e.g. \"0.03\") to a double, or nil when absent or
+  unparseable (the model has no price table, so ECA omits the cost fields)."
+  [s]
+  (when s
+    (try (Double/parseDouble (str s)) (catch Throwable _ nil))))
+
 (defn- make-event-handler
   "Build the ECA event handler for the transcript: renders `chat/contentReceived`
   (streaming inline), flips `running?` when a prompt finishes, and prompts the
@@ -401,7 +423,8 @@
   that has been sent but not yet confirmed consumed by ECA; `resend-steer!` is
   called with the steer text to re-issue it as a normal prompt if the run ends
   before ECA consumes it (the protocol's documented fallback)."
-  [^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!]
+  [sid ^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!
+   set-status! set-trust! usage-event!]
   (let [streamer (ecastream/make-streamer pane)
         ;; Accumulate assistant text across `text` content events so the
         ;; completed reply can be logged to the project dialog on finish.
@@ -441,7 +464,11 @@
             (when (and (= "text" (:type content))
                        (seq (str (:text content))))
               (swap! assistant-acc str (str (:text content))))
-            (streamer content)
+            ;; usage events carry token/cost totals — feed the footer readout
+            ;; instead of the transcript (which has nothing to render for them).
+            (if (= "usage" (:type content))
+              (usage-event! content)
+              (streamer content))
             (when (= "finished" (:state content))
               (finish!))
             ;; manual-approval tool call -> in YOLO mode auto-approve (everything
@@ -449,7 +476,7 @@
             ;; with a readable font and a click of YOLO to switch into trust mode.
             (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
               (if @yolo-ref
-                (eca/approve! @chat-id (:id content))
+                (eca/approve! sid @chat-id (:id content))
                 (let [id (:id content)
                       name (str (:name content))
                       summary (:summary content)
@@ -530,13 +557,13 @@
                       (actionPerformed [_]
                         (vreset! decided? true)
                         (.dispose dialog)
-                        (eca/approve! @chat-id id))))
+                        (eca/approve! sid @chat-id id))))
                   (.addActionListener reject
                     (proxy [java.awt.event.ActionListener] []
                       (actionPerformed [_]
                         (vreset! decided? true)
                         (.dispose dialog)
-                        (eca/reject! @chat-id id))))
+                        (eca/reject! sid @chat-id id))))
                   ;; "Approve tool" — permanently allow this tool in the
                   ;; approved-tools allowlist, then approve the current call.
                   (.addActionListener approve-tool
@@ -545,7 +572,7 @@
                         (vreset! decided? true)
                         (.dispose dialog)
                         (ecacfg/approve-tool! name)
-                        (eca/approve! @chat-id id))))
+                        (eca/approve! sid @chat-id id))))
                   (.addActionListener yolo
                     (proxy [java.awt.event.ActionListener] []
                       (actionPerformed [_]
@@ -554,16 +581,16 @@
                         ;; "YOLO" — approve this call and switch into trust mode
                         ;; so all future tool calls auto-approve.
                         (reset! yolo-ref true)
-                        (uifooter/set-trust-indicator! true)
-                        (eca/set-trust! @chat-id true)
-                        (eca/approve! @chat-id id))))
+                        (set-trust! true)
+                        (eca/set-trust! sid @chat-id true)
+                        (eca/approve! sid @chat-id id))))
                   ;; Dialog dismissed (X / Esc / lost focus) without a choice →
                   ;; treat as a safe reject rather than running the tool.
                   (.addWindowListener dialog
                     (proxy [java.awt.event.WindowAdapter] []
                       (windowClosed [_]
                         (when-not @decided?
-                          (eca/reject! @chat-id id)))))
+                          (eca/reject! sid @chat-id id)))))
                   ;; Show the MODAL approval dialog on the EDT. This handler runs
                   ;; on the ECA reader thread; showing a modal dialog directly off
                   ;; the EDT spins a nested event pump that can wedge the EDT and
@@ -581,7 +608,7 @@
         (let [st (str (:status params))]
           (when (= "idle" st)
             (finish!))
-          (uifooter/set-status! st))
+          (set-status! st))
 
         ;; ECA re-syncs its model catalog on startup/login: remember the full set
         ;; of provider-qualified ids so model qualification is exact — this is what
@@ -871,36 +898,96 @@
       (when (projects/project-exists? "Generic") "Generic")
       "default"))
 
-(defn- choose-project-dialog!
-  "Modal chooser shown when `blocked` is already open in another session.
-  Returns the chosen project name, or nil if the user cancels. Call on the EDT."
-  [^Component owner ^String blocked ^String reason]
-  (let [names (vec (remove #(= % blocked) (projects/list-project-names)))]
-    (when (seq names)
-      (some-> (JOptionPane/showInputDialog
-               owner
-               (str "Project \"" blocked "\" is already open in another grog session"
-                    (when reason (str " (" reason ")")) ".\n\n"
-                    "Pick a different project for THIS session:")
-               "Project already open"
-               JOptionPane/WARNING_MESSAGE
-               nil
-               (into-array Object names)
-               (first names))
-              str not-empty))))
+(defn- pick-or-create-project-dialog!
+  "Modal chooser: pick an existing project (excluding `blocked`, which is the one
+  already open elsewhere) OR type a name to create a new one. `message` is the
+  lead line (may contain simple HTML). Returns the chosen/typed project name, or
+  nil if the user cancels. Call on the EDT."
+  [^Component owner ^String message ^String blocked]
+  (let [names (vec (remove #(= % blocked) (projects/list-project-names)))
+        model (javax.swing.DefaultListModel.)
+        _ (doseq [n names] (.addElement model n))
+        lst (doto (JList. model)
+              (.setSelectionMode ListSelectionModel/SINGLE_SELECTION)
+              (.setFont (widgets/ui-font))
+              (.setVisibleRowCount 8))
+        _ (when (seq names) (.setSelectedIndex lst 0))
+        filter-field (doto (JTextField. 22)
+                       (.setFont (widgets/ui-font))
+                       (.setToolTipText "Type to filter the project list"))
+        apply-filter! (fn []
+                        (let [q (str/lower-case (str/trim (str (.getText filter-field))))
+                              filtered (if (str/blank? q)
+                                         names
+                                         (filterv #(str/includes? (str/lower-case %) q) names))]
+                          (.removeAllElements model)
+                          (doseq [n filtered] (.addElement model n))
+                          (when (seq filtered) (.setSelectedIndex lst 0))))
+        _ (.addDocumentListener (.getDocument filter-field)
+            (reify javax.swing.event.DocumentListener
+              (insertUpdate [_ _] (apply-filter!))
+              (removeUpdate [_ _] (apply-filter!))
+              (changedUpdate [_ _] (apply-filter!))))
+        scroll (doto (JScrollPane. lst)
+                 (.setPreferredSize (java.awt.Dimension. 340 170)))
+        name-field (doto (JTextField. 22) (.setFont (widgets/ui-font)))
+        msg (doto (JLabel. (str "<html>" message "</html>"))
+              (.setFont (widgets/ui-font)))
+        filter-row (doto (JPanel. (BorderLayout. 8 0))
+                     (.add (doto (JLabel. "Search:") (.setFont (widgets/ui-font)))
+                           BorderLayout/WEST)
+                     (.add filter-field BorderLayout/CENTER))
+        north (doto (JPanel. (BorderLayout. 0 6))
+                (.add msg BorderLayout/NORTH)
+                (.add filter-row BorderLayout/SOUTH))
+        new-row (doto (JPanel. (BorderLayout. 8 0))
+                  (.add (doto (JLabel. "New project:") (.setFont (widgets/ui-font)))
+                        BorderLayout/WEST)
+                  (.add name-field BorderLayout/CENTER))
+        panel (doto (JPanel. (BorderLayout. 0 10))
+                (.setBorder (javax.swing.BorderFactory/createEmptyBorder 8 8 8 8))
+                (.add north BorderLayout/NORTH)
+                (.add scroll BorderLayout/CENTER)
+                (.add new-row BorderLayout/SOUTH))
+        res (JOptionPane/showConfirmDialog owner panel "Project"
+                                           JOptionPane/WARNING_MESSAGE
+                                           JOptionPane/OK_CANCEL_OPTION)]
+    (when (= res JOptionPane/OK_OPTION)
+      (let [typed (str/trim (str (.getText name-field)))]
+        (cond
+          (seq typed)                    typed
+          (seq (.getSelectedValue lst))  (str (.getSelectedValue lst))
+          :else                          nil)))))
+
+(defn- ensure-project!
+  "Create `name` if it doesn't exist yet (full scaffold via `create-project!`),
+  make it the active project, and claim its session lock. Returns the name."
+  ^String [name]
+  (let [nm (str/trim (str name))]
+    (when (and (seq nm) (not (projects/project-exists? nm)))
+      (try (projects/create-project! nm) (catch Throwable _ nil)))
+    (projects/set-project! nm)
+    (session/claim! nm)
+    nm))
 
 (defn- resolve-exclusive-project!
-  "If the active project is already open in another session, offer alternatives
-  (or fall back to the generic/default project), then claim the lock for the
-  project this session will use. Returns the project name. Call on the EDT."
+  "If the active project is already open in another session, let the user pick a
+  different one OR create a new one (falling back to the generic/default project
+  on cancel), then claim the lock for the project this session will use.
+  Returns the project name. Call on the EDT."
   ^String []
   (let [proj (projects/project-name)]
     (if-let [h (session/holder proj)]
-      (let [choice (or (choose-project-dialog! nil proj (session/holder-desc h))
-                       (generic-project))]
-        (projects/set-project! choice)
-        (session/claim! choice)
-        choice)
+      (let [reason (session/holder-desc h)
+            msg (str "Project \"" proj "\" is already open in another grog session"
+                     (when reason (str " (" reason ")")) ".<br><br>"
+                     "Open a different project, or type a name to create a new one:")
+            choice (or (pick-or-create-project-dialog! nil msg proj)
+                       (generic-project))
+            ;; a typed name could still be the blocked (or another held) project —
+            ;; don't steal its lock; fall back to the generic/default project
+            choice (if (session/holder choice) (generic-project) choice)]
+        (ensure-project! choice))
       (do (session/claim! proj) proj))))
 
 (defn- show-project-manager!
@@ -1126,10 +1213,19 @@
             (catch Throwable _ nil))))
       (.setVisible dialog true))))
 
-(defn- build-chat-frame
-  "Build the chat frame (not yet shown). Returns the JFrame."
-  ^JFrame []
-  (let [transcript-scroll (transcript/make-chat-pane @logo-image)
+(defn- build-session!
+  "Build ONE chat session (a tab): transcript, prompt, toolbar, its own ECA
+  connection and state. Returns a session map whose `:panel` is the tab content.
+  `open-project!` opens/focuses a project tab; `refresh-bar!` re-renders the
+  shared status bar."
+  [^JFrame frame open-project! refresh-bar!]
+  (let [project (or (projects/project-name) "default")
+        ;; Unique per-tab id for THIS session's own ECA connection. Multiple
+        ;; tabs = multiple `eca server` processes; they must NOT share one
+        ;; connection (the old single global connection made a second tab fail
+        ;; with "already connected").
+        sid (str project "#" (System/nanoTime))
+        transcript-scroll (transcript/make-chat-pane @logo-image)
         pane (transcript/chat-pane transcript-scroll)
         prompt (JTextArea. 4 84)
         prompt-scroll (JScrollPane. prompt)
@@ -1155,7 +1251,7 @@
                     (.setIcon mic (widgets/action-icon :stop :color (Color. 160 160 170)))
                     (.setToolTipText mic "Transcribing…"))
         voice-stop! (fn []
-                      (let [h @voice-handle]
+                      (when-let [h @voice-handle]
                         (reset! voice-handle nil)
                         (mic-busy!)
                         (future
@@ -1201,36 +1297,72 @@
                           (transcript/append-status!
                            pane "[voice] disabled — add :voice {:enabled true :command [\"whisper-cli\" \"-m\" \"model.bin\" \"-f\" \"{wav}\" \"-nt\"]} to grog.edn")
                           :else (voice-start!)))
-        frame (JFrame. (str "grog — " (or (projects/project-name) "default")))
+        ;; Hold-to-talk via a keyboard chord: start on key PRESS, stop on
+        ;; RELEASE (see the frame-level chord binding). Idempotent, so the key's
+        ;; auto-repeat while held doesn't restart recording.
+        ptt-start! (fn []
+                     (when (and (not @voice-handle) (not @voice-busy))
+                       (try (config/reload!) (catch Throwable _))
+                       (if (voice/enabled?)
+                         (voice-start!)
+                         (transcript/append-status!
+                          pane "[voice] disabled — add :voice {:enabled true :command [\"whisper-cli\" \"-m\" \"model.bin\" \"-f\" \"{wav}\" \"-nt\"]} to grog.edn"))))
+        ptt-stop! (fn [] (when @voice-handle (voice-stop!)))
         queue (LinkedBlockingQueue.)
         running? (atom false)
         history-ref (atom [])
         chat-id (atom (projects/active-project-chat-id))
-        _ (uifooter/init-model! (models/qualify-eca-model (config/eca-model)
-                                                          nil
-                                                          (try (config/llm-url) (catch Exception _ nil))))
+        ;; per-session status/model/trust, shown by the SHARED status bar when
+        ;; this tab is active.
+        status (atom "idle")
+        model (atom (models/qualify-eca-model (config/eca-model)
+                                              nil
+                                              (try (config/llm-url) (catch Exception _ nil))))
         yolo-ref (atom false)   ; trust (yolo) mode: auto-approve all tool calls
+        ;; Per-prompt and per-session token/cost totals, folded from ECA `usage`
+        ;; content events. `:turn-*` is cleared at the start of each new prompt
+        ;; (send-fn); `:session-tokens` accumulates, while `:session-cost` is
+        ;; ECA's own cumulative figure carried through as-is. Costs are doubles
+        ;; parsed from ECA's 2-dp strings (nil when the model has no price).
+        usage-ref (atom {:turn-tokens 0 :turn-cost 0.0
+                         :session-tokens 0 :session-cost nil})
+        usage-event! (fn [content]
+                       (let [toks (long (or (:sessionTokens content) 0))
+                             lmc  (parse-cost (:lastMessageCost content))
+                             sc   (parse-cost (:sessionCost content))]
+                         (swap! usage-ref
+                                (fn [u]
+                                  (cond-> (-> u
+                                              (update :turn-tokens + toks)
+                                              (update :session-tokens + toks)
+                                              (update :turn-cost + (or lmc 0.0)))
+                                    sc (assoc :session-cost sc))))
+                         (refresh-bar!)))
         last-sent (atom nil)    ; last user message sent, to suppress ECA's echo
         pending-steer* (atom nil) ; steer text sent but not yet confirmed consumed by ECA
         connected (atom false)
-        event-handler (make-event-handler pane running? chat-id yolo-ref last-sent
+        set-status! (fn [st] (reset! status (str st)) (refresh-bar!))
+        set-trust!  (fn [on?] (reset! yolo-ref (boolean on?)) (refresh-bar!))
+        event-handler (make-event-handler sid pane running? chat-id yolo-ref last-sent
                                           pending-steer*
                                           (fn [s]
                                             ;; steer was dropped (run finished before
                                             ;; ECA consumed it): re-issue as a normal prompt
                                             (transcript/append-status! pane (str "[grog] resending as a prompt: " s))
                                             (reset! last-sent (str s))
-                                            (.put ^LinkedBlockingQueue queue (str s))))
+                                            (.put ^LinkedBlockingQueue queue (str s)))
+                                          set-status! set-trust! usage-event!)
         connect-eca! (fn []
                        (when-not @connected
                          (try
-                           (let [cfg (ecacfg/generate-config!)
+                           (let [cfg (ecacfg/generate-config! (ecacfg/default-eca-config-path)
+                                                              (ecacfg/session-config-path project))
                                  ws (projects/workspace-folders)
                                  _ (dbg! "ECA starting: config=" cfg
-                                         " model=" (or (uifooter/current-model) "(none)")
+                                         " model=" (or @model "(none)")
                                          " chatId=" @chat-id
                                          " workspace=" (pr-str ws))
-                                 init (eca/connect! ws
+                                 init (eca/connect! sid ws
                                                     :event-handler event-handler
                                                     :request-handler (make-request-handler pane)
                                                     :eca-binary (config/eca-binary)
@@ -1258,6 +1390,9 @@
                     (do
                       (reset! running? true)
                       (cancel/clear!)
+                      ;; new prompt -> clear the per-turn usage accumulator
+                      (swap! usage-ref assoc :turn-tokens 0 :turn-cost 0.0)
+                      (refresh-bar!)
                       (reset! last-sent (str text))
                       ;; persist the user's message to the project dialog
                       ;; (best effort; no-op without an active project)
@@ -1265,16 +1400,16 @@
                         (project-dialog/append-turn! :user (str text))
                         (catch Throwable e
                           (dbg! "dialog append user error:" (.getMessage e))))
-                      (dbg! "send-fn: connected, about to prompt -> " (pr-str (str text)) " model-next=" (pr-str (uifooter/current-model)))
+                      (dbg! "send-fn: connected, about to prompt -> " (pr-str (str text)) " model-next=" (pr-str @model))
                       (let [url (try (config/llm-url) (catch Exception _ nil))
                             ;; ECA needs an explicit model or it fails with
                             ;; "No available model found"; fall back to grog's
                             ;; configured model when the footer model is unset.
-                            model (or (some-> (uifooter/current-model)
+                            model (or (some-> @model
                                               (models/qualify-eca-model nil url))
                                       (models/qualify-eca-model (config/eca-model) nil url))]
                         (try
-                          (let [resp (eca/prompt! text {:chatId @chat-id
+                          (let [resp (eca/prompt! sid text {:chatId @chat-id
                                                         :model model
                                                         :trust @yolo-ref})
                                 ;; ECA reports model/backend failures IN-BAND as
@@ -1302,7 +1437,7 @@
                             (transcript/append-status! pane (str "[grog] " (.getMessage e)))))
                         (conj history {:user text})))))
         stop-action! (fn []
-                       (when @connected (eca/stop! @chat-id))
+                       (when @connected (eca/stop! sid @chat-id))
                        (cancel/cancel!)
                        (reset! running? false))
         set-model-fn (fn [name]
@@ -1310,18 +1445,19 @@
                                                           nil
                                                           (try (config/llm-url) (catch Exception _ nil)))]
                          (when (and @connected id)
-                           (eca/selected-model! id {:chatId @chat-id}))
+                           (eca/selected-model! sid id {:chatId @chat-id}))
+                         (reset! model id)
                          (uifooter/set-model-ref! id)
                          (when id (models/save-eca-model! id))
                          (config/reload!)
-                         (uifooter/set-model! id)
+                         (refresh-bar!)
                          (transcript/append-status! pane (str "model: " id))))
         set-yolo-fn (fn [on?]
                       (let [next (if (nil? on?) (not @yolo-ref) on?)]
                         (reset! yolo-ref next)
-                        (uifooter/set-trust-indicator! next)
+                        (refresh-bar!)
                         (when @connected
-                          (eca/set-trust! @chat-id next))
+                          (eca/set-trust! sid @chat-id next))
                         (transcript/append-status!
                          pane
                          (str "trust (yolo) mode: "
@@ -1348,7 +1484,7 @@
                             (reset! last-sent t)
                             (transcript/append-user! pane t)
                             (when @connected
-                              (eca/steer! @chat-id t)))
+                              (eca/steer! sid @chat-id t)))
                         ;; idle: queue a normal prompt as before
                         (do
                           (dbg! "submit -> queue: " (pr-str t) " running?=" @running?)
@@ -1425,7 +1561,15 @@
                                (actionPerformed [_ _] (show-shell!))))
     (.addActionListener settings (reify java.awt.event.ActionListener
                                    (actionPerformed [_ _]
-                                     (uisettings/show-settings! frame))))
+                                     ;; Hand the dialog THIS session's setters:
+                                     ;; the Models tab has to update the session
+                                     ;; :model atom (what the shared status bar
+                                     ;; renders and chat/prompt reads), not just
+                                     ;; the global footer refs.
+                                     (uisettings/show-settings!
+                                      frame
+                                      {:on-model set-model-fn
+                                       :on-refresh refresh-bar!}))))
     (.addActionListener export (reify java.awt.event.ActionListener
                                  (actionPerformed [_ _]
                                    (uiexport/save-transcript! frame pane))))
@@ -1471,33 +1615,9 @@
       (.add toolbar (Box/createHorizontalStrut 14))
       ;; project — a single toolbar button showing the current project name;
       ;; clicking it opens the project manager.  (No "project:" prefix label.)
-      (let [proj-btn (widgets/styled-button (or (projects/project-name) "default"))
-            update-btn! (fn []
-                          (.setText proj-btn
-                                    (str (or (projects/project-name) "default") "  ")))
-            switch-to! (fn [nm]
-                         (loop [nm nm, tries 0]
-                           (when (and (seq nm) (not= nm (projects/project-name)) (< tries 6))
-                             (if-let [h (session/holder nm)]
-                               ;; already open in another session -> offer another
-                               (do (transcript/append-status!
-                                    pane (str "[project] \"" nm "\" is open in another grog session"
-                                              " (" (session/holder-desc h) ") — pick a different one."))
-                                   (when-let [alt (choose-project-dialog! frame nm (session/holder-desc h))]
-                                     (recur alt (inc tries))))
-                               (do (session/release! (projects/project-name))
-                                   (when @connected
-                                     (eca/disconnect!)
-                                     (reset! connected false))
-                                   (projects/set-project! nm)
-                                   (session/claim! nm)
-                                   ;; new project -> new stable chat identity
-                                   (reset! chat-id (projects/active-project-chat-id))
-                                   (transcript/clear! pane)
-                                   (transcript/append-status! pane (str "Project: " nm))
-                                   (.setTitle frame (str "grog — " nm))
-                                   (connect-eca!)))))
-                         (update-btn!))
+      (let [proj-btn (widgets/styled-button project)
+            update-btn! (fn [] (.setText proj-btn (str project "  ")))
+            switch-to! (fn [nm] (open-project! nm))
             open-project-manager! (fn []
                                     (show-project-manager! frame switch-to!))]
           (update-btn!)
@@ -1507,25 +1627,6 @@
               (actionPerformed [_] (open-project-manager!))))
           (.add toolbar proj-btn)
           (.add toolbar (Box/createHorizontalStrut 14)))
-      ;; model — dainty, dim, small
-      (let [model-label (JLabel. (str " " (or (uifooter/current-model) (config/model))))
-            base (widgets/ui-font)
-            dainty (Font. (.getFamily base) Font/PLAIN (max 12 (int (/ (.getSize base) 1.4))))]
-        (.setFont model-label dainty)
-        (.setForeground model-label (Color. 140 142 152))
-        (.add toolbar (uifooter/register-label! model-label))
-        (.add toolbar (Box/createHorizontalStrut 16)))
-      ;; status — dot icon (running / idle / question), no text
-      (let [status-label (JLabel.)]
-        (.setOpaque status-label false)
-        (.add toolbar (uifooter/register-status-label! status-label))
-        (uifooter/set-status! "idle")
-        (.add toolbar (Box/createHorizontalStrut 10)))
-      ;; trust — dot icon (on / off), no text
-      (let [trust-label (JLabel.)]
-        (.setOpaque trust-label false)
-        (.add toolbar (uifooter/register-trust-label! trust-label))
-        (uifooter/set-trust-indicator! @yolo-ref))
       ;; Windows: re-assert opaque+dark on the toolbar and every child now that
       ;; all buttons/labels have been added — the LAF can lazily create its
       ;; internal content panel on first layout, so a second walk catches it.
@@ -1584,43 +1685,234 @@
         (.add south prompt-scroll BorderLayout/CENTER)
         (.add south toolbar BorderLayout/SOUTH)
         (.add root south BorderLayout/SOUTH))
-      ;; explicit black on frame + content so nothing light can peek through
-      (.setBackground root (Color. 0 0 0))
-      (.setContentPane frame root)
-      (.setBackground frame (Color. 0 0 0)))
-    (uifonts/install-zoom-bindings! (.getRootPane frame))
-    ;; Ctrl+E exports the whole conversation as colour-preserving HTML
-    (let [im (.getInputMap (.getRootPane frame) JComponent/WHEN_IN_FOCUSED_WINDOW)
-          am (.getActionMap (.getRootPane frame))]
-      (.put im (KeyStroke/getKeyStroke KeyEvent/VK_E (java.awt.event.InputEvent/CTRL_DOWN_MASK))
-            "grog-export")
-      (.put am "grog-export"
-            (proxy [AbstractAction] []
-              (actionPerformed [_] (uiexport/save-transcript! frame pane)))))
-    ;; register the chat panes for the shared appearance/zoom system
-    (uifonts/apply-all!)
+      ;; explicit black on the session panel so nothing light can peek through
+      (.setBackground root (Color. 0 0 0)))
     ;; greet with a snarky startup line in the transcript
     (let [snark (or (some-> (soul/startup-snark-line) str/trim not-empty)
                     chat-startup-snark-fallback)]
       (transcript/append-banner! pane snark))
+    {:project project
+     :panel (:panel bg)
+     :pane pane
+     :prompt prompt
+     :status status
+     :model model
+     :yolo-ref yolo-ref
+     :usage usage-ref
+     :connected connected
+     :connect! connect-eca!
+     :disconnect! (fn []
+                    (try (eca/disconnect! sid) (catch Throwable _ nil))
+                    (reset! connected false)
+                    (session/release! project))
+     :focus! (fn [] (.requestFocusInWindow prompt))
+     :set-yolo! set-yolo-fn
+     :ptt-start! ptt-start!
+     :ptt-stop! ptt-stop!
+     :stop! stop-action!}))
+
+(defn- tab-header
+  "A tab header for the tabbed chat frame: the session's LIVE status dot (the
+  same icon and colours as the footer's running/LLM indicator), the project
+  name, and a drawn ✕ that closes the tab.
+
+  `status-atom` is the session's `:status` atom; a watch keeps THIS tab's dot
+  current whether or not it is the active tab — which is the point of a
+  browser-style tab strip. `on-close` is a 0-arg fn."
+  ^JComponent [^String title status-atom ^Runnable on-close]
+  (let [dot (doto (JLabel. (uifooter/status-dot-icon @status-atom))
+              (.setToolTipText (str "status: " @status-atom)))
+        lbl (doto (JLabel. title) (.setFont (widgets/ui-font)))
+        ;; A drawn icon, not the literal U+2715 character: that codepoint is
+        ;; missing from plenty of UI fonts and rendered as a tofu box.
+        btn (doto (JButton. (uifooter/close-icon (Color. 205 210 220) 12))
+              (.setContentAreaFilled false)
+              (.setBorderPainted false)
+              (.setFocusable false)
+              (.setOpaque false)
+              (.setMargin (java.awt.Insets. 0 5 0 1))
+              (.setCursor (java.awt.Cursor/getPredefinedCursor java.awt.Cursor/HAND_CURSOR))
+              (.setToolTipText "Close tab")
+              (.addActionListener (reify java.awt.event.ActionListener
+                                    (actionPerformed [_ _] (.run on-close)))))
+        panel (doto (JPanel. (FlowLayout. FlowLayout/LEFT 0 0))
+                (.setOpaque false)
+                (.add dot)
+                (.add lbl)
+                (.add btn))]
+    ;; live dot for THIS tab, active or not; removed in close-session!
+    (add-watch status-atom :grog.ui/tab-dot
+               (fn [_ _ _ nv]
+                 (SwingUtilities/invokeLater
+                   (fn []
+                     (.setIcon dot (uifooter/status-dot-icon nv))
+                     (.setToolTipText dot (str "status: " nv))))))
+    panel))
+
+(defn- build-chat-frame
+  "Build the tabbed chat frame (not yet shown). One tab per project/session; a
+  shared status bar at the bottom reflects the ACTIVE tab."
+  ^JFrame []
+  (let [frame (JFrame. "grog")
+        tabs (JTabbedPane.)
+        sessions (atom [])          ; session maps, in tab order
+        active (atom nil)
+        ;; --- shared status bar (bottom) — reflects the active session ---
+        bar-model (JLabel.)
+        bar-status (JLabel.)
+        bar-trust (JLabel.)
+        bar-usage (JLabel.)
+        _ (uifooter/register-label! bar-model)
+        _ (uifooter/register-status-label! bar-status)
+        _ (uifooter/register-trust-label! bar-trust)
+        _ (uifooter/register-usage-label! bar-usage)
+        render-bar! (fn []
+                      (SwingUtilities/invokeLater
+                        (fn []
+                          (let [s @active]
+                            (uifooter/set-model! (or (some-> s :model deref) (config/model)))
+                            (uifooter/set-status! (or (some-> s :status deref) "idle"))
+                            (uifooter/set-trust-indicator! (boolean (some-> s :yolo-ref deref)))
+                            (uifooter/set-usage! (some-> s :usage deref))
+                            (uifooter/set-model-ref! (or (some-> s :model deref) (config/model)))))))
+        select! (fn [s]
+                  (when s
+                    (reset! active s)
+                    (.setSelectedComponent tabs (:panel s))
+                    (.setTitle frame (str "grog — " (:project s)))
+                    (render-bar!)
+                    (SwingUtilities/invokeLater
+                      (fn []
+                        (try
+                          ;; re-layout the newly-shown tab so the transcript/logo
+                          ;; pick up the current bounds after a switch/resize
+                          (.revalidate ^JComponent (:panel s))
+                          (.repaint ^JComponent (:panel s))
+                          ((:focus! s))
+                          (catch Throwable _ nil))))))
+        cycle! (fn [d]
+                 (when (pos? (.getTabCount tabs))
+                   (select! (nth @sessions (mod (+ (.getSelectedIndex tabs) d) (.getTabCount tabs))))))
+        close-session!
+        (fn close-session! [s]
+          (when s
+            (remove-watch (:status s) :grog.ui/tab-dot)
+            (let [i (.indexOfComponent tabs (:panel s))
+                  was-active? (identical? s @active)]
+              (try ((:disconnect! s)) (catch Throwable _ nil))
+              (swap! sessions (fn [xs] (vec (remove #(identical? % s) xs))))
+              (when (>= i 0) (.removeTabAt tabs i))
+              (if (seq @sessions)
+                ;; background tab, or the active one with others left -> fall
+                ;; back to the last remaining tab
+                (when was-active? (select! (last @sessions)))
+                ;; last tab closed -> EXIT, like a browser closing its final
+                ;; window. `:disconnect!` already detached this session; System/exit
+                ;; runs the shutdown hook that drops the remaining project locks and
+                ;; disconnects any stragglers.
+                (System/exit 0)))))
+        open-project!
+        (fn open-project! [nm]
+          (let [nm (str/trim (str nm))]
+            (when (seq nm)
+              (if-let [s (some #(when (= nm (:project %)) %) @sessions)]
+                (select! s)
+                (if-let [h (session/holder nm)]
+                  ;; open in ANOTHER process -> pick another, or create a new one
+                  (when-let [alt (pick-or-create-project-dialog!
+                                  frame
+                                  (str "Project \"" nm "\" is already open in another grog session"
+                                       (when-let [d (session/holder-desc h)] (str " (" d ")")) ".<br><br>"
+                                       "Open a different project, or type a name to create a new one:") nm)]
+                    (open-project! alt))                  (do ;; create the project on demand (Ctrl+T / typed-new name)
+                      (when-not (projects/project-exists? nm)
+                        (try (projects/create-project! nm) (catch Throwable _ nil)))
+                      (session/claim! nm)
+                      (projects/set-project! nm)
+                      (let [s (build-session! frame open-project! render-bar!)]
+                        (swap! sessions conj s)
+                        (.addTab tabs (:project s) (:panel s))
+                        ;; header = live status dot + project name + ✕ (closes THIS tab)
+                        (.setTabComponentAt tabs (dec (.getTabCount tabs))
+                                            (tab-header (:project s) (:status s) #(close-session! s)))
+                        (uifonts/apply-all!)
+                        (select! s)
+                        (try ((:connect! s)) (catch Throwable e (dbg! "session connect error:" (.getMessage e))))
+                        s)))))))
+        close-current!
+        (fn [] (when-let [s @active] (close-session! s)))
+        new-tab! (fn []
+                   (when-let [nm (pick-or-create-project-dialog!
+                                  frame "Open a project, or type a name to create a new one:" nil)]
+                     (open-project! nm)))]
+    ;; --- frame chrome ---
     (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
     (.setSize frame 1350 1020)
     (.setLocationRelativeTo frame nil)
     (set-frame-icon! frame)
-    ;; Give the prompt keyboard focus once the frame is shown & laid out, so on
-    ;; Windows the caret/typing land in the input area (and Enter reaches it)
-    ;; instead of falling to the transcript/scrollpane. Best-effort; runs after
-    ;; the window is visible via invokeLater.
+    (uifonts/install-zoom-bindings! (.getRootPane frame))
+    ;; --- shared status bar + tabbed content ---
+    (let [bar (doto (JToolBar.)
+                (.setFloatable false) (.setRollover true) (.setBorder nil))]
+      (.add bar (Box/createHorizontalGlue))
+      (.add bar bar-model)
+      (.add bar (Box/createHorizontalStrut 16))
+      (.add bar bar-status)
+      (.add bar (Box/createHorizontalStrut 10))
+      (.add bar bar-trust)
+      (.add bar (Box/createHorizontalStrut 12))
+      (.add bar bar-usage)
+      (.add bar (Box/createHorizontalStrut 12))
+      (if (appearance/windows?) (darken-toolbar! bar) (transparent! bar))
+      (.setContentPane frame
+                       (doto (JPanel. (BorderLayout.))
+                         (.setBackground (Color. 0 0 0))
+                         (.add tabs BorderLayout/CENTER)
+                         (.add bar BorderLayout/SOUTH))))
+    ;; --- keyboard shortcuts (Ctrl+Tab / Ctrl+1..9 / Ctrl+T / Ctrl+W) ---
+    (let [im (.getInputMap (.getRootPane frame) JComponent/WHEN_IN_FOCUSED_WINDOW)
+          am (.getActionMap (.getRootPane frame))
+          ctrl java.awt.event.InputEvent/CTRL_DOWN_MASK
+          shift java.awt.event.InputEvent/SHIFT_DOWN_MASK
+          put! (fn [keycode mods nm f]
+                 (.put im (KeyStroke/getKeyStroke (int keycode) (int mods)) nm)
+                 (.put am nm (proxy [AbstractAction] []
+                               (actionPerformed [_] (f)))))
+          put-rel! (fn [keycode mods nm f]
+                     (.put im (KeyStroke/getKeyStroke (int keycode) (int mods) true) nm)
+                     (.put am nm (proxy [AbstractAction] []
+                                   (actionPerformed [_] (f)))))]
+      (put! KeyEvent/VK_TAB ctrl "grog-tab-next" #(cycle! 1))
+      (put! KeyEvent/VK_TAB (bit-or ctrl shift) "grog-tab-prev" #(cycle! -1))
+      (doseq [n (range 1 10)]
+        (put! (+ (int KeyEvent/VK_0) n) ctrl (str "grog-tab-" n)
+              #(when (< (dec n) (count @sessions)) (select! (nth @sessions (dec n))))))
+      (put! KeyEvent/VK_T ctrl "grog-tab-new" new-tab!)
+      (put! KeyEvent/VK_W ctrl "grog-tab-close" close-current!)
+      ;; Ctrl+E — export the ACTIVE tab's transcript (was lost in the tab refactor)
+      (put! KeyEvent/VK_E ctrl "grog-export"
+            #(when-let [s @active] (uiexport/save-transcript! frame (:pane s))))
+      ;; Hold-to-talk: press the chord → record; release → stop + transcribe.
+      ;; Default Alt+Space; override with :voice {:push-to-talk-key "…"} if your
+      ;; window manager steals it.
+      (if-let [^KeyStroke ks (KeyStroke/getKeyStroke (voice/push-to-talk-key))]
+        (let [down-mask (bit-or java.awt.event.InputEvent/SHIFT_DOWN_MASK
+                                java.awt.event.InputEvent/CTRL_DOWN_MASK
+                                java.awt.event.InputEvent/ALT_DOWN_MASK
+                                java.awt.event.InputEvent/META_DOWN_MASK
+                                java.awt.event.InputEvent/ALT_GRAPH_DOWN_MASK)
+              ;; keep only the *extended* (DOWN) modifier bits: getKeyStroke(String)
+              ;; also sets the deprecated ALT_MASK/CTRL_MASK bits, which don't match
+              ;; real KeyEvents and would make the binding silently never fire.
+              code (.getKeyCode ks)
+              mods (bit-and (.getModifiers ks) down-mask)]
+          (put! code mods "grog-ptt-start" #(when-let [s @active] ((:ptt-start! s))))
+          (put-rel! code mods "grog-ptt-stop" #(when-let [s @active] ((:ptt-stop! s)))))
+        (dbg! "voice: unparseable :voice :push-to-talk-key" (voice/push-to-talk-key))))
+    ;; --- first tab = the active project ---
+    (open-project! (or (projects/project-name) "default"))
     (SwingUtilities/invokeLater
-      (fn []
-        (try
-          (.requestFocusInWindow prompt)
-          (catch Throwable _ nil))
-        ;; Auto-connect ECA on startup (instead of lazily on the first send) so
-        ;; the initialize/initialized handshake lands in grog-ui.log right
-        ;; away — a failed connect is visible in the log before you type a
-        ;; single message.
-        (connect-eca!)))
+      (fn [] (try ((:focus! @active)) (catch Throwable _ nil))))
     frame))
 
 (defn -main
@@ -1633,7 +1925,7 @@
   ;; cleanly shut down the ECA subprocess (if any) on JVM exit, and drop our
   ;; project session lock so the next launch doesn't see us as a live holder
   (.addShutdownHook (Runtime/getRuntime)
-                    (Thread. (fn [] (session/release-all!) (eca/disconnect!))))
+                    (Thread. (fn [] (session/release-all!) (eca/disconnect-all!))))
   (SwingUtilities/invokeLater
     (fn []
       (try

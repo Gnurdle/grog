@@ -45,8 +45,11 @@
 ;; when absent, the first subdirectory of the projects home is used (legacy
 ;; GROG_PROJECT env behavior, now file-driven).
 (defn- config-file []
-  (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
-           ".config/grog/project-search.edn"))
+  ;; grog hands the PER-PROJECT config path via GROG_PROJECT_SEARCH_CONFIG; fall
+  ;; back to the config-home default only when run standalone.
+  (or (some-> (System/getenv "GROG_PROJECT_SEARCH_CONFIG") str str/trim not-empty io/file)
+      (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
+               ".config/grog/project-search.edn")))
 
 (defn- load-config []
   (if-let [f (config-file)]
