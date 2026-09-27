@@ -19,18 +19,15 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.config :as config]
-            [grog.core :as core]
             [grog.log :as glog]
             [grog.eca :as eca]
-            [grog.eca-config :as ecacfg]
-            [grog.models :as models]
             [grog.appearance :as appearance]
+            [grog.chat :as chat]
+            [grog.client :as client]
+            [grog.client.remote :as clientremote]
             [grog.projects :as projects]
-            [grog.secrets :as secrets]
             [grog.session :as session]
             [grog.tool-args :as tool-args]
-            [grog.project-dialog :as project-dialog]
-            [grog.ui.cancel :as cancel]
             [grog.ui.dnd :as dnd]
             [grog.ui.eca-stream :as ecastream]
             [grog.ui.export :as uiexport]
@@ -48,7 +45,6 @@
                         JMenuItem JOptionPane JPanel JPopupMenu JScrollPane JTextArea
                         JTextField JToolBar KeyStroke ListSelectionModel SwingUtilities
                         JTabbedPane)
-           (java.util.concurrent LinkedBlockingQueue)
            (java.awt.datatransfer StringSelection)
            (java.awt.event KeyEvent MouseAdapter)))
 
@@ -56,19 +52,8 @@
 (def ^:private chat-startup-snark-fallback
   "No snark pool — someone edited the wrong file. Pity.")
 
-;; Provider API keys are read from the OS keyring (/secret) and injected into
-;; the ECA child process env at launch — ECA config references them only as
-;; `${env:...}` (no literal keys, no persistent Windows env vars).
-(def ^:private provider-env-accounts
-  ["OPENROUTER_API_KEY" "MOONSHOT_API_KEY" "XAI_API_KEY"])
-
-(defn- provider-env
-  "Per-process env vars for the ECA server, pulled from the OS keyring."
-  []
-  (into {} (keep (fn [acct]
-                   (when-let [v (secrets/get-secret acct)]
-                     [acct v])))
-        provider-env-accounts))
+;; provider-env / provider-env-accounts moved to grog.chat — headless (OS
+;; keyring only), and the core needs them when it spawns ECA.
 
 ;; Debug tracer: writes to the real stderr (so it lands in the per-instance log
 ;; `grog-ui.<pid>.log` / $GROG_LOG, via grog.log's in-process tee) regardless of
@@ -401,224 +386,133 @@
 
 ;; (file-uri removed — ECA workspace URIs are built robustly in grog.projects/workspace-folders)
 
-(defn- parse-cost
-  "Parse an ECA cost string (e.g. \"0.03\") to a double, or nil when absent or
-  unparseable (the model has no price table, so ECA omits the cost fields)."
-  [s]
-  (when s
-    (try (Double/parseDouble (str s)) (catch Throwable _ nil))))
+;; parse-cost moved to grog.chat (headless; used by usage-event! below).
 
-(defn- make-event-handler
-  "Build the ECA event handler for the transcript: renders `chat/contentReceived`
-  (streaming inline), flips `running?` when a prompt finishes, and prompts the
-  user to approve/reject manual-approval tool calls. Runs on the ECA reader thread.
-  Rendering is driven by `grog.ui.eca-stream`, which emits structured messages
-  (assistant/thinking/tool cards) onto the rich transcript.
+(defn- show-approval-dialog!
+  "Modal tool-approval dialog for one manual-approval tool call.
 
-  `yolo-ref` is the trust (YOLO) atom: when it's truthy, manual-approval tool
-  calls are auto-approved and the dialog is skipped — \"check it and everything
-  goes\". `last-sent` holds the most recently sent user message, so the ECA echo
-  of that message (a `text` content event mirroring the prompt) can be suppressed
-  instead of duplicating the local user echo. `pending-steer*` tracks a steer
-  that has been sent but not yet confirmed consumed by ECA; `resend-steer!` is
-  called with the steer text to re-issue it as a normal prompt if the run ends
-  before ECA consumes it (the protocol's documented fallback)."
-  [sid ^JComponent pane running? chat-id yolo-ref last-sent pending-steer* resend-steer!
-   set-status! set-trust! usage-event!]
-  (let [streamer (ecastream/make-streamer pane)
-        ;; Accumulate assistant text across `text` content events so the
-        ;; completed reply can be logged to the project dialog on finish.
-        assistant-acc (atom "")
-        ;; a steer is consumed when ECA echoes it back; resend undelivered steers
-        ;; on any idle/finished transition (protocol fallback).
-        finish! (fn []
-                  (when-let [s @pending-steer*]
-                    (reset! pending-steer* nil)
-                    (resend-steer! s))
-                  ;; the assistant reply is done — persist it to the project
-                  ;; dialog (best effort; ignore if no active project).
-                  (let [reply (str/trim (str @assistant-acc))]
-                    (reset! assistant-acc nil)
-                    (when (seq reply)
-                      (try
-                        (project-dialog/append-turn! :assistant reply)
-                        (catch Throwable e
-                          (dbg! "dialog append assistant error:" (.getMessage e))))))
-                  (reset! running? false))]
-    (fn [method params]
-      (case method
-        "chat/contentReceived"
-        (let [content (:content params)
-              echo? (and (= "text" (:type content))
-                         @last-sent
-                         (= (str/trim (str (:text content)))
-                            (str/trim (str @last-sent))))]
-          ;; the steer echo (from ECA consuming the steer) confirms it was
-          ;; accepted — mark it consumed so the finish-path doesn't resend it.
-          (when (and echo? @pending-steer*
-                     (= (str/trim (str (:text content)))
-                        (str/trim (str @pending-steer*))))
-            (reset! pending-steer* nil))
-          (when-not echo?
-            ;; accumulate the assistant reply text for the project dialog
-            (when (and (= "text" (:type content))
-                       (seq (str (:text content))))
-              (swap! assistant-acc str (str (:text content))))
-            ;; usage events carry token/cost totals — feed the footer readout
-            ;; instead of the transcript (which has nothing to render for them).
-            (if (= "usage" (:type content))
-              (usage-event! content)
-              (streamer content))
-            (when (= "finished" (:state content))
-              (finish!))
-            ;; manual-approval tool call -> in YOLO mode auto-approve (everything
-            ;; goes, no permission dialog); otherwise ask the user in a dialog
-            ;; with a readable font and a click of YOLO to switch into trust mode.
-            (when (and (= "toolCallRun" (:type content)) (true? (:manualApproval content)))
-              (if @yolo-ref
-                (eca/approve! sid @chat-id (:id content))
-                (let [id (:id content)
-                      name (str (:name content))
-                      summary (:summary content)
-                      ;; Tool name/summary in a modest, regular-weight monospace
-                      ;; (NOT the 1.5x dialog scale) so long summaries stay
-                      ;; compact instead of towering over the dialog.
-                      body (doto (JTextArea.
-                                  (str "Approve tool call?\n\n  " name "\n"
-                                       (when-let [args (:arguments content)]
-                                         (when (seq args)
-                                           (str "\n  args: " (pr-str args) "\n")))
-                                       (when (seq summary) (str "\n" summary "\n"))
-                                       "\n• Approve — just this once\n"
-                                       "• Approve tool — permanently allow this tool\n"
-                                       "• Reject — don't run it\n"
-                                       "• YOLO — this call and everything after, no more dialogs"))
-                             (.setEditable false)
-                             (.setLineWrap true)
-                             (.setWrapStyleWord true)
-                             (.setFont (widgets/dialog-mono-font))
-                             (.setOpaque true)
-                             (.setBackground (Color. 22 24 30))
-                             (.setForeground (Color. 224 226 232))
-                             (.setCaretColor (Color. 224 226 232))
-                             (.setCaretPosition 0)
-                             (.setBorder (javax.swing.BorderFactory/createEmptyBorder
-                                          12 14 12 14)))
-                      ;; Scrollable center keeps the body bounded; the buttons
-                      ;; live in a separate SOUTH panel so they are ALWAYS
-                      ;; visible and reachable, no matter how long the summary.
-                      scroll (doto (JScrollPane. body)
-                               (.setBorder (javax.swing.BorderFactory/createLineBorder
-                                             (Color. 60 63 72))))
-                      _ (widgets/boost-horizontal-wheel! scroll)
-                      approve (widgets/styled-button "Approve")
-                      approve-tool (widgets/styled-button "Approve tool")
-                      reject  (widgets/styled-button "Reject")
-                      yolo    (widgets/styled-button "YOLO")
-                      ;; GridLayout (not FlowLayout) so all four buttons stay
-                      ;; visible at any dialog/font size — FlowLayout clips the
-                      ;; trailing button (YOLO) when they overflow the width.
-                      buttons (doto (JPanel. (java.awt.GridLayout. 1 4 8 8))
-                                (.setBorder (javax.swing.BorderFactory/createEmptyBorder
-                                             10 12 12 12))
-                                (.add approve)
-                                (.add approve-tool)
-                                (.add reject)
-                                (.add yolo))
-                      dialog (doto (JDialog. (JOptionPane/getFrameForComponent pane)
-                                             "grog — tool approval" true)
-                               (.setLayout (BorderLayout.))
-                               (.add scroll BorderLayout/CENTER)
-                               (.add buttons BorderLayout/SOUTH)
-                               (.setSize (java.awt.Dimension. 620 340))
-                               (.setMinimumSize (java.awt.Dimension. 380 200))
-                               ;; Resizable, so a tall summary on a short screen
-                               ;; can always be shrunk/scrolled to reach the
-                               ;; buttons on the SOUTH panel.
-                               (.setResizable true)
-                               (.setLocationRelativeTo pane)
-                               ;; X / Esc / focus loss without a click:
-                               ;; windowClosed fires the reject path below.
-                               (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
-                      ;; guard so windowClosed (fired by dispose in the button
-                      ;; handlers too) doesn't double-answer with a reject.
-                      decided? (volatile! false)]
-                  ;; Enter approves (the natural default action); Esc closes.
-                  (when-let [^javax.swing.JRootPane rp (.getRootPane dialog)]
-                    (.setDefaultButton rp approve))
-                  (.put (.getInputMap (.getRootPane dialog) JComponent/WHEN_IN_FOCUSED_WINDOW)
-                        (KeyStroke/getKeyStroke KeyEvent/VK_ESCAPE 0)
-                        "grog-approval-cancel")
-                  (.put (.getActionMap (.getRootPane dialog)) "grog-approval-cancel"
-                        (proxy [AbstractAction] []
-                          (actionPerformed [_] (.dispose dialog))))
-                  (.addActionListener approve
-                    (proxy [java.awt.event.ActionListener] []
-                      (actionPerformed [_]
-                        (vreset! decided? true)
-                        (.dispose dialog)
-                        (eca/approve! sid @chat-id id))))
-                  (.addActionListener reject
-                    (proxy [java.awt.event.ActionListener] []
-                      (actionPerformed [_]
-                        (vreset! decided? true)
-                        (.dispose dialog)
-                        (eca/reject! sid @chat-id id))))
-                  ;; "Approve tool" — permanently allow this tool in the
-                  ;; approved-tools allowlist, then approve the current call.
-                  (.addActionListener approve-tool
-                    (proxy [java.awt.event.ActionListener] []
-                      (actionPerformed [_]
-                        (vreset! decided? true)
-                        (.dispose dialog)
-                        (ecacfg/approve-tool! name)
-                        (eca/approve! sid @chat-id id))))
-                  (.addActionListener yolo
-                    (proxy [java.awt.event.ActionListener] []
-                      (actionPerformed [_]
-                        (vreset! decided? true)
-                        (.dispose dialog)
-                        ;; "YOLO" — approve this call and switch into trust mode
-                        ;; so all future tool calls auto-approve.
-                        (reset! yolo-ref true)
-                        (set-trust! true)
-                        (eca/set-trust! sid @chat-id true)
-                        (eca/approve! sid @chat-id id))))
-                  ;; Dialog dismissed (X / Esc / lost focus) without a choice →
-                  ;; treat as a safe reject rather than running the tool.
-                  (.addWindowListener dialog
-                    (proxy [java.awt.event.WindowAdapter] []
-                      (windowClosed [_]
-                        (when-not @decided?
-                          (eca/reject! sid @chat-id id)))))
-                  ;; Show the MODAL approval dialog on the EDT. This handler runs
-                  ;; on the ECA reader thread; showing a modal dialog directly off
-                  ;; the EDT spins a nested event pump that can wedge the EDT and
-                  ;; leave the whole app unresponsive to close. Hoisting the show
-                  ;; onto the EDT keeps the frame responsive and lets the reader
-                  ;; thread keep dispatching.
-                  (SwingUtilities/invokeLater
-                    (fn []
-                      (try
-                        (.setVisible dialog true)
-                        (catch Throwable e
-                          (dbg! "approval dialog error:" (.getMessage e)))))))))))
+  **Pure view**: it renders the four choices and hands the decision back through
+  `on-answer` (which points at `grog.chat/answer-approval!`). This fn never
+  talks to ECA — the core owns approve/reject and captures `sid`/`chat-id`.
 
-        "chat/statusChanged"
-        (let [st (str (:status params))]
-          (when (= "idle" st)
-            (finish!))
-          (set-status! st))
+  Shows itself via `SwingUtilities/invokeLater`, deliberately: a modal dialog
+  shown directly off the ECA reader thread spins a nested event pump that can
+  wedge the EDT and leave the app unresponsive to close.
 
-        ;; ECA re-syncs its model catalog on startup/login: remember the full set
-        ;; of provider-qualified ids so model qualification is exact — this is what
-        ;; disambiguates OpenRouter catalog orgs that collide with native provider
-        ;; names (deepseek/…, openai/…, google/…, …).
-        "config/updated"
-        (when-let [ms (get-in params [:chat :models])]
-          (models/register-eca-catalog! ms))
-
-        nil))))
+  `req` is the published approval event: `{:id :name :args :summary}`."
+  [^JComponent owner {:keys [name args summary on-answer]}]
+  (let [answer! (fn [d] (when on-answer (on-answer d)))
+        ;; Tool name/summary in a modest, regular-weight monospace
+        ;; (NOT the 1.5x dialog scale) so long summaries stay
+        ;; compact instead of towering over the dialog.
+        body (doto (JTextArea.
+                     (str "Approve tool call?\n\n  " name "\n"
+                          (when (seq args)
+                            (str "\n  args: " (pr-str args) "\n"))
+                          (when (seq summary) (str "\n" summary "\n"))
+                          "\n• Approve — just this once\n"
+                          "• Approve tool — permanently allow this tool\n"
+                          "• Reject — don't run it\n"
+                          "• YOLO — this call and everything after, no more dialogs"))
+               (.setEditable false)
+               (.setLineWrap true)
+               (.setWrapStyleWord true)
+               (.setFont (widgets/dialog-mono-font))
+               (.setOpaque true)
+               (.setBackground (Color. 22 24 30))
+               (.setForeground (Color. 224 226 232))
+               (.setCaretColor (Color. 224 226 232))
+               (.setCaretPosition 0)
+               (.setBorder (javax.swing.BorderFactory/createEmptyBorder
+                            12 14 12 14)))
+        ;; Scrollable center keeps the body bounded; the buttons live in a
+        ;; separate SOUTH panel so they are ALWAYS visible and reachable, no
+        ;; matter how long the summary.
+        scroll (doto (JScrollPane. body)
+                 (.setBorder (javax.swing.BorderFactory/createLineBorder
+                              (Color. 60 63 72))))
+        _ (widgets/boost-horizontal-wheel! scroll)
+        approve (widgets/styled-button "Approve")
+        approve-tool (widgets/styled-button "Approve tool")
+        reject (widgets/styled-button "Reject")
+        yolo (widgets/styled-button "YOLO")
+        ;; GridLayout (not FlowLayout) so all four buttons stay visible at any
+        ;; dialog/font size — FlowLayout clips the trailing button (YOLO) when
+        ;; they overflow the width.
+        buttons (doto (JPanel. (java.awt.GridLayout. 1 4 8 8))
+                  (.setBorder (javax.swing.BorderFactory/createEmptyBorder
+                               10 12 12 12))
+                  (.add approve)
+                  (.add approve-tool)
+                  (.add reject)
+                  (.add yolo))
+        dialog (doto (JDialog. (JOptionPane/getFrameForComponent owner)
+                               "grog — tool approval" true)
+                 (.setLayout (BorderLayout.))
+                 (.add scroll BorderLayout/CENTER)
+                 (.add buttons BorderLayout/SOUTH)
+                 (.setSize (java.awt.Dimension. 620 340))
+                 (.setMinimumSize (java.awt.Dimension. 380 200))
+                 ;; Resizable, so a tall summary on a short screen can always be
+                 ;; shrunk/scrolled to reach the buttons on the SOUTH panel.
+                 (.setResizable true)
+                 (.setLocationRelativeTo owner)
+                 ;; X / Esc / focus loss without a click:
+                 ;; windowClosed fires the reject path below.
+                 (.setDefaultCloseOperation JDialog/DISPOSE_ON_CLOSE))
+        ;; guard so windowClosed (fired by dispose in the button handlers too)
+        ;; doesn't double-answer with a reject.
+        decided? (volatile! false)]
+    ;; Enter approves (the natural default action); Esc closes.
+    (when-let [^javax.swing.JRootPane rp (.getRootPane dialog)]
+      (.setDefaultButton rp approve))
+    (.put (.getInputMap (.getRootPane dialog) JComponent/WHEN_IN_FOCUSED_WINDOW)
+          (KeyStroke/getKeyStroke KeyEvent/VK_ESCAPE 0)
+          "grog-approval-cancel")
+    (.put (.getActionMap (.getRootPane dialog)) "grog-approval-cancel"
+          (proxy [AbstractAction] []
+            (actionPerformed [_] (.dispose dialog))))
+    (.addActionListener approve
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_]
+          (vreset! decided? true)
+          (.dispose dialog)
+          (answer! :approve))))
+    (.addActionListener reject
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_]
+          (vreset! decided? true)
+          (.dispose dialog)
+          (answer! :reject))))
+    ;; "Approve tool" — permanently allow this tool in the approved-tools
+    ;; allowlist, then approve the current call.
+    (.addActionListener approve-tool
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_]
+          (vreset! decided? true)
+          (.dispose dialog)
+          (answer! :approve-tool))))
+    (.addActionListener yolo
+      (proxy [java.awt.event.ActionListener] []
+        (actionPerformed [_]
+          (vreset! decided? true)
+          (.dispose dialog)
+          ;; "YOLO" — approve this call and switch into trust mode so all
+          ;; future tool calls auto-approve.
+          (answer! :yolo))))
+    ;; Dialog dismissed (X / Esc / lost focus) without a choice →
+    ;; treat as a safe reject rather than running the tool.
+    (.addWindowListener dialog
+      (proxy [java.awt.event.WindowAdapter] []
+        (windowClosed [_]
+          (when-not @decided?
+            (answer! :reject)))))
+    (SwingUtilities/invokeLater
+      (fn []
+        (try
+          (.setVisible dialog true)
+          (catch Throwable e
+            (dbg! "approval dialog error:" (.getMessage e))))))))
 
 (defn- show-question-dialog!
   "Modal 'Question from the LLM' dialog.
@@ -716,99 +610,10 @@
     (.setVisible dlg true)
     @result))
 
-(defn- make-request-handler
-  "Handle ECA server→client requests. The one that matters for the user is
-  `chat/askQuestion` — the LLM asking a question — which surfaces a dialog on
-  the EDT and answers with the user's input (or cancels). Everything else gets
-  safe defaults (empty diagnostics / empty result). Runs on the ECA reader
-  thread; the dialog is marshalled to the EDT with `invokeAndWait` and the
-  reader thread blocks until the user answers (which is what we want: ECA is
-  waiting for the response)."
-  [^JComponent pane]
-  (fn [method params]
-    (case method
-      "chat/askQuestion"
-      (let [prompt (or (some-> (:prompt params) str str/trim not-empty)
-                       (some-> (:message params) str str/trim not-empty)
-                       (some-> (:question params) str str/trim not-empty)
-                       (pr-str params))
-            options (when (sequential? (:options params)) (vec (:options params)))
-            allow-freeform? (not (false? (:allowFreeform params)))
-            res (atom {:cancelled true :answer nil})]
-        (transcript/append-status!
-         pane
-         (str "[LLM question] " prompt))
-        (SwingUtilities/invokeAndWait
-          (fn []
-            (reset! res (show-question-dialog! pane prompt options allow-freeform?))))
-        {:result @res})
-
-      "editor/getDiagnostics"
-      {:result {:diagnostics []}}
-
-      {:result {}})))
-
-(defn- handle-turn!
-  "Echo user input, route slash commands, or hand an LLM turn to `send-fn`
-  (a closure `(fn [history text] -> history)` owned by the frame). Also handles
-  `/eca-model <name>` via `set-model-fn` and `/yolo [on|off]` via `set-yolo-fn`.
-  Returns the updated history."
-  [^JComponent pane history text send-fn set-model-fn set-yolo-fn]
-  (cancel/clear!)
-  ;; echo the user's input (prompt or command) as a bubble
-  (when (seq (str/trim text))
-    (transcript/append-user! pane text))
-  (binding [*out* (transcript/console-writer pane)
-            *err* (transcript/console-writer pane)]
-    (cond
-      (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))
-      (let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
-        (set-model-fn (str/trim (second m)))
-        history)
-
-      (re-matches #"(?i)^/yolo(?:\s+(on|off))?$" (str/trim text))
-      (let [m (re-matches #"(?i)^/yolo(?:\s+(on|off))?$" (str/trim text))
-            on? (when (second m) (= "on" (str/lower-case (second m))))]
-        (set-yolo-fn on?)
-        history)
-
-      :else
-      (case (core/route-slash-command! text)
-        :grog.core/quit
-        (do (System/exit 0) history)
-        :grog.core/clear
-        (do
-          ;; wipe the transcript, and drop any trust (yolo) auto-approve so a
-          ;; fresh transcript starts from a clean slate
-          (transcript/clear! pane)
-          (set-yolo-fn false)
-          (println "History cleared.")
-          [])
-        :grog.core/handled
-        history
-        :grog.core/llm
-        (send-fn history text)))))
-
-(defn- chat-worker!
-  "Process the input queue on a background thread. `send-fn` is the ECA turn
-  closure; `running?` is managed by the ECA event lifecycle."
-  [^JComponent pane ^LinkedBlockingQueue queue history-ref send-fn set-model-fn set-yolo-fn]
-  (Thread.
-    (fn []
-      (loop []
-        (when-let [text (.take queue)]
-          (dbg! "worker take: " (pr-str (str text)))
-          (try
-            (reset! history-ref (handle-turn! pane @history-ref text send-fn set-model-fn set-yolo-fn))
-            (catch Throwable e
-              ;; Never let a hidden exception in the turn pipeline kill the
-              ;; worker thread — that would silently swallow every message
-              ;; queued after it. Log it loudly so grog-ui's log shows what
-              ;; actually failed instead of a dead, mute queue.
-              (dbg! "worker turn error: " (.getMessage e))
-              (dbg! (str (with-out-str (.printStackTrace e))))
-              (transcript/append-status! pane (str "[grog] internal error handling that message: " (.getMessage e)))))
-          (recur))))))
+;; make-request-handler / handle-turn! / chat-worker! moved to grog.chat —
+;; headless turn pipeline (the queue loop, slash-command routing, and the
+;; askQuestion round trip publish into the event stream instead of touching
+;; Swing; the subscriber in build-session! paints them).
 
 (def ^:private shell-frame-ref (atom nil))
 
@@ -1308,28 +1113,40 @@
                          (transcript/append-status!
                           pane "[voice] disabled — add :voice {:enabled true :command [\"whisper-cli\" \"-m\" \"model.bin\" \"-f\" \"{wav}\" \"-nt\"]} to grog.edn"))))
         ptt-stop! (fn [] (when @voice-handle (voice-stop!)))
-        queue (LinkedBlockingQueue.)
-        running? (atom false)
-        history-ref (atom [])
-        chat-id (atom (projects/active-project-chat-id))
+        ;; The session's domain half — state, prompt queue, worker thread, ECA
+        ;; connection, model/trust setters — now lives behind the client
+        ;; boundary (`grog.client.local`); the UI opens it and subscribes. The
+        ;; names below are unchanged so every downstream reference keeps
+        ;; resolving; the core's :trust is aliased to `yolo-ref`. View-only
+        ;; atoms (voice, logo) stay here in the UI.
+        sess (client/open! {:project project
+                            :console (fn [] (transcript/console-writer pane))
+                            :trace-fn (make-eca-tracer)})
+        sid (:id sess)
+        chat-state (:state sess)
+        running? (:running? chat-state)
+        history-ref (:history chat-state)
         ;; per-session status/model/trust, shown by the SHARED status bar when
         ;; this tab is active.
-        status (atom "idle")
-        model (atom (models/qualify-eca-model (config/eca-model)
-                                              nil
-                                              (try (config/llm-url) (catch Exception _ nil))))
-        yolo-ref (atom false)   ; trust (yolo) mode: auto-approve all tool calls
+        status (:status chat-state)
+        model (:model chat-state)
+        yolo-ref (:trust chat-state)   ; trust (yolo) mode: auto-approve all tool calls
         ;; Per-prompt and per-session token/cost totals, folded from ECA `usage`
         ;; content events. `:turn-*` is cleared at the start of each new prompt
         ;; (send-fn); `:session-tokens` accumulates, while `:session-cost` is
         ;; ECA's own cumulative figure carried through as-is. Costs are doubles
         ;; parsed from ECA's 2-dp strings (nil when the model has no price).
-        usage-ref (atom {:turn-tokens 0 :turn-cost 0.0
-                         :session-tokens 0 :session-cost nil})
+        usage-ref (:usage chat-state)
+        ;; the adapter resets the per-turn counters on each send; the bar must
+        ;; re-render even when no usage event flows (this is the old send-fn's
+        ;; inline refresh-bar!, moved to a watch so it survives the move)
+        _ (add-watch usage-ref :grog.ui/usage-bar
+                     (fn [_ _ _ _]
+                       (try (refresh-bar!) (catch Throwable _ nil))))
         usage-event! (fn [content]
                        (let [toks (long (or (:sessionTokens content) 0))
-                             lmc  (parse-cost (:lastMessageCost content))
-                             sc   (parse-cost (:sessionCost content))]
+                             lmc  (chat/parse-cost (:lastMessageCost content))
+                             sc   (chat/parse-cost (:sessionCost content))]
                          (swap! usage-ref
                                 (fn [u]
                                   (cond-> (-> u
@@ -1338,130 +1155,70 @@
                                               (update :turn-cost + (or lmc 0.0)))
                                     sc (assoc :session-cost sc))))
                          (refresh-bar!)))
-        last-sent (atom nil)    ; last user message sent, to suppress ECA's echo
-        pending-steer* (atom nil) ; steer text sent but not yet confirmed consumed by ECA
-        connected (atom false)
+        connected (:connected chat-state)
         set-status! (fn [st] (reset! status (str st)) (refresh-bar!))
         set-trust!  (fn [on?] (reset! yolo-ref (boolean on?)) (refresh-bar!))
-        event-handler (make-event-handler sid pane running? chat-id yolo-ref last-sent
-                                          pending-steer*
-                                          (fn [s]
-                                            ;; steer was dropped (run finished before
-                                            ;; ECA consumed it): re-issue as a normal prompt
-                                            (transcript/append-status! pane (str "[grog] resending as a prompt: " s))
-                                            (reset! last-sent (str s))
-                                            (.put ^LinkedBlockingQueue queue (str s)))
-                                          set-status! set-trust! usage-event!)
-        connect-eca! (fn []
-                       (when-not @connected
-                         (try
-                           (let [cfg (ecacfg/generate-config! (ecacfg/default-eca-config-path)
-                                                              (ecacfg/session-config-path project))
-                                 ws (projects/workspace-folders)
-                                 _ (dbg! "ECA starting: config=" cfg
-                                         " model=" (or @model "(none)")
-                                         " chatId=" @chat-id
-                                         " workspace=" (pr-str ws))
-                                 init (eca/connect! sid ws
-                                                    :event-handler event-handler
-                                                    :request-handler (make-request-handler pane)
-                                                    :eca-binary (config/eca-binary)
-                                                    :args ["--config-file" cfg]
-                                                    :env (provider-env)
-                                                    :log-fn (fn [line] (dbg! "eca:" line))
-                                                    :trace-fn (make-eca-tracer))]
-                             (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
-                           (reset! connected true)
-                           (catch Throwable e
-                             (transcript/append-status! pane (str "[grog] ECA connect failed: " (.getMessage e)))
-                             (reset! running? false)))))
-        send-fn (fn [history text]
-                  (connect-eca!)
-                  (if-not @connected
-                    (do (reset! running? false)
-                        ;; ECA is down after a send attempt — don't silently
-                        ;; swallow the user's message. Make it obvious both on
-                        ;; screen and in grog-ui.log (the log is the dif for
-                        ;; reproducing what happened next).
-                        (let [msg (str "[grog] not connected to ECA — message not sent: " text)]
-                          (dbg! msg)
-                          (transcript/append-status! pane msg))
-                        history)
-                    (do
-                      (reset! running? true)
-                      (cancel/clear!)
-                      ;; new prompt -> clear the per-turn usage accumulator
-                      (swap! usage-ref assoc :turn-tokens 0 :turn-cost 0.0)
-                      (refresh-bar!)
-                      (reset! last-sent (str text))
-                      ;; persist the user's message to the project dialog
-                      ;; (best effort; no-op without an active project)
-                      (try
-                        (project-dialog/append-turn! :user (str text))
-                        (catch Throwable e
-                          (dbg! "dialog append user error:" (.getMessage e))))
-                      (dbg! "send-fn: connected, about to prompt -> " (pr-str (str text)) " model-next=" (pr-str @model))
-                      (let [url (try (config/llm-url) (catch Exception _ nil))
-                            ;; ECA needs an explicit model or it fails with
-                            ;; "No available model found"; fall back to grog's
-                            ;; configured model when the footer model is unset.
-                            model (or (some-> @model
-                                              (models/qualify-eca-model nil url))
-                                      (models/qualify-eca-model (config/eca-model) nil url))]
-                        (try
-                          (let [resp (eca/prompt! sid text {:chatId @chat-id
-                                                        :model model
-                                                        :trust @yolo-ref})
-                                ;; ECA reports model/backend failures IN-BAND as
-                                ;; {:ok {:model "error" :status "error"}} (no
-                                ;; JSON-RPC :error key) — surface those instead
-                                ;; of silently swallowing them.
-                                e (:error resp)
-                                o (:ok resp)]
-                            (cond
-                              e
-                              (transcript/append-status! pane (str "[grog] " (or (:message e) (pr-str e))))
-
-                              (= "error" (some-> o :status str))
-                              (transcript/append-status!
-                               pane (str "[grog] ECA error: "
-                                         (or (some-> o :message str (not-empty))
-                                             (some-> o :model str (not-empty))
-                                             (pr-str o))))
-
-                              :else
-                              (dbg! "eca prompt ok: model=" (:model o) " status=" (:status o))))
-                          (catch Throwable e
-                            (dbg! "eca prompt error:" (.getMessage e))
-                            (reset! running? false)
-                            (transcript/append-status! pane (str "[grog] " (.getMessage e)))))
-                        (conj history {:user text})))))
-        stop-action! (fn []
-                       (when @connected (eca/stop! sid @chat-id))
-                       (cancel/cancel!)
-                       (reset! running? false))
-        set-model-fn (fn [name]
-                       (let [id (models/qualify-eca-model name
-                                                          nil
-                                                          (try (config/llm-url) (catch Exception _ nil)))]
-                         (when (and @connected id)
-                           (eca/selected-model! sid id {:chatId @chat-id}))
-                         (reset! model id)
-                         (uifooter/set-model-ref! id)
-                         (when id (models/save-eca-model! id))
-                         (config/reload!)
-                         (refresh-bar!)
-                         (transcript/append-status! pane (str "model: " id))))
-        set-yolo-fn (fn [on?]
-                      (let [next (if (nil? on?) (not @yolo-ref) on?)]
-                        (reset! yolo-ref next)
-                        (refresh-bar!)
-                        (when @connected
-                          (eca/set-trust! sid @chat-id next))
-                        (transcript/append-status!
-                         pane
-                         (str "trust (yolo) mode: "
-                              (if next "ON — tool calls auto-approved" "off")))))
+        ;; The core owns the domain work and publishes events; this session
+        ;; subscribes and paints them. Behaviour matches the old inline handler —
+        ;; but the subscriber is the seam grog-server will publish over instead.
+        streamer (ecastream/make-streamer pane)
+        _sub (client/subscribe! sid
+                                (fn [ev]
+                                (case (:type ev)
+                                  :content (let [c (:content ev)]
+                                             (if (= "usage" (:type c))
+                                               (usage-event! c)
+                                               (streamer c)))
+                                  :status  (set-status! (:value ev))
+                                  :trust   (set-trust! (:value ev))
+                                  ;; transcript lines the core emits (worker
+                                  ;; errors etc.) — plain status text
+                                  :line    (transcript/append-status! pane (:text ev))
+                                  ;; echo of the typed input (handle-turn!)
+                                  :user    (transcript/append-user! pane (:text ev))
+                                  ;; /clear — wipe the transcript
+                                  :clear   (transcript/clear! pane)
+                                  ;; the dialog hoists itself onto the EDT
+                                  ;; (invokeAndWait inside) and answers back
+                                  ;; into the core's request handler
+                                  :question (do
+                                              (transcript/append-status!
+                                               pane (str "[LLM question] " (:prompt ev)))
+                                              (SwingUtilities/invokeAndWait
+                                               (fn []
+                                                 ((:answer ev)
+                                                  (show-question-dialog!
+                                                   pane
+                                                   (:prompt ev)
+                                                   (:options ev)
+                                                   (:allowFreeform? ev))))))
+                                  ;; the model changed — the adapter setter
+                                  ;; used to touch the footer/status inline;
+                                  ;; now the view reacts (set-model-ref! is
+                                  ;; Swing, so it lives here, not there)
+                                  :model (do (uifooter/set-model-ref! (:value ev))
+                                             (refresh-bar!)
+                                             (transcript/append-status! pane (:text ev)))
+                                  ;; the dialog hoists itself onto the EDT
+                                  ;; (invokeLater inside) and answers back into
+                                  ;; the client's approval registry
+                                  :approval (show-approval-dialog!
+                                              pane
+                                              (assoc ev :on-answer
+                                                     (fn [d]
+                                                       (client/answer!
+                                                        sid {:approval-id (:id ev)
+                                                             :decision d}))))
+                                  nil)))
+        ;; Domain closures all moved behind `grog.client` — the local adapter
+        ;; owns the ECA connection, prompt queue, worker thread, and the
+        ;; model/trust setters; failures/status land in the transcript as
+        ;; published events, not direct pane calls. These are the view-side
+        ;; thunks the toolbar, settings dialog, and slash-command hooks call.
+        connect-eca! (fn [] (client/connect! sid))
+        stop-action! (fn [] (client/stop! sid))
+        set-model-fn (fn [nm] (client/set-model! sid nm))
+        set-yolo-fn (fn [on?] (client/set-trust! sid on?))
         bg (background-panel)
         sent? (atom false)   ; first real message flips the logo to subdued
         submit! (fn []
@@ -1474,21 +1231,17 @@
                       (when (compare-and-set! sent? false true)
                         ((:subdue! bg) true))
                       (if @running?
-                        ;; model is mid-turn: echo the prompt locally and steer
-                        ;; the running response (chat/promptSteer). Set last-sent
-                        ;; so ECA's own echo of the steer is suppressed (no dup).
-                        ;; Track it as pending: if the prompt finishes before ECA
-                        ;; consumes the steer (dropped), we resend it as a regular
-                        ;; prompt (see make-event-handler's finish handling).
-                        (do (reset! pending-steer* t)
-                            (reset! last-sent t)
-                            (transcript/append-user! pane t)
-                            (when @connected
-                              (eca/steer! sid @chat-id t)))
+                        ;; model is mid-turn: echo the prompt locally, then
+                        ;; steer through the client (the adapter sets
+                        ;; last-sent/pending-steer and issues chat/promptSteer
+                        ;; when connected — ECA's own echo stays suppressed and
+                        ;; an unconsumed steer is resent; see make-event-handler)
+                        (do (transcript/append-user! pane t)
+                            (client/steer! sid t))
                         ;; idle: queue a normal prompt as before
                         (do
                           (dbg! "submit -> queue: " (pr-str t) " running?=" @running?)
-                          (.put ^LinkedBlockingQueue queue t))))))]
+                          (client/prompt! sid t))))))]
     ;; larger fonts
     (doto pane
       (.setFont (ui-monospace-font))
@@ -1589,8 +1342,8 @@
       (.addActionListener clear (reify java.awt.event.ActionListener
                                   (actionPerformed [_ _]
                                     (do-clear!)))))
-    ;; start worker
-    (.start (chat-worker! pane queue history-ref send-fn set-model-fn set-yolo-fn))
+    ;; (the worker thread was started by grog.client.local at open! — the
+    ;; queue loop, slash-command routing, and view hooks live there now)
     ;; layout over the logo background
     (let [root (:panel bg)
           toolbar (let [tb (doto (JToolBar.)
@@ -1701,10 +1454,7 @@
      :usage usage-ref
      :connected connected
      :connect! connect-eca!
-     :disconnect! (fn []
-                    (try (eca/disconnect! sid) (catch Throwable _ nil))
-                    (reset! connected false)
-                    (session/release! project))
+     :disconnect! (fn [] (client/close! sid))
      :focus! (fn [] (.requestFocusInWindow prompt))
      :set-yolo! set-yolo-fn
      :ptt-start! ptt-start!
@@ -1922,6 +1672,16 @@
   ;; <base>.<pid>.log as well as the console. Done here, in-process, so the
   ;; launchers need no redirection/rotation and no platform-specific PID logic.
   (glog/install!)
+  ;; Phase 3: when grog.edn configures a server, the GUI runs as a THIN
+  ;; client — ECA / MCP / projects / keys live in grog-server (see
+  ;; doc/server-and-client.md §2). Example:
+  ;;   :server {:cmd ["clojure" "-M" "-m" "grog.server"] :dir "/path/to/grog"}
+  ;; Without :server the lazy local adapter stays (grog.client) — today's
+  ;; single-process behavior, unchanged.
+  (when-let [srv (try (:server (config/grog)) (catch Throwable _ nil))]
+    (when-let [cmd (:cmd srv)]
+      (clientremote/install! {:cmd cmd :dir (or (:dir srv) ".")})
+      (println "[grog] thin-client mode — grog-server:" (pr-str cmd))))
   ;; cleanly shut down the ECA subprocess (if any) on JVM exit, and drop our
   ;; project session lock so the next launch doesn't see us as a live holder
   (.addShutdownHook (Runtime/getRuntime)

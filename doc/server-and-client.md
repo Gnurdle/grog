@@ -27,7 +27,7 @@ over one protocol. Local (in-process) and remote are then just two adapters.
         ├── MCP servers (memory, imaging, office, odoo, project-search, …)
         ├── projects, memory dbs, per-project config files
         ├── OS keyring / secrets, provider keys
-        ├── project session locks
+        ├── project ownership (single writer per project)
         └── grog.session ×N ──► event stream (chatId-routed)
                      ▲
                      │  protocol: JSON-RPC-2.0 over stdio (local) / WS (remote)
@@ -44,7 +44,7 @@ The UI must be written against this and **never** call ECA/MCP directly again:
 ```clojure
 grog.client
   (sessions)                 ; -> [{:id :project :status :model :trust}]
-  (open! project)            ; -> session-id (claims the project lock)
+  (open! project)            ; -> session-id (server owns the project; client attaches)
   (close! id)
   (prompt! id text)
   (stop! id)  (steer! id text)
@@ -87,7 +87,7 @@ client is the identity adapter.
 | MCP servers | client machine | **server** |
 | Provider API keys / keyring | client machine | **server only** |
 | Projects, memory dbs, per-project configs | client | **server** |
-| Project session locks | client | **server** |
+| Project session locks | *retire* — the server owns each project; clients only attach (`multiuser…` §3.5) | ~~client → server~~ n/a |
 | Transcript *model* (messages/events) | inside the Swing component | **server session** (client renders) |
 | Terminal/PTY, appearance, rendering | client | **client** |
 | Window/tabs/input | client | **client** |
@@ -134,14 +134,18 @@ Each phase is independently shippable and reversible.
 - Shared bottom status bar bound to the **active** tab.
 - Shortcuts: `Ctrl+Tab`/`Ctrl+Shift+Tab` cycle, `Ctrl+1…9` jump, `Ctrl+T` new tab,
   `Ctrl+W` close tab.
-- Per-tab project lock; opening a project already in a tab **focuses** it.
+- Opening a project already in a tab **focuses** it — today's single-process
+  guard; in the server world two clients on one project are normal (§3.5).
 - *Not* a step toward the server in code structure, but it defines the UX.
 
 ### Phase 1 — Extract `grog.session` (headless)
 - Move event handling / worker / connect wiring out of `grog.ui` into
   `grog.session`; the transcript becomes an **event stream** with the Swing
   component as one subscriber.
-- Rename the current lock ns `grog.session` → `grog.project-lock`.
+- ~~Rename the current lock ns `grog.session` → `grog.project-lock`.~~
+  **TABLED — unresolved** (see `multiuser-and-shared-mcp.md` §3.5): no rename, no
+  user dimension, nothing deleted. Phase 1 therefore names the headless core
+  **`grog.chat`** instead of `grog.session`.
 - Accept: the GUI runs identically with the UI talking only to `grog.session`.
 
 ### Phase 2 — `grog.client` + `grog.client.local`
