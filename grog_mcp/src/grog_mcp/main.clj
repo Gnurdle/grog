@@ -28,6 +28,7 @@
            [io.modelcontextprotocol.server McpServerFeatures$AsyncToolSpecification]
            [io.modelcontextprotocol.spec
             McpSchema$ServerCapabilities McpSchema$Tool McpSchema$CallToolResult
+            McpSchema$JsonSchema
             McpSchema$TextContent]
            [reactor.core.publisher Mono]
            [com.fasterxml.jackson.databind ObjectMapper]))
@@ -69,16 +70,34 @@
 
 (defn- tool
   "Wrap a single tool-spec map {:name :description :schema :fn} as an MCP AsyncToolSpecification."
-  [{:keys [name description schema fn]}]
+  [{:keys [name description schema] tool-fn :fn}]
   (McpServerFeatures$AsyncToolSpecification.
-    (McpSchema$Tool. name description schema)
+    ;; CRITICAL: `:schema` arrives as a JSON **string**. The SDK's String
+    ;; constructor (Tool/String,String,String) ships it verbatim, so
+    ;; `function.parameters` reaches providers as a string — and strict
+    ;; providers reject the ENTIRE request ("Expected object, received string" /
+    ;; "must be a JSON Schema object"), which surfaces as an unexplained 400
+    ;; (sometimes mislabelled as context overflow by the failover chain) plus
+    ;; tools being called with empty arguments, because the model never sees
+    ;; parameter names. Build a real JsonSchema object instead. Keys may be
+    ;; strings (parsed JSON) or keywords (a caller passing a literal map), so
+    ;; both are accepted.
+    (McpSchema$Tool.
+     name description
+     (let [m (if (string? schema) (json/parse-string schema) schema)
+           jget (fn [k] (or (get m k) (get m (keyword k))))]
+       (McpSchema$JsonSchema.
+        (jget "type")
+        (jget "properties")
+        (some-> (jget "required") vec)
+        (jget "additionalProperties"))))
     (reify java.util.function.BiFunction
       (apply [_ _exchange arguments]
         (Mono/create
           (reify java.util.function.Consumer
             (accept [_ sink]
               (try
-                (.success sink (text-result (fn arguments)))
+                (.success sink (text-result (tool-fn arguments)))
                 (catch Throwable t
                   (.success sink (error-result
                                   (str "Error executing tool " name ": "
@@ -88,7 +107,10 @@
 ;; Server construction
 ;; ---------------------------------------------------------------------------
 
-(defn- collect-tools [ids]
+(defn collect-tools
+  "Flatten the tool specs of the given server ids (public: `grog-mcp.http`
+  reuses this so the HTTP endpoint serves exactly the stdio toolset)."
+  [ids]
   (mapcat (fn [id]
             (let [{:keys [tools]} (get servers id)]
               (try

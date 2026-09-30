@@ -1,17 +1,32 @@
 (ns grog.server
-  "grog-server — headless JSON-RPC 2.0 endpoint over stdio (Phase 3).
+  "grog-server — headless JSON-RPC 2.0 endpoint over stdio AND a Unix-domain
+  socket (Phase 3 + 3.6).
 
-  Transport is NDJSON: one JSON object per line; requests/responses on
-  stdin/stdout, server-initiated notifications on stdout. The server runs the
-  FULL local stack (ECA child, MCP, projects, keys, locks) through
-  `grog.client.local`; the thin client holds none of it — the whole point of
-  the split (doc/server-and-client.md §2).
+  Transport is NDJSON: one JSON object per line; requests/responses on the
+  inbound/outbound channel, server-initiated notifications broadcast to every
+  attached client. The server runs the FULL local stack (ECA child, MCP,
+  projects, keys, locks) through `grog.client.local`; the thin clients hold
+  none of it — the whole point of the split (doc/server-and-client.md §2).
+
+  Two transports, one hub:
+
+    stdio        — the transitional mode: a client spawns this process as a
+                   child and speaks over its stdin/stdout (client 1 / Swing).
+    unix socket  — the daemon mode: `GROG_SERVER_SOCKET` (or
+                   `$XDG_RUNTIME_DIR/grog-$USER.sock`) is bound and MANY clients
+                   attach at once. Notifications fan out to all of them;
+                   responses go only to the caller.
+
+  Self-hosting rule: the socket is bound best-effort in stdio mode too, so a
+  server spawned by client 1 can host client 2. A bind failure (another server
+  already owns the path) is logged, never fatal.
 
   Client -> server methods (params keywordized JSON objects):
 
     open            {:project ..}                       -> session snapshot (with :id)
     close           {:id ..}                            -> nil
     sessions        {}                                  -> [snapshot ..]
+    projects        {}                                  -> [{:name .. :description ..} ..]
     session         {:id ..}                            -> snapshot | nil
     connect         {:id ..}                            -> nil  (spawns the ECA child)
     prompt          {:id .. :text ..}                   -> nil  (queued on the worker)
@@ -21,12 +36,19 @@
     set-model       {:id .. :model ..}                  -> nil
     set-trust       {:id .. :on ..}                     -> nil
     answer-question {:question-id .. :result ..}        -> nil
+    projects        {}                                  -> [{:name .. :description ..} ..]
+    create-project  {:name .. :description ..}          -> nil
 
-  Server -> client notifications:
+  `open` is IDEMPOTENT PER PROJECT: if a session for that project already
+  exists it is returned as-is, so attaching clients share the one session the
+  server owns (doc/server-and-client.md §3 — 'the server owns the project; the
+  client attaches'). Creating a second session for a project would double the
+  ECA child and the working set for no reason.
 
-    event    {:sessionId .. :event ..}  a stamped grog.chat envelope tagged
-                                        with the session id for routing (the
-                                        envelope's own :session is the project)
+  Server -> client notifications (broadcast):
+
+    event    {:sessionId .. <stamped envelope keys>}  a stamped grog.chat
+                                        envelope tagged with the session id
     question {:sessionId .. :question-id .. :prompt .. :options .. :allowFreeform? ..}
                                         asked via chat/askQuestion; the ECA
                                         reader waits up to `question-timeout-ms`
@@ -34,21 +56,62 @@
                                         wire version of the local wedge-safety
                                         rule (a missing client can't hang a turn)
 
-  stdout is the RPC channel: on startup the Clojure process streams are
-  redirected to stderr so no stray println can corrupt the stream. Slash
-  command output reaches the GUI as `:line` events via the per-session console
-  publisher (same buffer-until-flush semantics as
-  `grog.ui.transcript/console-writer`)."
+  stdout is the RPC channel in stdio mode: on startup the Clojure process
+  streams are redirected to stderr so no stray println can corrupt the stream.
+  In socket mode stdout is free, and everything (logs included) goes to stderr."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [grog.chat :as chat]
             [grog.client :as client]
-            [grog.client.local :as local]))
+            [grog.client.local :as local]
+            [grog.config :as config]
+            [grog.mcp-http :as mcp-http]
+            [grog.projects :as projects]
+            [grog.soul :as soul])
+  (:import (java.io BufferedReader BufferedWriter File InputStreamReader
+                    OutputStreamWriter PrintWriter)
+           (java.net StandardProtocolFamily UnixDomainSocketAddress)
+           (java.nio.channels Channels ServerSocketChannel SocketChannel)
+           (java.nio.charset StandardCharsets)
+           (java.nio.file Files Paths)
+           (java.sql Connection DriverManager ResultSet)
+           (com.github.javakeyring Keyring)))
 
 (def ^:private question-timeout-ms
   "Bound on the ECA reader wait for a remote chat/askQuestion answer:
   wedge-safety over the wire."
   600000)
+
+(defn- jni-selftest
+  "Exercise the two JNI-backed libraries the server links but no normal RPC
+  reaches: sqlite-jdbc (org.sqlite.JDBC loads a native lib on first connection)
+  and java-keyring (com.github.javakeyring, JNA -> OS secret service).
+
+  Exposed as the `debug/jni` method so a freshly built (native) image can prove
+  its JNI works instead of failing at first real use. JSON-serialisable map."
+  []
+  {:sqlite
+   (try
+     (Class/forName "org.sqlite.JDBC")
+     (with-open [^Connection c (DriverManager/getConnection "jdbc:sqlite::memory:")]
+       (let [st (.createStatement c)]
+         (.execute st "create table t(x integer)")
+         (.execute st "insert into t values (42)")
+         (let [^ResultSet rs (.executeQuery st "select x from t")]
+           (when (.next rs) {:ok true :value (.getInt rs 1)}))))
+     (catch Throwable e {:error (str (class e) ": " (.getMessage e))}))
+
+   :keyring
+   (let [f (future
+             (try
+               (with-open [^Keyring kr (Keyring/create)]
+                 {:ok true :llm-key-present (some? (.getPassword kr "grog" "LLM_API_KEY"))})
+               (catch Throwable e {:error (str (class e) ": " (.getMessage e))})))]
+     (deref f 5000 {:error "timeout (keyring backend did not respond)"}))})
+
+(defn- log! [& xs]
+  (binding [*out* *err*]
+    (apply println xs)))
 
 ;; --- stdout writer ---------------------------------------------------------
 
@@ -63,12 +126,31 @@
   interleaved notifications atomic — a partial line would poison the stream."
   [^java.io.Writer w obj]
   (locking w
-    (.write w (json/generate-string obj))
+    (.write w ^String (json/generate-string obj))
     (.write w "\n")
     (.flush w)))
 
-(defn- notify! [^java.io.Writer w method params]
+(defn- notify!
+  [^java.io.Writer w method params]
   (write-line! w {:jsonrpc "2.0" :method method :params params}))
+
+;; --- connection hub --------------------------------------------------------
+;;
+;; One hub per server process. Every attached transport (stdio writer, or one
+;; writer per socket connection) registers here. Notifications broadcast to
+;; all of them; request responses are written straight back to their origin.
+
+(defn- make-hub
+  "Returns {:add! :remove! :broadcast!}. Writers are compared by identity, so
+  each connection is distinct even if two share a writer class."
+  []
+  (let [!conns (atom #{})]
+    {:add!       (fn [w] (swap! !conns conj w) w)
+     :remove!    (fn [w] (swap! !conns disj w))
+     :broadcast! (fn [method params]
+                   (doseq [w @!conns]
+                     (try (notify! w method params)
+                          (catch Throwable _ nil))))}))
 
 ;; --- console publisher -----------------------------------------------------
 
@@ -97,10 +179,21 @@
 
 ;; --- sessions --------------------------------------------------------------
 
+(defn- session-by-project
+  "The existing session snapshot for `project`, or nil. Sessions are
+  server-global, so an attaching client finds the one already running."
+  [project]
+  (some #(when (= (str project) (str (:project %))) %) (client/sessions)))
+
 (defn- open-session!
-  "open + wire the event forwarder. The console publisher resolves the state
-  lazily through the :on-state hook (open! creates the state)."
-  [^java.io.Writer w questions {:keys [project]}]
+  "open + wire the broadcast event forwarder. The console publisher resolves the
+  state lazily through the :on-state hook (open! creates the state).
+
+  `questions` is the server-global registry of pending chat/askQuestion
+  promises, keyed by the question id that goes out on the wire; the ECA reader
+  thread blocks (inside the subscriber) on the promise until `answer-question`
+  arrives or `question-timeout-ms` elapses."
+  [broadcast! questions {:keys [project]}]
   (let [st (atom nil)
         opened (client/open! {:project project
                               :on-state (fn [state] (reset! st state))
@@ -114,32 +207,47 @@
                answer-fn (:answer ev)
                p (promise)]
            (swap! questions assoc qid p)
-           (notify! w "question"
-                    (assoc (dissoc ev :answer)
-                           :sessionId id
-                           :questionId qid))
+           (broadcast! "question"
+                       (assoc (dissoc ev :answer)
+                              :sessionId id
+                              :questionId qid))
            (let [res (deref p question-timeout-ms ::timeout)]
              (swap! questions dissoc qid)
              (answer-fn (if (= ::timeout res)
                           {:cancelled true :answer nil}
                           res))))
-         (notify! w "event" (assoc ev :sessionId id)))))
+         (broadcast! "event" (assoc ev :sessionId id)))))
     (client/session id)))
 
+;; --- request handling ------------------------------------------------------
+
 (defn- handle-request
-  "Dispatch one JSON-RPC request; write the response (or error)."
-  [^java.io.Writer w questions {:keys [id method params]}]
+  "Dispatch one JSON-RPC request. `send!` writes the response back to the
+  originating connection; `broadcast!` fans notifications out to all."
+  [send! broadcast! questions {:keys [id method params]}]
   (let [params (or params {})
         respond! (fn [result error]
-                   (write-line! w (cond-> {:jsonrpc "2.0" :id id}
-                                    (some? result) (assoc :result result)
-                                    error (assoc :error error))))]
+                   (send! (cond-> {:jsonrpc "2.0" :id id}
+                            (some? result) (assoc :result result)
+                            error (assoc :error error))))]
     (try
       (let [result
             (case method
-              "open" (open-session! w questions params)
+              "open" (let [snap (or (session-by-project (:project params))
+                                    (open-session! broadcast! questions params))]
+                       ;; banner = client 1's startup snark line (doc §3.2); the
+                       ;; renderer seeds it as the first transcript line
+                       (assoc snap :banner (soul/startup-snark-line)))
               "close" (do (client/close! (:id params)) nil)
               "sessions" (client/sessions)
+              "projects" (mapv (fn [n]
+                                 (let [m (projects/manifest-for n)
+                                       d (some-> (:description m) str str/trim not-empty)]
+                                   (cond-> {:name n} d (assoc :description d))))
+                               (projects/list-project-names))
+              "create-project" (do (projects/create-project! (:name params)
+                                                             (:description params))
+                                   nil)
               "session" (client/session (:id params))
               "connect" (do (client/connect! (:id params)) nil)
               "prompt" (do (client/prompt! (:id params) (:text params)) nil)
@@ -155,6 +263,7 @@
               (do (when-let [p (get @questions (:question-id params))]
                     (deliver p (or (:result params) {:cancelled true :answer nil})))
                   nil)
+              "debug/jni" (jni-selftest)
               (throw (ex-info (str "unknown method: " method) {:method method})))]
         ;; JSON-RPC: a null result is still a result — always respond
         (respond! (if (nil? result) nil result) nil))
@@ -163,33 +272,165 @@
                        :message (or (.getMessage e) (str (class e)))
                        :data {:method method}})))))
 
-;; --- main ------------------------------------------------------------------
+;; --- transports ------------------------------------------------------------
 
-(defn -main
-  "Run the server: stdin = JSON-RPC requests (NDJSON), stdout = responses +
-  event/question notifications. stdin EOF = client gone: detach every session
-  (drop ECA children, release project locks) and exit."
-  [& _]
-  ;; stdout is the RPC channel — send the process streams to stderr so stray
-  ;; printlns (Java or Clojure) land in the log instead of corrupting frames.
-  (alter-var-root #'*out* (constantly *err*))
-  (client/set-impl! (local/->LocalClient))
+(defn- serve-stdio!
+  "Serve the transitional stdio transport until stdin EOF, then detach every
+  session and return. `send!` is the stdout writer; notifications go through
+  the hub."
+  [hub questions]
   (let [w (out-writer)
-        questions (atom {})
-        rdr (java.io.BufferedReader. (java.io.InputStreamReader. System/in "UTF-8"))]
+        rdr (java.io.BufferedReader. (java.io.InputStreamReader. System/in "UTF-8"))
+        send! (fn [obj] (write-line! w obj))]
+    ((:add! hub) w)
     (try
       (loop []
         (when-let [line (.readLine rdr)]
           (when-not (str/blank? line)
             (try
-              (handle-request w questions (json/parse-string line true))
+              (handle-request send! (:broadcast! hub) questions
+                              (json/parse-string line true))
               (catch Throwable e
-                ;; a poisoned line must not kill the server
-                (binding [*out* *err*]
-                  (println "[grog-server] bad request:" (.getMessage e))))))
+                (log! "[grog-server] bad request:" (.getMessage e)))))
           (recur)))
       (finally
+        ((:remove! hub) w)))))
+
+(defn- serve-connection!
+  "Read NDJSON lines from one socket connection until it closes. The connection
+  joins the hub for the whole read loop, so it receives every notification."
+  [^SocketChannel ch hub questions]
+  (let [w (PrintWriter.
+           (BufferedWriter.
+            (OutputStreamWriter. (Channels/newOutputStream ch) StandardCharsets/UTF_8)))
+        rdr (BufferedReader.
+             (InputStreamReader. (Channels/newInputStream ch) StandardCharsets/UTF_8))
+        send! (fn [obj] (write-line! w obj))]
+    ((:add! hub) w)
+    (try
+      (loop []
+        (when-let [line (.readLine rdr)]
+          (when-not (str/blank? line)
+            (try
+              (handle-request send! (:broadcast! hub) questions
+                              (json/parse-string line true))
+              (catch Throwable e
+                (log! "[grog-server] bad request:" (.getMessage e)))))
+          (recur)))
+      (catch Throwable _ nil)
+      (finally
+        ((:remove! hub) w)
+        (try (.close ch) (catch Throwable _ nil))))))
+
+(defn- serve-socket!
+  "Blocking accept loop. Each accepted connection gets its own thread."
+  [^ServerSocketChannel ssc hub questions]
+  (loop []
+    (let [ch (.accept ssc)]
+      (doto (Thread. #(serve-connection! ch hub questions))
+        (.setDaemon true)
+        (.start))
+      (recur))))
+
+(defn- server-bind
+  "TCP interface to bind: GROG_SERVER_BIND, else config :server :bind, else
+  0.0.0.0 (internal network; auth lands later)."
+  ^String []
+  (or (let [s (System/getenv "GROG_SERVER_BIND")] (when-not (str/blank? s) s))
+      (get-in (config/grog) [:server :bind])
+      "0.0.0.0"))
+
+(defn- server-port
+  "TCP port: GROG_SERVER_PORT, else config :server :tcp-port, else 9640.
+  A KNOWN port — that is the point: other machines, the Swing client and the
+  systemd unit all find the SAME server on it."
+  ^long []
+  (long (or (some-> (System/getenv "GROG_SERVER_PORT") parse-long)
+            (get-in (config/grog) [:server :tcp-port])
+            9640)))
+
+(defn- bind-tcp!
+  "Open + bind the TCP listener (INET family). Returns the channel; the accept
+  loop and per-connection hub are family-agnostic, so nothing else changes."
+  ^ServerSocketChannel [^String host ^long port]
+  (let [ssc (ServerSocketChannel/open)]
+    (.bind ssc (java.net.InetSocketAddress. host (int port)))
+    ssc))
+
+;; --- main ------------------------------------------------------------------
+
+(defn- mcp-base-port
+  "The MCP endpoint base port: env override, else config, else nil."
+  []
+  (some-> (or (System/getenv "GROG_MCP_BASE_PORT")
+              (get-in (config/grog) [:server :mcp-base-port]))
+          str parse-long))
+
+(defn- start-mcp-http! []
+  (when (not= false (get-in (config/grog) [:server :mcp-http]))
+    (mcp-http/start! (cond-> {}
+                       (mcp-base-port) (assoc :base-port (mcp-base-port))))))
+
+(defn -main
+  "Run the server.
+
+  Two modes, chosen by whether a socket path is configured:
+
+    socket-daemon (GROG_SERVER_SOCKET set, or GROG_SERVER_DAEMON=1)
+      — bind the socket REQUIRED, no stdio, stay alive until killed.
+    stdio (default) — serve stdin/stdout until EOF, and bind the socket
+      best-effort so an attaching client can join the same server.
+
+  stdin EOF in stdio mode = the spawning client is gone: detach every session
+  (drop ECA children, release project locks) and exit."
+  [& _]
+  ;; stdout is the RPC channel in stdio mode — route the Clojure process streams
+  ;; to stderr so stray printlns (Java or Clojure) can't corrupt frames.
+  (alter-var-root #'*out* (constantly *err*))
+  (client/set-impl! (local/->LocalClient))
+  (try (start-mcp-http!)
+       (catch Throwable e (log! "[grog-server] mcp-http start failed:" (.getMessage e))))
+  (let [hub (make-hub)
+        questions (atom {})
+        daemon? (or (let [s (System/getenv "GROG_SERVER_SOCKET")] (not (str/blank? s)))
+                    (= "1" (System/getenv "GROG_SERVER_DAEMON")))
+        host (server-bind)
+        port (server-port)
+        disable-socket? (= "1" (System/getenv "GROG_SERVER_NO_SOCKET"))
+        ssc (when-not disable-socket?
+              (try
+                (let [c (bind-tcp! host port)]
+                  (log! "[grog-server] listening on tcp" host port)
+                  c)
+                (catch Throwable e
+                  (if daemon?
+                    (do (log! "[grog-server] FATAL: socket bind failed:" (.getMessage e))
+                        (System/exit 2))
+                    (do (log! "[grog-server] socket bind skipped:" (.getMessage e))
+                        nil)))))]
+    ;; clean up the socket file + sessions on the way out
+    (.addShutdownHook
+     (Runtime/getRuntime)
+     (Thread. (fn []
+                (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
+                     (catch Throwable _ nil))
+                (try (mcp-http/stop!) (catch Throwable _ nil))
+                (when ssc
+                  (try (.close ^ServerSocketChannel ssc) (catch Throwable _ nil))))))
+    (if daemon?
+      ;; socket daemon: accept loop owns the main thread; no stdio at all.
+      (serve-socket! ssc hub questions)
+      ;; transitional stdio: stdin owns the main thread; the socket (if bound)
+      ;; is served on a daemon thread that dies with the process.
+      (do
+        (when ssc
+          (doto (Thread. #(serve-socket! ssc hub questions))
+            (.setDaemon true)
+            (.start)))
         (try
-          (doseq [{:keys [id]} (client/sessions)] (client/close! id))
-          (catch Throwable _ nil))
-        (System/exit 0)))))
+          (serve-stdio! hub questions)
+          (finally
+            (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
+                 (catch Throwable _ nil))
+            (try (mcp-http/stop!) (catch Throwable _ nil))
+            (System/exit 0)))))))

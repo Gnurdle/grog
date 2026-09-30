@@ -6,7 +6,8 @@
         ;; imaging / document toolchain (moved from grog/src/grog deps.edn)
         org.apache.poi/poi-ooxml {:mvn/version "5.3.0"}
         org.apache.pdfbox/pdfbox {:mvn/version "3.0.4"}
-        net.sourceforge.tess4j/tess4j {:mvn/version "5.14.0"}
+        ;; OCR shells out to the `tesseract` CLI (see grog_imaging.image) — no
+        ;; tess4j/JNA/lept4j native chain.
         org.boofcv/boofcv-io {:mvn/version "1.2.2"}
         org.boofcv/boofcv-feature {:mvn/version "1.2.2"}
         io.modelcontextprotocol.sdk/mcp {:mvn/version "0.8.0"}

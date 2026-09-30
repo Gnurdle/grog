@@ -1003,6 +1003,12 @@
    ;; where FlatLaf transparent viewports repaint as white.
    :splash-img nil
    :follow? true
+   ;; Follow-mode is USER-GESTURE driven (see the scrollbar listener below):
+   ;; these fields are what stop content growth from yanking a reading user back
+   ;; to the bottom, and what makes new output discoverable instead.
+   :programmatic-scroll? false   ; we scrolled, not the user
+   :last-scroll-value nil        ; last scrollbar value we know to be ours
+   :pending-new? false           ; content arrived while not following
    :width 640
    :total 0
    :ys []
@@ -1023,19 +1029,37 @@
 (defn- st-of ^clojure.lang.Atom [^JComponent c]
   (.getClientProperty c state-key))
 
+(def ^:private follow-slack-px
+  "How close to the bottom counts as 'at the bottom' when re-arming follow mode.
+  Small on purpose: the listener is gesture-driven now, so we no longer need a
+  big tolerance to paper over growth-induced events (that tolerance was what
+  yanked readers back down)."
+  4)
+
 (defn- scroll-to-bottom! [^clojure.lang.Atom st]
   (SwingUtilities/invokeLater
    (fn []
      (when-let [^JScrollPane sp (:scrollpane @st)]
-       (.validate sp)
-       (let [vp (.getViewport sp)
-             view (.getView vp)
-             vh (.getHeight view)
-             vph (.getHeight vp)]
-         (.setViewPosition vp (Point. 0 (max 0 (- (long vh) (long vph))))))))))
+       ;; Our own scroll must never be read as a user gesture by the follow-mode
+       ;; listener (which is gesture-driven — see make-chat-pane).
+       (swap! st assoc :programmatic-scroll? true)
+       (try
+         (.validate sp)
+         (let [vp (.getViewport sp)
+               view (.getView vp)
+               vh (.getHeight view)
+               vph (.getHeight vp)]
+           (.setViewPosition vp (Point. 0 (max 0 (- (long vh) (long vph)))))
+           (swap! st assoc
+                  :last-scroll-value (.getValue (.getVerticalScrollBar sp))
+                  :follow? true
+                  :pending-new? false))
+         (finally
+           (swap! st assoc :programmatic-scroll? false)))))))
 
 (defn- update-and-validate! [^clojure.lang.Atom st]
   (let [s @st
+        prev-total (:total s)
         msgs (:messages s)
         width (max 160 (:width s))
         inner (double (- width (* 2 outer-pad)))
@@ -1054,12 +1078,19 @@
                      (long (+ y0 (+ (long h) msg-gap)))))
             [hm ys y]))
         total' (if (seq ys) (- total msg-gap) 0)]
-    (swap! st assoc :heights hm :ys ys :total total'))
+    (swap! st assoc :heights hm :ys ys :total total'
+           ;; did the content grow? — drives the not-following cue in the tail
+           :grew? (not= total' prev-total)))
   (when-let [^JComponent c (:component @st)]
     (.revalidate c)
     (.repaint c))
-  (when (:follow? @st)
-    (scroll-to-bottom! st))
+  (if (:follow? @st)
+    (scroll-to-bottom! st)
+    ;; Not following: content that arrives must be DISCOVERABLE, never silent.
+    ;; This drives the "↓ more" chip (painted in paint-view!) and, through it,
+    ;; the way back to the bottom.
+    (when (:grew? @st)
+      (swap! st assoc :pending-new? true)))
   nil)
 
 ;; --- streaming coalescing ---------------------------------------------------
@@ -1636,6 +1667,22 @@
                     hover? (= (:hover-msg s) (:id m))
                     m (assoc m :y-offset y :sel-h h)]
                 (paint-message! ctx m w hover? nil actions)))))
+        ;; "↓ more" chip, shown only while NOT following. Painted in VIEWPORT
+        ;; coordinates (bottom of the visible area) so it stays put while content
+        ;; scrolls beneath it, and registered as an action so the existing click
+        ;; path can hit it without a new component.
+        (when (:pending-new? s)
+          (let [cw 92
+                ch 24
+                cx (int (- (.getWidth view) cw 18))
+                cy (int (- bot ch 10))
+                rect (Rectangle. cx cy cw ch)]
+            (.setColor g2 (java.awt.Color. 24 26 32 235))
+            (.fillRoundRect g2 cx cy cw ch 10 10)
+            (.setColor g2 (java.awt.Color. 110 160 210))
+            (.drawRoundRect g2 cx cy cw ch 10 10)
+            (.drawString g2 "↓ more" (int (+ cx 16)) (int (+ cy 17)))
+            (swap! actions conj {:rect rect :kind :latest})))
         (swap! st assoc :actions (deref actions))
         ;; Selection highlight and selection feedback are painted AFTER the
         ;; message rows so they are actually visible — the old code painted the
@@ -1714,17 +1761,36 @@
         view (make-view-st st)
         sp (JScrollPane. view)]
     (swap! st assoc :scrollpane sp :drain-timer drain-timer)
-    ;; manual scroll-away disables follow mode; scrolling back to the bottom
-    ;; re-enables it, so the transcript auto-follows whenever it's positioned at
-    ;; the end (and stops following the moment you scroll up to read).
+    ;; Follow mode is armed/disarmed by USER GESTURES only.
+    ;;
+    ;; The old version recomputed `near?` on EVERY adjustment event — including
+    ;; the ones Swing fires when the CONTENT grows (a streaming append changes
+    ;; the scrollbar's maximum while the value stays put). Two failures followed:
+    ;; (a) scrolling up a few notches while output streamed left you "within
+    ;; tolerance" of a bottom that kept moving, so the next 33 ms layout tick
+    ;; yanked you back down; (b) a genuine follower could be dropped the moment
+    ;; growth landed before the event. Scrollbar geometry is therefore no longer
+    ;; a signal at all:
+    ;;   - ignore events WE caused (:programmatic-scroll?)
+    ;;   - ignore events where the VALUE did not change (growth/extent/max only)
+    ;;   - otherwise: value at the bottom => follow; value above => stop, and the
+    ;;     "↓ more" chip becomes the way back.
     (.addAdjustmentListener (.getVerticalScrollBar sp)
       (reify AdjustmentListener
         (adjustmentValueChanged [_ _]
-          (when-let [vp (.getViewport sp)]
-            (let [vr (.getViewRect vp)
-                  vh (.getHeight (.getView vp))
-                  near? (<= (- vh (+ (.getY ^Rectangle vr) (.getHeight ^Rectangle vr))) 60)]
-              (swap! st assoc :follow? (boolean near?)))))))
+          (let [{:keys [programmatic-scroll? last-scroll-value]} @st
+                ^javax.swing.JScrollBar sb (.getVerticalScrollBar sp)
+                v (long (.getValue sb))
+                ext (long (.getVisibleAmount ^javax.swing.JScrollBar sb))
+                max' (long (.getMaximum sb))
+                at-bottom? (>= (+ v ext) (- max' follow-slack-px))]
+            (when (and (not programmatic-scroll?)
+                       (not= v last-scroll-value))
+              (swap! st assoc
+                     :last-scroll-value v
+                     :follow? (boolean at-bottom?)
+                     ;; only a gesture that returns to the bottom clears the cue
+                     :pending-new? (if at-bottom? false (:pending-new? @st))))))))
     ;; click/drag: text selection over the painted `:zones` (the single geometry
     ;; source). Press picks the zone under the cursor; drag extends to the zone
     ;; under the cursor; release copies the selected zone span. Ctrl+A/C use the
@@ -1793,7 +1859,13 @@
                             :copy-message
                             (let [payload (:payload a)]
                               (copy-text! payload)
-                              (note-copied! st (str "Copied " (desc-label payload))))))))
+                              (note-copied! st (str "Copied " (desc-label payload))))
+                            ;; "↓ more": jump to the bottom and resume following.
+                            ;; Painted only while NOT following, so it doubles as
+                            ;; the "new output is waiting" cue.
+                            :latest
+                            (do (swap! st assoc :follow? true :pending-new? false)
+                                (scroll-to-bottom! st))))))
                     (mouseMoved [^MouseEvent e]
                       (let [a (hit-action st (.getPoint e))
                             hover-msg (when a (:msg-id a))]

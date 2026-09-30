@@ -55,4 +55,8 @@
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :ns-default build}
   :eca-test {:main-opts ["-m" "grog.eca-test"]}
-  :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
+  :jline-native {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  ;; GraalVM native-image for the backend (grog.server). `graal-build-time`
+  ;; makes Clojure classes initialize at build time so the image doesn't do the
+  ;; whole runtime boot per launch. See scripts/native-image.sh.
+  :native {:extra-deps {com.github.clj-easy/graal-build-time {:mvn/version "1.0.6"}}}}}

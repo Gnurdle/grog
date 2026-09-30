@@ -16,6 +16,7 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [grog.config :as config]
+            [grog.mcp-http :as mcp-http]
             [grog.models :as models]
             [grog.projects :as projects]
             [grog.secrets :as secrets]
@@ -199,55 +200,56 @@
   (abs-path (System/getProperty "user.dir" ".")))
 
 (defn memory-db-path
-  "The grog-memory SQLite store for the ACTIVE project:
-  `~/grog-projects/<proj>/state/mem.db`. grog is always in a project
-  (`resolve-active-project` guarantees one), so there is no repo-root fallback."
-  ^String []
-  (or (projects/active-memory-db-path)
-      (throw (ex-info "no active project for memory store" {}))))
+  "The grog-memory SQLite store for `project`:
+  `~/grog-projects/<proj>/state/mem.db`. grog is always in a project,
+  so there is no repo-root fallback."
+  ^String [project]
+  (when-not (and project (not (str/blank? (str project))))
+    (throw (ex-info "no active project for memory store" {})))
+  (projects/memory-db-path project))
 
 (defn memory-config-path
   "Per-project grog-memory server config: `<project>/state/memory.edn`. Never a
   global file — two sessions on different projects can't clobber each other."
-  ^String []
-  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/memory.edn"))
+  ^String [project]
+  (str (.getPath (projects/state-dir project)) "/memory.edn"))
 
 (defn- write-memory-config!
-  "Write this project's grog-memory config (`{:db … :max-open …}`) and return its
+  "Write `project`'s grog-memory config (`{:db … :max-open …}`) and return its
   path (handed to the server via `GROG_MEMORY_CONFIG`). Preserves a user-set
   `:max-open`."
-  ^String []
-  (let [p   (memory-config-path)
+  ^String [project]
+  (let [p   (memory-config-path project)
         cur (try (edn/read-string (slurp (io/file p))) (catch Exception _ nil))
         m   (merge {:max-open 8} (when (map? cur) cur)
-                   {:db (memory-db-path)})]
+                   {:db (memory-db-path project)})]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
 
 (defn- memory-env
-  "Env for the grog-memory server: point it at this project's config file."
-  []
-  {"GROG_MEMORY_CONFIG" (write-memory-config!)})
+  "Env for the grog-memory server: point it at THIS project's config file."
+  [project]
+  {"GROG_MEMORY_CONFIG" (write-memory-config! project)})
 
 (defn project-search-config-path
   "Per-project grog-project-search config: `<project>/state/project-search.edn`."
-  ^String []
-  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/project-search.edn"))
+  ^String [project]
+  (str (.getPath (projects/state-dir project)) "/project-search.edn"))
 
 (defn- write-project-search-config!
-  "Write this project's grog-project-search config (projects home + active project)
+  "Write `project`'s grog-project-search config (projects home + project name)
   and return its path (handed to the server via `GROG_PROJECT_SEARCH_CONFIG`)."
-  ^String []
-  (let [p (project-search-config-path)
+  ^String [project]
+  (let [p (project-search-config-path project)
         m {:projects-dir (.getPath (config/projects-dir))
-           :project (projects/project-name)}]
+           :project project}]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
 
 (defn- project-search-env
-  "Env for the grog-project-search server: point it at this project's config file."
-  []
-  {"GROG_PROJECT_SEARCH_CONFIG" (write-project-search-config!)})
+  "Env for the grog-project-search server: point it at THIS project's config file."
+  [project]
+  {"GROG_PROJECT_SEARCH_CONFIG" (write-project-search-config! project)})
 
 (defn default-eca-config-path
   "The standard ECA config file this generator starts from."
@@ -353,80 +355,67 @@
     {"GROG_IMAP_CONFIG" path}))
 
 (defn grog-mcp-servers
-  "The grog MCP server specs, keyed by server id."
-  []
-  (let [root (grog-root)
-        servers
-        {"grog-imaging"
-     (shell-wrapped (str root "/grog-imaging")
-                    "clojure -M:mcp"
-                    nil)
+  "The grog MCP server specs for `project`, keyed by server id.
 
-     ;; JVM memory (Clojure/SQLite), served by the grog-mcp bundle restricted to
-     ;; its memory tools — no Python/venv. Reads the same `memory.edn` and uses a
-     ;; byte-compatible schema, so existing mem.db files work as-is. The server
-     ;; KEY stays "grog-memory" so ECA tool names (grog-memory__assoc_*) don't
-     ;; change and existing allowlists keep working.
-     "grog-memory"
-     (shell-wrapped (str root "/grog_mcp")
-                    "clojure -M:mcp --server grog-memory"
-                    (memory-env))
+  Every entry spawns the SAME command — the grog-mcp bundle JVM restricted to one
+  server (`--server <id>`) from the single `grog_mcp` project — rather than
+  `cd <repo>/grog-<x> && clojure -M:mcp`. Two reasons: the old form needed 13
+  separate project trees on disk, and each of those servers built its MCP tool
+  descriptor with the SDK's String constructor, which ships
+  `function.parameters` as a JSON *string* — strict providers reject that whole
+  request (400) and the model cannot see parameter names, so tools get called
+  with empty arguments. The bundle's wrapper builds a real JsonSchema object
+  (grog_mcp/main.clj). One entry per server id keeps ECA tool names
+  (`<id>__<tool>`) and therefore existing allowlists intact, and `spec` below is
+  the single place the command is built — the uberjar (`java -jar …`) swap lands
+  there and needs no other change.
 
-     "grog-office"
-     (shell-wrapped (str root "/grog-office")
-                    "clojure -M:mcp"
-                    nil)
+  The Streamable-HTTP branch (`grog.mcp-http`) is inert with the server line
+  parked: no daemon runs, so `urls` is nil and the stdio specs are returned."
+  [project]
+  (if-let [us (mcp-http/urls)]
+    (into {} (map (fn [[k u]] [k {:url u}])) us)
+    (let [root (grog-root)
+          bundle (str root "/grog_mcp")
+          ;; Prefer the built uberjar (no Clojure CLI needed, one artifact), but
+          ;; fall back to the source tree when it hasn't been built — dev boxes
+          ;; and a fresh checkout keep working either way. `build.clj` writes
+          ;; target/grog-mcp-<version>.jar; pick the newest if several exist.
+          jar (->> (seq (.listFiles (java.io.File. (str bundle "/target"))))
+                   (filter (fn [^java.io.File f]
+                             (re-matches #"grog-mcp-.*\.jar" (.getName f))))
+                   (sort-by (fn [^java.io.File f] (.lastModified f)))
+                   last)
+          spec (fn [id env]
+                 (if jar
+                   (shell-wrapped bundle
+                                  (str "java --add-opens=java.base/java.lang=ALL-UNNAMED"
+                                       " --enable-native-access=ALL-UNNAMED"
+                                       " -cp '" (.getAbsolutePath ^java.io.File jar) "'"
+                                       " clojure.main -m grog_mcp.main --server " id)
+                                  env)
+                   (shell-wrapped bundle (str "clojure -M:mcp --server " id) env)))]
+      (cond-> {"grog-imaging" (spec "grog-imaging" nil)
 
-     "grog-search"
-     (shell-wrapped (str root "/grog-search")
-                    "clojure -M:mcp"
-                    nil)
+               ;; JVM memory (Clojure/SQLite), served by the grog-mcp bundle
+               ;; restricted to its memory tools — no Python/venv. Reads the same
+               ;; `memory.edn` with a byte-compatible schema, so existing mem.db
+               ;; files work as-is. The KEY stays "grog-memory" so ECA tool names
+               ;; (grog-memory__assoc_*) don't change and allowlists keep working.
+               "grog-memory"  (spec "grog-memory" (memory-env project))
 
-     "grog-big"
-     (shell-wrapped (str root "/grog-big")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-babashka"
-     (shell-wrapped (str root "/grog-babashka")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-fetch"
-     (shell-wrapped (str root "/grog-fetch")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-rss"
-     (shell-wrapped (str root "/grog-rss")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-project-search"
-     (shell-wrapped (str root "/grog-project-search")
-                    "clojure -M:mcp"
-                    (project-search-env))
-
-     "grog-alpaca"
-     (shell-wrapped (str root "/grog-alpaca")
-                    "clojure -M:mcp"
-                    nil)}]
-    (cond-> servers
-      (imap-configured?)
-      (assoc "grog-imap"
-             (shell-wrapped (str root "/grog-imap")
-                            "clojure -M:mcp"
-                            (imap-env)))
-      (odoo-configured?)
-      (assoc "grog-odoo"
-             (shell-wrapped (str root "/grog-odoo")
-                            "clojure -M:mcp"
-                            (odoo-env)))
-      (gitlab-configured?)
-      (assoc "grog-gitlab"
-             (shell-wrapped (str root "/grog-gitlab")
-                            "clojure -M:mcp"
-                            (gitlab-env))))))
+               "grog-office"         (spec "grog-office" nil)
+               "grog-search"         (spec "grog-search" nil)
+               "grog-big"            (spec "grog-big" nil)
+               "grog-babashka"       (spec "grog-babashka" nil)
+               "grog-fetch"          (spec "grog-fetch" nil)
+               "grog-rss"            (spec "grog-rss" nil)
+               "grog-project-search" (spec "grog-project-search"
+                                           (project-search-env project))
+               "grog-alpaca"         (spec "grog-alpaca" nil)}
+        (imap-configured?)   (assoc "grog-imap"   (spec "grog-imap" (imap-env)))
+        (odoo-configured?)   (assoc "grog-odoo"   (spec "grog-odoo" (odoo-env)))
+        (gitlab-configured?) (assoc "grog-gitlab" (spec "grog-gitlab" (gitlab-env)))))))
 
 (defn debug-dump-config!
   "Log that the ECA config was (re)written to the grog debug log, **without**
@@ -503,21 +492,21 @@
 ;; --- Per-project rules (global SOUL + project SOUL overlay + context) ------
 
 (defn project-rules-file
-  "The absolute path of the generated ECA rules markdown for the active project.
+  "The absolute path of the generated ECA rules markdown for `project`.
   The file is the composed per-project standing context:
     * global SOUL.md (base personality),
     * the project's own SOUL.md (if present) — overrides global on conflicts,
     * the project's loaded context (banner + notes + dialog snapshot).
 
   Written under the project's `state/` dir so it stays out of the source tree.
-  Returns nil if no active project can be resolved."
-  ^String []
-  (when-let [proj (projects/resolve-active-project)]
+  Returns nil if `project` is nil."
+  ^String [project]
+  (when-let [proj project]
     (let [^java.io.File dir (projects/state-dir proj)
           f (io/file dir "eca-rules.md")
           global (soul/read-text)
           project-soul (soul/read-project-text proj)
-          ctx (projects/load-context)
+          ctx (projects/load-context proj)
           parts (cond-> []
                   (seq global)
                   (conj "## Persistent instructions (global SOUL)\n\n" global)
@@ -534,10 +523,10 @@
       (.getPath f))))
 
 (defn- add-rules!
-  "Add a `rules` entry pointing at the active project's generated rules file (if
-  any). ECA loads rule files/dirs as standing context on every prompt."
-  [cfg]
-  (if-let [rules-file (project-rules-file)]
+  "Add a `rules` entry pointing at `project`'s generated rules file (if any).
+  ECA loads rule files/dirs as standing context on every prompt."
+  [cfg project]
+  (if-let [rules-file (project-rules-file project)]
     (update cfg :rules conj {:path rules-file})
     cfg))
 
@@ -548,11 +537,15 @@
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 
 (defn generate-config!
-  "Produce the merged ECA config map and write it to
-  `(generated-config-path)`, dumping it to the debug log. Returns the written path."
+  "Produce the merged ECA config map and write it to `out-path`
+  (default `(generated-config-path)`), dumping it to the debug log. The
+  project-scoped bits (memory, project-search, rules) are resolved for
+  `project` — NOT the process-global active project — so concurrent sessions
+  in one grog process can't stamp each other's stores. Returns the written path."
   ([] (generate-config! (default-eca-config-path)))
   ([base-path] (generate-config! base-path (generated-config-path)))
-  ([base-path out-path]
+  ([base-path out-path] (generate-config! base-path out-path (projects/resolve-active-project)))
+  ([base-path out-path project]
    (let [base-file (io/file base-path)
          base-exists? (.exists base-file)
          base-parsed (when base-exists?
@@ -584,10 +577,10 @@
                               " qualified=" (pr-str model)
                               " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
          merged (-> base
-                    (assoc :mcpServers (grog-mcp-servers))
+                    (assoc :mcpServers (grog-mcp-servers project))
                     (cond-> model (assoc :defaultModel model))
                     (add-approval!)
-                    (add-rules!))
+                    (add-rules! project))
          out (or out-path (generated-config-path))]
      (spit (io/file out) (json/generate-string merged {:pretty true}))
      (debug-dump-config! out merged)

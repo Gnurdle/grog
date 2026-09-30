@@ -8,17 +8,14 @@
             [grog.brave :as brave]
             [grog.config :as config]
             [grog.babashka :as babashka]
-            [grog.boofcv-pdf :as boofcv-pdf]
             [grog.chat-context :as chat-ctx]
             [grog.chron :as chron]
-            [grog.fs :as fs]
             [grog.jobs :as jobs]
             [grog.tasks :as tasks]
             [grog.edn-store :as edn-store]
             [grog.md-stream :as md-stream]
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
-            [grog.pager :as pager]
             [grog.projects :as projects]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
@@ -36,6 +33,24 @@
 (def ^:private ansi-answer "\u001B[38;2;100;220;255m")
 (def ^:private ansi-tool-call "\u001B[38;2;255;0;255m")
 (def ^:private ansi-snark "\u001B[2m\u001B[3m")
+
+;; The file/OCR/pager tool namespaces (`grog.fs`, `grog.boofcv-pdf`,
+;; `grog.pager` -> `grog.image-png`) drag in java.awt / POI / PDFBox / Tess4J /
+;; BoofCV / Swing. The CLI classpath has them; the GraalVM server image omits
+;; them (that reach is what made native-image unfixable). Referencing them
+;; *lazily* keeps the CLI fully working while leaving the server's reach
+;; AWT-free — callers degrade to nil when the namespace isn't on the classpath.
+(defn- opt-var
+  "Resolve `ns-str/var-str` on demand; nil if that namespace isn't present."
+  [ns-str var-str]
+  (try (requiring-resolve (symbol ns-str var-str))
+       (catch Throwable _ nil)))
+
+(defn- opt-call
+  "Call an optional namespace's fn with `args`; nil when the namespace is absent."
+  [ns-str var-str & args]
+  (when-let [v (opt-var ns-str var-str)]
+    (apply v args)))
 
 (defn- tool-call-println!
   "Log a tool invocation line to stderr in magenta."
@@ -435,10 +450,11 @@
                                   (println (str content-buf))
                                   (println "grog: end raw response content")))
                               (when dumped-buf?
-                                (pager/emit-final-reply! {:answer-prefix answer-prefix
-                                                          :raw-content (str content-buf)
-                                                          :ansi-answer (appearance/ansi-answer)
-                                                          :ansi-reset ansi-reset}))
+                                (opt-call "grog.pager" "emit-final-reply!"
+                                          {:answer-prefix answer-prefix
+                                           :raw-content (str content-buf)
+                                           :ansi-answer (appearance/ansi-answer)
+                                           :ansi-reset ansi-reset}))
                               (print ansi-reset)
                               (cond
                                 md-stream-live?
@@ -594,7 +610,7 @@
               (tool-call-println! "grog: tool" nm (pr-str q))))
           (#{"read_office_document" "read_pdf_document" "ocr_pdf_document"
              "analyze_pdf_line_drawings"} nm)
-          (if-let [p (some-> (fs/tool-log-path args) not-empty)]
+          (if-let [p (some-> (opt-call "grog.fs" "tool-log-path" args) not-empty)]
             (tool-call-println! "grog: tool" nm (pr-str p))
             (tool-call-println! "grog: tool" nm "(path missing or empty)"))
           (#{"assoc_store" "assoc_get" "assoc_keys" "assoc_search"} nm)
@@ -624,10 +640,10 @@
                             (tool-call-println! "grog: tool" nm)))
         (cond
           (= nm "brave_web_search") (brave/run-web-search! args)
-          (= nm "read_office_document") (fs/run-read-office-document! args)
-          (= nm "read_pdf_document") (fs/run-read-pdf-document! args)
-          (= nm "ocr_pdf_document") (fs/run-ocr-pdf-document! args)
-          (= nm "analyze_pdf_line_drawings") (boofcv-pdf/run-analyze-pdf-line-drawings! args)
+          (= nm "read_office_document") (opt-call "grog.fs" "run-read-office-document!" args)
+          (= nm "read_pdf_document") (opt-call "grog.fs" "run-read-pdf-document!" args)
+          (= nm "ocr_pdf_document") (opt-call "grog.fs" "run-ocr-pdf-document!" args)
+          (= nm "analyze_pdf_line_drawings") (opt-call "grog.boofcv-pdf" "run-analyze-pdf-line-drawings!" args)
           (= nm "assoc_store") (assoc-memory/run-assoc-store! args)
           (= nm "assoc_get") (assoc-memory/run-assoc-get! args)
           (= nm "assoc_keys") (assoc-memory/run-assoc-keys! args)
@@ -671,10 +687,11 @@
         tool-calls))
 
 (defn- chat-tools-payload []
-  (vec (concat [(fs/read-office-document-tool-spec)
-                (fs/read-pdf-document-tool-spec)
-                (fs/ocr-pdf-document-tool-spec)
-                (boofcv-pdf/analyze-pdf-line-drawings-tool-spec)]
+  (vec (concat (vec (keep identity
+                          [(opt-call "grog.fs" "read-office-document-tool-spec")
+                           (opt-call "grog.fs" "read-pdf-document-tool-spec")
+                           (opt-call "grog.fs" "ocr-pdf-document-tool-spec")
+                           (opt-call "grog.boofcv-pdf" "analyze-pdf-line-drawings-tool-spec")]))
                (assoc-memory/tool-specs)
                (when (brave/brave-search-configured?)
                  [(brave/tool-spec)])
@@ -741,10 +758,11 @@
   "Show full answer (markdown vs plain per config) via `grog.pager/emit-final-reply!`.
   `<image-png>path</image-png>` opens a PNG file in a Swing viewer (see `grog.image-png`)."
   [content answer-prefix]
-  (pager/emit-final-reply! {:answer-prefix answer-prefix
-                          :raw-content content
-                          :ansi-answer (appearance/ansi-answer)
-                          :ansi-reset ansi-reset}))
+  (opt-call "grog.pager" "emit-final-reply!"
+            {:answer-prefix answer-prefix
+             :raw-content content
+             :ansi-answer (appearance/ansi-answer)
+             :ansi-reset ansi-reset}))
 
 (defn- chat-with-tools!
   "Run /v1/chat/completions, executing `tool_calls` (Office/PDF, OCR, BoofCV lines, optional Brave,
@@ -1513,10 +1531,12 @@
     (println (brave-status-line))
     (println (llm-status-line))
     (println (with-api-key-status-line))
-    (println (fs/startup-status-line))
+    (println (or (opt-call "grog.fs" "startup-status-line")
+                 "grog: file tools unavailable in this build"))
     (println (edn-store/startup-status-line))
     (println (config/active-project-status-line))
-    (println (boofcv-pdf/startup-status-line))
+    (println (or (opt-call "grog.boofcv-pdf" "startup-status-line")
+                 "grog: pdf line tools unavailable in this build"))
     (println (babashka/startup-status-line))
     (mcp/try-load-declared-config!)
     (println (mcp-status-line))

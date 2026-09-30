@@ -92,8 +92,9 @@
           (when-not @connected
             (try
               (let [cfg (ecacfg/generate-config! (ecacfg/default-eca-config-path)
-                                                 (ecacfg/session-config-path project))
-                    ws (projects/workspace-folders)
+                                                 (ecacfg/session-config-path project)
+                                                 project)
+                    ws (projects/workspace-folders project)
                     _ (dbg! "ECA starting: config=" cfg
                             " model=" (or @(:model state) "(none)")
                             " chatId=" @(:chat-id state)

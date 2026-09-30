@@ -98,6 +98,13 @@
               (when (and c2 (not (:dead c2))) c2))
             (let [pb (ProcessBuilder. ^java.util.List (vec cmd))]
               (when dir (.directory pb (File. (str dir))))
+              ;; Swing self-manages its server: this child speaks stdio and must
+              ;; NOT claim the public rendezvous socket — that belongs to the
+              ;; systemd daemon (Electron's transport). Without this the two
+              ;; fight over $XDG_RUNTIME_DIR/grog-$USER.sock, and the daemon's
+              ;; bind is FATAL, so it exits and the service "tanks".
+              (doto (.environment pb)
+                (.put "GROG_SERVER_NO_SOCKET" "1"))
               (let [p (.start pb)
                     conn {:process p
                           :in (BufferedReader. (InputStreamReader. (.getInputStream p) "UTF-8"))

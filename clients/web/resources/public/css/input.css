@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* grog role colours — grog.edn :appearance :chat, exposed as CSS vars so the
+   client's palette stays driven by grog.edn (doc/clients/web-client-plan.md §2) */
+:root{
+  /* teal-on-near-black, lifted from the splash logo (logo.jpg) palette:
+     #183747 #25535C #307886 #36929D #41C4CA #48A3AB — the transcript now
+     sits in the same colour family as the splash instead of pink/green/grey. */
+  --grog-bg:#0d0e11; --grog-answer:#7fe3ea; --grog-thinking:#4fb0ba; --grog-tool:#36929d;
+  --grog-user:#41c4ca; --grog-snark:#7d989e; --grog-bubble:#10262b; --grog-border:#22454c;
+  /* body letters (the big readable text), tinted toward the splash teal */
+  --grog-text:#cdeef2; --grog-text-think:#9dc6cc; --grog-text-tool:#7cabb1; --grog-text-user:#a0e6ec;
+  /* fixed font for code (transcript .md) — no mono font is bundled, so lean on
+     whatever the OS ships: SF Mono / Fira Code / DejaVu / Consolas. */
+  --grog-mono: ui-monospace,"SFMono-Regular","Fira Code","DejaVu Sans Mono","Liberation Mono","Consolas",monospace;
+}
+body{ background:#020617; color:#eaf7f8;
+      font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+.app{ background:var(--grog-bg); }
+.role-answer{color:var(--grog-answer)} .role-think{color:var(--grog-thinking)}
+.role-tool{color:var(--grog-tool)} .role-user{color:var(--grog-user)} .role-snark{color:var(--grog-snark)}
+/* transcript message text — teal-tinted so the letters match the splash */
+.seg-answer{color:var(--grog-text)} .seg-think{color:var(--grog-text-think)}
+.seg-tool{color:var(--grog-text-tool)} .seg-user{color:var(--grog-text-user)}
+.seg-snark{color:var(--grog-snark)}
+.card{ background:var(--grog-bubble); border:1px solid var(--grog-border); }
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#334155;border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#64748b}
+
+/* Markdown in the transcript (grog-web.md → hiccup). Code and tables are the two
+   things a plain `white-space: pre-wrap` span could never get right: code needs a
+   FIXED font, tables need real borders/columns instead of a wall of `|`. */
+.md{ line-height:1.5; overflow-wrap:anywhere }
+.md > :first-child{ margin-top:0 }
+.md > :last-child{ margin-bottom:0 }
+.md p{ margin:0 0 .6em }
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{ margin:.9em 0 .4em; font-weight:600; line-height:1.25 }
+.md h1{ font-size:1.35em } .md h2{ font-size:1.2em } .md h3{ font-size:1.08em }
+.md ul,.md ol{ margin:0 0 .6em; padding-left:1.5em }
+.md ul{ list-style:disc } .md ol{ list-style:decimal }
+.md li{ margin:.15em 0 }
+.md li > p{ margin:0 }
+.md blockquote{ margin:0 0 .6em; padding:.1em 0 .1em .8em; border-left:3px solid var(--grog-border); opacity:.85 }
+.md hr{ border:0; border-top:1px solid var(--grog-border); margin:.9em 0 }
+.md a{ color:var(--grog-answer); text-decoration:underline }
+.md a:hover{ text-decoration:none }
+
+/* inline + block code — the fixed font */
+.md code{ font-family:var(--grog-mono); font-size:.88em;
+          background:rgba(255,255,255,.07); border:1px solid var(--grog-border);
+          border-radius:.25rem; padding:.05em .35em }
+.md pre{ margin:0 0 .7em; padding:.6em .8em; overflow:auto;
+         background:rgba(0,0,0,.45); border:1px solid var(--grog-border); border-radius:.4rem }
+.md pre code{ font-family:var(--grog-mono); font-size:.85em; background:none; border:0; padding:0 }
+
+/* GFM tables — real grid, header tint, horizontal scroll when wide */
+.md table{ border-collapse:collapse; margin:0 0 .7em; font-size:.85em;
+           display:block; width:max-content; max-width:100%; overflow-x:auto }
+.md th,.md td{ border:1px solid var(--grog-border); padding:.25em .6em; vertical-align:top }
+.md th{ background:rgba(255,255,255,.06); font-weight:600 }

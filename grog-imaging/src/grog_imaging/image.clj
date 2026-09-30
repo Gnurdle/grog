@@ -8,8 +8,6 @@
            [java.io File]
            [java.util ArrayList Base64 List]
            [javax.imageio ImageIO]
-           [net.sourceforge.tess4j ITessAPI$TessOcrEngineMode ITessAPI$TessPageIteratorLevel
-            ITessAPI$TessPageSegMode Tesseract TesseractException Word]
            [org.apache.pdfbox Loader]
            [org.apache.pdfbox.pdmodel PDDocument]
            [org.apache.pdfbox.rendering ImageType PDFRenderer]
@@ -107,20 +105,101 @@
         (number? v) (not (zero? (long v)))
         :else default))
 
+(def ocr-psm-default
+  "Default page-segmentation mode: PSM_SINGLE_BLOCK (6) — the same value tess4j's
+  ITessAPI exposed, now handed to the CLI as `--psm`."
+  6)
+
 (defn parse-ocr-psm [m]
   (let [x (or (:page_seg_mode m) (get m "page_seg_mode")
               (:pageSegMode m) (get m "pageSegMode"))]
     (cond (number? x) (max 0 (min ocr-psm-max (long x)))
-          :else ITessAPI$TessPageSegMode/PSM_SINGLE_BLOCK)))
+          :else ocr-psm-default)))
 
-(defn- make-tesseract ^Tesseract [^String datapath ^String language ^long dpi ^long psm]
-  (doto (Tesseract.)
-    (.setDatapath datapath)
-    (.setLanguage (or (some-> language str str/trim not-empty) "eng"))
-    (.setOcrEngineMode ITessAPI$TessOcrEngineMode/OEM_LSTM_ONLY)
-    (.setPageSegMode (int psm))
-    (.setVariable "user_defined_dpi" (str dpi))
-    (.setVariable "preserve_interword_spaces" "1")))
+;; --- Tesseract via the CLI, not tess4j/JNA ----------------------------------
+;; OCR shells out to the `tesseract` executable. Rationale: tess4j drags in
+;; JNA + lept4j and a native-library chain (DLL discovery, MSVC runtime, API
+;; version matching) that has no place in a portable jar and is a known
+;; native-image blocker; the CLI is the SAME engine with the same options, and
+;; it turns tessdata into a plain path argument. Word boxes come from `tsv`
+;; output (level 5 rows) instead of the Java Word iterator.
+
+(def ^:private path-separator
+  (System/getProperty "path.separator"))
+
+(defn- tesseract-bin
+  "The tesseract executable: `:tesseract-bin` from imaging.edn, else the first
+  executable `tesseract`/`tesseract.exe` on PATH, else the bare name (so the
+  error message is about the missing binary rather than a null path)."
+  ^String []
+  (or (some-> (:tesseract-bin (imaging-config)) str str/trim not-empty)
+      (try
+        (some (fn [dir]
+                (let [a (io/file dir "tesseract")
+                      b (io/file dir "tesseract.exe")]
+                  (cond (.canExecute a) (.getAbsolutePath a)
+                        (.canExecute b) (.getAbsolutePath b))))
+              (remove str/blank? (str/split (or (System/getenv "PATH") "") (re-pattern (java.util.regex.Pattern/quote path-separator)))))
+        (catch Throwable _ nil))
+      "tesseract"))
+
+(defn- run-tesseract
+  "Run the CLI over `img-file`; `opts` = {:lang :psm :dpi :tessdata :format}.
+  `:format` nil means plain text (stdout); \"tsv\" gives word boxes. Returns
+  stdout; throws ex-info on a non-zero exit."
+  ^String [^File img-file {:keys [lang psm dpi tessdata format]}]
+  (let [args (cond-> [(tesseract-bin)
+                      (.getAbsolutePath img-file)
+                      "stdout"
+                      "-l" (or (some-> lang str str/trim not-empty) "eng")
+                      "--psm" (str (long (or psm ocr-psm-default)))
+                      "--oem" "1"
+                      "-c" "preserve_interword_spaces=1"]
+               dpi (into ["--dpi" (str (long dpi))])
+               (some-> tessdata str str/trim not-empty) (into ["--tessdata-dir" (str tessdata)])
+               format (into [format]))
+        pb (doto (ProcessBuilder. ^java.util.List (vec args))
+             (.redirectErrorStream true))
+        p (.start pb)
+        out (slurp (.getInputStream p))
+        code (.waitFor p)]
+    (when-not (zero? (long code))
+      (throw (ex-info "tesseract CLI failed"
+                      {:exit (long code)
+                       :bin (first args)
+                       :output (subs (str out) 0 (min 400 (count (str out))))})))
+    out))
+
+(defn- ocr-buffered-image
+  "OCR an in-memory image by way of a temp PNG (preprocessing is applied by the
+  caller, so the CLI sees exactly the pixels tess4j would have seen)."
+  ^String [^BufferedImage img {:keys [format] :as opts}]
+  (let [tmp (File/createTempFile "grog-ocr-" ".png")]
+    (try
+      (ImageIO/write img "png" tmp)
+      (run-tesseract tmp opts)
+      (finally
+        (try (.delete tmp) (catch Throwable _ nil))))))
+
+(defn- parse-tsv-words
+  "Word rows from `tesseract … tsv`. Columns:
+  level page block par line word left top width height conf text — level 5 = word."
+  [^String tsv]
+  (->> (str/split-lines (str tsv))
+       (drop 1)
+       (keep (fn [ln]
+               (let [c (str/split ln #"\t" -1)]
+                 (when (and (>= (count c) 12) (= "5" (nth c 0)))
+                   (let [text (nth c 11)]
+                     (when (seq (str/trim text))
+                       {:text text
+                        :confidence (try (Double/parseDouble (nth c 10))
+                                         (catch Throwable _ 0.0))
+                        :x (long (or (parse-long (nth c 6)) 0))
+                        :y (long (or (parse-long (nth c 7)) 0))
+                        :width (long (or (parse-long (nth c 8)) 0))
+                        :height (long (or (parse-long (nth c 9)) 0))}))))))
+       vec))
 
 (defn- image-to-grayscale ^BufferedImage [^BufferedImage src]
   (let [w (.getWidth src)
@@ -160,10 +239,10 @@
       (-> joined (str/replace #"\n{3,}" "\n\n") str/trim))))
 
 (defn- ocr-pdf-page!
-  [^Tesseract tess ^PDFRenderer renderer page-idx dpi preprocess?]
+  [^PDFRenderer renderer page-idx dpi preprocess? lang psm tessdata]
   (let [^BufferedImage rgb (.renderImageWithDPI renderer (int page-idx) (float dpi) ImageType/RGB)
         ^BufferedImage img (preprocess-page-image rgb preprocess?)]
-    (.doOCR tess img)))
+    (ocr-buffered-image img {:lang lang :psm psm :dpi dpi :tessdata tessdata})))
 
 (defn extract-pdf-ocr!
   [^File f max-pages dpi lang-out ^String datapath psm preprocess?]
@@ -175,7 +254,6 @@
         {:page_count 0 :pages_read 0 :pages_truncated false :dpi dpi :language lang-out
          :page_seg_mode psm :preprocess preprocess? :text ""}
         (let [end (int (min page-count max-pages))
-              tess (make-tesseract datapath lang-out (long dpi) (long psm))
               ^PDFRenderer renderer
               (doto (PDFRenderer. doc)
                 (.setSubsamplingAllowed false)
@@ -190,8 +268,8 @@
               (mapv (fn [pidx]
                       (try
                         (str "\n\n--- page " (inc pidx) " ---\n\n"
-                             (ocr-pdf-page! tess renderer pidx dpi preprocess?))
-                        (catch TesseractException e
+                             (ocr-pdf-page! renderer pidx dpi preprocess? lang-out psm datapath))
+                        (catch Throwable e
                           (str "\n\n--- page " (inc pidx) " ---\n[OCR error: "
                                (.getMessage e) "]\n"))))
                     (range 0 end))
@@ -376,26 +454,21 @@
 
 (defn ocr-image!
   "OCR a decoded BufferedImage. Optional word-level boxes (text + confidence +
-  bounding rect) via Tesseract's word iterator."
+  bounding rect) come from the CLI's `tsv` output. `datapath` is the tessdata
+  directory (or nil); `language` is a Tesseract language expression (e.g. \"eng\",
+  \"eng+deu\")."
   [^BufferedImage rgb ^String datapath ^String language psm dpi
    preprocess? with-words?]
   (let [img (preprocess-page-image rgb preprocess?)
-        tess (make-tesseract datapath language dpi psm)
-        text (try (.doOCR tess img)
-                  (catch TesseractException e
-                    (throw (ex-info "OCR failed" {:detail (.getMessage e)}))))
+        opts {:lang language :psm psm :dpi dpi :tessdata datapath}
+        text (try
+               (ocr-buffered-image img opts)
+               (catch Throwable e
+                 (throw (ex-info "OCR failed" {:detail (.getMessage e)}))))
         words (when with-words?
                 (try
-                  (let [^List ws (.getWords tess img
-                                            (int ITessAPI$TessPageIteratorLevel/RIL_WORD))]
-                    (mapv (fn [^Word w]
-                            (let [^Rectangle r (.getBoundingBox w)]
-                              {:text (.getText w)
-                               :confidence (double (.getConfidence w))
-                               :x (int (.x r)) :y (int (.y r))
-                               :width (int (.width r)) :height (int (.height r))}))
-                          ws))
-                  (catch TesseractException e
+                  (parse-tsv-words (ocr-buffered-image img (assoc opts :format "tsv")))
+                  (catch Throwable e
                     (throw (ex-info "OCR word boxes failed"
                                     {:detail (.getMessage e)})))))]
     {:text (normalize-ocr-text-for-llm text)

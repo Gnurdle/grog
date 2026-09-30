@@ -185,8 +185,8 @@
   directory (`project-root`). This abandons the repo-root workspace — the agent
   operates purely on the active project. Falls back to the projects home if the
   project dir cannot be resolved. Always returns a non-empty seq."
-  []
-  (let [proj (or (resolve-active-project) (project-name) "default")
+  [proj]
+  (let [proj (or proj (project-name) "default")
         root (or (project-root proj)
                  (ensure-project-dir! proj))]
     [{:uri (str (.toURI (platform/canonical-file root)))
@@ -345,10 +345,10 @@
   "Load a project's relevant context as a markdown string: a short header with the
   project path, manifest description (if any), and top-level layout, then the
   contents of its `notes/` text files (best effort; the `dialog/thread.edn` chat
-  log is deliberately excluded). Returns nil when no active project / no dir."
-  ^String []
-  (when-let [proj-dir (project-dir-for-active)]
-    (let [proj (project-name)]
+  log is deliberately excluded). Returns nil when no project / no dir."
+  ^String [proj]
+  (when-let [proj-dir (project-dir (or proj (project-name)))]
+    (let [proj (or proj (project-name))]
       (if-not (and proj (.isDirectory proj-dir))
         (str "Active project: **" proj "** (no directory yet at "
              (.getPath proj-dir) " — create it to hold project context).")

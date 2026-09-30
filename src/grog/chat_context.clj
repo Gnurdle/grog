@@ -25,7 +25,7 @@
           "The active project's directory is your working scope; its primary "
           "working dir is " (some-> (projects/project-root p) .getPath) ".\n\n"
           "### Project context\n\n"
-          (or (projects/load-context)
+          (or (projects/load-context p)
               "(no context loaded)"))}))
 
 (defn system-messages
