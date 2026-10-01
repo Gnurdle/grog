@@ -57,7 +57,7 @@
   (into base-known-secret-defs @!extra-secret-defs))
 
 (defn known-secret-defs
-  "Backward-compatible accessor for the built-in account definitions."
+  "The built-in account definitions."
   []
   base-known-secret-defs)
 
@@ -93,6 +93,27 @@
 (defn known-account?
   [^String account]
   (boolean (when account ((known-account-set) account))))
+
+(def ^:private secret-verbs
+  #{"set" "rm" "del" "delete" "file" "backend" "list"})
+
+(defn redact-secret-command
+  "Mask the secret VALUE in a `/secret …` command line so it can be echoed into
+  the transcript, logged, and persisted without leaking the credential.
+
+  Handles both explicit (`/secret set KEY VALUE`) and short (`/secret KEY
+  VALUE`) forms; a bare `/secret`, `/secret file`, `/secret backend`, `/secret
+  list`, and `/secret rm KEY` carry no secret and pass through unchanged. Any
+  non-`/secret` line is returned as-is, so this is safe to apply to every turn."
+  [s]
+  (let [t (some-> s str)]
+    (if (nil? t)
+      s
+      (if-let [[_ pre k] (re-matches #"(?is)^(\s*/secret\s+(?:set\s+)?)(\S+)\s+\S.*$" t)]
+        (if (contains? secret-verbs (str/lower-case k))
+          t
+          (str pre k " ***redacted***"))
+        t))))
 
 (defonce ^:private keyring-read-timeout-ms 4000)
 

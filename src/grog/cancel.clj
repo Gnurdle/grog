@@ -1,13 +1,14 @@
-(ns grog.ui.cancel
-  "Cancellation registry wiring a Stop button (or any caller) to an in-flight
+(ns grog.cancel
+  "Cancellation registry wiring a Stop action (or any caller) to an in-flight
   generation in `grog.core/post-chat-stream!`.
 
-  The GUI passes `(grog.ui.cancel/cancel-state)` as the `:cancel-state` opt to
+  Callers pass `(grog.cancel/cancel-state)` as the `:cancel-state` opt to
   `grog.core/chat-with-tools!`. Inside the stream loop:
     * the live SSE response stream is stored in `(:stream state)`, and
     * `(:flag state)` is polled each iteration.
   `cancel!` sets the flag AND closes the live stream, so the blocking read
   returns/throws promptly and the round finishes.")
+
 (defonce ^:private state
   (atom {:flag (atom false)
          :stream (atom nil)}))

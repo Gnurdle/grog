@@ -1,13 +1,13 @@
 (ns grog.client.remote
-  "Phase-3 remote adapter: implements `grog.client/Client` by speaking NDJSON
+  "Remote adapter: implements `grog.client/Client` by speaking NDJSON
   JSON-RPC to a `grog-server` process (see `grog.server`).
 
   The GUI is untouched by remote mode: `open!` returns a LOCAL `grog.chat`
   state map whose atoms form a *shadow* of the server-side session, kept in
   sync from incoming `event` notifications (status/trust/model from events;
-  running?/usage optimistic at call time — exactly where the local closures
-  used to set them). The status bar, tab dots, and subscriber all bind those
-  atoms unchanged. Swapping local for remote is therefore an install call.
+  running?/usage optimistic at call time — where the local adapter sets them).
+  The status bar, tab dots, and subscriber all bind those atoms unchanged.
+  Swapping local for remote is therefore an install call.
 
   Non-serializable opts (`:console`, `:trace-fn`, `:on-state`) are dropped at
   the boundary — the server owns its console publisher and tracer; slash
@@ -98,11 +98,11 @@
               (when (and c2 (not (:dead c2))) c2))
             (let [pb (ProcessBuilder. ^java.util.List (vec cmd))]
               (when dir (.directory pb (File. (str dir))))
-              ;; Swing self-manages its server: this child speaks stdio and must
-              ;; NOT claim the public rendezvous socket — that belongs to the
-              ;; systemd daemon (Electron's transport). Without this the two
-              ;; fight over $XDG_RUNTIME_DIR/grog-$USER.sock, and the daemon's
-              ;; bind is FATAL, so it exits and the service "tanks".
+              ;; this child is self-managed: it speaks stdio and must NOT claim
+              ;; the public rendezvous socket — that belongs to the systemd
+              ;; daemon (Electron's transport). Without this the two fight over
+              ;; $XDG_RUNTIME_DIR/grog-$USER.sock, and the daemon's bind is
+              ;; FATAL, so it exits and the service "tanks".
               (doto (.environment pb)
                 (.put "GROG_SERVER_NO_SOCKET" "1"))
               (let [p (.start pb)

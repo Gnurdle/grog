@@ -36,7 +36,7 @@
 
 ;; The file/OCR/pager tool namespaces (`grog.fs`, `grog.boofcv-pdf`,
 ;; `grog.pager` -> `grog.image-png`) drag in java.awt / POI / PDFBox / Tess4J /
-;; BoofCV / Swing. The CLI classpath has them; the GraalVM server image omits
+;; BoofCV. The CLI classpath has them; the GraalVM server image omits
 ;; them (that reach is what made native-image unfixable). Referencing them
 ;; *lazily* keeps the CLI fully working while leaving the server's reach
 ;; AWT-free — callers degrade to nil when the namespace isn't on the classpath.
@@ -756,7 +756,7 @@
 
 (defn- print-buffered-reply!
   "Show full answer (markdown vs plain per config) via `grog.pager/emit-final-reply!`.
-  `<image-png>path</image-png>` opens a PNG file in a Swing viewer (see `grog.image-png`)."
+  `<image-png>path</image-png>` opens a PNG file in an image viewer window (see `grog.image-png`)."
   [content answer-prefix]
   (opt-call "grog.pager" "emit-final-reply!"
             {:answer-prefix answer-prefix
@@ -808,13 +808,14 @@
 (defn run-tool-loop-on-messages
   "Run one full LLM tool loop from initial `messages` (for `/jobs`, chron, the
   GUI, etc.). Returns same map as internal chat round. `cancel-state` (optional)
-  is forwarded as the cancellation context (see `grog.ui.cancel`)."
+  is forwarded as the cancellation context (see `grog.cancel`)."
   [messages & {:keys [answer-prefix cancel-state] :or {answer-prefix "\n\n[grog] "}}]
   (chat-with-tools! messages (cond-> {:answer-prefix answer-prefix}
                                cancel-state (assoc :cancel-state cancel-state))))
 
 (declare help-text handle-shell-command! handle-jobs-command! handle-chron-command!
          handle-mcp-command! handle-project-command! handle-secret-command!
+         handle-doctor-command!
          handle-soul-command! handle-model-command! handle-tasks-command!)
 
 (defn- kv-save-state!
@@ -881,6 +882,7 @@
       (handle-chron-command! line)  ::handled
       (handle-mcp-command! line)    ::handled
       (handle-secret-command! line) ::handled
+      (handle-doctor-command! line) ::handled
       (handle-soul-command! line)   ::handled
       (handle-model-command! line)  ::handled
       :else ::llm)))
@@ -923,7 +925,7 @@
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"
     "          :llm {:extra-payload {:transforms [\"middle-out\"]} — provider-specific fields merged into every request payload"
     "          :llm {:profiles {:local {:model \"qwen2.5-coder:7b-instruct\" :url \"http://localhost:11434/v1\"} …}} — named model presets; switch with /model <profile>"
-    "Optional: paths resolve against the repo root — grog.home property, GROG_HOME env, or cwd (exported by grog-ui); SOUL path resolves here"
+    "Optional: paths resolve against the repo root — grog.home property, GROG_HOME env, or cwd; SOUL path resolves here"
     "          :edn-store {:root \"edn-store\"} — optional .edn tree (MCP admin config); root under repo root"
     "          :soul {:path \"SOUL.md\"} — persistent instructions → model `system` message every request"
     "          :skills {:roots [\"skills\"]} — each skill is <root>/<name>/skill.edn + SKILL.md; /skills in chat; list_skills, read_skill, save_skill, delete_skill (writes use first root only); :max-body-chars, :prompt-skill-lines"
@@ -943,7 +945,7 @@
     ""
     "Thinking: dark green; assistant reply: cyan. With :format-markdown true, the answer is buffered and ANSI-rendered once by default. Set :chat-stream-live-markdown true to render paragraphs and fenced code blocks as they close; GFM tables still buffer until a blank line. With :format-markdown false and :chat-stream-live-content true, answer tokens stream in cyan."
     "Markdown in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/> is parsed (legacy <text-markdown> still works); GFM pipe tables draw as box tables."
-    "<image-png>repo-root-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in a Swing window; path is absolute or repo-root relative (requires display / non-headless JVM)."
+    "<image-png>repo-root-relative/path.png</image-png> or <image-png>…<image-png/> (case-insensitive) opens that PNG in an image window; path is absolute or repo-root relative (requires a display / non-headless JVM)."
     "Chat: prompt chat> or <project> >. Before each line, stderr reports context size (JSON kB + rough token est.). When :chat-show-thinking is true, each round opens with a thinking banner `── thinking k/n ──` if :chat-tool-loop-limit is set, else `── thinking k ──`."
     "Models must support tool calling for these tools (many recent instruct models)."
     ""
@@ -963,6 +965,7 @@
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
     "  /secret — list known secret keys and set/unset status (values never printed); /secret set <KEY> <value> (or /secret <KEY> <value>) stores in the OS keyring, falling back to <config-home>/secrets.edn on headless/unsupported systems; /secret rm <KEY> removes; /secret file|backend | status"
+    "  /doctor — probe external dependencies (bash/java/bb/eca/soffice/tesseract/pdftoppm/rg/jq/node) with paths+versions, and audit config solvency with provenance (which file each effective key came from); broken EDN is reported by file"
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
     "  /model — show current LLM model and URL, plus any :llm :profiles"
@@ -1387,6 +1390,16 @@
           (println "grog:/secret: try /secret (list), /secret set <KEY> <value>, /secret rm <KEY>, /secret file, /secret backend."))))
     true))
 
+(defn- handle-doctor-command! [line]
+  (when (re-matches #"(?i)^/doctor(?:\s+(.*))?$" (str/trim line))
+    (try
+      ;; loaded lazily: doctor probes external binaries, no need to pay for it
+      ;; unless asked. `--json` prints the machine-readable report.
+      ((requiring-resolve 'grog.doctor/print-human!))
+      (catch Throwable e
+        (println "grog:/doctor error:" (or (.getMessage e) (str (class e))))))
+    true))
+
 (defn- handle-soul-command! [line]
   (when (str/starts-with? line "/soul")
     (let [rest (str/trim (subs line (count "/soul")))]
@@ -1640,8 +1653,8 @@
     (#{"help" "-h" "--help"} (first args)) (println (help-text))
     (= "chat" (first args))
     (do (binding [*out* *err*]
-          (println "grog: the console chat has been removed — run the GUI instead:")
-          (println "  ./grog-ui   (or: clojure -M:gui)"))
+          (println "grog: this command line sends ONE message then exits. For an"
+                   "interactive session use the desktop app; otherwise pass text:"))
         (System/exit 1))
     :else
     (run-once! (str/join " " (map expand-at-token args)))))

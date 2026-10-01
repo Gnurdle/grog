@@ -3,9 +3,9 @@
   an ECA-driven agent loop can execute short Clojure/Babashka scripts in an isolated,
   host-neutral sandbox.
 
-  This restores grog's `run_babashka` tool on the ECA/MCP surface by porting
-  `grog.babashka` (same contract: script reads problem input from **stdin**, writes
-  the answer to **stdout**, must not mutate the host; Python is off-limits).
+  It provides grog's `run_babashka` tool on the ECA/MCP surface (contract: script
+  reads problem input from **stdin**, writes the answer to **stdout**, must not
+  mutate the host; Python is off-limits).
 
   * Babashka is a **given** — always enabled (no config toggle). `bb` must be on
     PATH (override the command with `:cmd` in ~/.config/grog/babashka.edn).

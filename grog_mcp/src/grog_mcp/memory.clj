@@ -1,9 +1,8 @@
 (ns grog-mcp.memory
   "grog-memory — associative key/value store backed by SQLite over JDBC.
 
-  A faithful Clojure re-implementation of the (now-Python) grog-memory MCP server
-  (src/grog_memory/server.py) so the consolidated grog-mcp bundle can serve the
-  same assoc_* tools without a Python process. Deliberately byte-compatible:
+  Served by the consolidated grog-mcp bundle, byte-compatible with the
+  grog-memory MCP server:
 
     * Same 7 tools: assoc_open_store / assoc_close_store / assoc_store /
       assoc_get / assoc_keys / assoc_delete / assoc_search
@@ -35,7 +34,7 @@
 ;; Config is file-based: ~/.config/grog/memory.edn
 ;;   {:db "grog-memory.db" :max-open 8}
 ;; (env vars are intentionally NOT read — file-config normalization, like the
-;; Python grog-memory server. GROG_MEMORY_DB / GROG_MEMORY_MAX_OPEN are gone.)
+;; other grog servers.)
 (defn- config-file ^java.io.File []
   ;; grog hands the PER-PROJECT config path via GROG_MEMORY_CONFIG; fall back to
   ;; the config-home default only when run standalone.
@@ -96,10 +95,9 @@
 ;; default store, and no label means the default — the active project's
 ;; state/mem.db when grog exported GROG_MEMORY_CONFIG.
 ;;
-;; Without this the MCP dropped `name` on the floor: a caller asking for
-;; "global" silently hit the default (project) store, so writes landed there
-;; AND reads of them succeeded there too — a false-positive round trip that
-;; left global-mem.db unreachable while a project was active.
+;; `name` must be honored: a caller asking for "global" must not silently hit
+;; the default (project) store, which would leave global-mem.db unreachable
+;; while a project is active.
 
 (defn- store-label
   "The store label a caller passed (`name`/`store`/`Namespace`), or nil."

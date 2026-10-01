@@ -1,21 +1,22 @@
-// grog web client — Electron main: the CLIENT HOST (attach mode).
+// grog web client — Electron main: the CLIENT HOST.
 //
-// Client 2 does NOT spawn grog-server. Per the multi-client layout
-// (doc/multi-client-layout.md §5), the daemon owns ECA/MCP/projects and clients
-// ATTACH — over the server's Unix-domain socket (grog.server). This process
-// holds that socket and bridges it to the renderer over IPC; it also forwards
-// window focus, which the question-visibility rule needs
+// TWO TRANSPORT MODES, one code path downstream:
+//   EMBEDDED (default) — spawn the grog spine as OUR CHILD and speak NDJSON over
+//     its stdio. The client owns that process: no daemon, no systemd, no socket,
+//     and closing the app ends it cleanly (its stdin hits EOF and the spine tears
+//     down sessions + ECA + MCP children). This is the shipping shape per
+//     doc/multi-client-layout.md (decisions A1/A3): everything on the client.
+//   ATTACH (GROG_SERVER_HOST set) — dial a running server over TCP, for
+//     remote/multi-client use.
+//
+// It also forwards window focus, which the question-visibility rule needs
 // (doc/clients/web-client-plan.md §3.4.1).
-//
-// If no server is listening, we say so loudly (a visible "unreachable" state)
-// and keep retrying — never fill the gap by spawning a second server (that
-// double-claims project locks).
 const { app, BrowserWindow, ipcMain, Menu, session } = require("electron");
 const net = require("net");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
-const { execFile } = require("child_process");
+const { execFile, spawn, spawnSync } = require("child_process");
 
 // Same rendezvous the server computes (grog.server/default-socket-path):
 // GROG_SERVER_SOCKET wins; else $XDG_RUNTIME_DIR/grog-$USER.sock; else tmp.
@@ -23,6 +24,88 @@ const SOCKET_PATH =
   process.env.GROG_SERVER_SOCKET ||
   path.join(process.env.XDG_RUNTIME_DIR || os.tmpdir(),
             `grog-${process.env.USER || "user"}.sock`);
+
+// --- transport configuration (see the header for the two modes) -------------
+const EMBEDDED = !process.env.GROG_SERVER_HOST;
+const ATTACH_HOST = process.env.GROG_SERVER_HOST || "127.0.0.1";
+const ATTACH_PORT = Number(process.env.GROG_SERVER_PORT || 9640);
+// The client lives INSIDE the tree it drives (clients/web/src/main), so the
+// spine's working directory must be the TREE ROOT — the one with deps.edn and
+// src/grog. Do not trust path arithmetic alone: verify each candidate — a wrong
+// root makes the spine die instantly with "Could not locate grog/server.clj on
+// classpath" and the UI report "server unavailable".
+function looksLikeGrogRoot(dir) {
+  try {
+    return !!dir
+      && fs.existsSync(path.join(dir, "deps.edn"))
+      && fs.existsSync(path.join(dir, "src", "grog"));
+  } catch { return false; }
+}
+
+// A packaged app has no source tree: the jars travel beside it, under
+// resources/jars (electron-builder's extraResources — see package.json).
+const PACKAGED = app.isPackaged;
+const JARS_DIR = PACKAGED ? path.join(process.resourcesPath, "jars") : null;
+
+function packagedJar(prefix) {
+  try {
+    return fs.readdirSync(JARS_DIR)
+      .filter((f) => f.startsWith(prefix) && f.endsWith(".jar"))
+      .sort()
+      .map((f) => path.join(JARS_DIR, f))[0] || null;
+  } catch { return null; }
+}
+
+function findGrogHome() {
+  // Packaged: there is no tree to find. The backend runs from an absolute jar
+  // path, and this is only its working directory.
+  if (PACKAGED) return process.resourcesPath;
+  const up4 = path.resolve(__dirname, "..", "..", "..", "..");
+  const candidates = [process.env.GROG_HOME, up4, process.cwd()].filter(Boolean);
+  for (const c of candidates) if (looksLikeGrogRoot(c)) return c;
+  return process.env.GROG_HOME || up4;
+}
+
+const GROG_HOME = findGrogHome();
+if (!PACKAGED && !looksLikeGrogRoot(GROG_HOME)) {
+  console.warn(`[grog-client] GROG_HOME=${GROG_HOME} does not look like a grog tree ` +
+               `(no deps.edn + src/grog) — set GROG_HOME explicitly`);
+}
+
+// The tool bundle the backend hands to the agent loop. A packaged install ships
+// it beside the app; from a source tree the backend finds it itself.
+const MCP_JAR = PACKAGED ? packagedJar("grog-mcp-") : null;
+
+// A client-owned spine: no TCP socket, no MCP HTTP endpoint (tools reach ECA
+// through the generated config instead), and its own MCP port range.
+const SPINE_ENV_EXTRA = Object.assign(
+  {
+    GROG_SERVER_NO_SOCKET: "1",
+    GROG_MCP_HTTP: "0",
+    GROG_MCP_BASE_PORT: process.env.GROG_MCP_BASE_PORT || "9800",
+  },
+  MCP_JAR ? { GROG_MCP_JAR: MCP_JAR } : {},
+);
+
+// Spine launch: prefer the self-contained spine jar when it exists (no Clojure
+// CLI, no source tree on the machine — the installable shape); fall back to the
+// CLI + tree for development checkouts.
+const SPINE_JAR = PACKAGED
+  ? (packagedJar("grog-spine") || path.join(JARS_DIR, "grog-spine.jar"))
+  : path.join(GROG_HOME, "target", "grog-spine.jar");
+const SPINE_JAVA_FLAGS = [
+  "--add-opens=java.base/java.lang=ALL-UNNAMED",
+  "--enable-native-access=ALL-UNNAMED",
+];
+const SPINE_HAS_JAR = fs.existsSync(SPINE_JAR);
+const SPINE_CMD = process.env.GROG_SPINE_CMD
+  || (SPINE_HAS_JAR ? "java" : "clojure");
+const SPINE_ARGS = process.env.GROG_SPINE_ARGS
+  ? process.env.GROG_SPINE_ARGS.split(/\s+/).filter(Boolean)
+  : (SPINE_HAS_JAR
+      ? [...SPINE_JAVA_FLAGS, "-cp", SPINE_JAR, "clojure.main", "-m", "grog.server"]
+      : ["-M", "-m", "grog.server"]);
+let spine = null;
 
 let win = null;
 let sock = null;
@@ -48,7 +131,8 @@ function send(method, params) {
 function notifyRenderer() {
   send("server-status", {
     connected,
-    path: SOCKET_PATH,
+    path: transportLabel(),
+    mode: EMBEDDED ? "embedded" : "attach",
     retrying: !connected && retryTimer != null,
     attempts: retryAttempts,
     nextRetryAt,
@@ -62,50 +146,121 @@ function rejectAll(reason) {
 
 function connect() {
   if (sock || connecting) return;
-  connecting = true;
-  // TCP on a KNOWN host:port — a unix socket can't serve other machines.
-  // GROG_SERVER_PORT / GROG_SERVER_HOST override; 9640 matches grog.server.
-  const s = net.connect(Number(process.env.GROG_SERVER_PORT || 9640),
-                        process.env.GROG_SERVER_HOST || "127.0.0.1");
-  sock = s;
-  s.on("connect", () => {
-    connecting = false;
-    connected = true;
-    // reset backoff — next drop starts fast again
-    retryDelay = RETRY_MIN_MS;
-    retryAttempts = 0;
-    nextRetryAt = 0;
-    console.log(`[grog-client] attached to ${SOCKET_PATH}`);
-    notifyRenderer();
-  });
-  s.on("data", (b) => {
+  // A backoff retry is already pending: don't let renderer calls respawn now.
+  // (scheduleRetry clears retryTimer before calling connect(), so the retry
+  // itself gets through.)
+  if (retryTimer) return;
+  if (EMBEDDED) spawnSpine();
+  else attach();
+}
+
+// Resolves once a transport is up, so a renderer call that arrives during
+// start-up WAITS instead of failing silently (a prompt that goes nowhere and
+// says nothing is the failure mode this prevents).
+let readyResolve = null;
+const ready = new Promise((r) => { readyResolve = r; });
+
+function onLine(line) {
+  if (!line.trim()) return;
+  let msg; try { msg = JSON.parse(line); } catch (e) { return; }
+  if (msg.id && pending.has(msg.id)) {
+    const { resolve, reject } = pending.get(msg.id);
+    pending.delete(msg.id);
+    if (msg.error) reject(new Error(msg.error.message || "server error"));
+    else resolve(msg.result);
+  } else if (msg.method) {
+    send(msg.method, msg.params);
+  }
+}
+
+function pump(stream) {
+  stream.on("data", (b) => {
     buf += b.toString("utf8");
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
-      if (!line.trim()) continue;
-      let msg; try { msg = JSON.parse(line); } catch (e) { continue; }
-      if (msg.id && pending.has(msg.id)) {
-        const { resolve, reject } = pending.get(msg.id);
-        pending.delete(msg.id);
-        if (msg.error) reject(new Error(msg.error.message || "server error"));
-        else resolve(msg.result);
-      } else if (msg.method) {
-        send(msg.method, msg.params);
-      }
+      onLine(line);
     }
   });
-  const lost = (err) => {
+}
+
+function transportLabel() {
+  return EMBEDDED ? `${SPINE_CMD} ${SPINE_ARGS.join(" ")}` : `${ATTACH_HOST}:${ATTACH_PORT}`;
+}
+
+function onReady(label) {
+  connecting = false;
+  connected = true;
+  retryDelay = RETRY_MIN_MS;
+  retryAttempts = 0;
+  nextRetryAt = 0;
+  console.log(`[grog-client] transport up: ${label}`);
+  if (readyResolve) { readyResolve(true); readyResolve = null; }
+  notifyRenderer();
+}
+
+function down(why) {
+  connecting = false;
+  connected = false;
+  sock = null;
+  buf = "";
+  // Log it: without this, a failing spawn (e.g. `java` not on PATH) is silent
+  // in the terminal while the renderer span and the UI just say "server
+  // unavailable".
+  console.error(`[grog-client] transport down: ${why}`);
+  rejectAll(why);
+  notifyRenderer();
+  send("server-down", { text: `[grog] ${why}` });
+}
+
+// EMBEDDED: the spine is our CHILD. Its stdin is the write target, its stdout is
+// the NDJSON stream, its stderr is echoed with a prefix. GROG_SERVER_NO_SOCKET
+// stops it from also binding a TCP port.
+function spawnSpine() {
+  connecting = true;
+  console.log(`[grog-client] spawning spine (${GROG_HOME}): ${SPINE_CMD} ${SPINE_ARGS.join(" ")}`);
+  spine = spawn(SPINE_CMD, SPINE_ARGS, {
+    cwd: GROG_HOME,
+    env: Object.assign({}, process.env, SPINE_ENV_EXTRA),
+    windowsHide: true,
+    // POSIX only: make the spine lead its own process group so killSpineTree can
+    // signal the WHOLE tree. Not on Windows (detached there would pop a console
+    // despite windowsHide); Windows gets an explicit `taskkill /T` instead.
+    detached: process.platform !== "win32",
+  });
+  pump(spine.stdout);
+  spine.stderr.on("data", (b) => process.stderr.write(`[grog-spine] ${b}`));
+  // A spawn error (ENOENT: `java`/`clojure` missing from PATH) fires here with
+  // NO 'spawn' event and NO 'exit' event. Left unhandled, nothing is logged or
+  // rescheduled, so every renderer call re-enters connect() and respawns
+  // instantly — a 1000/sec storm that looks like a hang. Report the reason and
+  // back off like any other lost transport.
+  spine.on("error", (e) => {
     connecting = false;
-    if (connected || err) {
-      console.log(`[grog-client] disconnected from ${SOCKET_PATH}: ${err ? err.message : "closed"}`);
-    }
-    connected = false;
-    sock = null;
-    buf = "";
-    rejectAll(`grog-server unreachable at ${SOCKET_PATH}`);
-    notifyRenderer();
-    send("server-down", { text: `[grog] grog-server unreachable at ${SOCKET_PATH}` });
+    console.error(`[grog-client] spine SPAWN FAILED (${SPINE_CMD}): ${e.message}`);
+    spine = null;
+    down(`spine failed to start: ${e.message}`);
+    scheduleRetry();
+  });
+  spine.on("spawn", () => { sock = spine.stdin; onReady(`child pid ${spine.pid}`); });
+  spine.on("exit", (code, sig) => {
+    spine = null;
+    if (!connected && !sock) return;   // start-up failure already reported
+    down(`spine exited (code ${code}${sig ? ", " + sig : ""})`);
+    scheduleRetry();                   // client-owned spine died: bring it back
+  });
+}
+
+// ATTACH: dial an already-running server (a daemon, or a remote host).
+function attach() {
+  connecting = true;
+  const s = net.connect(ATTACH_PORT, ATTACH_HOST);
+  sock = s;
+  s.on("connect", () => onReady(`${ATTACH_HOST}:${ATTACH_PORT}`));
+  pump(s);
+  const lost = (err) => {
+    if (connected || err) console.log(`[grog-client] disconnected: ${err ? err.message : "closed"}`);
+    down(`grog-server unreachable at ${ATTACH_HOST}:${ATTACH_PORT}`);
     scheduleRetry();
   };
   s.on("error", lost);
@@ -123,15 +278,23 @@ function scheduleRetry() {
   retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
 }
 
-const call = (method, params) => new Promise((resolve, reject) => {
+const call = async (method, params) => {
   if (!connected || !sock) {
     connect();
-    return reject(new Error(`grog-server unreachable at ${SOCKET_PATH}`));
+    const ok = await Promise.race([
+      ready,
+      new Promise((r) => setTimeout(() => r(false), 30000)),
+    ]);
+    if (!ok || !connected || !sock) {
+      throw new Error(`grog spine not reachable (${transportLabel()})`);
+    }
   }
   const id = nextId++;
-  pending.set(id, { resolve, reject });
-  sock.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} }) + "\n");
-});
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    sock.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} }) + "\n");
+  });
+};
 
 // --- voice (client-side speech-to-text) -------------------------------------
 // All voice processing stays on THIS machine: the renderer captures + encodes a
@@ -228,6 +391,18 @@ ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
 ipcMain.handle("grog:voice-status", () => voiceStatus());
 ipcMain.handle("grog:voice-transcribe", (_e, bytes) => transcribe(bytes));
 
+// A VM (or any box without working GPU acceleration) can hard-fail Electron's
+// compositor before a window ever appears; GROG_DISABLE_GPU=1 forces the safe
+// software path. Must be called before the app is ready.
+if (process.env.GROG_DISABLE_GPU === "1") {
+  try {
+    app.disableHardwareAcceleration();
+    console.log("[grog-client] GPU acceleration disabled (GROG_DISABLE_GPU=1)");
+  } catch (e) {
+    console.warn("[grog-client] disableHardwareAcceleration failed:", e.message);
+  }
+}
+
 app.whenReady().then(() => {
   // No default menu: its accelerators (Ctrl+W close-window, Ctrl+± page zoom,
   // Ctrl+0) would shadow the client's own shortcuts (close-tab, font-zoom).
@@ -239,4 +414,46 @@ app.whenReady().then(() => {
   connect();
   createWindow();
 });
-app.on("window-all-closed", () => { if (sock) sock.end(); app.quit(); });
+// Kill the spine AND everything it spawned. Necessary because the MCP servers
+// are GRANDCHILDREN: spine (java) -> eca -> bash -> java. Killing only the spine
+// pid leaves those running, and being orphaned they also keep whatever handles
+// they inherited — including our log file, which then makes the NEXT launch's
+// stdout redirect fail (cmd will not run a command whose redirect failed, so
+// the app "closes right after launch"). Measured: 32 leftover JVMs, ~5.4 GB.
+function killSpineTree(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
+    } else {
+      // The spine was spawned detached, so -pid addresses its whole group.
+      try { process.kill(-pid, "SIGTERM"); }
+      catch { try { process.kill(pid, "SIGTERM"); } catch {} }
+      setTimeout(() => { try { process.kill(-pid, "SIGKILL"); } catch {} }, 2000);
+    }
+  } catch { /* already gone */ }
+}
+
+// One teardown, used by every exit path. Closing stdin is the DESIGNED
+// shutdown (the spine sees EOF, closes sessions, releases locks, exits); the
+// tree kill is the fallback for a slow teardown and for the grandchild MCP JVMs
+// that neither Windows nor POSIX cascades to.
+function shutdown(reason) {
+  if (sock) sock.end();
+  const pid = spine && spine.pid;
+  if (!pid) { app.quit(); return; }
+  setTimeout(() => {
+    killSpineTree(pid);
+    console.log(`[grog-client] shutdown (${reason})`);
+    app.quit();
+  }, 2500);
+}
+
+app.on("window-all-closed", () => shutdown("window-all-closed"));
+
+// A signalled client (Ctrl-C in the launcher console, a test harness, a task
+// manager kill) must ALSO reap — the spine leads its own process group, so a
+// bare SIGTERM to Electron would leave it (and its MCP JVMs, and any inherited
+// handles) orphaned. Without this, scripts/electron-smoke.js left orphans.
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

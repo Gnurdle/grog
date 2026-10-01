@@ -43,7 +43,7 @@
 
 (defn- config-debug!
   "One-line config-loading trace written to the **real** stderr so it always
-  lands in the grog debug log (`grog-ui.<pid>.log`, or `$GROG_LOG`, via
+  lands in the grog debug log (`grog.<pid>.log`, or `$GROG_LOG`, via
   grog.log's in-process tee) even when the caller's `*out*`/`*err*` are rebound
   to the transcript pane."
   [& xs]
@@ -79,37 +79,58 @@
        (try (= (.getCanonicalPath a) (.getCanonicalPath b))
             (catch Exception _ (= (str a) (str b))))))
 
+(defn- fragment-entries
+  "Every config fragment we consider, in MERGE ORDER (later wins), as
+  `[label ^File source-kw data legacy-same?]`. One source of truth for both the
+  `[grog-config]` trace and `load-fragments` (used by `grog doctor`)."
+  []
+  (let [home-file (io/file (config-home-dir) "grog.edn")
+        legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
+        cwd-file (io/file "grog.edn")
+        legacy-same? (canonical-equal? home-file legacy-home-file)]
+    [["resource grog.edn" (some-> (io/resource "grog.edn") io/file) :classpath
+      (resource-edn "grog.edn") false]
+     ["home grog.edn" home-file :home (slurp-edn home-file) false]
+     ["legacy ~/.config/grog/grog.edn" legacy-home-file :legacy
+      (when (and (.exists legacy-home-file)
+                 (not (and (.exists home-file) legacy-same?)))
+        (slurp-edn legacy-home-file))
+      legacy-same?]
+     ["cwd ./grog.edn" cwd-file :cwd (slurp-edn cwd-file) false]]))
+
+(defn load-fragments
+  "The config fragments that were FOUND and parsed, in merge order, as
+  `{:source :classpath|:home|:legacy|:cwd, :path <str>, :data <map>}`.
+
+  This is what makes provenance observable: `grog doctor` walks it front-to-back
+  to attribute each effective key to the last file that set it (the
+  cwd-overlay-wins trap)."
+  []
+  (vec (keep (fn [[_label f src data _same?]]
+               (when (some? data)
+                 {:source src
+                  :path (or (some-> f .getPath) (str f))
+                  :data data}))
+             (fragment-entries))))
+
 (defn load-merge!
   "Load and deep-merge all config fragments (does not touch the cache atom).
   Writes a `[grog-config]` trace to the debug log for every fragment it looks
   at (classpath resource, config-home grog.edn, legacy ~/.config/grog, ./grog.edn)."
   []
-  (let [home-file (io/file (config-home-dir) "grog.edn")
-        legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
-        cwd-file (io/file "grog.edn")
-        resource (resource-edn "grog.edn")
-        home (slurp-edn home-file)
-        legacy-same? (canonical-equal? home-file legacy-home-file)
-        legacy (when (and (.exists legacy-home-file)
-                          (not (and (.exists home-file) legacy-same?)))
-                 (slurp-edn legacy-home-file))
-        cwd (slurp-edn cwd-file)
-        fragments (remove nil? [resource home legacy cwd])]
+  (let [entries (fragment-entries)
+        fragments (remove nil? (map (fn [[_ _ _ data _]] data) entries))]
     (config-debug! "config-home-dir=" (some-> (config-home-dir) .getPath)
                    " GROG_CONFIG_HOME=" (pr-str (System/getenv "GROG_CONFIG_HOME"))
                    " XDG_CONFIG_HOME=" (pr-str (System/getenv "XDG_CONFIG_HOME"))
                    " user.home=" (pr-str (System/getProperty "user.home")))
-    (trace-fragment "resource grog.edn" (some-> (io/resource "grog.edn") io/file) resource)
-    (trace-fragment "home grog.edn" home-file home)
-    (trace-fragment "legacy ~/.config/grog/grog.edn" legacy-home-file legacy
-                    (when legacy-same? "(same as home-file - skipped)"))
-    (trace-fragment "cwd ./grog.edn" cwd-file cwd)
+    (doseq [[label f _ data same?] entries]
+      (trace-fragment label f data (when same? "(same as home-file - skipped)")))
     (config-debug! "merged fragments=" (count fragments)
                    " sources=" (pr-str (vec (keep identity
-                                                  [(when resource "classpath")
-                                                   (when home "home")
-                                                   (when legacy "legacy")
-                                                   (when cwd "cwd")]))))
+                                                  (map (fn [[_ _ src data _]]
+                                                         (when data (name src)))
+                                                       entries)))))
     (reduce deep-merge {} fragments)))
 
 (defonce ^:private !cfg (atom nil))
@@ -155,7 +176,7 @@
 (defn repo-root
   "The grog project/repo root (where deps.edn, SOUL.md, skills/ etc. live).
   Resolution order: the `grog.home` system property, then the `GROG_HOME` env
-  var (exported by grog-ui), then the process working directory. Used as ECA's
+  var, then the process working directory. Used as ECA's
   `workspaceFolders` root and as the `/shell` working directory, so the tool
   model can address files by plain paths in the repo (no workspace containment).
   Returns a native path string: on Windows an MSYS-style `GROG_HOME` (`/c/...`)
@@ -321,7 +342,7 @@
   []
   (get-in (effective-llm-cfg) [:extra-payload]))
 
-;; Backward-compat alias — old code calls config/model
+;; Alias for `llm-model` (config/model)
 (defn model
   "Model id. Delegates to `llm-model`."
   []
@@ -620,12 +641,12 @@
 
 (defn log-base
   "Base path (no extension) for the per-instance GUI logs (`:log :dir`, default
-  `~/grog-ui`). `~` is expanded and a legacy `*.log` value is stripped.
+  `~/grog`). `~` is expanded and a `*.log` extension is stripped.
   Env override: `GROG_LOG`."
   ^String []
   (let [raw (or (some-> (System/getenv "GROG_LOG") str str/trim not-empty)
                 (some-> (:dir (log-cfg)) str str/trim not-empty)
-                "~/grog-ui")
+                "~/grog")
         s   (platform/expand-home raw)]
     (if (str/ends-with? (str/lower-case s) ".log")
       (subs s 0 (- (count s) 4))

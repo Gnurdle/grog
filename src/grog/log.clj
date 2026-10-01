@@ -3,15 +3,15 @@
 
   Every running grog writes its OWN log — `<base>.<pid>.log` — so concurrent
   instances never interleave (one shared file made multi-instance debugging
-  useless). `<base>` defaults to `~/grog-ui`; override with the `GROG_LOG` env
-  var (a legacy `…/grog-ui.log` value is accepted and its extension stripped).
+  useless). `<base>` defaults to `~/grog`; override with the `GROG_LOG` env
+  var (a `…/grog.log` value is accepted and its extension stripped).
   On startup the oldest instance logs are pruned, keeping `GROG_UI_LOG_KEEP`
   (default 5).
 
   This lives in the JVM, so it needs **no shell**: the PID is the JVM's own
   (`ProcessHandle/current`), the file/dir work is `babashka.fs`, and `System.out`
   / `System.err` (plus Clojure's `*out*` / `*err*` roots) are tee'd to BOTH the
-  console and the log file. The `grog-ui` / `grog-ui.bat` launchers therefore
+  console and the log file. The launchers therefore
   just find `clojure` and start the app — no redirection, no rotation scripts,
   no platform-specific PID tricks."
   (:require [babashka.fs :as fs]
@@ -29,7 +29,7 @@
   (.pid (java.lang.ProcessHandle/current)))
 
 (defn- base-path
-  "The log base (no extension): `:log :dir` in grog.edn (default `~/grog-ui`)."
+  "The log base (no extension): `:log :dir` in grog.edn (default `~/grog`)."
   ^String []
   (config/log-base))
 
@@ -88,6 +88,6 @@
         (alter-var-root #'*out* (fn [_] (PrintWriter. out true)))
         (alter-var-root #'*err* (fn [_] (PrintWriter. err true)))
         (reset! !path p)
-        (println (str "=== grog-ui launch: " (java.time.LocalDateTime/now)
+        (println (str "=== grog launch: " (java.time.LocalDateTime/now)
                       " pid=" (pid) " log=" p " ==="))
         p)))

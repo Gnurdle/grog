@@ -1,11 +1,11 @@
 (ns grog.mcp-http
-  "Owns the shared grog-mcp Streamable-HTTP endpoint process (Phase 3.5).
+  "Owns the shared grog-mcp Streamable-HTTP endpoint process.
 
   grog-server starts ONE grog-mcp JVM at boot (`clojure -M:http --base-port N`
   in the grog_mcp project): it serves the entire toolset over localhost HTTP,
-  one listener per server key. `grog.eca-config` then emits `:url` entries for
-  every key instead of 13 stdio commands, so each ECA — and every tab — dials
-  the one process instead of spawning its own pile of MCP JVMs.
+  one listener per server key. `grog.eca-config` emits `:url` entries for every
+  key instead of 13 stdio commands, so each ECA — and every tab — dials the one
+  process instead of spawning its own pile of MCP JVMs.
 
   Why a child process rather than in-process: the tools pull native/PDF/OCR/
   office/postgres deps; keeping them out of grog.server's JVM preserves crash
@@ -13,11 +13,11 @@
 
   Readiness: the endpoint prints one stderr line per listener —
     grog-mcp http READY <server-id> 127.0.0.1:<port>/mcp
-  — and we collect them into a {server-id url} map, which is what makes the
-  cutover observable (`urls` non-empty => ECA configs use `:url`).
+  — and we collect them into a {server-id url} map, which makes the endpoint's
+  state observable (`urls` non-empty => ECA configs use `:url`).
 
   Failure is soft: if the endpoint never comes up, `urls` stays empty and
-  eca-config falls back to spawning stdio MCPs exactly as before."
+  eca-config falls back to spawning stdio MCPs."
   (:require [clojure.string :as str])
   (:import (java.io BufferedReader File InputStreamReader)))
 

@@ -2,14 +2,12 @@
   "grog-search — a standalone MCP server (over stdio) exposing **Brave Web Search** so an
   ECA-driven agent loop can search the public web.
 
-  This is the \"Keep -> grog MCP\" path for grog's `brave_web_search` tool (see
-  doc/gap-analysis-grog-vs-eca.md §6.5). The old grog GUI shipped Brave in its own
-  tool loop (`grog.brave`); once the GUI was rewired onto ECA, ECA's model loop only
-  sees MCP servers, so the tool went missing. This server restores it with the same
-  behaviour and the same secret storage:
+  This exposes grog's `brave_web_search` tool on the ECA/MCP surface (see
+  doc/gap-analysis-grog-vs-eca.md §6.5). ECA's model loop only sees MCP servers,
+  so the tool is served here, with the same behaviour and secret storage:
 
     * API key: OS keyring, service `grog`, account `BRAVE_SEARCH_API`
-      (same as the original; also writable from grog chat with `/secret BRAVE_SEARCH_API <key>`).
+      (also writable from grog chat with `/secret BRAVE_SEARCH_API <key>`).
     * Tool: `brave_web_search` — query (required), count (1-10, default 5).
 
   ECA discovers this over stdio like the other grog servers:

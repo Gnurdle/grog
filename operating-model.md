@@ -26,8 +26,7 @@ Two properties make this worth building:
 
 ## 2. The taxonomy: two kinds of unit, and no deeper
 
-The system has two kinds of reusable unit. That's all. There is deliberately no
-six-layer model.
+The system has two kinds of reusable unit. That's all.
 
 - **Skills** — small, self-contained capabilities. Each has a manifest describing what
   it does and how to use it.

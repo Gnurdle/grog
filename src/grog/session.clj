@@ -57,7 +57,7 @@
 
 (defn- same-host?
   "True when lock host `h` names this machine — or names nothing. Tolerates
-  FQDN-vs-short drift (`caney` vs `caney.lan`), because hostname drift used to
+  FQDN-vs-short drift (`caney` vs `caney.lan`), because hostname drift can
   shove a local lock into the foreign-host branch and fake a holder. A lock
   with no `:host` is treated as local so it still gets the pid test instead of
   being reported held outright."

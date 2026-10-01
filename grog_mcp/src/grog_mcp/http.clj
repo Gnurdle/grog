@@ -4,9 +4,9 @@
 
   Why this exists: ECA accepts an MCP server entry as either `:command`
   (stdio — ECA spawns the child) or `:url` (Streamable HTTP — ECA dials out);
-  see ECA's `features/tools/mcp.clj` (~line 145, `->transport`). Dialling is
-  the cutover: instead of every ECA spawning 13 stdio JVMs (13 per tab!), this
-  one process serves the whole toolset and every ECA attaches to it.
+  see ECA's `features/tools/mcp.clj` (~line 145, `->transport`). This one
+  process serves the whole toolset and every ECA attaches to it, rather than
+  every ECA spawning its own stdio JVMs (13 per tab).
 
   Why one port PER SERVER KEY rather than a single merged endpoint: ECA names
   tools `<config-key>__<tool>` (hence `grog-memory__assoc_get`,

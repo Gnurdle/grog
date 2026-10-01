@@ -1,30 +1,29 @@
 (ns grog.client
-  "The client boundary (doc/server-and-client.md §3).
+  "The client boundary.
 
-  The Swing UI is written against this namespace and never calls ECA/MCP
-  directly again — that is the whole point of the seam. Adapters implement the
-  `Client` protocol:
+  Clients are written against this namespace and never call ECA/MCP directly —
+  that is the whole point of the seam. Adapters implement the `Client` protocol:
 
-    `grog.client.local`  — in-process, exactly today's behavior (Phase 2)
-    `grog.client.remote` — JSON-RPC to `grog-server` (Phase 3; not built yet)
+    `grog.client.local`  — in-process (the desktop app's path)
+    `grog.client.remote` — JSON-RPC to a server over a socket
 
   The UI calls only the delegating fns below, so swapping local for remote is
   an install call (`set-impl!`) instead of a rewrite. With no adapter
-  installed, the first call lazily installs the local one — zero-config today,
-  explicit choice tomorrow.
+  installed, the first call lazily installs the local one — zero-config local
+  by default; installing another adapter is an explicit choice.
 
-  Interface notes vs doc/server-and-client.md §3:
+  Interface notes:
     * `subscribe!`/`unsubscribe!` are SESSION-SCOPED (`id` first): events are
       per-session and the GUI paints into a per-tab stream; a global
-      fan-in can be layered on top later without changing this shape.
+      fan-in can be layered on top without changing this shape.
     * `answer!` takes `{:approval-id … :decision …}` — matching
       `grog.chat/answer-approval!`'s registry. Question events carry their own
-      `:answer` callback today (in-process); Phase 3 must route that as a
-      request/response — noted, not yet.
+      `:answer` callback (in-process); the remote adapter routes that as a
+      request/response.
     * `open!` returns `{:id :project :state}` where `:state` is the local
       `grog.chat` state map (atoms the status bar renders). The remote adapter
-      will return no `:state` — the UI must then read `sessions`/`snapshot` +
-      events. That is the one local-only convenience in this interface.
+      returns no `:state` — the UI reads `sessions`/`snapshot` + events
+      instead. That is the one local-only convenience in this interface.
 
   Seam rule: **zero `:import` forms in this file** — it is pure delegation.
   Adapters may import transport/process classes; this boundary may not pull in
@@ -46,7 +45,7 @@
   (close [this id])
   (sessions [this])   ; -> vector of (snapshot) maps, each with :id
   (session [this id]) ; -> snapshot map or nil
-  (connect! [this id])     ; eager ECA connect (tab open does this today)
+  (connect! [this id])     ; eager ECA connect (the tab-open path does this)
   (disconnect! [this id])  ; alias of close, kept for the UI's :disconnect! slot
   (prompt! [this id text]) ; queue a normal prompt
   (steer! [this id text])  ; steer a running turn
@@ -73,7 +72,7 @@
 
 (defn- need
   "The active adapter, lazily installing the local one on first use so the
-  single-process path needs no ceremony (today's behavior, unchanged)."
+  single-process path needs no ceremony."
   []
   (or @!impl
       (do ((requiring-resolve 'grog.client.local/install!))

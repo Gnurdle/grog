@@ -13,7 +13,7 @@
     - a message with neither                -> notification (event handler)
 
   Notifications (especially `chat/contentReceived`) are routed to a pluggable
-  event handler so the Swing UI can render them. Requests are routed to a
+  event handler so the UI can render them. Requests are routed to a
   pluggable request handler so it can answer `chat/askQuestion` / `editor/getDiagnostics`
   (responds with safe defaults if unset)."
   (:require [cheshire.core :as json]
@@ -136,7 +136,7 @@
 ;;   2. the bare name via the OS PATH lookup,
 ;;   3. well-known install locations (VS Code extension dirs, scoop shims, npm
 ;;      global, ~/.local, /usr/local)
-;; so `clojure -M:gui` / grog-ui works on Windows too.
+;; so it works on Windows too.
 
 (defn- windows?
   "True when running on a Microsoft Windows OS."

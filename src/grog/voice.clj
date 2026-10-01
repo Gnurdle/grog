@@ -56,7 +56,7 @@
 
 (defn push-to-talk-key
   "KeyStroke string for hold-to-talk (`:voice :push-to-talk-key`; default
-  \"ctrl shift SPACE\"). Swing KeyStroke syntax, e.g. \"ctrl shift SPACE\",
+  \"ctrl shift SPACE\"). AWT KeyStroke syntax, e.g. \"ctrl shift SPACE\",
   \"F9\", \"ctrl alt M\".
 
   Default avoids the usual collisions: Alt+Space is the WM window menu,

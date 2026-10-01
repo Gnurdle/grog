@@ -1,11 +1,11 @@
 (ns grog.chat
   "Headless chat core: one chat's mutable state plus an event stream.
 
-  This is the bottom of the client/server split. Today `grog.ui` is the only
-  consumer — the Swing transcript subscribes and paints. When `grog-server`
-  exists it publishes these same events over the wire and a thin client
-  subscribes instead. Local and remote are then the same code with a different
-  transport, which is the whole point of putting the stream down here.
+  This is the bottom of the client/server split. The UI transcript subscribes
+  and paints; `grog-server` publishes these same events over the wire and a
+  thin client subscribes instead. Local and remote are the same code with a
+  different transport, which is the whole point of putting the stream down
+  here.
 
   **Seam rule: this namespace declares no `:import` at all.** Verify with
   `grep -cE '^\\s*\\(:import' src/grog/chat.clj` → must be 0. The moment a
@@ -16,20 +16,18 @@
   packages — writing those names in this docstring would otherwise trip the
   test, so the rule would fail on its own documentation.)
 
-  Named `grog.chat`, not `grog.session`: `grog.session` is the project-lock ns
-  and its rename is TABLED (doc/multiuser-and-shared-mcp.md §3.5). The name also
-  fits better — bottom-up this core manages *chats* (`chatId`-scoped; one ECA
-  per project, many chats per ECA) while the *server* owns projects.
+  Named `grog.chat`, not `grog.session` (`grog.session` is the project-lock ns).
+  This core manages *chats* (`chatId`-scoped; one ECA per project, many chats
+  per ECA) while the *server* owns projects.
 
-  Event envelope — this is the prospective wire format
-  (doc/server-and-client.md §4):
+  Event envelope — the wire format:
 
       {:session <uuid>   ; this chat's id
        :chatId  <str>    ; ECA chat id, nil until a prompt mints one
        :user    <str>    ; \"local\" until multiuser lands
        :type    <kw>     ; :content :status :trust :approval :question
                           ; :user :clear :line
-                          ; (Step 3 normalizes :content into the doc's
+                          ; (normalized into the doc's
                           ;  :text|:thinking|:tool|… vocabulary)
        :at      <epoch-ms>
        ;; type-specific
@@ -41,7 +39,7 @@
             [grog.models :as models]
             [grog.project-dialog :as project-dialog]
             [grog.secrets :as secrets]
-            [grog.ui.cancel :as cancel]))
+            [grog.cancel :as cancel]))
 
 ;; ---------------------------------------------------------------------------
 ;; Session state
@@ -51,7 +49,7 @@
   "All mutable state for one chat, as a plain map of atoms.
 
   Every atom here is something BOTH the local GUI and a remote client must
-  observe — which is precisely why it belongs in the core and not in `grog.ui`.
+  observe — which is why it belongs in the core.
 
   Keys (initial values come from the caller, so `build-session!` keeps its
   existing expressions for `:chat-id` / `:model`):
@@ -76,7 +74,7 @@
    :last-sent (atom nil)
    :pending-steer (atom nil)
    ;; Pending tool-approval promises, keyed by ECA tool-call id. See
-   ;; `answer-approval!` — Option A: the core blocks here, a client answers.
+   ;; `answer-approval!` — the core blocks here, a client answers.
    :approvals (atom {})
    ;; subscribers to this chat's event stream
    :subs      (atom #{})})
@@ -112,8 +110,8 @@
   nil)
 
 (defn- stamp
-  "Stamp `event` with this chat's wire envelope (doc/server-and-client.md §4):
-  session/chat ids, acting user, timestamp. Pure data — no fan-out."
+  "Stamp `event` with this chat's wire envelope: session/chat ids, acting user,
+  timestamp. Pure data — no fan-out."
   [state event]
   (assoc event
          :session (:project state)
@@ -185,17 +183,14 @@
   nil)
 
 ;; ---------------------------------------------------------------------------
-;; Tool-approval round trip — OPTION A (blocking core), revisit later
+;; Tool-approval round trip — a blocking core
 ;; ---------------------------------------------------------------------------
 
-;; NOTE: this is a REQUEST/RESPONSE, not an event — `doc/server-and-client.md`
-;; models it as `answer!`.
+;; NOTE: this is a REQUEST/RESPONSE, not an event — clients `answer!` it.
 ;;
-;; IMPORTANT — corrects an earlier assumption: the ECA reader thread does NOT
-;; block on approval today. `ui.clj` shows the modal dialog via
-;; `SwingUtilities/invokeLater`, deliberately, with a comment about wedging the
-;; EDT if it were shown directly off the reader. ECA holds the tool call open
-;; until grog answers, so nothing here waits.
+;; The ECA reader thread does NOT block on approval: ECA holds the tool call
+;; open until grog answers, so nothing here waits. A client must therefore not
+;; show the decision dialog on the reader thread.
 ;;
 ;; Therefore the registry holds a RESPOND CLOSURE, not a promise: answering
 ;; later runs the right ECA action (approve / approve-and-allow / reject /
@@ -203,10 +198,10 @@
 ;; free — so other events, and other chats sharing one ECA connection, keep
 ;; flowing while a human reads a dialog.
 ;;
-;; REVISIT (deferred): Option B — a fully async turn loop with no per-call
-;; closures. Cleaner under real concurrency, but it rewrites `handle-turn!` /
-;; `chat-worker!`. Not needed while same-project concurrency is unresolved
-;; (locks TABLED), so we take the smallest correct cut now.
+;; A fully async turn loop with no per-call closures would be cleaner under
+;; real concurrency, but it rewrites `handle-turn!` / `chat-worker!`. Not needed
+;; while same-project concurrency is unresolved, so the current design takes the
+;; smallest correct cut.
 
 (defn answer-approval!
   "Deliver a client's decision for a pending tool approval.
@@ -230,20 +225,20 @@
 
   Domain work lives here — echo suppression, assistant-text accumulation,
   finish detection, model-catalog capture, tool-approval bookkeeping.
-  Everything that needs pixels is *published*; `grog.ui` subscribes and paints.
+  Everything that needs pixels is *published*; a client subscribes and paints.
 
   Events emitted through `publish!`:
 
     :content   every non-echoed `chat/contentReceived` (including `usage` — the
                subscriber decides whether to render it or fold it into the
-               footer). Raw content for now; normalizing it into the doc's
-               `:status|:assistant|:thinking|:tool|…` vocabulary is Step 3's
-               job, once we've measured what actually flows.
-    :status    published AFTER finish-on-idle, preserving the old ordering
+               footer). Carried raw; normalizing it into the doc's
+               `:status|:assistant|:thinking|:tool|…` vocabulary happens
+               downstream, once we've measured what actually flows.
+    :status    published AFTER finish-on-idle
     :trust     YOLO switch flipped by an approval answer
     :approval  a question needing a client answer — see `answer-approval!`
 
-  `hooks` — plain fns injected by the caller so this namespace stays Swing-free:
+  `hooks` — plain fns injected by the caller so this namespace stays free of any UI toolkit:
 
     :resend-steer (fn [s])  re-issue a steer ECA never consumed"
   [state sid {:keys [resend-steer]}]
@@ -367,18 +362,18 @@
 
   A subscriber (the GUI's modal dialog) replies through `:answer`; this fn
   BLOCKS on the ECA reader thread until then — which is what we want: ECA is
-  waiting for the response, exactly as before the split (the old code blocked
-  the reader on `invokeAndWait` for the same reason).
+  waiting for the response, so the answer has to arrive while the reader still
+  holds the turn.
 
   Wedge-safety, because a blocked reader thread wedges the whole chat: a
   question is only waited on if it was answered DURING the fan-out — i.e. the
   answering subscriber answers before it returns (the GUI's modal dialog
-  does, exactly like the old `invokeAndWait`). A subscriber that ignores the
+  does). A subscriber that ignores the
   event (a status-bar-only client), one that throws, or no subscribers at all
   all fall through to `{:cancelled true :answer nil}` immediately; the reader
   can never hang. An answer arriving ASYNC (after the subscriber returns) is
-  too late for this request — that lands with Option B's async turn loop
-  (see the approvals note above).
+  too late for this request — see the approvals note above for the async
+  turn-loop alternative.
 
   Everything else gets safe defaults (empty diagnostics / empty result)."
   [state]
@@ -437,9 +432,12 @@
   output to `*out*`."
   [state {:keys [send set-model! set-yolo! console quit!]} text]
   (cancel/clear!)
-  ;; echo the user's input (prompt or command) as a bubble
+  ;; echo the user's input (prompt or command) as a bubble. `/secret KEY VALUE`
+  ;; carries a credential: publish a MASKED form so the value never reaches the
+  ;; transcript, the persisted chat DB, or (via the server) another client.
+  ;; See grog.secrets/redact-secret-command.
   (when (seq (str/trim text))
-    (publish! state {:type :user :text (str text)}))
+    (publish! state {:type :user :text (secrets/redact-secret-command (str text))}))
   (let [route (fn []
                 (cond
                   (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))
@@ -493,7 +491,8 @@
      (loop []
        (when-let [text (.take queue)]
          (binding [*out* *err*]
-           (println "worker take:" (pr-str (str text))))
+           ;; never log a credential: mask `/secret KEY VALUE` before printing
+           (println "worker take:" (pr-str (secrets/redact-secret-command (str text)))))
          (try
            (reset! (:history state) (handle-turn! state hooks text))
            (catch Throwable e

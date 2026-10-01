@@ -431,7 +431,8 @@
     (normalized-declared-cfgs))))
 
 (defn tool-specs-dynamic
-  "Deprecated name: specs come from cache, not running processes."
+  "Alias for `tool-specs-from-cache`: specs come from cache, not running
+  processes."
   []
   (tool-specs-from-cache))
 

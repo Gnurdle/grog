@@ -3,8 +3,8 @@
 
   Connects to the real `eca server`, completes the handshake, records the
   `config/updated` / `tool/serverUpdated` notifications, sends one `chat/prompt`,
-  and dumps every `chat/contentReceived` event that comes back. Used to prove the
-  client works before rewiring the Swing GUI. Not part of the app."
+  and dumps every `chat/contentReceived` event that comes back. A standalone
+  smoke test — not part of the app."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [grog.eca :as eca]))

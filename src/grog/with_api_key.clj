@@ -1,7 +1,7 @@
 (ns grog.with-api-key
   "HTTP tool that injects a keyring secret the LLM never sees.
 
-  Configure `:with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]}` (or legacy `:allowed-accounts`).
+  Configure `:with-api-key {:allowed-secrets [\"BRAVE_SEARCH_API\" …]}` (`:allowed-accounts` is also accepted).
   Optional `:allowed-url-prefixes`, https-only by default, non-public hosts rejected."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
@@ -67,7 +67,7 @@
 (defn- parse-with-api-key-args [arguments]
   (let [m (parse-json-args arguments)
         url (str-trim (or (:url m) (get m "url")))
-        ;; secret_name (preferred) or legacy secret_account
+        ;; secret_name (preferred) or secret_account
         secret-name (str-trim (or (:secret_name m) (get m "secret_name")
                                   (:secret_account m) (get m "secret_account")))
         header-name (str-trim (or (:header_name m) (get m "header_name")
@@ -86,7 +86,7 @@
         secret-method (or (normalize-secret-method secret-method-raw)
                           (when (= "header" legacy-placement) "header")
                           (when (= "query" legacy-placement) "query"))
-        ;; Legacy query used auth_name as param name
+        ;; a query placement with no param name falls back to auth_name
         query-param-name' (if (and (= "query" secret-method) (str/blank? query-param-name) (not (str/blank? header-name)))
                             header-name
                             query-param-name)

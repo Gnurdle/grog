@@ -48,7 +48,7 @@
   (or (some-> (System/getenv k) str str/trim not-empty) default))
 
 ;; Configuration is file-based (per-server ~/.config/grog/<name>.edn);
-;; env vars are intentionally NOT read (dropped in the file-config normalization).
+;; env vars are intentionally NOT read (file-config normalization).
 ;; Big's config lives in ~/.config/grog/big.edn:
 ;;   {:url "http://localhost:4000/v1"
 ;;    :model "big"

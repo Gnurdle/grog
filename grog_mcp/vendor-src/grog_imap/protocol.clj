@@ -590,7 +590,7 @@
   (expunge conn))
 
 (defn idle
-  "IMAP IDLE is deferred for v1. `imap-command!` blocks waiting for a tagged
+  "IMAP IDLE is not implemented. `imap-command!` blocks waiting for a tagged
   completion, but IDLE stays in continuation/streaming mode until the client
   sends DONE — so the naive version would hang the connection. Fail loudly
   instead of deadlocking."

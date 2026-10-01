@@ -1,6 +1,6 @@
 // grog web client — preload: the ONLY surface the renderer sees.
-// Mirrors cms-estimate's window.estimateAPI pattern: no Node, no transport,
-// no secrets in the renderer (doc/clients/web-client-plan.md §4).
+// No Node, no transport, no secrets in the renderer
+// (doc/clients/web-client-plan.md §4).
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("grogAPI", {

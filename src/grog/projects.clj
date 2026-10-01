@@ -371,7 +371,7 @@
                (str/join "\n")))))))
 
 ;; ---------------------------------------------------------------------------
-;; Project-owned state (collapse of the old edn-store "Projects/<proj>" split)
+;; Project-owned state, kept under each project's own home
 ;; Every project owns its runtime state under its own project home:
 ;;   ~/grog-projects/<proj>/state/mem.db        (SQLite assoc memory store)
 ;;   ~/grog-projects/<proj>/state/              (other working data)

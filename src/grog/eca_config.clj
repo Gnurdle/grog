@@ -71,12 +71,12 @@
           sql)))
 
 (defn- odoo-instances-data
-  "Legacy instances list from grog.edn's `:odoo` (used only as a one-time
-  migration fallback — Odoo config now lives in `odoo-instances.edn`).
+  "Instances list from grog.edn's `:odoo`, used as a one-time migration fallback
+  — Odoo config otherwise lives in `odoo-instances.edn`.
 
-  New shape: `:instances [{:name ... :url ... :db ... :user ... :password ...
-                           :sql {...}} ...]`.
-  Legacy shape (`:url`/`:db`/`:user`/`:password` at the top level) is treated
+  Shape: `:instances [{:name ... :url ... :db ... :user ... :password ...
+                       :sql {...}} ...]`.
+  A flat shape (`:url`/`:db`/`:user`/`:password` at the top level) is treated
   as a single instance named \"default\".
   Returns nil when nothing usable is configured."
   []
@@ -103,7 +103,7 @@
 
 (defn odoo-configured?
   "True when Odoo is configured anywhere: the user-maintained
-  `odoo-instances.edn`, a legacy `grog.edn :odoo` block, or legacy
+  `odoo-instances.edn`, a `grog.edn :odoo` block, or
   `GROG_ODOO_*` env vars."
   []
   (boolean
@@ -116,10 +116,10 @@
 
   Source of truth: the **user-maintained** `~/.config/grog/odoo-instances.edn`.
   Edit that file directly (credentials stay in config home, never in grog.edn).
-  If it's absent and grog.edn still carries a legacy `:odoo` block, grog writes
-  the file once (migration) so the model still sees the same instances.
+  If it's absent and grog.edn carries a `:odoo` block, grog writes the file
+  once (migration) so the model still sees the same instances.
 
-  Final fallback is legacy single-instance env vars (`GROG_ODOO_URL` /
+  Final fallback is single-instance env vars (`GROG_ODOO_URL` /
   `GROG_ODOO_DB` / `GROG_ODOO_USER` / `GROG_ODOO_PASSWORD`)."
   []
   (let [path (odoo-instances-path)
@@ -278,11 +278,25 @@
 
 (defn- shell-wrapped
   "An MCP stdio server spec that first `cd`s into `dir`, so `clojure -M:...`
-  resolves that project's deps.edn regardless of ECA's working directory."
+  resolves that project's deps.edn regardless of ECA's working directory.
+
+  When `dir` does not exist the `cd` is dropped: a packaged install has no
+  source tree, and runs the server from an absolute jar path instead."
   [dir cmdline env]
-  (cond-> {"command" "bash"
-           "args" ["-lc" (str "cd '" dir "' && " cmdline)]}
-    env (assoc "env" env)))
+  (let [prefix (if (and dir (.isDirectory (io/file dir)))
+                 (str "cd '" dir "' && ")
+                 "")]
+    (cond-> {"command" "bash"
+             "args" ["-lc" (str prefix cmdline)]}
+      env (assoc "env" env))))
+
+(defn- explicit-bundle-jar
+  "The tool-bundle jar named by `GROG_MCP_JAR`, when the app ships one outside
+  any source tree (a packaged install). Returns a File, or nil."
+  ^java.io.File []
+  (when-let [p (some-> (System/getenv "GROG_MCP_JAR") str str/trim not-empty)]
+    (let [f (io/file p)]
+      (when (.exists f) f))))
 
 (defn- clean-imap-account
   "Interpolate env refs in string fields; preserve numbers/booleans as-is."
@@ -309,7 +323,7 @@
 
 (defn imap-configured?
   "True when IMAP account metadata is available — from the email project file, or
-  (backward compat) grog.edn's `:imap :accounts`."
+  grog.edn's `:imap :accounts`."
   []
   (boolean
    (or (.exists (io/file (imap-project-config-file)))
@@ -317,8 +331,8 @@
        (seq (get-in (config/grog) [:imap :accounts])))))
 
 (defn- read-imap-accts
-  "Read the email project's account metadata file as EDN, falling back to legacy
-  JSON (the old `imap-accounts.json`). Returns a seq (possibly nil)."
+  "Read the email project's account metadata file as EDN, falling back to a
+  legacy JSON file (`imap-accounts.json`). Returns a seq (possibly nil)."
   []
   (let [edn-file (java.io.File. (imap-project-config-file))
         json-file (java.io.File. (str/replace (imap-project-config-file) #"\.edn$" ".json"))]
@@ -333,8 +347,8 @@
 
 (defn- imap-accounts-data
   "Account *metadata* (never secrets). Source of truth is the email project file
-  at `~/grog-projects/email/state/imap-accounts.edn` (legacy `.json` accepted);
-  falls back to grog.edn's `:imap :accounts` for backward compatibility."
+  at `~/grog-projects/email/state/imap-accounts.edn` (a `.json` file is also
+  accepted); falls back to grog.edn's `:imap :accounts`."
   []
   (let [accts (or (read-imap-accts)
                   (get-in (config/grog) [:imap :accounts]))]
@@ -359,19 +373,19 @@
 
   Every entry spawns the SAME command — the grog-mcp bundle JVM restricted to one
   server (`--server <id>`) from the single `grog_mcp` project — rather than
-  `cd <repo>/grog-<x> && clojure -M:mcp`. Two reasons: the old form needed 13
-  separate project trees on disk, and each of those servers built its MCP tool
+  `cd <repo>/grog-<x> && clojure -M:mcp`. Two reasons: a per-project form needs
+  13 separate project trees on disk, and each server would build its MCP tool
   descriptor with the SDK's String constructor, which ships
   `function.parameters` as a JSON *string* — strict providers reject that whole
   request (400) and the model cannot see parameter names, so tools get called
   with empty arguments. The bundle's wrapper builds a real JsonSchema object
   (grog_mcp/main.clj). One entry per server id keeps ECA tool names
   (`<id>__<tool>`) and therefore existing allowlists intact, and `spec` below is
-  the single place the command is built — the uberjar (`java -jar …`) swap lands
-  there and needs no other change.
+  the single place the command is built — the uberjar (`java -jar …`) can be
+  swapped in there and needs no other change.
 
-  The Streamable-HTTP branch (`grog.mcp-http`) is inert with the server line
-  parked: no daemon runs, so `urls` is nil and the stdio specs are returned."
+  The Streamable-HTTP branch (`grog.mcp-http`) is inert unless a daemon is
+  running: with no daemon, `urls` is nil and the stdio specs are returned."
   [project]
   (if-let [us (mcp-http/urls)]
     (into {} (map (fn [[k u]] [k {:url u}])) us)
@@ -381,11 +395,12 @@
           ;; fall back to the source tree when it hasn't been built — dev boxes
           ;; and a fresh checkout keep working either way. `build.clj` writes
           ;; target/grog-mcp-<version>.jar; pick the newest if several exist.
-          jar (->> (seq (.listFiles (java.io.File. (str bundle "/target"))))
-                   (filter (fn [^java.io.File f]
-                             (re-matches #"grog-mcp-.*\.jar" (.getName f))))
-                   (sort-by (fn [^java.io.File f] (.lastModified f)))
-                   last)
+          jar (or (explicit-bundle-jar)
+                  (->> (seq (.listFiles (java.io.File. (str bundle "/target"))))
+                       (filter (fn [^java.io.File f]
+                                 (re-matches #"grog-mcp-.*\.jar" (.getName f))))
+                       (sort-by (fn [^java.io.File f] (.lastModified f)))
+                       last))
           spec (fn [id env]
                  (if jar
                    (shell-wrapped bundle
@@ -423,7 +438,7 @@
   be written to a log).
 
   Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
-  lands in the real debug log (`grog-ui.<pid>.log`, via grog.log's in-process
+  lands in the real debug log (`grog.<pid>.log`, via grog.log's in-process
   tee), even when called from a worker thread whose `*err*` is bound to the
   transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
@@ -532,7 +547,7 @@
 
 (defn- eca-config-debug! [& xs]
   "One-line ECA-config trace written to the **real** stderr so it lands in the
-  grog debug log (`grog-ui.<pid>.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
+  grog debug log (`grog.<pid>.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
   rebinding."
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 

@@ -1,25 +1,24 @@
 (ns grog.server
   "grog-server — headless JSON-RPC 2.0 endpoint over stdio AND a Unix-domain
-  socket (Phase 3 + 3.6).
+  socket.
 
   Transport is NDJSON: one JSON object per line; requests/responses on the
   inbound/outbound channel, server-initiated notifications broadcast to every
   attached client. The server runs the FULL local stack (ECA child, MCP,
   projects, keys, locks) through `grog.client.local`; the thin clients hold
-  none of it — the whole point of the split (doc/server-and-client.md §2).
+  none of it.
 
   Two transports, one hub:
 
-    stdio        — the transitional mode: a client spawns this process as a
-                   child and speaks over its stdin/stdout (client 1 / Swing).
-    unix socket  — the daemon mode: `GROG_SERVER_SOCKET` (or
-                   `$XDG_RUNTIME_DIR/grog-$USER.sock`) is bound and MANY clients
-                   attach at once. Notifications fan out to all of them;
-                   responses go only to the caller.
+    stdio        — a client spawns this process as a child and speaks over its
+                   stdin/stdout (how the desktop app runs it).
+    unix socket  — `GROG_SERVER_SOCKET` (or `$XDG_RUNTIME_DIR/grog-$USER.sock`)
+                   is bound and MANY clients may attach at once. Notifications
+                   fan out to all of them; responses go only to the caller.
 
-  Self-hosting rule: the socket is bound best-effort in stdio mode too, so a
-  server spawned by client 1 can host client 2. A bind failure (another server
-  already owns the path) is logged, never fatal.
+  The socket is bound best-effort in stdio mode too, so a client that spawned a
+  server can also host another. A bind failure (another server already owns the
+  path) is logged, never fatal.
 
   Client -> server methods (params keywordized JSON objects):
 
@@ -40,10 +39,9 @@
     create-project  {:name .. :description ..}          -> nil
 
   `open` is IDEMPOTENT PER PROJECT: if a session for that project already
-  exists it is returned as-is, so attaching clients share the one session the
-  server owns (doc/server-and-client.md §3 — 'the server owns the project; the
-  client attaches'). Creating a second session for a project would double the
-  ECA child and the working set for no reason.
+  exists it is returned as-is, so every client shares the one session the server
+  owns. Creating a second session for a project would double the ECA child and
+  the working set for no reason.
 
   Server -> client notifications (broadcast):
 
@@ -235,8 +233,8 @@
             (case method
               "open" (let [snap (or (session-by-project (:project params))
                                     (open-session! broadcast! questions params))]
-                       ;; banner = client 1's startup snark line (doc §3.2); the
-                       ;; renderer seeds it as the first transcript line
+                       ;; banner = the startup snark line; the renderer seeds
+                       ;; it as the first transcript line
                        (assoc snap :banner (soul/startup-snark-line)))
               "close" (do (client/close! (:id params)) nil)
               "sessions" (client/sessions)
@@ -275,7 +273,7 @@
 ;; --- transports ------------------------------------------------------------
 
 (defn- serve-stdio!
-  "Serve the transitional stdio transport until stdin EOF, then detach every
+  "Serve the stdio transport until stdin EOF, then detach every
   session and return. `send!` is the stdout writer; notifications go through
   the hub."
   [hub questions]
@@ -334,7 +332,7 @@
 
 (defn- server-bind
   "TCP interface to bind: GROG_SERVER_BIND, else config :server :bind, else
-  0.0.0.0 (internal network; auth lands later)."
+  0.0.0.0 (internal network; no auth)."
   ^String []
   (or (let [s (System/getenv "GROG_SERVER_BIND")] (when-not (str/blank? s) s))
       (get-in (config/grog) [:server :bind])
@@ -342,8 +340,8 @@
 
 (defn- server-port
   "TCP port: GROG_SERVER_PORT, else config :server :tcp-port, else 9640.
-  A KNOWN port — that is the point: other machines, the Swing client and the
-  systemd unit all find the SAME server on it."
+  A KNOWN port — that is the point: other machines and the systemd unit all
+  find the SAME server on it."
   ^long []
   (long (or (some-> (System/getenv "GROG_SERVER_PORT") parse-long)
             (get-in (config/grog) [:server :tcp-port])
@@ -367,7 +365,14 @@
           str parse-long))
 
 (defn- start-mcp-http! []
-  (when (not= false (get-in (config/grog) [:server :mcp-http]))
+  ;; The Streamable-HTTP tool endpoint belongs to the standalone daemon. A
+  ;; client-owned spine (the desktop app's backend) does not want it at all: its
+  ;; ECA gets the tools from the generated config, which spawns the MCP jar per
+  ;; server id. GROG_MCP_HTTP=0 turns it off regardless of config, so a packaged
+  ;; client can be explicit instead of relying on the config file it may not own.
+  (when (and (not= false (get-in (config/grog) [:server :mcp-http]))
+             (not (contains? #{"0" "false" "no"} (some-> (System/getenv "GROG_MCP_HTTP")
+                                                          clojure.string/lower-case))))
     (mcp-http/start! (cond-> {}
                        (mcp-base-port) (assoc :base-port (mcp-base-port))))))
 
@@ -420,7 +425,7 @@
     (if daemon?
       ;; socket daemon: accept loop owns the main thread; no stdio at all.
       (serve-socket! ssc hub questions)
-      ;; transitional stdio: stdin owns the main thread; the socket (if bound)
+      ;; stdio mode: stdin owns the main thread; the socket (if bound)
       ;; is served on a daemon thread that dies with the process.
       (do
         (when ssc

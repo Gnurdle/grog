@@ -1,25 +1,23 @@
 (ns grog.client.local
-  "In-process adapter for `grog.client` (Phase 2).
+  "In-process adapter for `grog.client`.
 
-  Owns everything that used to live as closures inside
-  `grog.ui/build-session!`: the session registry, each session's ECA
-  connection, prompt queue + worker thread, model/trust setters, approval
-  answers, stop/disconnect. The view passes in only what is genuinely
-  view-side — `:console` (the transcript writer factory), `:trace-fn` (debug
-  tracer) — and subscribes to the session's `grog.chat` event stream to paint.
+  Owns the session-registry domain: each session's ECA connection, prompt queue
+  + worker thread, model/trust setters, approval answers, stop/disconnect. The
+  view passes in only what is genuinely view-side — `:console` (the transcript
+  writer factory), `:trace-fn` (debug tracer) — and subscribes to the session's
+  `grog.chat` event stream to paint.
 
-  **No Swing.** Every error the old code printed straight into the transcript
-  (`ECA connect failed`, `not connected — message not sent`, ECA in-band
-  errors, model/trust changes) is published as a `:line`/`:model`/`:trust`
-  event instead — which is also exactly the seam `grog-server` will publish
-  over the wire later. **Seam check:** zero windowing-toolkit `:import` forms
-  (`grep -cE '^\\s*\\(:import' src/grog/client/local.clj` → the only import is
-  the queue).
+  Every error (`ECA connect failed`, `not connected — message not
+  sent`, ECA in-band errors, model/trust changes) is published as a
+  `:line`/`:model`/`:trust` event instead — the same seam `grog-server`
+  publishes over the wire. **Seam check:** zero windowing-toolkit `:import`
+  forms (`grep -cE '^\\s*\\(:import' src/grog/client/local.clj` → the only
+  import is the queue).
 
-  Verified behavior parity with the old inline closures: connect is lazy (first
-  send or explicit `connect!`), a failed prompt keeps `running?` down and says
-  so loudly, `/yolo` toggles through ECA's trust, steer-vs-queue is the view's
-  call (it reads `running?` from the shared state)."
+  Connect is lazy (first send or explicit `connect!`), a failed prompt keeps
+  `running?` down and says so loudly, `/yolo` toggles through ECA's trust,
+  steer-vs-queue is the view's call (it reads `running?` from the shared
+  state)."
   (:require [grog.chat :as chat]
             [grog.client :as client]
             [grog.config :as config]
@@ -29,7 +27,7 @@
             [grog.project-dialog :as project-dialog]
             [grog.projects :as projects]
             [grog.session :as session]
-            [grog.ui.cancel :as cancel])
+            [grog.cancel :as cancel])
   (:import (java.util.concurrent LinkedBlockingQueue)))
 
 (defn- dbg!
@@ -51,20 +49,18 @@
       (throw (ex-info "grog.client.local: unknown session" {:id id}))))
 
 (defn- line!
-  "Publish a transcript status line through the session's stream (the old code
-  appended straight to the pane — same text, new seam)."
+  "Publish a transcript status line through the session's stream."
   [state text]
   (chat/publish! state {:type :line :text (str text)}))
 
 (defn- make-session!
-  "Build one session: state, queue, ECA handlers, connection, worker — all the
-  domain closures the UI used to own. Starts the worker; does NOT connect
-  (lazy, as before)."
+  "Build one session: state, queue, ECA handlers, connection, worker. Starts
+  the worker; does NOT connect (lazy)."
   [{:keys [project console quit! trace-fn on-state]}]
   (let [project (or project "default")
         ;; unique per-tab id; doubles as the ECA connection id. Multiple tabs
-        ;; = multiple `eca server` processes, one connection each (the old
-        ;; single global connection made a second tab fail "already connected").
+        ;; = multiple `eca server` processes, one connection each (a single
+        ;; shared connection would make a second tab fail "already connected").
         id (str project "#" (System/nanoTime))
         queue (LinkedBlockingQueue.)
         state (chat/make-state
@@ -186,8 +182,7 @@
             (reset! (:model state) mid)
             (when mid (models/save-eca-model! mid))
             (config/reload!)
-            ;; the view used to update the footer + status line inline; now it
-            ;; reacts to this event (set-model-ref! is Swing — not ours)
+            ;; the view reacts to this event to update the footer + status line
             (chat/publish! state {:type :model
                                   :value mid
                                   :text (str "model: " mid)})))

@@ -2,8 +2,8 @@
   "Minimal CommonMark-ish renderer for the web client: Markdown string → hiccup.
 
   Deliberately small — it exists so ECA answers render with REAL tables (GFM pipe
-  tables become <table>, not a wall of `|`) and monospace <pre>/<code>, which is
-  what the plain `white-space: pre-wrap` span was mangling (see
+  tables become <table>, not a wall of `|`) and monospace <pre>/<code> instead
+  of a plain `white-space: pre-wrap` span (see
   doc/clients/web-client-plan.md §3.2). It is NOT a full spec parser.
 
   Block level: fenced + indented code, ATX headings, GFM pipe tables,

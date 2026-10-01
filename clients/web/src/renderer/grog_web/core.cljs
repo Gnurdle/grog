@@ -1,11 +1,10 @@
 (ns grog-web.core
-  "grog web client renderer (P1/P2): tabs, status bar, trust/model, tool-approval
+  "grog web client renderer: tabs, status bar, trust/model, tool-approval
   and LLM-question dialogs. Transport lives in Electron main; this ns only sees
   window.grogAPI (see doc/clients/web-client-plan.md).
 
-  The renderer is THIN: no ECA/MCP/native deps. Normalizing ECA's raw `:content`
-  into the role vocabulary happens here for now (plan risk 1 recommends moving it
-  into `grog.chat` so all clients share one vocabulary — TODO P3)."
+  The renderer is THIN: no ECA/MCP/native deps. ECA's raw `:content` is
+  normalized into the role vocabulary here."
   (:require [clojure.string :as str]
             [reagent.core :as r]
             [reagent.dom :as rdom]
@@ -200,7 +199,7 @@
                         (rf/dispatch [:status-line nil (str "[grog] mic error: " (.-message e))]))))
           {})))))
 
-;; --- font size (client 1 parity: font-zoom) --------------------------------
+;; --- font size (font-zoom) -------------------------------------------------
 
 (def ^:private min-font 11)
 (def ^:private max-font 30)
@@ -476,7 +475,7 @@
     [:div {:class "text-center seg-snark italic text-sm py-1"} text]
 
     ;; assistant answer / reasoning render as Markdown — real <table>s and
-    ;; monospace <pre>/<code> (the plain pre-wrap span used to mangle both).
+    ;; monospace <pre>/<code>.
     ;; The role label sits in a fixed column so blocks indent under it.
     (contains? #{:answer :thinking} kind)
     [:div {:class "flex gap-2 text-sm"}
@@ -565,7 +564,7 @@
                   ;; fade the previous frame toward the page bg, then paint glyphs
                   (set! (.-fillStyle ctx) "rgba(13,14,17,0.10)")
                   (.fillRect ctx 0 0 w h)
-                  ;; teal, not the old green — matches the splash logo palette
+                  ;; teal — matches the splash logo palette
                   (set! (.-fillStyle ctx) "#2ec7cd")
                   (set! (.-font ctx) matrix-font)
                   (dotimes [i cols]
@@ -891,7 +890,7 @@
 
 (defn ^:export init []
   (rf/dispatch-sync [:init])
-  ;; restore the saved font size (client 1 parity: font-zoom), then apply it
+  ;; restore the saved font size (font-zoom), then apply it
   (rf/dispatch-sync
    [:set-font-size
     (let [s (try (.getItem (.-localStorage js/window) "grog-web.font-size")
@@ -901,7 +900,7 @@
   (.onNotify js/window.grogAPI
              (fn [msg] (rf/dispatch [:notify (js->clj msg :keywordize-keys true)])))
   (.onFocus js/window.grogAPI (fn [f] (rf/dispatch [:focus (boolean f)])))
-  ;; global shortcuts (client 1 parity: §3.1)
+  ;; global shortcuts (§3.1)
   (.addEventListener
    js/document "keydown"
    (fn [e]

@@ -92,8 +92,8 @@ Optional LibreOffice for rendering.
 Persistent SQLite key/value memory. **Clojure/SQLite (JVM)** — served by the
 `grog-mcp` bundle (`--server grog-memory`), no Python. Per-project isolation via
 `~/.config/grog/memory.edn` (`:db` points at the active project's store; grog
-writes it). Byte-compatible with the original Python server (same schema), so
-existing `mem.db` files work as-is. The `grog-memory/` Python server is legacy.
+writes it). Byte-compatible with the Python server in `grog-memory/` (same
+schema), so existing `mem.db` files work as-is.
 
 | Tool | Description |
 |---|---|
@@ -138,11 +138,11 @@ Email account setup, read/search, flag, move/copy/append, with OAuth.
 | `imap_set_flags` | Set message flags |
 
 ### grog-gitlab — GitLab REST API (read-only)
-Co-opted from `bbutils/gitlab.clj` (babashka). Wraps the GitLab v4 API; read-only.
+Wraps the GitLab v4 API; read-only.
 Config in `~/.config/grog/gitlab.edn` (`:url` + `:token "${GROG_GITLAB_TOKEN}"`).
 The token is a **system secret**: stored with `/secret set GITLAB_TOKEN <value>`
 (OS keyring), injected per-process by grog as `GROG_GITLAB_TOKEN`, and never
-written to disk in plaintext. Legacy `:token-file` still supported as a fallback.
+written to disk in plaintext. A `:token-file` is also supported as a fallback.
 
 | Tool | Description |
 |---|---|
@@ -195,4 +195,4 @@ The bundle delivers ~52 tools including the SQLite `assoc_*` memory store.
 | **TOTAL** | | **~67** | |
 
 *See also:* [`eca-users-guide.md`](eca-users-guide.md) (enabling these in ECA on a
-teammate's box), [`README.md`](README.md) (config mechanics), `state.md` (implementation).
+teammate's box), [`README.md`](README.md) (config mechanics), `state.md` (implementation).ementation).

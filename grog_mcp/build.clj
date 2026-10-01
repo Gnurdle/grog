@@ -13,9 +13,8 @@
   grog.eca-config)."
   (:require [clojure.tools.build.api :as b]))
 
-(def version "0.1.0")
+(def default-version "0.1.0")
 (def class-dir "target/classes")
-(def uber-file (format "target/grog-mcp-%s.jar" version))
 (def src-dirs ["src" "vendor-src"])
 
 (defn- basis [] (b/create-basis {:project "deps.edn"}))
@@ -25,12 +24,18 @@
 
 (defn uber
   "Copy the bundle's sources (server namespaces live in vendor-src) into the
-  class dir, then merge the whole classpath into one jar."
-  [_]
+  class dir, then merge the whole classpath into one jar.
+
+  `:version` overrides the jar name's version (build_dist stamps the collective
+  version here): clojure -T:build uber :version '\"1.2.3\"'. eca_config finds the
+  bundle by globbing target/grog-mcp-*.jar and taking the newest, so the name
+  only has to be unique, not fixed."
+  [{:keys [version] :or {version default-version}}]
   (clean nil)
-  (b/copy-dir {:src-dirs src-dirs :target-dir class-dir})
-  (b/uber {:class-dir class-dir
-           :uber-file uber-file
-           :basis (basis)})
-  (println "wrote" uber-file (str "(" (quot (.length (java.io.File. uber-file)) 1048576) " MB)"))
-  uber-file)
+  (let [uber-file (format "target/grog-mcp-%s.jar" version)]
+    (b/copy-dir {:src-dirs src-dirs :target-dir class-dir})
+    (b/uber {:class-dir class-dir
+             :uber-file uber-file
+             :basis (basis)})
+    (println "wrote" uber-file (str "(" (quot (.length (java.io.File. uber-file)) 1048576) " MB)"))
+    uber-file))

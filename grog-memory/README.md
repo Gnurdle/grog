@@ -1,13 +1,12 @@
 # grog-memory
 
-> **⚠️ Legacy.** The default `grog-memory` is now the **Clojure/SQLite** server in
-> `grog_mcp/src/grog_mcp/memory.clj` (served by the `grog-mcp` bundle:
-> `clojure -M:mcp --server grog-memory`). It is byte-compatible (same 7 tools,
-> same SQLite schema, same `memory.edn` `:db`), so existing stores work as-is and
-> no Python is needed. This Python server is kept for reference only.
-
 An **MCP server** (over stdio) exposing grog's **associative memory** — a
 persistent key→value SQL store an ECA-driven agent loop can read/write.
+
+It is byte-compatible with the Clojure/SQLite server in
+`grog_mcp/src/grog_mcp/memory.clj` (served by the `grog-mcp` bundle:
+`clojure -M:mcp --server grog-memory`) — same 7 tools, same SQLite schema, same
+`memory.edn` `:db` — so existing stores work as-is.
 
 Backed by Python's built-in **`sqlite3`** (no native/system deps, no JDBC/babashka).
 There is **no EDN-file store** here — memory is a plain SQLite database.
@@ -76,7 +75,3 @@ assoc_close_store("/home/you/memory/notes.db")
   stores open concurrently, evicting the least-recently-used one.
 - Closing a store closes its connection; it re-opens lazily if used again.
 - Without a `handle`, everything targets the default store (`:db`).
-
-## Status
-
-Functional against SQLite out of the box, including multi-store open/close.

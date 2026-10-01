@@ -105,12 +105,3 @@ See `docs/OAuth2.md` for the full setup.
 
 JVM Clojure — deps.edn; stdlib sockets/SSL + `java.net.http` only. Mirrors the
 self-contained-client approach of `grog-odoo`'s XML-RPC layer.
-
-## Status
-
-Phases 1–3 complete. Protocol layer builds clean and is unit-tested; `core`
-drives the whole inbox/manage surface with no MCP SDK; the MCP server is a thin
-adapter over it. 50 tests / 223 assertions green. Verified live against Gmail
-(TLS, LOGIN with app password, LIST/EXAMINE/SEARCH, non-destructive). Remaining
-(Phase 4): README refresh (this), real-account checks for other providers, and
-final `java -jar` packaging verification.

@@ -76,7 +76,7 @@
               :throw-exceptions false}
        (= method "GET") (assoc :query-params query-params)))))
 
-;; Fixed request-token (now uses GET + passes callback correctly)
+;; OAuth request-token: signed GET with an out-of-band callback
 (defn request-token []
   (let [uri      (str base-url "/oauth/request_token")
         response (signed-request "GET" uri
@@ -95,7 +95,7 @@
 
 ;; Helper function to make signed request
 
-;; Backward compatibility
+;; Convenience wrapper for a signed GET
 (defn signed-get [uri & {:keys [query-params]}]
   (signed-request "GET" uri :query-params query-params))
 

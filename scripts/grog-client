@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# grog-client -- launch the grog Electron client (the desktop app).
+#
+# This is the POSIX twin of run-web.bat and is what the .desktop entry points
+# at, so the app appears in the menu/taskbar with a real icon instead of
+# requiring a terminal and a hand-typed command.
+#
+# It prefers a PACKAGED build and falls back to the dev tree, so the same
+# launcher works before and after `bb dist`.
+#
+# Usage:  scripts/grog-client [--console]
+#   default   log to $XDG_STATE_HOME/grog/client.log (desktop-friendly: no tty)
+#   --console also stream to stdout (use this from a terminal)
+set -uo pipefail
+
+console=0
+[ "${1:-}" = "--console" ] && console=1
+
+repo="$(cd "$(dirname "$0")/.." && pwd -P)"
+web="$repo/clients/web"
+log="${GROG_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/grog/client.log}"
+mkdir -p "$(dirname "$log")"
+
+export NODE_ENV=production
+export GROG_MCP_BASE_PORT="${GROG_MCP_BASE_PORT:-9800}"
+# VM / no-GPU boxes: the compositor can hard-fail before a window appears.
+[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || export GROG_DISABLE_GPU=1
+
+# --- pick a runtime ----------------------------------------------------------
+cmd=()
+if [ -x "$web/dist/linux-unpacked/grog" ]; then
+  cmd=("$web/dist/linux-unpacked/grog")
+elif ls "$web"/dist/*.AppImage >/dev/null 2>&1; then
+  apk=$(ls -t "$web"/dist/*.AppImage | head -1)
+  chmod +x "$apk" 2>/dev/null || true
+  cmd=("$apk")
+elif [ -x "$web/node_modules/electron/dist/electron" ]; then
+  # dev tree: --class makes the WM_CLASS match StartupWMClass=grog so the
+  # taskbar/dock groups the window under the right icon.
+  cmd=("$web/node_modules/electron/dist/electron" "--class=grog" "$web")
+else
+  echo "grog-client: no Electron runtime found." >&2
+  echo "  build the client:  cd \"$web\" && npm install && npm run build" >&2
+  echo "  or package it:     bb dist" >&2
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "grog" "No Electron runtime found — run: cd clients/web && npm install"
+  fi
+  exit 1
+fi
+
+# main.js needs the spine jar; java must be on PATH (it spawns it).
+if ! command -v java >/dev/null 2>&1 && [ ! -f "$repo/target/grog-spine.jar" ]; then
+  echo "grog-client: neither java nor $repo/target/grog-spine.jar present" >&2
+fi
+
+echo "grog-client: ${cmd[*]}  (log: $log)"
+if [ "$console" = 1 ]; then
+  "${cmd[@]}" 2>&1 | tee -a "$log"
+  exit "${PIPESTATUS[0]}"
+else
+  "${cmd[@]}" >>"$log" 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && { echo "--- tail of $log ---"; tail -n 40 "$log"; }
+  exit "$rc"
+fi

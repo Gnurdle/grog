@@ -2,11 +2,11 @@
   "One-line previews of tool-call parameters.
 
   Shared by the GUI transcript's tool cards (collapsed header, selection text
-  and hover tooltip), by `grog.ui/summarize-content` in the ECA debug log, and
-  by the CLI tool log in `grog.core` — anywhere a tool call is reduced to a
-  single line and the tool name alone isn't enough to know what happened.
+  and hover tooltip) and by the CLI tool log in `grog.core` — anywhere a tool
+  call is reduced to a single line and the tool name alone isn't enough to know
+  what happened.
 
-  Deliberately dependency-free (no Swing, no JSON parsing): the parameters
+  Deliberately dependency-free (no UI toolkit, no JSON parsing): the parameters
   arrive from ECA as a map, as `:argumentsText` JSON/EDN text, or from an LLM
   `tool_call` as a JSON string, and every one of those is useful to a human
   as-is once whitespace is collapsed and the result is length-capped."

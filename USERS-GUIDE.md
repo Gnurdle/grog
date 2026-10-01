@@ -30,16 +30,13 @@ The location is **platform-aware** and can be overridden with **`GROG_CONFIG_HOM
 | Any (override) | `$GROG_CONFIG_HOME/grog.edn` |
 
 > **Windows:** grog uses `~/.config/grog` (same as ECA's own `~/.config/eca`).
-> The old `%APPDATA%\grog` location is no longer supported; if you have files
-> there, move them (e.g. `grog.edn`, `secrets.edn`, `odoo-instances.edn`) to
-> `C:\Users\you\.config\grog\` yourself.
 
 Secrets and generated files (ECA config, IMAP/Odoo metadata, approved-tools,
 `secrets.edn`) live **in the same config home directory**, so moving to a new
 machine is "copy one folder + set one env var".
 
-> Legacy Linux users: `~/.config/grog/grog.edn` is still honored even when
-> `$GROG_CONFIG_HOME` points elsewhere.
+> `~/.config/grog/grog.edn` is honored even when `$GROG_CONFIG_HOME` points
+> elsewhere.
 
 ---
 
@@ -59,7 +56,7 @@ machine is "copy one folder + set one env var".
 
    ```bash
    cd <repo>
-   clojure -M:gui          # Swing GUI (or ./grog-ui)
+   scripts/grog-client --console   # desktop app (Linux; scripts\grog-client.bat on Windows)
    ```
 
 4. **Talk to it.** If your provider needs an API key, store it (section 4) before
@@ -151,7 +148,7 @@ In **chat** (GUI or terminal):
 ```text
 /secret                       # list accounts + set/unset status (values never printed)
 /secret set LLM_API_KEY sk-...   # store a key (both backends)
-/secret BRAVE_SEARCH_API ...     # legacy form — same effect
+/secret BRAVE_SEARCH_API ...     # alternative form — same effect
 /secret rm LLM_API_KEY           # remove from keyring and file store
 /secret file                     # show the fallback file path
 /secret backend                  # show which backend is active
@@ -191,14 +188,14 @@ That's all you need for any OpenAI-compatible cloud provider.
 ### Windows
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
-  or `$GROG_CONFIG_HOME`). The old `%APPDATA%\grog` location is no longer used.
+  or `$GROG_CONFIG_HOME`).
 - **Log files**: each running grog writes its own log — `<base>.<pid>.log` — so
-  concurrent instances never share a file. `<base>` defaults to `~/grog-ui`
-  (`%USERPROFILE%\grog-ui` on Windows) and is set by `:log {:dir … :keep …}` in
+  concurrent instances never share a file. `<base>` defaults to `~/grog`
+  (`%USERPROFILE%\grog` on Windows) and is set by `:log {:dir … :keep …}` in
   `grog.edn` (`GROG_LOG` / `GROG_UI_LOG_KEEP` override for one-off runs). On
   startup the oldest instance logs are pruned, keeping `:keep` (default 5).
   Logging is in-process (`grog.log`), which tees stdout/stderr to both the console
-  and the file, so `tail -f ~/grog-ui.<pid>.log` shows live output.
+  and the file, so `tail -f ~/grog.<pid>.log` shows live output.
 - **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
   PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
   `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
@@ -212,7 +209,7 @@ That's all you need for any OpenAI-compatible cloud provider.
 ### Linux
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`).
-- **Launch**: `./grog-ui` (or `clojure -M:gui`).
+- **Launch**: `scripts/grog-client` (add `--console` to stream the log here).
 - **Secret backend**: Secret Service if a desktop session with a keyring is
   running; otherwise falls back to `~/.config/grog/secrets.edn`.
 
@@ -258,7 +255,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 |---|---|
 | `/secret` | list known accounts + set/unset status (values never printed) |
 | `/secret set <KEY> <value>` | store a secret (keyring or file fallback) |
-| `/secret <KEY> <value>` | legacy alias for the above |
+| `/secret <KEY> <value>` | short alias for the above |
 | `/secret rm <KEY>` | delete a secret |
 | `/secret file` | show the fallback store path |
 | `/secret backend` | show active backend |
@@ -279,7 +276,7 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 | `grog.edn` | your config (user-level) |
 | `secrets.edn` | fallback secret store (owner-only perms) |
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
-| `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; legacy `.json` still read) |
+| `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
 | `approved-tools.edn` | permanently-allowed tool names |
 
 ---

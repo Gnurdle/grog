@@ -3,8 +3,8 @@
 
   One JVM, one McpServer: registers the ~44 tools from ALL the Clojure grog MCP
   servers (babashka, big, fetch, rss, search, project-search, office, imaging,
-  odoo, imap) as in-process tools. This replaces the 9 separate stdio JVMs at
-  startup — one boot, one classpath, one process to supervise.
+  odoo, imap) as in-process tools — one boot, one classpath, one process to
+  supervise.
 
   Rationale & tradeoffs:
     * Per-MCP composability is preserved: each tool is defined in its own

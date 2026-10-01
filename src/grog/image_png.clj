@@ -1,7 +1,7 @@
 (ns grog.image-png
   "Detect `<image-png>…</image-png>` or `<image-png>…<image-png/>` (case-insensitive) in assistant text.
   Inner content is an absolute or repo-root-relative path to a PNG file. Opens each image in
-  a new Swing window; returns text with tags replaced by short notes for the terminal."
+  a new image window; returns text with tags replaced by short notes for the terminal."
   (:require [clojure.string :as str]
             [grog.fs :as fs])
   (:import [java.awt GraphicsEnvironment Image]
@@ -104,7 +104,7 @@
           (.append sb (str "\n\n[image-png: " (.getMessage e) "]\n\n")))))))
 
 (defn process-tags!
-  "Side effect: open Swing window(s) for each tag. Returns `s` with tags replaced by short notes."
+  "Side effect: open image window(s) for each tag. Returns `s` with tags replaced by short notes."
   ^String [^String s]
   (if (or (str/blank? s) (nil? (next-open-idx s 0)))
     s
