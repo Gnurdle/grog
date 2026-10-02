@@ -26,38 +26,42 @@ if (-not (Test-Path $scoop)) {
 }
 if (-not (Test-Path $scoop)) {
   Write-Host 'scoop could not be installed - stopping' -ForegroundColor Red
+  Write-Host 'Install it by hand: https://scoop.sh'
   exit 1
 }
 Write-Host "scoop: $scoop"
 
-# Call the shim by path: a freshly installed scoop is not on this session's PATH.
-function Scoop([string[]]$Args) { & $scoop @Args }
+# The shim is called by absolute path everywhere below: a freshly installed scoop
+# is not on this session's PATH, and a helper function is not worth the footguns
+# (naming a parameter $Args silently collides with PowerShell's automatic $args,
+# which is how an earlier version of this script managed to print scoop's help
+# and nothing else).
 
 # --- git first - scoop clones buckets with it, and it is grog's bash ----------
 Step 'git (also the bash shell grog uses)'
-Scoop @('install','git')
+& $scoop install git
 
 # --- buckets -----------------------------------------------------------------
 Step 'buckets'
 $buckets = (& $scoop bucket list 2>$null) -join ' '
-if ($buckets -notmatch '\bjava\b')         { Scoop @('bucket','add','java') }
-if ($buckets -notmatch '\bextras\b')       { Scoop @('bucket','add','extras') }
-if ($buckets -notmatch 'scoop-clojure')    { Scoop @('bucket','add','scoop-clojure','https://github.com/littleli/scoop-clojure') }
+if ($buckets -notmatch '\bjava\b')      { & $scoop bucket add java }
+if ($buckets -notmatch '\bextras\b')    { & $scoop bucket add extras }
+if ($buckets -notmatch 'scoop-clojure') { & $scoop bucket add scoop-clojure https://github.com/littleli/scoop-clojure }
 
 # --- required ------------------------------------------------------------------
 Step 'Java'
-Scoop @('install','java/temurin-lts-jdk')
+& $scoop install java/temurin-lts-jdk
 
 # --- optional ------------------------------------------------------------------
 if (-not $Minimal) {
   Step 'optional tools'
   # tesseract-languages is separate on purpose: tesseract ships the OCR engine
   # but no recognition data, and OCR fails without it.
-  Scoop @('install','nodejs-lts')
-  Scoop @('install','babashka')
-  Scoop @('install','ripgrep','jq')
-  Scoop @('install','poppler','tesseract','tesseract-languages')
-  Scoop @('install','extras/libreoffice')
+  & $scoop install nodejs-lts
+  & $scoop install babashka
+  & $scoop install ripgrep jq
+  & $scoop install poppler tesseract tesseract-languages
+  & $scoop install extras/libreoffice
 }
 
 # --- ECA -----------------------------------------------------------------------
@@ -83,7 +87,7 @@ if (Test-Path $ecaExe) {
     Write-Host "ECA -> $ecaDir (added to your PATH)"
   } catch {
     Write-Host "ECA download failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host "Get it by hand from https://github.com/editor-code-assistant/eca/releases"
+    Write-Host 'Get it by hand from https://github.com/editor-code-assistant/eca/releases'
   }
 }
 
