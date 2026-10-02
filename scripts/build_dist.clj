@@ -38,19 +38,86 @@
           (say "created VERSION (0.1.0) — edit it to release")
           "0.1.0")))
 
+(def ^:private windows?
+  (str/includes? (str/lower-case (str (System/getProperty "os.name"))) "win"))
+
+(defn- where-on-path
+  "Windows last resort: ask where.exe (respects PATHEXT + PATH, so it finds
+  shims our fixed extension list might miss). First existing hit or nil.
+  Spawns raw ProcessBuilder - not sh! - to avoid recursing into ourselves."
+  [prog]
+  (when windows?
+    (try
+      (let [p (.start (java.lang.ProcessBuilder. ["where.exe" (str prog)]))
+            out (slurp (.getInputStream p))]
+        (.waitFor p)
+        (->> (str/split-lines out)
+             (map str/trim)
+             (filter #(and (seq %) (fs/exists? %)))
+             first))
+      (catch Exception _ nil))))
+
+(defn- find-on-path
+  "PATH search that also tries the Windows shim extensions.
+
+  Babashka's program resolver matches the bare name only, so on Windows a
+  `clojure` that is really `clojure.cmd` (scoop shim) or `clojure.bat` (the
+  official installer) fails with 'Cannot resolve program: clojure' - even though
+  the shell finds it fine. Resolve it to a real file first.
+
+  Falls back to the name as given, so anything the resolver CAN handle (and any
+  absolute path) still works.
+
+  A program that already IS a path (absolute, or containing a separator) is
+  returned untouched - there is nothing to look up, and babashka.fs/file would
+  even throw on an absolute child."
+  [prog]
+  (if (or (str/includes? (str prog) "/")
+          (str/includes? (str prog) "\\")
+          (.isAbsolute (java.io.File. (str prog))))
+    (str prog)
+    ;; Windows: try the executable extensions BEFORE the bare name. An
+    ;; extensionless `clojure` may be a POSIX script (the Clojure tools zip
+    ;; ships one) which CreateProcess rejects with error=193; the .cmd/.bat is
+    ;; the runnable one. On POSIX the bare name is the only candidate.
+    (let [exts (if windows? [".exe" ".cmd" ".bat" ".com" ""] [""])
+        dirs (remove str/blank?
+                     (str/split (or (System/getenv "PATH") "")
+                                (re-pattern (java.util.regex.Pattern/quote java.io.File/pathSeparator))))]
+    (or (some (fn [d]
+                (some (fn [e]
+                        (let [f (fs/file d (str prog e))]
+                          (when (fs/exists? f) (str f))))
+                      exts))
+              dirs)
+        (or (where-on-path prog)
+            (do (when windows?
+                  (say "WARNING:" prog "not on PATH (searched .exe/.cmd/.bat/.com, then where.exe)"))
+                prog))))))
+
 (defn sh!
   "Run argv in `dir`, streaming output. Throws on a non-zero exit."
   [dir & args]
-  (let [args (mapv str args)]
+  (let [args (mapv str args)
+        ;; resolve the program, not the rest of argv: babashka passes arguments
+        ;; through untouched, and going via `cmd /c` would let cmd re-parse them
+        ;; (it would strip the quotes from e.g. :version "0.1.0").
+        prog (find-on-path (first args))
+        args (into [prog] (rest args))]
     (say "$" (str/join " " args))
-    (let [r (apply p/shell {:dir dir :out :inherit :err :inherit :continue true} args)]
+    ;; Skip babashka's own resolver: we already resolved the program, and its
+    ;; Windows path re-runs fs/which (bare-name-only, executable? check) which
+    ;; is precisely what was throwing 'Cannot resolve program: ...'. Ours
+    ;; returns absolute paths, so ProcessBuilder needs no help finding them.
+    (let [r (apply p/shell {:dir dir :out :inherit :err :inherit :continue true
+                            :program-resolver (fn [{:keys [program]}] program)}
+                   args)]
       (when-not (zero? (:exit r))
         (die (str "command failed (" (:exit r) "): " (str/join " " args)))))))
 
-(defn- npm-cmd [] (if (str/includes? (str/lower-case (System/getProperty "os.name")) "win") "npm.cmd" "npm"))
+(defn- npm-cmd [] (if windows? "npm.cmd" "npm"))
 
-(defn- os-tag []
-  (if (str/includes? (str/lower-case (System/getProperty "os.name")) "win") "windows" "linux"))
+(defn- os-tag [] (if windows? "windows" "linux"))
 
 (defn- arch-tag []
   (let [a (str/lower-case (System/getProperty "os.arch"))]
@@ -59,10 +126,13 @@
           :else a)))
 
 (defn- newest [dir re]
-  (->> (fs/list-dir dir)
+  ;; nil instead of throwing when the dir doesn't exist (fresh checkout +
+  ;; --skip-jars): assemble! then reports its own 'jar missing' die message.
+  (when (fs/directory? dir)
+    (->> (fs/list-dir dir)
        (filter #(re-matches re (str (fs/file-name %))))
        (sort-by #(fs/last-modified-time %) #(compare %2 %1))
-       first))
+       first)))
 
 (defn build! [{:keys [version skip-jars? skip-web?]}]
   (let [web (fs/file root "clients/web")]
