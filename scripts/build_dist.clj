@@ -146,6 +146,28 @@
        (sort-by #(fs/last-modified-time %) #(compare %2 %1))
        first)))
 
+(defn- web-deps-ready?
+  "npm run build resolves shadow-cljs from node_modules/.bin - absent there,
+  npm's only signal is the cryptic \"'shadow-cljs' is not recognized\"."
+  [web]
+  (let [bin (fs/file web "node_modules/.bin")]
+    (and (fs/directory? bin)
+         (boolean (some #(fs/exists? (fs/file bin %))
+                        ["shadow-cljs" "shadow-cljs.cmd" "shadow-cljs.ps1"])))))
+
+(defn- ensure-web-deps!
+  "node_modules is gitignored, so a fresh clone has none: bootstrap it here.
+  The jar side self-provisions (clojure fetches Maven deps on its own); this
+  is the web side's equivalent, keeping bb dist ONE entry point (E1). Re-checks
+  after install and dies if still missing (scripts blocked, offline, ...)."
+  [web]
+  (when-not (web-deps-ready? web)
+    (say "node_modules lacks shadow-cljs - running npm install (once per clone)")
+    (sh! web (npm-cmd) "install")
+    (when-not (web-deps-ready? web)
+      (die (str "npm install completed but shadow-cljs is still missing -"
+                " check npm's output above for blocked scripts or network errors")))))
+
 (defn build! [{:keys [version skip-jars? skip-web?]}]
   (let [web (fs/file root "clients/web")]
     (if skip-jars?
@@ -157,7 +179,8 @@
         (sh! root "clojure" "-T:build" "spine" ":version" (pr-str version))))
     (if skip-web?
       (say "skipping the renderer build (--skip-web)")
-      (do (say "building the renderer bundle")
+      (do (ensure-web-deps! web)
+          (say "building the renderer bundle")
           (sh! web (npm-cmd) "run" "build")))
     true))
 

@@ -139,6 +139,46 @@ function Ensure($App, $Probe, $VersionArgs) {
 Step 'git (also the bash shell grog uses)'
 Ensure 'git' 'bash' @('--version')
 
+# scoop's git manifest shims sh/git/git-gui/git-bash/scalar - but NOT bash, and
+# Git for Windows' installer only puts cmd\ (git.exe) on PATH. So bash.exe sits
+# in <git>\bin while `bash` is not a command anywhere: PowerShell says "not
+# recognized", and ECA - which spawns every MCP server as `bash -lc ...` - dies
+# with CreateProcess error=2. (grog-client.bat papers over this with a PATH
+# fixup; nothing else does.) Add the missing shim; shims\ is on PATH.
+Step 'bash (grog spawns its tool servers as bash -lc)'
+$bashCmd = Get-Command bash -ErrorAction SilentlyContinue
+if ($bashCmd -and ($bashCmd.Source -notlike '*System32*')) {
+  # System32\bash.exe would be WSL's stub - wrong shell for grog - so only a
+  # non-stub counts as "found".
+  Note ("{0,-26} {1}" -f 'bash', $bashCmd.Source)
+} else {
+  if ($bashCmd) { Note ("{0,-26} {1} is WSL's stub, not Git for Windows'" -f 'bash', $bashCmd.Source) }
+  $gitRoot = $null
+  try { $gitRoot = (& $scoop prefix git 2>$null | Select-Object -First 1) } catch {}
+  $gitBash = $null
+  if ($gitRoot) {
+    foreach ($c in @('bin\bash.exe', 'usr\bin\bash.exe')) {
+      $p = Join-Path $gitRoot $c
+      if (Test-Path -LiteralPath $p) { $gitBash = $p; break }
+    }
+  }
+  if ($gitBash) {
+    & $scoop shim add bash $gitBash
+    # Verify the SHIM FILE, not this session's PATH - scoop may have changed
+    # PATH without this shell noticing (the whole lesson of this script).
+    $made = Join-Path (Split-Path $scoop -Parent) 'bash.exe'
+    if (Test-Path -LiteralPath $made) {
+      Note ("{0,-26} shim -> {1}" -f 'bash', $gitBash)
+    } else {
+      Note ("{0,-26} 'scoop shim add' did not produce {1}" -f 'bash', $made)
+      $script:Broken += 'bash'
+    }
+  } else {
+    Note ("{0,-26} no Git for Windows found to shim - run: scoop install git" -f 'bash')
+    $script:Broken += 'bash'
+  }
+}
+
 # --- buckets ------------------------------------------------------------------
 # Before anything is installed FROM them: java/ holds Temurin, extras/ holds
 # LibreOffice, scoop-clojure holds babashka.

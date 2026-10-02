@@ -38,7 +38,7 @@
   [{:id "bash"
     :names ["bash"] :version ["--version"] :required? true
     :capability "MCP servers are spawned as `bash -lc \"cd ... && java ... --server <id>\"`"
-    :hint {:windows "scoop install git   (Git for Windows ships bash.exe)"
+    :hint {:windows "scoop install git;  scoop shim add bash \"$(scoop prefix git)\\bin\\bash.exe\"  (scoop does not shim bash itself)"
            :posix   "apt install bash  |  dnf install bash"}}
    {:id "java" :names ["java"] :version ["-version"] :required? true
     :capability "runs grog-spine.jar and the grog-mcp tool jar"

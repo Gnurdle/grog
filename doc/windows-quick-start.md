@@ -34,12 +34,18 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser   # once, i
 irm get.scoop.sh | iex
 ```
 
-Scoop clones buckets with **git**, so install that first. It is also the bash
-shell grog needs, so it is doing double duty:
+Scoop clones buckets with **git**, so install that first. Git for Windows also
+ships `bash.exe`, which grog needs — but scoop's manifest shims only
+`sh`/`git`/`git-bash`, **not** `bash`, so the command doesn't exist until you
+add it (otherwise every tool server fails with `CreateProcess error=2`):
 
 ```powershell
-scoop install git                    # bash - required, and needed for buckets
+scoop install git                        # git - required, and needed for buckets
+scoop shim add bash "$(scoop prefix git)\bin\bash.exe"
+                                          # exposes Git for Windows' bash.exe as `bash`
 ```
+
+(`scripts\prereqs.ps1` does both for you — this section is the manual version.)
 
 Now add the buckets that hold the rest. `main` is the only one scoop starts
 with; the last of these is third-party and needs its URL:
@@ -178,7 +184,7 @@ does the same thing.
 |---|---|
 | The window closes immediately | Run `scripts\grog-client.bat` from an open console so you can read the log. A process holding a stale `%TEMP%\grog-client-*.log` open can stop the launcher; close stray `java.exe`/`bash.exe` and retry. |
 | The backend never starts | `java -version` — it must be on PATH. |
-| Every tool server reports `CreateProcess error=2` | `bash --version` — it must be on PATH (Git for Windows). |
+| Every tool server reports `CreateProcess error=2` | `bash --version` — it must resolve to Git for Windows, not WSL's stub. Missing? `scoop shim add bash "$(scoop prefix git)\bin\bash.exe"` (scoop doesn't shim bash itself). |
 | Config errors mentioning `clojure.lang.Symbol` | `grog.edn` starts with a byte-order mark. Save it as UTF-8 **without** a BOM. |
 | The tool jar is missing | Re-extract the bundle, or copy `grog-mcp-<version>.jar` into `grog_mcp\target\`. |
 | `/doctor` shows a tool as missing | Install it, or ignore it if you don't need that feature. |
@@ -210,14 +216,19 @@ tool ever reports a *missing* argument it should have received, run that test.
 ## 8. Building from source
 
 Only for working on grog itself. This path also needs the
-[Clojure CLI](https://clojure.org/guides/install_clojure) and Babashka; running
-grog does **not**.
+[Clojure CLI](https://clojure.org/guides/install_clojure), Babashka, and
+Node.js; running grog does **not**.
 
 ```cmd
 git clone <remote> %USERPROFILE%\grog
 cd %USERPROFILE%\grog
+cd clients\web && npm install && cd ..\..
 bb dist                   :: both jars + the interface bundle + dist/ + tarball
 ```
+
+`npm install` is once per clone: `node_modules/` is deliberately not in git.
+Skip it and `bb dist` runs it for you before the renderer build — the jar side
+self-provisions Maven deps the same way, so the build is one command either way.
 
 `bb dist` writes the two jars the app expects:
 
