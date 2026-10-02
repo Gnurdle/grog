@@ -62,6 +62,9 @@
     {:sessions {} :order [] :active nil :focused? true :input ""
      :connected? false :socket-path "" :opened? false :font-size 16
      :dialog nil :dialog-input "" :q-input "" :projects []
+     ;; model picker (settings dialog): catalogue from the server, which source
+     ;; is being browsed, and the search string
+     :catalogue nil :model-source "eca" :model-query ""
      :voice nil :recording? false :transcribing? false}))
 
 (rf/reg-sub :db (fn [db _] db))
@@ -227,7 +230,9 @@
   (fn [{:keys [db]} [_ kind initial]]
     (cond-> {:db (assoc db :dialog kind :dialog-input (or initial ""))}
       ;; the project picker needs the live list from the server
-      (= kind :projects) (assoc :dispatch [:fetch-projects]))))
+      (= kind :projects) (assoc :dispatch [:fetch-projects])
+      ;; the settings dialog opens onto the model picker's current source
+      (= kind :settings) (assoc :dispatch [:models-fetch nil]))))
 
 ;; --- project list (server `projects` method) -------------------------------
 
@@ -242,6 +247,39 @@
     {}))
 (rf/reg-event-db :dialog-input (fn [db [_ s]] (assoc db :dialog-input s)))
 (rf/reg-event-db :dialog-close (fn [db _] (assoc db :dialog nil)))
+
+;; --- model picker ----------------------------------------------------------
+;;
+;; The catalogue lives on the SERVER (it has the config, the OpenRouter/Ollama
+;; fetchers and ECA's own model list). `models` answers from cache, and a slow
+;; source is refreshed in the background — the refreshed list arrives as a
+;; `models` broadcast, so a first click on Ollama/OpenRouter shows "loading…"
+;; and then fills in, rather than freezing the dialog.
+
+(rf/reg-event-db :models-source
+  (fn [db [_ source]] (assoc db :model-source source :model-query "")))
+
+(rf/reg-event-db :model-query
+  (fn [db [_ q]] (assoc db :model-query q)))
+
+(rf/reg-event-db :catalogue
+  (fn [db [_ cat]] (assoc db :catalogue (js->clj cat :keywordize-keys true))))
+
+(rf/reg-event-db :models-source-loaded
+  (fn [db [_ {:keys [source models]}]]
+    (assoc-in db [:catalogue (keyword source)] (vec models))))
+
+(rf/reg-event-fx :models-fetch
+  "Ask for `source`'s models (default: whichever source is being browsed).
+  `force` re-fetches a source we already have cached."
+  (fn [{:keys [db]} [_ force]]
+    (-> (.call js/window.grogAPI
+               "models"
+               (clj->js (cond-> {:source (or (:model-source db) "eca")}
+                          force (assoc :force true))))
+        (.then (fn [cat] (rf/dispatch [:catalogue cat])))
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] models failed: " (.-message e))]))))
+    {}))
 
 (rf/reg-event-db :status-line
   (fn [db [_ sid text]]
@@ -328,6 +366,8 @@
                                     [:retry-status (select-keys (:params msg) [:attempts :nextRetryAt :retrying])]
                                     [:retry-open]]}
       "server-down"   {:dispatch [:status-line nil (:text (:params msg))]}
+      ;; a background OpenRouter/Ollama refresh landed
+      "models"        {:dispatch [:models-source-loaded (:params msg)]}
       nil)))
 
 ;; --- commands --------------------------------------------------------------
@@ -394,11 +434,16 @@
       {:db (assoc-in db [:sessions id :trust] on)})))
 
 (rf/reg-event-fx :set-model
-  (fn [{:keys [db]} [_ id model]]
+  (fn [{:keys [db]} [_ id model source]]
     (let [m (str/trim (str model))]
       (if (seq m)
         (do
-          (-> (.call js/window.grogAPI "set-model" (clj->js {:id id :model m}))
+          ;; `source` (from the picker) lets the server qualify the id exactly:
+          ;; an OpenRouter catalog id must not be mistaken for a native
+          ;; provider just because its org slug matches one.
+          (-> (.call js/window.grogAPI "set-model"
+                     (clj->js (cond-> {:id id :model m}
+                                source (assoc :source (str source)))))
               (.catch (fn [e] (rf/dispatch [:status-line id (str "[grog] set-model failed: " (.-message e))]))))
           {:db (assoc db :dialog nil)})
         {}))))
@@ -460,6 +505,9 @@
 (rf/reg-sub :ui-dialog (fn [db _] (:dialog db)))
 (rf/reg-sub :dialog-input (fn [db _] (:dialog-input db)))
 (rf/reg-sub :projects (fn [db _] (:projects db)))
+(rf/reg-sub :catalogue (fn [db _] (:catalogue db)))
+(rf/reg-sub :model-source (fn [db _] (:model-source db)))
+(rf/reg-sub :model-query (fn [db _] (:model-query db)))
 (rf/reg-sub :pending-questions
   (fn [db _] (->> (:sessions db) (keep (fn [[id s]] (when (:pending-question s) id))) set)))
 
@@ -832,11 +880,25 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Cancel"]]]]))
 
+(def ^:private picker-sources
+  "Model sources the picker offers, in order. `eca` is ECA's own catalogue
+  (offline, arrives on connect); the other two are fetched."
+  [["eca" "ECA"] ["openrouter" "OpenRouter"] ["ollama" "Ollama"]])
+
 (defn- settings-dialog []
   (let [in @(rf/subscribe [:dialog-input]) active @(rf/subscribe [:active])
-        sess (get-in @(rf/subscribe [:sessions]) [active])]
+        sess (get-in @(rf/subscribe [:sessions]) [active])
+        src @(rf/subscribe [:model-source])
+        q @(rf/subscribe [:model-query])
+        cat @(rf/subscribe [:catalogue])
+        all (get cat (keyword src))
+        all (or all [])
+        shown (if (str/blank? q)
+                all
+                (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
+        loading-src? (some #(= src %) (:loading cat))]
     [overlay
-     [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[520px]"}
+     [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[520px] max-h-[85vh] overflow-y-auto"}
       [:div {:class "text-slate-200 text-sm font-medium"} "Settings"]
       [:div {:class "text-xs text-slate-400"} (str "project: " (:project sess))]
       [:label {:class "text-xs text-slate-400"} "model"]
@@ -845,6 +907,48 @@
                :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:set-model active in]))
                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
       [:div {:class "text-[0.7rem] text-slate-500"} "persists via /eca-model on the server"]
+
+      ;; browse + search + pick. The list comes from the server; a source that
+      ;; has never been fetched shows "loading…" and fills in via broadcast.
+      [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
+       [:div {:class "flex items-center gap-1"}
+        (into [:span {:class "flex items-center gap-1"}]
+              (for [[id label] picker-sources]
+                ^{:key id}
+                [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
+                                      (if (= id src)
+                                        "bg-sky-600 border-sky-500 text-slate-950 font-medium"
+                                        "bg-slate-800 border-slate-700 text-slate-300"))
+                          :on-click #(rf/dispatch [:models-source id])}
+                 label]))
+        [:button {:class "ml-auto px-2 py-1 rounded text-[0.7rem] bg-slate-800 border border-slate-700 text-slate-300"
+                  :title "refresh this source"
+                  :on-click #(rf/dispatch [:models-fetch :force])} "↻"]]
+       [:input {:value q :placeholder "search models…"
+                :on-change #(rf/dispatch [:model-query (.. % -target -value)])
+                :on-key-down #(when (= "Escape" (.-key %)) (rf/dispatch [:model-query ""]))
+                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-500"}]
+       (into [:div {:class "max-h-48 overflow-y-auto rounded-md border border-slate-700"}]
+             (cond
+               loading-src?
+               [[:div {:class "p-2 text-xs text-slate-500"} (str "loading " src "…")]]
+
+               (empty? shown)
+               [[:div {:class "p-2 text-xs text-slate-500"}
+                 (str "no models — " (if (= "eca" src)
+                                       "connect a session, or pick another source"
+                                       "press ↻ to fetch"))]]
+
+               :else
+               (for [m shown]
+                 ^{:key m}
+                 [:div {:class "px-2 py-1 text-[0.7rem] font-mono text-slate-300 hover:bg-slate-800 cursor-pointer"
+                        :on-click #(rf/dispatch [:dialog-input m])
+                        :on-double-click #(rf/dispatch [:set-model active m src])}
+                  m])))
+       [:div {:class "text-[0.7rem] text-slate-500"}
+        (str (count shown) " model" (when (not= 1 (count shown)) "s")
+             " · click fills the box, double-click applies")]]
       [:div {:class "border-t border-slate-700 pt-3 space-y-1"}
        [:label {:class "text-xs text-slate-400"} "font size"]
        [:div {:class "flex items-center gap-2"}

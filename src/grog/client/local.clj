@@ -173,9 +173,9 @@
           (cancel/cancel!)
           (reset! running? false))
         set-model-fn
-        (fn [nm]
+        (fn [nm source]
           (let [mid (models/qualify-eca-model nm
-                                              nil
+                                              source
                                               (try (config/llm-url) (catch Exception _ nil)))]
             (when (and @connected mid)
               (eca/selected-model! id mid {:chatId @(:chat-id state)}))
@@ -186,6 +186,9 @@
             (chat/publish! state {:type :model
                                   :value mid
                                   :text (str "model: " mid)})))
+        ;; slash-command seam: /eca-model has no transport, so it qualifies with
+        ;; source=nil (the url/config heuristics decide).
+        set-model-1 (fn [nm] (set-model-fn nm nil))
         set-trust-fn
         (fn [on?]
           (let [next (if (nil? on?) (not @(:trust state)) on?)]
@@ -216,7 +219,7 @@
     ;; routing; :console/:quit! are the view-provided seams
     (.start (chat/chat-worker! state queue
                                {:send send-fn
-                                :set-model! set-model-fn
+                                :set-model! set-model-1
                                 :set-yolo! set-trust-fn
                                 :console console
                                 :quit! quit!}))
@@ -256,7 +259,8 @@
     ;; tolerant: a tab closed (or a duplicate click) must never blow up a turn
     (when-let [s (get @!sessions id)]
       (chat/answer-approval! (:state s) approval-id decision)))
-  (set-model! [_ id model] ((:set-model! (sess id)) model))
+  (set-model! [_ id model] ((:set-model! (sess id)) model nil))
+  (set-model! [_ id model source] ((:set-model! (sess id)) model source))
   (set-trust! [_ id on?] ((:set-trust! (sess id)) on?))
   (subscribe! [_ id f] (chat/subscribe! (:state (sess id)) f))
   (unsubscribe! [_ id f] (chat/unsubscribe! (:state (sess id)) f)))

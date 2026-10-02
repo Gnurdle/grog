@@ -366,18 +366,41 @@ function createWindow() {
   });
   // surface renderer console + load failures in the terminal — a blank window
   // is otherwise indistinguishable from a failed build or a thrown init
+  let loadFailed = false;
   win.webContents.on("console-message", (_e, level, message, line, source) =>
     console.log(`[renderer:${level}] ${message} (${source}:${line})`));
-  win.webContents.on("did-fail-load", (_e, code, desc, url) =>
-    console.log(`[renderer] did-fail-load ${code} ${desc} ${url}`));
+  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    loadFailed = true;
+    console.log(`[renderer] did-fail-load ${code} ${desc} ${url}`);
+  });
   win.webContents.on("did-finish-load", () => {
-    console.log("[renderer] loaded ok");
+    // did-finish-load also fires for an ERROR page, so don't claim success then
+    // — printing "loaded ok" after a failure is exactly how a black window hid.
+    console.log(loadFailed ? "[renderer] load FAILED (see did-fail-load above)"
+                           : "[renderer] loaded ok");
     notifyRenderer();   // let the renderer paint the current attach state
   });
-  // Dev: load from the shadow-cljs dev server (it serves resources/public and
-  // /js with hot reload). Prod: load the built file directly.
+  // A BLACK/BLANK window has two very different causes and this is the only way
+  // to tell them apart from the outside: the renderer process dying (logged
+  // here) versus a live renderer that simply isn't painting (a GPU/compositor
+  // problem — see GROG_DISABLE_GPU / --disable-gpu).
+  win.webContents.on("render-process-gone", (_e, details) =>
+    console.log(`[renderer] PROCESS GONE reason=${details && details.reason} exitCode=${details && details.exitCode}`));
+  win.webContents.on("unresponsive", () => console.log("[renderer] unresponsive"));
+  // So a blank window is inspectable on a machine with no terminal attached
+  // (e.g. launched from the Start Menu): GROG_OPEN_DEVTOOLS=1 opens a detached
+  // DevTools window whose Console tab shows whatever threw.
+  if (process.env.GROG_OPEN_DEVTOOLS === "1") {
+    win.webContents.openDevTools({ mode: "detach" });
+  }
+  // Packaged installs ALWAYS load the bundled page. Nothing in a shipped app may
+  // depend on an env var being set: launching grog.exe directly (or from a Start
+  // Menu shortcut) has no NODE_ENV at all, and the old test below pointed such a
+  // window at the shadow-cljs dev server -> ERR_CONNECTION_REFUSED -> a black
+  // window painted with only the BrowserWindow background colour.
+  // Dev URL is for an UNPACKAGED tree only, and only when explicitly asked for.
   const devUrl = process.env.GROG_WEB_DEV_URL ||
-    (process.env.NODE_ENV === "production" ? null : "http://localhost:9633");
+    ((!PACKAGED && process.env.NODE_ENV !== "production") ? "http://localhost:9633" : null);
   if (devUrl) win.loadURL(devUrl);
   else win.loadFile(path.join(__dirname, "..", "..", "resources", "public", "index.html"));
   // guard against "Object has been destroyed" when the window is closing
@@ -401,6 +424,9 @@ if (process.env.GROG_DISABLE_GPU === "1") {
   } catch (e) {
     console.warn("[grog-client] disableHardwareAcceleration failed:", e.message);
   }
+} else {
+  console.log("[grog-client] GPU acceleration enabled (if the window is black,"
+    + " relaunch with GROG_DISABLE_GPU=1 or --disable-gpu)");
 }
 
 app.whenReady().then(() => {

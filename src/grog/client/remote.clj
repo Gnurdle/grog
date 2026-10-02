@@ -259,6 +259,9 @@
                         :approval-id (:approval-id ans)
                         :decision (if (keyword? d) (name d) (str d))}))))
   (set-model! [_ id model] (call "set-model" {:id id :model model}))
+  (set-model! [_ id model source]
+    (call "set-model" (cond-> {:id id :model model}
+                        source (assoc :source (str source)))))
   (set-trust! [_ id on?] (call "set-trust" {:id id :on (boolean on?)}))
   (subscribe! [_ id f]
     (when-let [{:keys [subs]} (get @!sessions id)]

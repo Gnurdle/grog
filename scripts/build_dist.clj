@@ -338,23 +338,25 @@
     ;; portable tarball/zip are a developer convenience only, so they are
     ;; opt-in via --bundle rather than part of the shipping path.
     (when (some #{"--bundle"} args) (assemble! opts))
-    (when-not (some #{"--no-package"} args) (package! opts))
-    ;; Report the artifact that was actually produced rather than predicting a
-    ;; name: electron-builder's ${arch} for AppImage is x86_64, not x64.
-    (let [dist (fs/file root "clients/web/dist")
-          artifact (->> (when (fs/directory? dist) (fs/list-dir dist))
-                        (filter #(re-matches
-                                   (re-pattern
-                                     (str "grog-" (java.util.regex.Pattern/quote version)
-                                          ".*\\.(exe|AppImage|deb)$"))
-                                   (str (fs/file-name %))))
-                        (sort-by #(fs/last-modified-time %) #(compare %2 %1))
-                        first)]
-      (if artifact
-        (do (say "")
-            (say "ARTIFACT:" (str artifact))
-            (say "  copy that one file to the target and run it"))
-        (say "done.")))))
+    (let [packaged? (not (some #{"--no-package"} args))]
+      (when packaged? (package! opts))
+      ;; Report the artifact that was actually produced rather than predicting a
+      ;; name: electron-builder's ${arch} for AppImage is x86_64, not x64.
+      (let [dist (fs/file root "clients/web/dist")
+            artifact (when packaged?
+                       (->> (when (fs/directory? dist) (fs/list-dir dist))
+                            (filter #(re-matches
+                                      (re-pattern
+                                        (str "grog-" (java.util.regex.Pattern/quote version)
+                                             ".*\\.(exe|AppImage|deb)$"))
+                                      (str (fs/file-name %))))
+                            (sort-by #(fs/last-modified-time %) #(compare %2 %1))
+                            first))]
+        (if artifact
+          (do (say "")
+              (say "ARTIFACT:" (str artifact))
+              (say "  copy that one file to the target and run it"))
+          (say "done."))))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))

@@ -32,8 +32,22 @@
     steer           {:id .. :text ..}                   -> nil
     stop            {:id ..}                            -> nil
     answer          {:id .. :approval-id .. :decision ..} -> nil
-    set-model       {:id .. :model ..}                  -> nil
+    set-model       {:id .. :model .. :source? ..}      -> nil
+                                        (:source is the picker transport —
+                                        `openrouter`/`ollama` — so an id is
+                                        qualified exactly, never mistaken for a
+                                        native provider of the same name)
     set-trust       {:id .. :on ..}                     -> nil
+    models          {:source? .. :force? ..}            -> {:eca [..]
+                                                            :openrouter [..]
+                                                            :ollama [..]
+                                                            :loading [..]}
+                                        the settings-dialog model catalogue.
+                                        Answers from cache; an uncached (or
+                                        :force'd) remote source is fetched on a
+                                        BACKGROUND thread and arrives later as a
+                                        `models` notification, so a slow network
+                                        never blocks this request loop.
     answer-question {:question-id .. :result ..}        -> nil
     projects        {}                                  -> [{:name .. :description ..} ..]
     create-project  {:name .. :description ..}          -> nil
@@ -53,6 +67,8 @@
                                         for answer-question, then cancels — the
                                         wire version of the local wedge-safety
                                         rule (a missing client can't hang a turn)
+    models   {:source .. :models [..]}  a background model-catalogue refresh
+                                        completing (see `models` above)
 
   stdout is the RPC channel in stdio mode: on startup the Clojure process
   streams are redirected to stderr so no stray println can corrupt the stream.
@@ -64,6 +80,7 @@
             [grog.client.local :as local]
             [grog.config :as config]
             [grog.mcp-http :as mcp-http]
+            [grog.models :as models]
             [grog.projects :as projects]
             [grog.soul :as soul])
   (:import (java.io BufferedReader BufferedWriter File InputStreamReader
@@ -255,7 +272,25 @@
                                            {:approval-id (:approval-id params)
                                             :decision (keyword (:decision params))})
                            nil)
-              "set-model" (do (client/set-model! (:id params) (:model params)) nil)
+              ;; Model catalogue for the settings picker. Answers from cache and
+              ;; refreshes OpenRouter/Ollama on a BACKGROUND thread, because a
+              ;; network fetch here would block this single request loop (and so
+              ;; every other client) for up to the HTTP timeout. The refreshed
+              ;; list arrives as a `models` broadcast. `:source eca` is ECA's own
+              ;; catalogue (populated on connect) and needs no fetch.
+              "models" (let [src (keyword (or (:source params) "eca"))
+                             known (models/catalogue)]
+                         (when (and (#{:openrouter :ollama} src)
+                                    (or (boolean (:force params))
+                                        (nil? (get known src))))
+                           (models/fetch-async!
+                            src
+                            (fn [s ms]
+                              (broadcast! "models" {:source (name s) :models ms}))))
+                         known)
+              "set-model" (do (client/set-model! (:id params) (:model params)
+                                                 (:source params))
+                              nil)
               "set-trust" (do (client/set-trust! (:id params) (boolean (:on params))) nil)
               "answer-question"
               (do (when-let [p (get @questions (:question-id params))]
