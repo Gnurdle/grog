@@ -5,8 +5,19 @@ Two callers:
   * the grog installer, right after it lays grog down
   * a person, by hand:   powershell -ExecutionPolicy Bypass -File prereqs.ps1
 
-Safe to re-run, and PASSIVE: a tool that is already installed - by scoop or by
-anything else - is never touched. Only what is missing gets installed.
+Safe to re-run and PASSIVE: anything already usable - installed by scoop or by
+anything else - is left alone.
+
+"Already usable" is decided with scoop's own signals rather than by guessing:
+
+  scoop list          installed apps. A failed install appears as a row whose
+                      Info column reads "Install failed"; the app directory
+                      exists but has no `current` junction.
+  scoop which <cmd>   resolves the shim's TARGET. Exit 2 means "not found, not
+                      a scoop shim, or a broken shim" - so a leftover shim from
+                      a failed install is not mistaken for a working tool.
+  and, of course,      actually running the tool, for anything scoop did not
+                      install.
 
   -Minimal   required pieces only (git/bash, Java, ECA); skip the optional tools
 #>
@@ -17,6 +28,7 @@ $ErrorActionPreference = 'Continue'
 $ecaVersion = '0.134.2'
 
 function Step($m) { Write-Host ''; Write-Host "== $m" -ForegroundColor Cyan }
+function Note($m) { Write-Host ("  " + $m) }
 
 # --- scoop -------------------------------------------------------------------
 Step 'scoop'
@@ -30,38 +42,92 @@ if (-not (Test-Path $scoop)) {
   Write-Host 'Install it by hand: https://scoop.sh'
   exit 1
 }
-Write-Host "scoop: $scoop"
+Note "scoop: $scoop"
 
 # The shim is called by absolute path: a freshly installed scoop is not on this
 # session's PATH. There is deliberately no wrapper taking an $Args parameter -
 # that name collides with PowerShell's automatic $args, and an earlier version of
 # this script ended up invoking scoop with no arguments at all (scoop's help).
 
-# --- installed? ---------------------------------------------------------------
-# Cached `scoop list`, so the question costs one call rather than one per tool.
+# --- scoop queries --------------------------------------------------------------
 $script:ScoopList = $null
+$script:Broken = @()
 
-function Scoop-Has([string]$Name) {
-  if ($null -eq $script:ScoopList) { $script:ScoopList = (& $scoop list 2>$null) -join "`n" }
-  return [bool]($script:ScoopList -match "(?m)^\s*$([regex]::Escape($Name))\s")
+function Scoop-Rows {
+  if ($null -eq $script:ScoopList) { $script:ScoopList = @(& $scoop list 2>$null) }
+  return $script:ScoopList
 }
 
-function Ensure([string]$App, [string]$Probe) {
+# 'ok' | 'failed' | 'absent' - straight from what scoop reports.
+function Scoop-Status([string]$Name) {
+  $row = Scoop-Rows | Where-Object { $_ -match "^\s*$([regex]::Escape($Name))\s" } | Select-Object -First 1
+  if (-not $row) { return 'absent' }
+  if ($row -match 'Install failed') { return 'failed' }
+  return 'ok'
+}
+
+# True when scoop's shim resolves to a real target. Exit 2 covers a broken shim.
+function Scoop-Which([string]$Cmd) {
+  if (-not $Cmd) { return $false }
+  & $scoop which $Cmd *> $null
+  return ($LASTEXITCODE -eq 0)
+}
+
+# Last resort for tools scoop did not install: does it actually answer?
+function Tool-Works($Probe, $VersionArgs) {
+  if (-not $Probe) { return $false }
+  if (-not (Get-Command $Probe -ErrorAction SilentlyContinue)) { return $false }
+  try { return [bool]((& $Probe @VersionArgs 2>&1 | Out-String) -match '\S') }
+  catch { return $false }
+}
+
+function Usable($Probe, $VersionArgs) {
+  if (-not $Probe) { return $false }
+  return (Scoop-Which $Probe) -or (Tool-Works $Probe $VersionArgs)
+}
+
+# --- the one rule: install only what is missing --------------------------------
+function Ensure($App, $Probe, $VersionArgs) {
   $name = ($App -split '/')[-1]
-  # Present if the tool answers, OR scoop already has it (its shims may not be on
-  # this session's PATH yet, which is exactly the stale-PATH trap).
-  if (($Probe -and (Get-Command $Probe -ErrorAction SilentlyContinue)) -or (Scoop-Has $name)) {
-    Write-Host ("  {0,-26} already present" -f $App)
+  $state = Scoop-Status $name
+
+  # scoop says the last install failed: the directory is there, the app is not.
+  if ($state -eq 'failed') {
+    Note ("{0,-26} scoop reports a FAILED install - cleaning up" -f $App)
+    & $scoop uninstall $App
+    $script:ScoopList = $null
+    $state = 'absent'
+  }
+
+  if (-not $Probe) {
+    # No program to run (language data). Scoop's word is all there is.
+    if ($state -eq 'ok') { Note ("{0,-26} installed (no version check available)" -f $App); return }
+  } elseif (Usable $Probe $VersionArgs) {
+    Note ("{0,-26} already present" -f $App)
     return
   }
-  Write-Host ("  {0,-26} installing" -f $App)
+
+  # Registered, but nothing answers: usually stale shims from a moved install.
+  if ($state -eq 'ok') {
+    Note ("{0,-26} installed but not answering - resetting shims" -f $App)
+    & $scoop reset $App
+    if (Usable $Probe $VersionArgs) { Note ("{0,-26} ok after reset" -f $App); return }
+  }
+
+  Note ("{0,-26} installing" -f $App)
   & $scoop install $App
-  $script:ScoopList = $null      # a fresh install invalidates the cache
+  $script:ScoopList = $null
+
+  if (-not $Probe) { Note ("{0,-26} installed (no version check available)" -f $App); return }
+  if (Usable $Probe $VersionArgs) { Note ("{0,-26} installed ok" -f $App); return }
+
+  Note ("{0,-26} INSTALLED BUT NOT WORKING - check it by hand" -f $App)
+  $script:Broken += $App
 }
 
 # --- git first - scoop clones buckets with it, and it is grog's bash ----------
 Step 'git (also the bash shell grog uses)'
-Ensure 'git' 'bash'
+Ensure 'git' 'bash' @('--version')
 
 # --- buckets ------------------------------------------------------------------
 # Before anything is installed FROM them: java/ holds Temurin, extras/ holds
@@ -74,29 +140,31 @@ if ($buckets -notmatch 'scoop-clojure') { & $scoop bucket add scoop-clojure http
 
 # --- required ------------------------------------------------------------------
 Step 'Java'
-Ensure 'java/temurin-lts-jdk' 'java'
+Ensure 'java/temurin-lts-jdk' 'java' @('-version')
 
 # --- optional ------------------------------------------------------------------
 if (-not $Minimal) {
   Step 'optional tools'
-  Ensure 'nodejs-lts' 'node'
-  Ensure 'babashka' 'bb'
-  Ensure 'ripgrep' 'rg'
-  Ensure 'jq' 'jq'
-  Ensure 'poppler' 'pdftoppm'
+  Ensure 'nodejs-lts'         'node'      @('--version')
+  Ensure 'babashka'           'bb'        @('--version')
+  Ensure 'ripgrep'            'rg'        @('--version')
+  Ensure 'jq'                 'jq'        @('--version')
+  Ensure 'poppler'            'pdftoppm'  @('-v')
+  Ensure 'tesseract'          'tesseract' @('--version')
   # tesseract-languages is separate on purpose: tesseract ships the OCR engine
   # but no recognition data, and OCR fails without it.
-  Ensure 'tesseract' 'tesseract'
-  Ensure 'tesseract-languages' ''
-  Ensure 'extras/libreoffice' 'soffice'
+  Ensure 'tesseract-languages' $null      @()
+  Ensure 'extras/libreoffice' 'soffice'   @('--version')
 }
 
 # --- ECA -----------------------------------------------------------------------
 Step "ECA $ecaVersion"
 $ecaDir = Join-Path $env:LOCALAPPDATA 'eca'
 $ecaExe = Join-Path $ecaDir 'eca.exe'
-if (Test-Path $ecaExe) {
-  Write-Host "  already at $ecaDir"
+if (Tool-Works 'eca' @('--version')) {
+  Note "already answering: $((Get-Command eca).Source)"
+} elseif (Test-Path $ecaExe) {
+  Note "already at $ecaDir"
 } else {
   $zip = Join-Path $env:TEMP 'eca-native-windows-amd64.zip'
   try {
@@ -111,18 +179,26 @@ if (Test-Path $ecaExe) {
     if ($userPath -notlike "*$ecaDir*") {
       [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $ecaDir), 'User')
     }
-    Write-Host "  ECA -> $ecaDir (added to your PATH)"
+    if (Tool-Works $ecaExe @('--version')) { Note "ECA -> $ecaDir (added to your PATH)" }
+    else { Note "ECA unpacked but not answering - check $ecaDir"; $script:Broken += 'eca' }
   } catch {
-    Write-Host "  ECA download failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host '  Get it by hand from https://github.com/editor-code-assistant/eca/releases'
+    Note "ECA download failed: $($_.Exception.Message)"
+    Note 'Get it by hand from https://github.com/editor-code-assistant/eca/releases'
+    $script:Broken += 'eca'
   }
 }
 
 # --- report ---------------------------------------------------------------------
 Step 'summary'
-foreach ($c in @('git','bash','java','node','bb','eca','rg','jq','tesseract','pdftoppm')) {
+foreach ($c in @('bash','java','node','bb','eca','rg','jq','tesseract','pdftoppm','soffice')) {
   $src = (Get-Command $c -ErrorAction SilentlyContinue).Source
-  Write-Host ("  {0,-12} {1}" -f $c, ($(if ($src) { $src } else { 'not found (optional, or not on PATH yet)' })))
+  Note ("{0,-12} {1}" -f $c, ($(if ($src) { $src } else { 'not found' })))
+}
+
+if ($script:Broken.Count -gt 0) {
+  Write-Host ''
+  Write-Host ('NOT WORKING: ' + ($script:Broken -join ', ')) -ForegroundColor Yellow
+  Write-Host 'grog still runs without the optional ones.'
 }
 Write-Host ''
 Write-Host 'Open a NEW terminal before starting grog - PATH changes need a new shell.'
