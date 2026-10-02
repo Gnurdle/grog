@@ -179,9 +179,6 @@
         (json/generate-string {:error "secret_name not allowed for with_api_key"
                                :allowed (vec (sort allowed))})
 
-        (not (secrets/known-account? secret-name))
-        (json/generate-string {:error "unknown secret_name" :hint "Use /secret; name must be in known-secret-defs."})
-
         (str/blank? secret-method)
         (json/generate-string {:error "secret_method is required or use legacy auth_placement"
                                :allowed_methods (vec (sort known-secret-methods))})

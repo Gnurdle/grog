@@ -1,7 +1,8 @@
 (ns build
   "Build tasks for the grog-mcp bundle (`clojure -T:build uber`).
 
-  Produces ONE jar holding every tool server (src + vendor-src + all the heavy
+  Produces ONE jar holding every tool server (src + the sibling projects via
+  `:local/root` + all the heavy
   deps: POI, PDFBox, BoofCV, sqlite, keyring, postgres, cheshire, clj-http, the
   MCP SDK and plumcp). That jar is what eca_config points every MCP entry at, so
   the install needs no Clojure CLI, no 13 project trees, and no repo paths.
@@ -15,7 +16,9 @@
 
 (def default-version "0.1.0")
 (def class-dir "target/classes")
-(def src-dirs ["src" "vendor-src"])
+;; Just the bundle's own sources: the 12 servers arrive on the classpath as
+;; `:local/root` deps (see deps.edn), NOT as a vendored copy.
+(def src-dirs ["src"])
 
 (defn- basis [] (b/create-basis {:project "deps.edn"}))
 
@@ -23,8 +26,8 @@
   (b/delete {:path "target"}))
 
 (defn uber
-  "Copy the bundle's sources (server namespaces live in vendor-src) into the
-  class dir, then merge the whole classpath into one jar.
+  "Copy the bundle's own sources into the class dir, then merge the whole
+  classpath into one jar (the 12 servers come in via `:local/root`).
 
   `:version` overrides the jar name's version (build_dist stamps the collective
   version here): clojure -T:build uber :version '\"1.2.3\"'. eca_config finds the

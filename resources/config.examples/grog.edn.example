@@ -71,8 +71,11 @@
 ;;         ;; ctrl+SPACE = Linux IME toggle.)
 ;;         :push-to-talk-key "ctrl shift SPACE"}
 
+;; Per-instance client logs (`<base>.<pid>.log`) are controlled by ENV, not by
+;; this file: GROG_LOG (base path; default ~/grog) and GROG_UI_LOG_KEEP (default
+;; 5). Set GROG_LOG_WIRE=1 to also record the raw NDJSON driver traffic.
+
 ;; Operational knobs (all optional; env vars remain overrides for one-off runs):
-;;   ;:log {:dir "~/grog-ui" :keep 5}          ; per-instance GUI logs (<dir>.<pid>.log)
 ;;   ;:mcp {:idle-timeout-ms 900000}           ; stop idle MCP servers after 15 min
 ;;   ;:terminal {:shell "bash"}                ; terminal + /shell (default $SHELL)
 ;;   ;:imaging {:tessdata "/usr/share/tesseract-ocr/5/tessdata"}

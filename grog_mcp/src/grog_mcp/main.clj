@@ -52,7 +52,7 @@
    :grog-project-search {:name "grog-project-search" :version "0.1.0" :tools 'grog-project-search.main/tool-spec}
    :grog-office         {:name "grog-office" :version "0.1.0" :tools 'grog-office.main/tools}
    :grog-imaging        {:name "grog-imaging" :version "0.1.0" :tools 'grog-imaging.main/tools}
-   :grog-odoo           {:name "grog-odoo" :version "0.3.0" :tools 'grog-odoo.main/build-tools}
+   :grog-odoo           {:name "grog-odoo" :version "0.4.0" :tools 'grog-odoo.main/build-tools}
    :grog-imap           {:name "grog-imap" :version "0.1.0" :tools 'grog-imap.main/build-tools}
    :grog-gitlab         {:name "grog-gitlab" :version "0.2.0" :tools 'grog-gitlab.main/build-tools}
    :grog-alpaca         {:name "grog-alpaca" :version "0.1.0" :tools 'grog-alpaca.main/build-tools}
@@ -99,9 +99,14 @@
               (try
                 (.success sink (text-result (tool-fn arguments)))
                 (catch Throwable t
+                  ;; `:faultString` matters: XML-RPC faults (Odoo permission and
+                  ;; validation errors) carry their only useful text there, and
+                  ;; without it every one of them reads as "Odoo XML-RPC fault".
                   (.success sink (error-result
                                   (str "Error executing tool " name ": "
-                                       (or (:message (ex-data t)) (.getMessage t))))))))))))))
+                                       (or (:message (ex-data t))
+                                           (:faultString (ex-data t))
+                                           (.getMessage t))))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Server construction

@@ -19,7 +19,7 @@ On Windows that expands to `C:\Users\you\.config\grog\`.
 | `imaging.edn.example` | grog-imaging | Tesseract `tessdata` dir for OCR tools | ✅ rename to `imaging.edn` |
 | `gitlab.edn.example` | grog-gitlab | GitLab instance(s) config | ✅ rename to `gitlab.edn` |
 | `gitlab-instances.edn.example` | grog-gitlab | multi-instance list (token-file paths) | ✅ rename to `gitlab-instances.edn` |
-| `odoo-instances.edn.example` | grog-odoo | Odoo instances (url/db/user/password/sql) | ✅ rename to `odoo-instances.edn` |
+| `odoo-instances.edn.example` | grog-odoo | Odoo instances (url/db/user/password/allow-write) | ✅ rename to `odoo-instances.edn` |
 | `imap-accounts.edn.example` | grog-imap | IMAP account metadata (never secrets) | ✅ rename to `imap-accounts.edn` |
 | `secrets.edn.example` | grog core | OS-keyring **fallback** file (owner-only) | ⚠️ generated automatically; only needed if you have no keyring |
 
@@ -38,7 +38,8 @@ example can confuse the runtime — delete them from `~/.config/grog` instead:
 - Location: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` on every OS
   (Windows uses the same `~/.config/grog`), or override with `$GROG_CONFIG_HOME`.
 - Merge order, later wins: classpath `resources/grog.edn` → config-home
-  `grog.edn` → legacy `~/.config/grog/grog.edn` → `./grog.edn` in the run dir.
+  `grog.edn` → legacy `~/.config/grog/grog.edn`. There is no `./grog.edn`
+  (run-dir) layer — nothing may override the user's config.
 
 ## Notes
 

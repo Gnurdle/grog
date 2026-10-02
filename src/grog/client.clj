@@ -51,7 +51,7 @@
   (steer! [this id text])  ; steer a running turn
   (stop! [this id])
   (answer! [this id ans])  ; ans = {:approval-id .. :decision ..}
-  (set-model! [this id model])
+  (set-model! [this id model] [this id model source])
   (set-trust! [this id on?])
   (subscribe! [this id f])   ; f receives stamped events, per session
   (unsubscribe! [this id f]))
@@ -91,7 +91,9 @@
 (defn steer! [id text] (steer! (need) id text))
 (defn stop! [id] (stop! (need) id))
 (defn answer! [id ans] (answer! (need) id ans))
-(defn set-model! [id model] (set-model! (need) id model))
+(defn set-model!
+  ([id model] (set-model! (need) id model))
+  ([id model source] (set-model! (need) id model source)))
 (defn set-trust! [id on?] (set-trust! (need) id on?))
 (defn subscribe! [id f] (subscribe! (need) id f))
 (defn unsubscribe! [id f] (unsubscribe! (need) id f))

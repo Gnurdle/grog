@@ -32,8 +32,22 @@
     steer           {:id .. :text ..}                   -> nil
     stop            {:id ..}                            -> nil
     answer          {:id .. :approval-id .. :decision ..} -> nil
-    set-model       {:id .. :model ..}                  -> nil
+    set-model       {:id .. :model .. :source? ..}      -> nil
+                                        (:source is the picker transport —
+                                        `openrouter`/`ollama` — so an id is
+                                        qualified exactly, never mistaken for a
+                                        native provider of the same name)
     set-trust       {:id .. :on ..}                     -> nil
+    models          {:source? .. :force? ..}            -> {:eca [..]
+                                                            :openrouter [..]
+                                                            :ollama [..]
+                                                            :loading [..]}
+                                        the settings-dialog model catalogue.
+                                        Answers from cache; an uncached (or
+                                        :force'd) remote source is fetched on a
+                                        BACKGROUND thread and arrives later as a
+                                        `models` notification, so a slow network
+                                        never blocks this request loop.
     answer-question {:question-id .. :result ..}        -> nil
     projects        {}                                  -> [{:name .. :description ..} ..]
     create-project  {:name .. :description ..}          -> nil
@@ -53,6 +67,12 @@
                                         for answer-question, then cancels — the
                                         wire version of the local wedge-safety
                                         rule (a missing client can't hang a turn)
+    models   {:source .. :models [..]}  a background model-catalogue refresh
+                                        completing (see `models` above)
+    running  {:sessionId .. :value ..}  a turn STARTED or FINISHED. The server
+                                        owns the turn lifecycle; clients use
+                                        this for the busy indicator (tab dot /
+                                        status bar) instead of inferring it.
 
   stdout is the RPC channel in stdio mode: on startup the Clojure process
   streams are redirected to stderr so no stray println can corrupt the stream.
@@ -64,6 +84,7 @@
             [grog.client.local :as local]
             [grog.config :as config]
             [grog.mcp-http :as mcp-http]
+            [grog.models :as models]
             [grog.projects :as projects]
             [grog.soul :as soul])
   (:import (java.io BufferedReader BufferedWriter File InputStreamReader
@@ -152,6 +173,11 @@
 
 ;; --- console publisher -----------------------------------------------------
 
+(def ^:private ^Class char-array-class
+  "Class of a primitive char array - `write(char[])` is the third one-arg
+  overload a Writer proxy cannot tell apart from the others."
+  (Class/forName "[C"))
+
 (defn- console-publisher
   "Server-side stand-in for the GUI's console-writer: buffers *out*/*err*
   output for one turn and emits it as a `:line` event on flush/close, so slash
@@ -166,8 +192,18 @@
                       (chat/publish! state {:type :line :text s})))))]
     (proxy [java.io.Writer] []
       (write
+        ;; java.io.Writer has TWO one-arg overloads - write(int c) and
+        ;; write(String s) - and a proxy dispatches on ARITY alone, so the int
+        ;; has to be decoded by hand. Clojure's println separates its arguments
+        ;; with write(32): with the naive (str x) every multi-arg println in a
+        ;; slash command reached the transcript with the separator rendered as
+        ;; the literal text "32" (e.g. "·  32BRAVE_SEARCH_API32— 32Brave …").
         ([x]
-         (.append sb (str x)))
+         (.append sb (cond
+                       (integer? x) (char (int x))
+                       (string? x) ^String x
+                       (instance? char-array-class x) (String. ^chars x)
+                       :else (str x))))
         ([x off len]
          (.append sb (if (string? x)
                        (subs ^String x (int off) (int (+ (long off) (long len))))
@@ -255,7 +291,25 @@
                                            {:approval-id (:approval-id params)
                                             :decision (keyword (:decision params))})
                            nil)
-              "set-model" (do (client/set-model! (:id params) (:model params)) nil)
+              ;; Model catalogue for the settings picker. Answers from cache and
+              ;; refreshes OpenRouter/Ollama on a BACKGROUND thread, because a
+              ;; network fetch here would block this single request loop (and so
+              ;; every other client) for up to the HTTP timeout. The refreshed
+              ;; list arrives as a `models` broadcast. `:source eca` is ECA's own
+              ;; catalogue (populated on connect) and needs no fetch.
+              "models" (let [src (keyword (or (:source params) "eca"))
+                             known (models/catalogue)]
+                         (when (and (#{:openrouter :ollama} src)
+                                    (or (boolean (:force params))
+                                        (nil? (get known src))))
+                           (models/fetch-async!
+                            src
+                            (fn [s ms]
+                              (broadcast! "models" {:source (name s) :models ms}))))
+                         known)
+              "set-model" (do (client/set-model! (:id params) (:model params)
+                                                 (:source params))
+                              nil)
               "set-trust" (do (client/set-trust! (:id params) (boolean (:on params))) nil)
               "answer-question"
               (do (when-let [p (get @questions (:question-id params))]

@@ -77,30 +77,30 @@ Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
    :db "odoo18_stage"
    :user "admin"
    :password "secret-or-api-key"
-   :sql {:type "postgres"
-         :host "127.0.0.1"
-         :port 5432
-         :db "odoo18_stage"
-         :user "odoo"
-         :password "..."}}
+   :allow-write false}
   {:name "prod"
    :url "https://odoo.example.com"
    :db "odoo18"
    :user "admin"
-   :password "..."}
+   :password "..."
+   :allow-write false}
 ]}
 ```
 
 - `name` is the only identifier the model can use. Selection is **locked to these
-  names**: `odoo_use_instance` validates against the allowlist and no tool accepts
-  a URL/host/db from the model.
-- `sql` is **optional** per instance. Without it, `odoo_execute_sql` reports a
-  clean error for that instance. Two backends are supported:
-  - `"postgres"` — direct JDBC to the Odoo Postgres (default, shown above).
-  - `"odoo-method"` — run SQL inside Odoo by calling a method you expose:
-    ```edn
-    :sql {:type "odoo-method" :model "custom.sql.runner" :method "run_sql"}
-    ```
+  names**: the server resolves the name from the allowlist and no tool accepts a
+  URL/host/db from the model.
+- **With more than one instance, every call must name one** via the `instance`
+  argument. There is no "first configured" fallback — a bare call is REFUSED, so
+  nothing can silently hit the wrong database. With exactly one instance the
+  argument is optional, since it is unambiguous.
+- `:allow-write` (default **false**) is the per-instance write switch. False
+  refuses any statement that could modify data *before Odoo is called*. True
+  passes mutating SQL through to Select-O-Matic, which still requires the Odoo
+  **superuser** account and an explicit confirmation.
+- There is **no `:sql` block and no database connection**. SQL goes through the
+  `select_o_matic` addon over the Odoo API, using the instance's own login — so
+  no database host/port/credentials are involved at all.
 
 ### Legacy single instance (backwards compatible)
 
@@ -119,15 +119,21 @@ Connection/auth is resolved lazily on the first tool call, per instance.
 
 | Tool | Purpose |
 |------|---------|
-| `odoo_list_instances()` | list pre-configured instances (name/url/db only — never credentials) |
-| `odoo_use_instance(instance)` | select the instance for all subsequent calls (enum of configured names) |
-| `odoo_authenticate()` | authenticate the currently selected instance |
-| `odoo_search_read(model, domain, fields, limit, offset, order)` | search/read records |
-| `odoo_get_fields(model, attributes)` | inspect a model's fields |
-| `odoo_execute_sql(sql)` | **read-only** SQL on the selected instance's `sql` backend |
+| `odoo_list_instances()` | list pre-configured instances (name/url/db/allow-write only — never credentials) |
+| `odoo_authenticate(instance?)` | authenticate an instance |
+| `odoo_search_read(instance?, model, domain, fields, limit, offset, order)` | search/read records |
+| `odoo_get_fields(instance?, model, attributes)` | inspect a model's fields |
+| `odoo_execute_sql(instance?, sql, row-limit?)` | SQL via the Select-O-Matic addon |
 
-Write tools (`odoo_create`, `odoo_write`, `odoo_unlink`, `odoo_call_method`)
-are intentionally **not exposed** — the model cannot modify the database.
+`instance` is optional **only** when exactly one instance is configured. With
+more than one, it is required on every call: a bare `odoo …` is refused.
+
+Record write tools (`odoo_create`, `odoo_write`, `odoo_unlink`,
+`odoo_call_method`) are intentionally **not exposed** — the model cannot modify
+records through the API. SQL writes are possible only through
+`odoo_execute_sql`, only on an instance marked `:allow-write true`, and there
+Select-O-Matic applies its own guards (superuser only, explicit confirmation,
+single statement, row ceiling, statement timeout).
 
 ## Security notes
 
@@ -135,33 +141,40 @@ are intentionally **not exposed** — the model cannot modify the database.
   instance *name*; the server resolves it from the pre-configured allowlist and
   rejects unknown names. Endpoints/URLs/database hosts are never accepted from
   the model.
-- **SQL is scoped to the selected instance** and never to a caller-supplied
-  database. The `sql` connection comes entirely from that instance's config.
-- **Read-only means read-only.** `odoo_execute_sql` accepts only `SELECT` / `WITH`
-  / `SHOW` / `EXPLAIN` / `DESCRIBE` / `VALUES` / `TABLE` statements; anything
-  that could change data (`INSERT`/`UPDATE`/`DELETE`/`DROP`/`CREATE`/…) is
-  refused before any connection is made. There is no `read_only=false` escape
-  hatch.
+- **No direct database access.** There is no JDBC connection and no database
+  credentials anywhere: SQL runs through the `select_o_matic` addon, over the
+  Odoo API, as the configured Odoo user. The database host/port never leave the
+  Odoo server.
+- **Read-only unless an instance opts in.** `odoo_execute_sql` accepts
+  `SELECT` / `WITH` / `SHOW` / `EXPLAIN` / `DESCRIBE` / `VALUES` / `TABLE`
+  statements always; anything that could change data is refused before Odoo is
+  called **unless** that instance is marked `:allow-write true`. The switch is
+  per instance — `prod` can stay read-only while `stage` does not.
+- **Requires the `select_o_matic` addon** on the Odoo instance, and the
+  configured Odoo user must be in its `group_select_o_matic` group. Writes
+  additionally need the superuser account (Select-O-Matic's own rule).
 - Credentials are never included in tool outputs.
 
 ## Example usage via the LLM
 
 - "Which instances can I use?" → `odoo_list_instances()`
-- "Use the stage instance" → `odoo_use_instance("stage")`
-- "Find the last 5 open sales orders" →
-  `odoo_search_read("sale.order", [["state","=","sale"]], ["name","amount_total","partner_id"], 5)`
-- "Which products are inactive?" →
-  `odoo_execute_sql("SELECT name, active FROM product_product WHERE active = false")`
+- "Find the last 5 open sales orders on stage" →
+  `odoo_search_read(instance="stage", model="sale.order", domain=[["state","=","sale"]], fields=["name","amount_total","partner_id"], limit=5)`
+- "Which products are inactive? (prod)" →
+  `odoo_execute_sql(instance="prod", sql="SELECT name, active FROM product_product WHERE active = false")`
+
+Note the `instance=` in every call: with more than one instance configured there
+is no default, by design.
 
 ## Structure
 
 - `src/grog_odoo/xmlrpc.clj` — self-contained XML-RPC client (encode + decode, fault-aware)
-- `src/grog_odoo/main.clj` — MCP stdio server: multi-instance config, strict
-  selection, Odoo tools, raw SQL (postgres / odoo-method backends)
+- `src/grog_odoo/main.clj` — MCP stdio server: multi-instance config, per-call
+  instance selection, Odoo record tools, SQL via the Select-O-Matic addon
 
 ## Status
 
 Functional: MCP handshake, tool discovery, clean missing-config errors verified;
 XML-RPC encode/decode verified against sample Odoo-shaped responses. Multi-instance
-config parsing, strict instance allowlist, and read-only SQL guarding are covered
-by the MCP server's own error paths.
+config parsing, the per-call instance rule, the per-instance write switch, and the
+`select_o_matic` call path are covered by the MCP server's own error paths.

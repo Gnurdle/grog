@@ -53,7 +53,7 @@ grog-2/
     tui/              ; future — each is a grog.client adapter + its own skin
 
   mcps/               ; tool layer, one project per server + the bundle
-    grog_mcp/         ;   bundle + vendor-src + the Streamable-HTTP endpoint
+    grog_mcp/         ;   bundle (:local/root deps) + the Streamable-HTTP endpoint
     grog-*/           ;   individual servers (still runnable standalone)
 
   doc/

@@ -6,9 +6,14 @@
     * otherwise: `${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn` on every OS
       (Windows included — matching ECA's own `~/.config/eca`).
 
-  Merge order (later wins): classpath `resources/grog.edn` → user config home →
-  legacy `~/.config/grog/grog.edn` (if present, for existing installs) →
-  `./grog.edn` in the current working directory."
+  Merge order (later wins): classpath `resources/grog.edn` → legacy
+  `~/.config/grog/grog.edn` (only when it differs from the config home) → the
+  user config home (the explicit `GROG_CONFIG_HOME` / `XDG_CONFIG_HOME` choice,
+  so it always wins).
+
+  There is deliberately NO `./grog.edn` (cwd) fragment any more. It silently
+  overrode the user's own config: a saved model or appearance is written to the
+  config home, so a stray cwd file made every save revert on the next reload."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -42,10 +47,11 @@
               a b))
 
 (defn- config-debug!
-  "One-line config-loading trace written to the **real** stderr so it always
-  lands in the grog debug log (`grog.<pid>.log`, or `$GROG_LOG`, via
-  grog.log's in-process tee) even when the caller's `*out*`/`*err*` are rebound
-  to the transcript pane."
+  "One-line config-loading trace written to the **real** stderr so it survives
+  even when the caller's `*out*`/`*err*` are rebound to the transcript pane.
+  On a console run these lines go to the terminal; the desktop client redirects
+  the backend's stderr into its per-instance log (`<base>.<pid>.log` — see
+  clients/web/src/main/log.js)."
   [& xs]
   (.println System/err (str "[grog-config] " (apply str (interpose " " (map str xs))))))
 
@@ -86,25 +92,26 @@
   []
   (let [home-file (io/file (config-home-dir) "grog.edn")
         legacy-home-file (io/file (System/getProperty "user.home") ".config" "grog" "grog.edn")
-        cwd-file (io/file "grog.edn")
         legacy-same? (canonical-equal? home-file legacy-home-file)]
+    ;; legacy FIRST, home LAST: the config home is the user's explicit choice
+    ;; (GROG_CONFIG_HOME / XDG_CONFIG_HOME) and must win. Legacy exists only as a
+    ;; courtesy for installs that predate a moved config home — it used to be
+    ;; merged AFTER, so the old default-location file overrode the new one.
     [["resource grog.edn" (some-> (io/resource "grog.edn") io/file) :classpath
       (resource-edn "grog.edn") false]
-     ["home grog.edn" home-file :home (slurp-edn home-file) false]
      ["legacy ~/.config/grog/grog.edn" legacy-home-file :legacy
       (when (and (.exists legacy-home-file)
                  (not (and (.exists home-file) legacy-same?)))
         (slurp-edn legacy-home-file))
       legacy-same?]
-     ["cwd ./grog.edn" cwd-file :cwd (slurp-edn cwd-file) false]]))
+     ["home grog.edn" home-file :home (slurp-edn home-file) false]]))
 
 (defn load-fragments
   "The config fragments that were FOUND and parsed, in merge order, as
-  `{:source :classpath|:home|:legacy|:cwd, :path <str>, :data <map>}`.
+  `{:source :classpath|:home|:legacy, :path <str>, :data <map>}`.
 
   This is what makes provenance observable: `grog doctor` walks it front-to-back
-  to attribute each effective key to the last file that set it (the
-  cwd-overlay-wins trap)."
+  to attribute each effective key to the last file that set it."
   []
   (vec (keep (fn [[_label f src data _same?]]
                (when (some? data)
@@ -116,7 +123,7 @@
 (defn load-merge!
   "Load and deep-merge all config fragments (does not touch the cache atom).
   Writes a `[grog-config]` trace to the debug log for every fragment it looks
-  at (classpath resource, config-home grog.edn, legacy ~/.config/grog, ./grog.edn)."
+  at (classpath resource, config-home grog.edn, legacy ~/.config/grog)."
   []
   (let [entries (fragment-entries)
         fragments (remove nil? (map (fn [[_ _ _ data _]] data) entries))]
@@ -213,6 +220,21 @@
   (let [m (get-in (grog) [:eca :model])]
     (when (seq (str/trim (str m))) (str/trim (str m)))))
 
+(defn eca-provider-overrides
+  "`:eca :providers` from grog.edn — provider entries grog merges into the
+  generated ECA config, so a fresh install needs no `eca/config.json`.
+
+  Values are ordinary ECA provider maps, e.g.
+    :providers {\"openrouter\" {:api \"openai-chat\"
+                               :url \"https://openrouter.ai/api/v1\"
+                               :key \"${env:GROG_LLM_API_KEY}\"}}
+  A `:key` should be an env REFERENCE, never a literal secret. Keys are
+  normalized to strings (JSON keys)."
+  []
+  (let [p (get-in (grog) [:eca :providers])]
+    (when (map? p)
+      (into {} (map (fn [[k v]] [(name k) v])) p))))
+
 (declare interpolate-env-var)
 
 (defn eca-binary
@@ -254,8 +276,12 @@
   "API key for OpenAI-compatible providers. Supports `${ENV}` and `${ENV:-default}` interpolation.
    Reads :llm :api-key (inline, not recommended) or OS keyring LLM_API_KEY.
 
-   A session override can explicitly set `:api-key nil` or `:api-key false` to disable
-   the key for backends that do not need one (e.g. local Ollama)."
+   An ABSENT `:llm :api-key` means \"fall back to the keyring\" — a user who only
+   ever ran `/secret set LLM_API_KEY …` has no `:api-key` at all. (This used to
+   return nil without consulting the keyring, so their key was silently ignored.)
+
+   To genuinely disable the key — a backend that needs none, e.g. local Ollama —
+   set `:api-key false` (in the config, or as a session override)."
   []
   (let [override @!llm-override
         explicit? (contains? override :api-key)
@@ -263,7 +289,7 @@
                   (:api-key override)
                   (:api-key (get-in (grog) [:llm] {})))]
     (cond
-      (or (nil? key-src) (false? key-src))
+      (false? key-src)
       nil
 
       :else
@@ -503,7 +529,9 @@
   (:with-api-key (grog) {}))
 
 (defn with-api-key-allowed-accounts
-  "Keyring secret names the model may pass as `with_api_key` :secret_name (each must be `secrets/known-account?`).
+  "Secret names the model may pass as `with_api_key` :secret_name. Any stored
+  secret name is acceptable here (declared or not); this list — not the
+  `:secrets {:accounts …}` registry — is the real gate.
   Config: `:allowed-secrets` (preferred) and/or legacy `:allowed-accounts` — merged and deduplicated."
   []
   (let [cfg (with-api-key-cfg)]
@@ -534,12 +562,11 @@
   (true? (:allow-insecure-http (with-api-key-cfg))))
 
 (defn with-api-key-configured?
-  "True when :with-api-key :allowed-secrets and/or :allowed-accounts is non-empty and every entry is a known keyring account."
+  "True when :with-api-key :allowed-secrets and/or :allowed-accounts is non-empty.
+  Entries need not be declared in `:secrets {:accounts …}` — the allowlist itself
+  is what authorizes a name."
   []
-  (let [accts (with-api-key-allowed-accounts)]
-    (boolean
-      (and (seq accts)
-           (every? #(secrets/known-account? %) accts)))))
+  (boolean (seq (with-api-key-allowed-accounts))))
 
 (defn- babashka-cfg []
   (:babashka (grog) {}))
@@ -636,30 +663,6 @@
       (let [v (:idle-timeout-ms (mcp-cfg))]
         (when (and (number? v) (pos? (long v))) (long v)))
       900000))
-
-(defn- log-cfg [] (:log (grog) {}))
-
-(defn log-base
-  "Base path (no extension) for the per-instance GUI logs (`:log :dir`, default
-  `~/grog`). `~` is expanded and a `*.log` extension is stripped.
-  Env override: `GROG_LOG`."
-  ^String []
-  (let [raw (or (some-> (System/getenv "GROG_LOG") str str/trim not-empty)
-                (some-> (:dir (log-cfg)) str str/trim not-empty)
-                "~/grog")
-        s   (platform/expand-home raw)]
-    (if (str/ends-with? (str/lower-case s) ".log")
-      (subs s 0 (- (count s) 4))
-      s)))
-
-(defn log-keep
-  "How many per-instance logs to keep (`:log :keep`, default 5).
-  Env override: `GROG_UI_LOG_KEEP`."
-  []
-  (or (some-> (System/getenv "GROG_UI_LOG_KEEP") str str/trim parse-long)
-      (let [v (:keep (log-cfg))]
-        (when (and (number? v) (pos? (long v))) (long v)))
-      5))
 
 (defn- terminal-cfg [] (:terminal (grog) {}))
 

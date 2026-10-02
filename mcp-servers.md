@@ -7,7 +7,7 @@ build (`grog_mcp/`) registers the same tools on a single JVM — see
 "Consolidated bundle" below.
 
 Notation: the model sees a server's tools prefixed by its id, e.g.
-`grog-odoo__odoo_search_read`.
+`grog-mcp__odoo_search_read`.
 
 ## Per-server catalog
 
@@ -116,7 +116,7 @@ Query Odoo records and metadata. **Strictly read-only**; SQL limited to
 | `odoo_authenticate` | Authenticate → uid |
 | `odoo_search_read` | Search/read records |
 | `odoo_get_fields` | Field metadata for a model |
-| `odoo_execute_sql` | Read-only SQL |
+| `odoo_execute_sql` | SQL via the Select-O-Matic addon (read-only unless the instance allows writes) |
 
 ### grog-imap — email (IMAP)
 Email account setup, read/search, flag, move/copy/append, with OAuth.
@@ -139,10 +139,12 @@ Email account setup, read/search, flag, move/copy/append, with OAuth.
 
 ### grog-gitlab — GitLab REST API (read-only)
 Wraps the GitLab v4 API; read-only.
-Config in `~/.config/grog/gitlab.edn` (`:url` + `:token "${GROG_GITLAB_TOKEN}"`).
-The token is a **system secret**: stored with `/secret set GITLAB_TOKEN <value>`
-(OS keyring), injected per-process by grog as `GROG_GITLAB_TOKEN`, and never
-written to disk in plaintext. A `:token-file` is also supported as a fallback.
+Config in `~/.config/grog/gitlab.edn` (`:url` only — the token is separate).
+The token is a **system secret**: store it with `/secret set GITLAB_TOKEN <value>`
+(OS keyring). The server reads it from the keyring **itself**, so it never enters
+an env var or any generated config file — anything grog injects as env is written
+verbatim into `~/.config/grog/sessions/<project>.json`. A `:token-file` remains
+as a legacy fallback.
 
 | Tool | Description |
 |---|---|
@@ -167,8 +169,8 @@ written to disk in plaintext. A `:token-file` is also supported as a fallback.
 `grog_mcp/` is a **build/assembly** that registers all of the above tools on a
 **single JVM** (one `McpServer`, one classpath, one process) — the runtime
 consolidation. The individual `grog-*` source trees stay canonical and standalone;
-`grog_mcp/` carries vendored copies of their `src/` under `vendor-src/` (so edits
-to a server's source should refresh `vendor-src/`).
+`grog_mcp/deps.edn` depends on them directly with `:local/root`, so the bundle
+always compiles against the LIVE sources — no vendored copy, no sync step.
 
 - **Uberjar:** `grog_mcp/target/grog-mcp.jar` (build with `clojure -T:build uber`).
 - **Run all:** `java -cp target/grog-mcp.jar clojure.main -m grog_mcp.main`

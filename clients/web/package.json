@@ -1,6 +1,7 @@
 { "name": "grog-web"
 , "version": "0.0.1"
 , "private": true
+, "author": "grog"
 , "description": "grog web/Electron client — P0 skeleton (see doc/clients/web-client-plan.md)"
 , "main": "src/main/main.js"
 , "scripts":
@@ -10,6 +11,9 @@
   , "dev": "concurrently -k \"npm:cljs\" \"npm:css\" \"wait-on tcp:9633 http://localhost:9633/js/main.js && npm run electron\""
   , "build": "shadow-cljs release app && tailwindcss -i resources/public/css/input.css -o resources/public/css/output.css --minify"
   , "start": "NODE_ENV=production electron ."
+  , "start:win": "set NODE_ENV=production&& electron ."
+  , "source": "NODE_ENV=production GROG_SPINE_CMD=clojure GROG_SPINE_ARGS=\"-M -m grog.server\" electron ."
+  , "source:win": "set NODE_ENV=production&& set GROG_SPINE_CMD=clojure&& set GROG_SPINE_ARGS=-M -m grog.server&& electron ."
   , "prod": "npm run build && npm start"
   , "dist": "electron-builder --publish never"
   }
@@ -20,9 +24,11 @@
   , "extraResources":
     [ { "from": "../../target/grog-spine.jar", "to": "jars/grog-spine.jar" }
     , { "from": "../../grog_mcp/target", "to": "jars", "filter": ["grog-mcp-*.jar"] }
+    , { "from": "../../scripts/prereqs.ps1", "to": "setup/prereqs.ps1" }
     ]
-  , "icon": "build/icon"
-  , "win": { "target": ["nsis"], "icon": "build/icon.ico" }
+  , "icon": "assets/icon"
+  , "win": { "target": ["nsis"], "icon": "assets/icon.ico"
+           , "artifactName": "grog-${version}-setup.${ext}" }
   , "nsis":
     { "oneClick": false
     , "perMachine": false
@@ -30,11 +36,16 @@
     , "createDesktopShortcut": true
     , "createStartMenuShortcut": true
     , "shortcutName": "grog"
+    , "installerIcon": "assets/icon.ico"
+    , "uninstallerIcon": "assets/icon.ico"
+    , "installerHeaderIcon": "assets/icon.ico"
+    , "include": "../../scripts/installer.nsh"
     }
   , "linux":
     { "target": ["AppImage", "tar.gz"]
-    , "icon": "build/icon.png"
+    , "icon": "assets/icon.png"
     , "category": "Development"
+    , "artifactName": "grog-${version}-${arch}.${ext}"
     , "desktop": { "Name": "grog", "StartupWMClass": "grog" }
     }
   }

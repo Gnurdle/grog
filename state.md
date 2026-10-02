@@ -42,9 +42,9 @@ per-tool inventory is in [`mcp-servers.md`](mcp-servers.md).
   `map?` returns false — argument parsing must handle `java.util.Map` / Jackson
   nodes.
 - The `grog_mcp/` bundle registers all of the servers' tools on a single JVM
-  (one `McpServer`, one classpath, one process). Its `vendor-src/` carries
-  vendored copies of each server's `src/`; edits to a server's source should
-  refresh `vendor-src/`.
+  (one `McpServer`, one classpath, one process). It depends on the sibling
+  projects directly via `:local/root` in `grog_mcp/deps.edn`, so the classpath
+  always points at the live `grog-*/src` trees — no vendored copy, no sync step.
 
 ## ECA config wiring
 
@@ -60,13 +60,13 @@ that reaches `running`.
 - Approval dialog options: **Approve / Reject / YOLO** (YOLO approves and turns
   trust on).
 - **`/clear`** and the Clear button wipe the transcript **and** reset YOLO off.
-- **Logging is per-instance and in-process** (`grog.log`): each running grog
-  writes its own `<base>.<pid>.log` (`~/grog.<pid>.log` on Linux,
+- **Logging is per-instance**: the Electron client main process writes its own
+  `<base>.<pid>.log` (`~/grog.<pid>.log` on Linux,
   `%USERPROFILE%\grog.<pid>.log` on Windows) so concurrent instances never
-  interleave. On startup the oldest instance logs are pruned, keeping
-  `GROG_UI_LOG_KEEP` (default 5). The JVM tees `System.out`/`System.err` to the
-  console **and** the file — no shell redirection, no rotation scripts, no
-  platform-specific PID logic.
+  interleave. `<base>` is `$GROG_LOG` else `~/grog`; on startup the oldest
+  instance logs are pruned, keeping `GROG_UI_LOG_KEEP` (default 5). The client
+  tees its own messages and the backend's `stdout`/`stderr` into the file — no
+  shell redirection, no rotation scripts. See `clients/web/src/main/log.js`.
 
 ## Invariant: the chat log is never standing context
 

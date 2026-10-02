@@ -18,7 +18,10 @@ grog merges several sources. **Later sources win.**
 |---|---|---|
 | 1 | bundled defaults (`resources/config.examples/grog.edn.example`) | built-in defaults / template |
 | 2 | **user `grog.edn`** (see table below) | your personal setup |
-| 3 | `./grog.edn` in the run directory | project/override config |
+
+There is deliberately no `./grog.edn` (working-directory) layer: it used to
+override the user config, which made saved settings (model, appearance) revert
+on reload.
 
 ### Where is the user `grog.edn`?
 
@@ -162,17 +165,30 @@ In **chat** (GUI or terminal):
 
 ### 4.4 Custom secret accounts
 
-You can teach grog about additional accounts (for the `with_api_key` tool) by
-adding them to `:secrets :accounts` in `grog.edn`:
+**The secret store is yours — any name you invent works.** `/secret set`,
+`/secret rm`, and any config field that names an account (e.g. an Odoo
+instance's `:password-secret "ODOO_PROD_PASSWORD"`) accept whatever name you
+type; nothing has to be declared first.
+
+```text
+/secret set ODOO_PROD_PASSWORD <value>     # works with no config change at all
+```
+
+Declaring an account under `:secrets :accounts` in `grog.edn` is **optional**
+and purely cosmetic — it only adds a description to the `/secret` listing:
 
 ```clojure
 {:secrets {:accounts [{:account "GITHUB_TOKEN"      :description "GitHub PAT"}
-                      {:account "PHANTOM_X"         :description "Another API token"}]}
- :with-api-key {:allowed-secrets ["GITHUB_TOKEN"]}}
+                      {:account "PHANTOM_X"         :description "Another API token"}]}}
 ```
 
-Then store them with `/secret set GITHUB_TOKEN <value>`. `with_api_key` will
-only accept account names listed in `:with-api-key :allowed-secrets`.
+`with_api_key` has its own explicit allowlist (`:with-api-key
+:allowed-secrets`) — *that* is the real gate for what the model may pass by
+name, and it too accepts names you never declared:
+
+```clojure
+{:with-api-key {:allowed-secrets ["ODOO_PROD_PASSWORD"]}}
+```
 
 ### 4.5 Configuring an API-keyed provider
 
@@ -189,18 +205,26 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
   or `$GROG_CONFIG_HOME`).
-- **Log files**: each running grog writes its own log — `<base>.<pid>.log` — so
-  concurrent instances never share a file. `<base>` defaults to `~/grog`
-  (`%USERPROFILE%\grog` on Windows) and is set by `:log {:dir … :keep …}` in
-  `grog.edn` (`GROG_LOG` / `GROG_UI_LOG_KEEP` override for one-off runs). On
-  startup the oldest instance logs are pruned, keeping `:keep` (default 5).
-  Logging is in-process (`grog.log`), which tees stdout/stderr to both the console
-  and the file, so `tail -f ~/grog.<pid>.log` shows live output.
-- **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
-  PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
-  `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
-  `:eca :binary` in your `grog.edn` to the full path (e.g.
-  `C:\Users\you\scoop\shims\eca.exe`).
+- **Log files**: the client writes one log per running instance —
+  `<base>.<pid>.log` — so concurrent instances never share a file. `<base>` is
+  `$GROG_LOG` (a trailing `.log` is stripped) else `~/grog`
+  (`%USERPROFILE%\grog` on Windows). The client captures its own messages **and**
+  the backend's stdout/stderr into the file, so `tail -f ~/grog.<pid>.log` shows
+  live output. On startup the oldest instance logs are pruned, keeping
+  `$GROG_UI_LOG_KEEP` (default 5). Set `GROG_LOG_WIRE=1` to also record the raw
+  driver traffic (NDJSON — off by default; high volume).
+- **Profile & cache**: Chromium's private store (HTTP/GPU/Code caches, Local
+  Storage) is kept in `%LOCALAPPDATA%\grog` — **Local** AppData, not Roaming, so
+  it never bloats a roaming/domain profile. This is not grog's config; that
+  stays in `~/.config/grog`.
+- **If the chat shows `ECA connect failed`**: grog resolves the `eca` binary
+  **at every launch** — `:eca :binary` (if set), else PATH, else
+  `~/.vscode/extensions` (`editor-code-assistant.eca-*`, the VS Code extension),
+  else scoop shims, npm global, and last the installer's own copy in
+  `%LOCALAPPDATA%\eca`. An ECA you install later is therefore picked up on the
+  next launch, and the installer never downloads a second copy when one is
+  already present. If it's somewhere else, set `:eca :binary` to the full path
+  (e.g. `C:\Users\you\scoop\shims\eca.exe`).
 - **Secret backend**: Windows Credential Manager; falls back to
   `~/.config/grog/secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
@@ -210,6 +234,8 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`).
 - **Launch**: `scripts/grog-client` (add `--console` to stream the log here).
+- **Log files**: same rule as Windows — `<base>.<pid>.log`, where `<base>` is
+  `$GROG_LOG` else `~/grog`.
 - **Secret backend**: Secret Service if a desktop session with a keyring is
   running; otherwise falls back to `~/.config/grog/secrets.edn`.
 
@@ -246,6 +272,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | Config changes "not applied" | grog reads config at startup. After editing `grog.edn`, restart (or use `/soul reload` where applicable). |
 | Windows: no config found | Your user `grog.edn` should be under `C:\Users\you\.config\grog\` (not AppData). |
 | Where's my `secrets.edn`? | `/secret file` prints its absolute path. |
+| Where's my client log? | `<base>.<pid>.log` — base is `$GROG_LOG` else `~/grog` (`%USERPROFILE%\grog`). The newest file is the running instance; the client prints its path at startup (`[grog-client] log file: …`). |
 
 ---
 
@@ -253,7 +280,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 
 | Command | Effect |
 |---|---|
-| `/secret` | list known accounts + set/unset status (values never printed) |
+| `/secret` | list accounts + set/unset status (values never printed) |
 | `/secret set <KEY> <value>` | store a secret (keyring or file fallback) |
 | `/secret <KEY> <value>` | short alias for the above |
 | `/secret rm <KEY>` | delete a secret |
@@ -278,6 +305,10 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
 | `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
 | `approved-tools.edn` | permanently-allowed tool names |
+
+Per-instance **client logs** live outside the config home: `<base>.<pid>.log` in
+`~/grog` by default (`%USERPROFILE%\grog` on Windows), or wherever `$GROG_LOG`
+points — see §5.
 
 ---
 

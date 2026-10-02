@@ -65,8 +65,15 @@
 
 ;; --- file I/O --------------------------------------------------------------
 
-(defn- grogedn-file ^java.io.File []
-  (io/file "grog.edn"))
+(defn- grogedn-file
+  "The user's grog.edn — the CONFIG HOME, the same file the rest of grog reads.
+
+  This deliberately does NOT use `./grog.edn`. It once did, which meant an
+  appearance save from the settings GUI dropped a stray grog.edn into whatever
+  directory grog happened to run from — and because `grog.config` merged a cwd
+  file LAST, that stray file then silently overrode the user's real config."
+  ^java.io.File []
+  (io/file (platform/config-home-dir) "grog.edn"))
 
 (defn- slurp-edn-map
   "Read `f` as a whole EDN map (best effort); nil if unreadable/missing."
@@ -97,10 +104,9 @@
     (current)))
 
 (defn save!
-  "Persist current appearance into grog.edn atomically, preserving all other
-  top-level keys and values in the working-directory file. Only the CWD file
-  is consulted here: a save from the settings GUI should never materialise a
-  full copy of the user's config-home file into the repo."
+  "Persist current appearance into the user's grog.edn (config home) atomically,
+  preserving all other top-level keys. That file is the only fragment grog reads,
+  so it is also the only place an appearance save may land."
   []
   (let [existing (or (slurp-edn-map (grogedn-file)) {})
         updated (assoc existing :appearance (current))

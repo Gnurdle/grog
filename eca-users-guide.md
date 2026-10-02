@@ -13,7 +13,7 @@ agent) so its model can use your Odoo, imaging, office and memory tools.
 
 | MCP server | Tools | Notes |
 |---|---|---|
-| `grog-odoo` | `odoo_list_instances`, `odoo_use_instance`, `odoo_authenticate`, `odoo_search_read`, `odoo_get_fields`, `odoo_execute_sql` | **Strictly read-only** — cannot create/update/delete anything; SQL limited to `SELECT/WITH/SHOW/EXPLAIN/DESCRIBE/VALUES/TABLE`. |
+| `grog-odoo` | `odoo_list_instances`, `odoo_authenticate`, `odoo_search_read`, `odoo_get_fields`, `odoo_execute_sql` | Records are read-only; SQL runs through the `select_o_matic` addon over the API (no database connection). With **more than one instance configured, every call must name one**. Writes only on instances marked `:allow-write true`. |
 | `grog-imaging` | `read_pdf_document`, `ocr_pdf_document`, `analyze_pdf_line_drawings`, `read_office_document`, … | PDF/OCR/imaging (needs Tesseract). |
 | `grog-office` | `import_document`, `list_blocks`, `get_text`, `find_text`, `replace_text`, `render`, `save`, … | docx manipulation + rendering (needs LibreOffice). |
 | `grog-memory` | `assoc_store`, `assoc_get`, `assoc_keys`, `assoc_delete`, `assoc_search` | Simple key/value memory. |
@@ -67,11 +67,11 @@ First create `~/.config/odoo-instances.edn`:
    :db "odoo18_stage" :user "admin" :password "CHANGE_ME"}
 ]}
 ```
-*Optional per-instance raw-SQL connection (needed for `odoo_execute_sql`):*
-```edn
-:sql {:type "postgres" :host "127.0.0.1" :port 5432
-      :db "odoo18_stage" :user "odoo" :password "CHANGE_ME"}
-```
+SQL needs **no database connection**: `odoo_execute_sql` goes through the
+`select_o_matic` addon over the Odoo API (the instance needs that addon
+installed, and the configured user in its `group_select_o_matic` group). Add
+`:allow-write true` to an instance only if mutating SQL should be permitted
+there — the default is read-only.
 
 Then in `config.json`:
 
@@ -144,17 +144,20 @@ Then in `config.json`:
 
 After editing `config.json`, **reload the window / restart ECA** in VS Code
 (`ECA: Restart` or the reload-window command). ECA spawns the servers on startup
-and the agent immediately sees the tools as `grog-odoo__…`, etc.
+and the agent immediately sees the tools as `grog-mcp__…` — one MCP process
+serves the whole toolbelt (see `mcp-servers.md`).
 
 ---
 
 ## 6. Try it
 
-- "Use the stage instance" → `grog-odoo__odoo_use_instance("stage")`
-- "Find the last 5 open sales orders" →
-  `grog-odoo__odoo_search_read("sale.order", [["state","=","sale"]], ["name","amount_total","partner_id"], 5)`
-- "Which products are inactive?" →
-  `grog-odoo__odoo_execute_sql("SELECT name, active FROM product_product WHERE active = false")`
+- "Find the last 5 open sales orders on stage" →
+  `grog-mcp__odoo_search_read(instance="stage", model="sale.order", domain=[["state","=","sale"]], fields=["name","amount_total","partner_id"], limit=5)`
+- "Which products are inactive on prod?" →
+  `grog-mcp__odoo_execute_sql(instance="prod", sql="SELECT name, active FROM product_product WHERE active = false")`
+
+Note the `instance=` on every call — with more than one instance configured
+there is no default, and a call without it is refused.
 
 ---
 
@@ -181,6 +184,7 @@ and the agent immediately sees the tools as `grog-odoo__…`, etc.
   java -cp <REPO>/grog-odoo/target/grog-odoo.jar clojure.main -m grog-odoo.main
   ```
   (It should print nothing and idle on stdio.)
-- **"Missing env GROG_ODOO_URL"** or **"…no :sql backend configured"** → check the
-  `env` block / `odoo-instances.edn` terms.
+- **"Missing env GROG_ODOO_URL"** or **"every call must name one explicitly"** →
+  check the `env` block / `odoo-instances.edn` terms: with several instances, each
+  call has to pass `instance`.
 - **Needs Java 17+** for the jar path; check `java -version`.

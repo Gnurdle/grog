@@ -1,54 +1,69 @@
 (ns grog-odoo.main
-  "grog-odoo — a **strictly read-only** MCP server (over stdio) exposing Odoo
-  ERP query tools.
+  "grog-odoo — an MCP server (over stdio) exposing Odoo ERP tools.
 
-  Talks to Odoo through its native XML-RPC API (`grog-odoo.xmlrpc`). The model
-  can search/read records and run read-only SQL, but has **no way to modify the
-  database** (create/write/unlink/call-method tools are removed, and SQL is
-  confined to read-only statements).
+  Talks to Odoo through its native XML-RPC API (`grog-odoo.xmlrpc`). Record
+  search/read is always available. SQL goes through the **Select-O-Matic**
+  addon (`select.o.matic.wizard`) — also over the API — so grog never opens a
+  database connection of its own and needs no database credentials.
 
-  Multiple Odoo *instances* can be configured. The model can only ever select
-  one of the pre-configured instance *names* (never a URL / endpoint).
+  INSTANCES. Several Odoo instances can be configured, and the model can only
+  ever name one of the pre-configured instance *names* (never a URL/endpoint):
 
-  Config is file-based: ~/.config/grog/odoo.edn
-    {:config \"~/.config/grog/odoo-instances.edn\"}   → load an instances file
-    {:url ... :db ... :user ... :password ...}        → single \"default\" instance
+    ~/.config/grog/odoo.edn
+      {:config \"~/.config/grog/odoo-instances.edn\"}   → load an instances file
+      {:url ... :db ... :user ... :password-secret ...} → single \"default\" instance
 
   where the instances file is EDN (legacy JSON also accepted):
 
     {:instances [
         {:name \"stage\", :url \"https://exclave.cmsaero.com\",
-         :db \"odoo18_stage\", :user \"admin\", :password \"...\",
-         :sql {:type \"postgres\", :host \"127.0.0.1\", :port 5432,
-               :db \"odoo18_stage\", :user \"odoo\", :password \"...\"}},
+         :db \"odoo18_stage\", :user \"admin\",
+         :password-secret \"ODOO_STAGE_PASSWORD\",
+         :allow-write false},
         {:name \"prod\", :url \"https://prod.example.com\",
-         :db \"odoo18\", :user \"admin\", :password \"...\"}]}
+         :db \"odoo18\", :user \"admin\",
+         :password-secret \"ODOO_PROD_PASSWORD\",
+         :allow-write false}]}
 
-  Single-instance fallback (when odoo.edn has no :config):
-    {:url \"https://...\" :db \"...\" :user \"...\" :password \"...\"}
-  else the default instances file ~/.config/grog/odoo-instances.edn is used.
-  ${ENV} / ${ENV:-default} interpolation inside the instances file is honored.
+  * `:password-secret` names an ACCOUNT in grog's secret store — the password
+    itself is NEVER in this file. Set it with `/secret set ODOO_STAGE_PASSWORD
+    <value>` (OS keyring; grog's `secrets.edn` is the headless fallback). This
+    server reads the store ITSELF rather than receiving the value in its
+    environment: everything in an MCP server's env map is written verbatim into
+    the generated ECA config, so an env-injected password would sit on disk in
+    cleartext.
+  * A missing secret THROWS, naming the instance + account + the exact fix. It
+    never authenticates with a blank password — that fails later, silently.
+  * `:password` (a literal, or `${ENV}`) still works for anyone not using the
+    store. `:password-secret` wins when both are present.
+  * `:allow-write` (default FALSE) is the per-instance write switch. With it
+    false, any statement that could modify data is refused before Odoo is even
+    called. With it true, mutating SQL is passed through to Select-O-Matic
+    (which still requires the SUPERUSER account and an explicit confirmation).
+  * There is no `:sql` block any more, and no JDBC connection: the direct
+    database path was removed in favour of Select-O-Matic's API.
+  * With MORE THAN ONE instance configured, EVERY call must name one with the
+    `instance` argument — there is no \"first configured\" fallback, so a bare
+    call can never silently hit the wrong database. With exactly one instance
+    the name is optional (it is unambiguous).
+  ${ENV} / ${ENV:-default} interpolation inside the config is honored.
 
-  Raw SQL runs through ``odoo_execute_sql`` and is *always* scoped to the
-  currently selected instance's ``:sql`` backend (either a ``postgres`` JDBC
-  connection or an ``odoo-method`` that executes SQL inside Odoo). There is no
-  tool that accepts a database URL/host — the model cannot break out of the
-  configured instance selection, and only read-only SQL statements are
-  accepted."
+  Requires the `select_o_matic` addon on the Odoo instance, and the configured
+  Odoo user to be in its `group_select_o_matic` group."
   (:require [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog-odoo.xmlrpc :as xrpc])
-  (:import [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
+  (:import [com.github.javakeyring Keyring]
+           [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
            [io.modelcontextprotocol.server McpServer]
            [io.modelcontextprotocol.server McpServerFeatures$AsyncToolSpecification]
            [io.modelcontextprotocol.spec
             McpSchema$ServerCapabilities McpSchema$Tool McpSchema$CallToolResult
             McpSchema$TextContent]
            [reactor.core.publisher Mono]
-           [com.fasterxml.jackson.databind ObjectMapper]
-           [java.sql DriverManager ResultSet]))
+           [com.fasterxml.jackson.databind ObjectMapper]))
 
 (set! *warn-on-reflection* true)
 
@@ -56,10 +71,6 @@
 
 (def ^{:private true} config*
   "Atom holding {:instances [..] :by-name {name inst}}; populated at startup."
-  (atom nil))
-
-(def ^{:private true} current*
-  "Atom holding the name of the currently selected instance (nil = first)."
   (atom nil))
 
 (def ^{:private true} auth*
@@ -79,6 +90,62 @@
 
 (defn- normalize-url [url]
   (str/replace (str url) #"/+$" ""))
+
+(defn- allowed-to-write?
+  "The per-instance write switch. Default FALSE: an instance is read-only until
+  it is explicitly marked otherwise."
+  [i]
+  (boolean (:allow-write i)))
+
+;; --- secrets ----------------------------------------------------------------
+;; Credentials live in grog's secret store, not in the instances file. Read the
+;; OS keyring directly — the pattern grog-gitlab and grog-search already use —
+;; rather than receiving the password through the process env: everything in an
+;; MCP server's env map is written VERBATIM into
+;; ~/.config/grog/sessions/<project>.json, so an env-injected credential ends up
+;; in cleartext on disk.
+
+(def ^:private ^String keyring-service "grog")
+
+(def ^:private keyring-read-timeout-ms 4000)
+
+(defn- keyring-secret
+  "Read `account` from the OS keyring (service \"grog\"). Time-bounded: without a
+  working Secret Service / D-Bus (SSH, containers) `Keyring/create` can block
+  forever. nil when absent, unsupported, or timed out."
+  ^String [^String account]
+  (when-not (str/blank? (str account))
+    (let [f (future
+              (try
+                (with-open [^Keyring kr (Keyring/create)]
+                  (some-> (.getPassword kr keyring-service (str account))
+                          str str/trim not-empty))
+                (catch Throwable _ nil)))
+          v (deref f keyring-read-timeout-ms ::timeout)]
+      (when-not (= ::timeout v) v))))
+
+(defn- secrets-file
+  "grog's file fallback: `<config-home>/secrets.edn`, an EDN map of
+  {account password}. Mirrors grog.secrets/secrets-file so a headless Linux box
+  — where the keyring backend is unreachable — still works."
+  ^java.io.File []
+  (let [home (or (some-> (System/getenv "XDG_CONFIG_HOME") str not-empty)
+                 (str (or (some-> (System/getenv "HOME") str not-empty) "~")
+                      "/.config"))]
+    (io/file home "grog" "secrets.edn")))
+
+(defn- file-secret ^String [^String account]
+  (try
+    (let [f (secrets-file)]
+      (when (.exists f)
+        (some-> (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
+                (get account) str str/trim not-empty)))
+    (catch Throwable _ nil)))
+
+(defn- lookup-secret
+  "OS keyring first, then grog's secrets file. nil when neither has it."
+  ^String [^String account]
+  (or (keyring-secret account) (file-secret account)))
 
 (defn- read-config-file!
   "Load instances from the config file at `path`. Accepts EDN (the current grog
@@ -104,8 +171,9 @@
                :db db
                :user (str (interp (or (:user i) (throw (ex-info (str "instance '" name "' missing :user") {})))))
                :password (str (or (interp (:password i)) ""))
-               :sql (when-let [s (:sql i)]
-                      (into {} (map (fn [[k v]] [k (interp v)])) s))}))
+               ;; the secret-store ACCOUNT NAME, not the secret itself
+               :password-secret (some-> (:password-secret i) str str/trim not-empty)
+               :allow-write (allowed-to-write? i)}))
           insts)))
 
 (defn- odoo-config-file []
@@ -146,7 +214,7 @@
               :db   (str (interp (:db cfg)))
               :user (str (interp (:user cfg)))
               :password (str (or (interp (:password cfg)) ""))
-              :sql  nil}])
+              :allow-write (allowed-to-write? cfg)}])
 
           :else
           (let [cfg-file (not-empty (str/trim (str (or (:config cfg) "~/.config/grog/odoo-instances.edn"))))
@@ -156,18 +224,61 @@
     (when-not (seq instances)
       (throw (ex-info "No Odoo instances configured. Add :config (or :url/:db/:user/:password) to ~/.config/grog/odoo.edn." {})))
     (reset! config* {:instances instances :by-name by-name})
-    (reset! current* nil)
     @config*))
 
-(defn- active-instance
-  "Return the currently selected instance map. Only names present in the
-  pre-configured allowlist can ever become current; anything else throws — the
-  model cannot specify an endpoint directly."
-  []
+(defn- instance-names []
+  (mapv :name (:instances @config*)))
+
+(defn- resolve-instance
+  "Pick the instance for THIS call.
+
+  With more than one instance configured the caller MUST name it: there is no
+  'first configured' fallback, because a bare call would silently hit whichever
+  instance happened to be listed first. That is the rule — `odoo …` never does
+  anything until an instance is stated explicitly. With exactly one instance
+  configured the name is optional, since it is unambiguous."
+  [a]
   (let [{:keys [instances by-name]} @config*
-        name (or @current* (:name (first instances)))]
-    (or (get by-name name)
-        (throw (ex-info "No Odoo instance selected — call odoo_use_instance first" {})))))
+        want (some-> (:instance a) str str/trim not-empty)]
+    (cond
+      want
+      (or (get by-name want)
+          (throw (ex-info (str "Unknown Odoo instance '" want "'. Available: "
+                               (str/join ", " (map :name instances))) {})))
+
+      (= 1 (count instances))
+      (first instances)
+
+      :else
+      (throw (ex-info (str "This grog has " (count instances)
+                           " Odoo instances configured, so every call must name one explicitly "
+                           "with the `instance` argument. Available: "
+                           (str/join ", " (map :name instances)))
+                      {:instances (map :name instances)})))))
+
+(defn- instance-password
+  "The password to authenticate `inst` with: the per-instance secret-store entry
+  when `:password-secret` is configured, otherwise the literal / `${ENV}`
+  `:password`.
+
+  Throws — naming the instance and the account — rather than authenticating with
+  a blank password, which fails later and silently. Resolution is LAZY (at auth
+  time, not boot), so a missing or unreachable secret can never break tool
+  registration."
+  ^String [inst]
+  (if-let [acct (:password-secret inst)]
+    (or (lookup-secret acct)
+        (throw (ex-info (str "Instance '" (:name inst) "': no secret for account '" acct
+                             "' in the OS keyring (service '" keyring-service "') "
+                             "or in " (.getPath (secrets-file)) ". Set it with:  "
+                             "/secret set " acct " <value>")
+                        {:instance (:name inst) :secret acct})))
+    (let [p (str (:password inst))]
+      (when (str/blank? p)
+        (throw (ex-info (str "Instance '" (:name inst) "' has no credentials: configure "
+                             ":password-secret (preferred) or :password.")
+                        {:instance (:name inst)})))
+      p)))
 
 (defn- instance-auth!
   "Authenticate `inst` lazily (cached) and return {:url :db :uid :password}."
@@ -175,23 +286,17 @@
   (let [name (:name inst)]
     (if-let [c (get @auth* name)]
       c
-      (let [uid (xrpc/xmlrpc-call! (:url inst) "common" "authenticate"
-                                   [(:db inst) (:user inst) (:password inst) {}])]
+      (let [pw (instance-password inst)
+            uid (xrpc/xmlrpc-call! (:url inst) "common" "authenticate"
+                                   [(:db inst) (:user inst) pw {}])]
         (when-not (pos? (long uid))
           (throw (ex-info (str "Odoo authentication failed for " name "/" (:user inst)) {})))
-        (let [c {:url (:url inst) :db (:db inst) :uid (long uid) :password (:password inst) :name name}]
+        (let [c {:url (:url inst) :db (:db inst) :uid (long uid) :password pw :name name}]
           (swap! auth* assoc name c)
           c)))))
 
 (defn- execute-kw
-  "Call `method` on Odoo `model` with `args`/`kwargs` on the active instance."
-  [model method args kwargs]
-  (let [{:keys [url db uid password]} (instance-auth! (active-instance))]
-    (xrpc/xmlrpc-call! url "object" "execute_kw" [db uid password model method args kwargs])))
-
-(defn- execute-kw-inst
-  "Call `method` on Odoo `model` on an explicit instance map (used for the
-  odoo-method SQL backend)."
+  "Call `method` on Odoo `model` with `args`/`kwargs` on instance `inst`."
   [inst model method args kwargs]
   (let [{:keys [url db uid password]} (instance-auth! inst)]
     (xrpc/xmlrpc-call! url "object" "execute_kw" [db uid password model method args kwargs])))
@@ -220,11 +325,17 @@
             (accept [_ sink]
               (try (.success sink (text-result (fn arguments)))
                    (catch Throwable t
+                     ;; Surface an XML-RPC fault's faultString: without it an Odoo
+                     ;; permission error degrades to the useless "Odoo XML-RPC
+                     ;; fault" and the caller cannot tell a bad query from a
+                     ;; missing group on the target.
                      (.success sink (error-result
                                      (str "Error executing tool " name ": "
-                                          (or (:message (ex-data t)) (.getMessage t))))))))))))))
+                                          (or (:message (ex-data t))
+                                              (:faultString (ex-data t))
+                                              (.getMessage t))))))))))))))
 
-;; --- raw SQL ---------------------------------------------------------------
+;; --- SQL, via the Select-O-Matic addon (no direct database access) ----------
 
 (def ^:private read-only-sql-pattern
   #"(?is)^\s*(?:\(?\s*)?(select|with|show|explain|describe|desc|values|table)\b")
@@ -232,152 +343,161 @@
 (defn- read-only-sql? [sql]
   (boolean (re-find read-only-sql-pattern (str sql))))
 
-(defn- rows->data [^ResultSet rs]
-  (let [meta (.getMetaData rs)
-        n (.getColumnCount meta)
-        cols (mapv (fn [i] (.getColumnLabel meta i)) (range 1 (inc n)))]
-    (loop [rows []]
-      (if (.next rs)
-        (recur (conj rows (into {}
-                                (for [i (range 1 (inc n))]
-                                  [(nth cols (dec i)) (let [v (.getObject rs i)]
-                                                        (if (instance? java.sql.Timestamp v)
-                                                          (str v)
-                                                          v))]))))
-        {:columns cols :rows rows :row-count (count rows)}))))
+(defn- select-o-matic!
+  "Run `sql` on `inst` through the Select-O-Matic wizard
+  (`select.o.matic.wizard`), over the Odoo API.
 
-(defn- postgres-sql!
-  "Run a read-only SQL query on the Postgres instance described by `sql-conf`.
-  The connection is always the one from the selected instance's config — never
-  caller-supplied. Non-read statements are refused before any connection is made."
-  [sql-conf sql]
-  (when-not (read-only-sql? sql)
-    (throw (ex-info "Refusing non-read-only SQL — grog-odoo is strictly read-only." {})))
-  (let [host (str (or (:host sql-conf) "127.0.0.1"))
-        port (long (or (:port sql-conf) 5432))
-        db   (or (:db sql-conf) (throw (ex-info "sql: postgres backend missing :db" {})))
-        user (or (:user sql-conf) (throw (ex-info "sql: postgres backend missing :user" {})))
-        password (str (or (:password sql-conf) ""))
-        jdbc-url (str "jdbc:postgresql://" host ":" port "/" db)]
-    (Class/forName "org.postgresql.Driver")
-    (with-open [conn (DriverManager/getConnection jdbc-url user password)]
-      (with-open [rs (.executeQuery (.createStatement conn) sql)]
-        (merge {:read-only true} (rows->data rs))))))
-
-(defn- odoo-method-sql!
-  "Run raw SQL by calling a method on the selected Odoo instance (for instances
-  that expose a SQL runner, e.g. a custom model method that executes on env.cr)."
-  [inst sql]
-  (let [sql-conf (:sql inst)
-        model (or (:model sql-conf)
-                  (throw (ex-info "sql: odoo-method backend missing :model" {})))
-        method (or (:method sql-conf)
-                   (throw (ex-info "sql: odoo-method backend missing :method" {})))]
-    (execute-kw-inst inst model method [sql] {})))
+  This is the ONLY way grog reaches SQL: no JDBC, no database host/port, no
+  database credentials — just the instance's normal Odoo login, and Select-O-Matic's
+  own guards (single statement, no dangerous functions, row ceiling, statement
+  timeout, read-only statements rolled back in a savepoint). Mutating statements
+  need the superuser account AND `confirm_write`, which we only send when the
+  instance is marked `:allow-write true`."
+  [inst sql row-limit confirm-write?]
+  (let [{:keys [url db uid password]} (instance-auth! inst)
+        model "select.o.matic.wizard"
+        call (fn [method args kwargs]
+               (xrpc/xmlrpc-call! url "object" "execute_kw" [db uid password model method args kwargs]))
+        wid (call "create" [{:sql_text sql
+                             :row_limit (int row-limit)
+                             :confirm_write (boolean confirm-write?)}] {})
+        _ (call "action_run" [[wid]] {})
+        [rec] (call "read" [[wid] ["status" "error" "result_json" "has_result"]] {})]
+    rec))
 
 (defn- run-sql!
-  "Execute a read-only SQL query against the active instance's configured `:sql`
-  backend. Statements that could change data are refused unconditionally — the
-  model has no way to opt into writes."
-  [sql]
-  (let [inst (active-instance)
-        sql-conf (:sql inst)]
-    (when-not sql-conf
-      (throw (ex-info (str "Instance '" (:name inst) "' has no :sql backend configured "
-                           "(add a `sql` block to its entry in the instances config)") {})))
-    (when-not (read-only-sql? sql)
-      (throw (ex-info (str "Refusing non-read-only SQL (" (str/trim sql) ") — grog-odoo is strictly read-only.") {})))
-    (let [backend (or (:type sql-conf) "postgres")]
-      (case backend
-        "postgres" (merge {:backend "postgres"} (postgres-sql! sql-conf sql))
-        "odoo-method" (merge {:backend "odoo-method" :sql sql}
-                             (odoo-method-sql! inst sql))
-        (throw (ex-info (str "Unsupported sql backend '" backend "'") {}))))))
+  "Execute SQL against `inst` via Select-O-Matic.
+
+  A statement that could modify data is refused *before* Odoo is called unless
+  the instance is marked `:allow-write true` — the write switch is per instance,
+  not a global setting."
+  [inst sql row-limit]
+  (let [write? (not (read-only-sql? sql))
+        name (:name inst)]
+    (when (and write? (not (:allow-write inst)))
+      (throw (ex-info (str "Instance '" name "' is configured read-only (:allow-write false), "
+                           "so a statement that could modify data is refused. "
+                           "Set :allow-write true on that instance to permit writes.")
+                      {:instance name :allow-write false})))
+    (let [rec (select-o-matic! inst sql row-limit write?)
+          status (:status rec)
+          error (:error rec)
+          payload (try (some-> (:result_json rec) str not-empty (json/read-str :key-fn keyword))
+                       (catch Exception _ nil))]
+      (when (and error (not (str/blank? (str error))))
+        (throw (ex-info (str "Select-O-Matic refused the statement: " error)
+                        {:instance name :status status})))
+      (merge {:instance name
+              :allow-write (:allow-write inst)
+              :status status
+              :has-result (:has_result rec)
+              :sql sql}
+             (when payload
+               {:columns (:columns payload)
+                :rows (:rows payload)
+                :row-count (count (:rows payload))})))))
 
 ;; --- tools ------------------------------------------------------------------
 
+(defn- instance-prop
+  "The `instance` tool argument. Listed as an enum of the configured names so
+  the model cannot invent an endpoint."
+  [names]
+  {:type :string
+   :enum names
+   :description (str "Which configured Odoo instance to act on. REQUIRED whenever more than one instance "
+                     "is configured — a call without it is refused. Available: " (str/join ", " names))})
+
 (defn build-tools
   "Build the full tool list. Reads the current config once so the instance enum
-  reflects exactly the pre-configured instances."
-  []
-  (let [{:keys [instances by-name]} @config*
-        instance-names (mapv :name instances)
-        instance-summaries (mapv (fn [i] {:name (:name i) :url (:url i) :db (:db i)}) instances)]
-    [{:name "odoo_list_instances"
-      :description "List the pre-configured Odoo instances the model may use. Returns name/url/db only (never credentials)."
-      :schema (json/write-str {:type :object :properties {} :required []})
-      :fn (fn [_] (ok {:instances instance-summaries}))}
+  reflects exactly the pre-configured instances.
 
-     {:name "odoo_use_instance"
-      :description (str "Select which pre-configured Odoo instance to use for all subsequent calls. "
-                        "You can ONLY pick one of these names; arbitrary endpoints are not allowed. "
-                        "Available: " (str/join ", " instance-names))
-      :schema (json/write-str {:type :object
-                               :properties {:instance {:type :string
-                                                       :enum instance-names}}
-                               :required [:instance]})
-      :fn (fn [a]
-            (let [a (kargs a)
-                  name (str (or (:instance a) ""))]
-              (if-let [inst (get by-name name)]
-                (do (reset! current* name)
-                    (let [auth (instance-auth! inst)]
-                      (ok {:instance name :uid (:uid auth) :db (:db inst) :authenticated true})))
-                (throw (ex-info (str "Unknown Odoo instance '" name "'. Available: "
-                                     (str/join ", " instance-names)) {})))))}
+  Loads the config HERE if nothing has yet: the bundle (`grog_mcp.main`) calls
+  this fn directly through `requiring-resolve` and never runs this server's
+  `-main`/`mcp-server` — the only other place `load-config!` is called. Without
+  this guard the tools come back with an EMPTY instance list under the bundle
+  (`{\"instances\": [], \"instance-required\": false}`)."
+  []
+  (when (nil? @config*) (load-config!))
+  (let [{:keys [instances]} @config*
+        names (mapv :name instances)
+        multi? (> (count instances) 1)
+        instance-summaries (mapv (fn [i] {:name (:name i) :url (:url i) :db (:db i)
+                                          :allow-write (:allow-write i)})
+                                 instances)]
+    [{:name "odoo_list_instances"
+      :description (str "List the pre-configured Odoo instances. Returns name/url/db/allow-write only "
+                        "(never credentials). "
+                        (when multi? (str "This grog has " (count instances)
+                                          " instances, so every other odoo_* call must pass `instance` explicitly.")))
+      :schema (json/write-str {:type :object :properties {} :required []})
+      :fn (fn [_] (ok {:instances instance-summaries
+                       :instance-required multi?}))}
 
      {:name "odoo_authenticate"
-      :description "Authenticate the currently selected Odoo instance (or the first configured one) and return the uid."
-      :schema (json/write-str {:type :object :properties {} :required []})
-      :fn (fn [_]
-            (let [inst (active-instance)
+      :description "Authenticate an Odoo instance and return the uid. Name the instance when more than one is configured."
+      :schema (json/write-str {:type :object
+                               :properties {:instance (instance-prop names)}
+                               :required (if multi? [:instance] [])})
+      :fn (fn [a]
+            (let [inst (resolve-instance (kargs a))
                   auth (instance-auth! inst)]
-              (ok {:instance (:name inst) :db (:db inst) :uid (:uid auth) :authenticated true})))}
+              (ok {:instance (:name inst) :db (:db inst) :uid (:uid auth)
+                   :allow-write (:allow-write inst) :authenticated true})))}
 
      {:name "odoo_search_read"
-      :description "Search Odoo records of `model` (e.g. res.partner, sale.order, account.move) matching `domain` (list of (field, operator, value) tuples). Operates on the currently selected instance. Returns matching records as JSON."
+      :description "Search Odoo records of `model` (e.g. res.partner, sale.order, account.move) matching `domain` (list of (field, operator, value) tuples). Returns matching records as JSON. Name the instance when more than one is configured."
       :schema (json/write-str {:type :object
-                               :properties {:model {:type :string}
+                               :properties {:instance (instance-prop names)
+                                            :model {:type :string}
                                             :domain {:type :array :items {:type :array}}
                                             :fields {:type :array :items {:type :string}}
                                             :limit {:type :integer}
                                             :offset {:type :integer}
                                             :order {:type :string}}
-                               :required [:model :domain]})
+                               :required (if multi? [:instance :model :domain] [:model :domain])})
       :fn (fn [a]
             (let [a (kargs a)
+                  inst (resolve-instance a)
                   kwargs (cond-> {}
                            (:fields a) (assoc :fields (vec (:fields a)))
                            (:limit a)  (assoc :limit (long (:limit a)))
                            (:offset a) (assoc :offset (long (:offset a)))
                            (:order a)  (assoc :order (:order a)))]
-              (ok (execute-kw (:model a) "search_read" [(:domain a)] kwargs))))}
+              (ok (execute-kw inst (:model a) "search_read" [(:domain a)] kwargs))))}
 
      {:name "odoo_get_fields"
-      :description "Return field metadata for `model` (e.g. res.partner) on the currently selected instance."
+      :description "Return field metadata for `model` (e.g. res.partner). Name the instance when more than one is configured."
       :schema (json/write-str {:type :object
-                               :properties {:model {:type :string} :attributes {:type :array :items {:type :string}}}
-                               :required [:model]})
-      :fn (fn [a] (let [a (kargs a)]
-                    (ok (execute-kw (:model a) "fields_get" []
-                                    {:attributes (or (:attributes a) ["string" "type" "required" "help"])}))))}
-
-     {:name "odoo_execute_sql"
-      :description (str "Run a read-only SQL query against the currently selected Odoo instance's configured SQL backend. "
-                        "The connection is determined solely by the selected instance's `sql` config — you cannot choose a database/endpoint. "
-                        "Only read-only statements are allowed: SELECT / WITH / SHOW / EXPLAIN / DESCRIBE / VALUES / TABLE. "
-                        "This MCP is strictly read-only: any statement that could change data (INSERT/UPDATE/DELETE/DDL/…) is refused."
-                        " Returns columns+rows.")
-      :schema (json/write-str {:type :object
-                               :properties {:sql {:type :string}}
-                               :required [:sql]})
+                               :properties {:instance (instance-prop names)
+                                            :model {:type :string}
+                                            :attributes {:type :array :items {:type :string}}}
+                               :required (if multi? [:instance :model] [:model])})
       :fn (fn [a]
             (let [a (kargs a)
-                  sql (str (or (:sql a) ""))]
+                  inst (resolve-instance a)]
+              (ok (execute-kw inst (:model a) "fields_get" []
+                              {:attributes (or (:attributes a) ["string" "type" "required" "help"])}))))}
+
+     {:name "odoo_execute_sql"
+      :description (str "Run SQL against an Odoo instance through the Select-O-Matic addon (select.o.matic.wizard) — "
+                        "over the Odoo API. There is no direct database connection and no database credentials are used. "
+                        "Read statements (SELECT/WITH/SHOW/EXPLAIN/…) always work. A statement that could modify data is "
+                        "refused unless the instance is marked :allow-write true, and even then Select-O-Matic requires the "
+                        "superuser account. Name the instance when more than one is configured.")
+      :schema (json/write-str {:type :object
+                               :properties {:instance (instance-prop names)
+                                            :sql {:type :string}
+                                            :row-limit {:type :integer}}
+                               :required (if multi? [:instance :sql] [:sql])})
+      :fn (fn [a]
+            (let [a (kargs a)
+                  inst (resolve-instance a)
+                  sql (str (or (:sql a) ""))
+                  limit (long (or (:row-limit a) 200))]
               (when (str/blank? sql)
                 (throw (ex-info "Missing required :sql" {})))
-              (ok (merge {:instance (:name (active-instance)) :sql sql}
-                         (run-sql! sql)))))}
+              (ok (run-sql! inst sql limit))))}
      ]))
 
 ;; --- server ----------------------------------------------------------------
@@ -386,7 +506,7 @@
   (load-config!)
   (let [transport-provider (StdioServerTransportProvider. (ObjectMapper.))
         server (-> (McpServer/async transport-provider)
-                   (.serverInfo "grog-odoo" "0.3.0")
+                   (.serverInfo "grog-odoo" "0.4.0")
                    (.capabilities (-> (McpSchema$ServerCapabilities/builder) (.tools true) (.build)))
                    (.build))]
     (doseq [t (build-tools)]

@@ -199,8 +199,13 @@
 ;; --- tools -----------------------------------------------------------------
 
 (defn build-tools
-  "Build the tool list. Every tool is a thin adapter over grog-imap.core."
+  "Build the tool list. Every tool is a thin adapter over grog-imap.core.
+
+  Loads the config HERE if nothing has: the bundle (`grog_mcp.main`) calls this
+  fn directly and never runs this server's `-main`/`mcp-server`, its only other
+  `load-config!` caller — so under the bundle the accounts list would be empty."
   []
+  (when (nil? @config*) (load-config!))
   (let [config @config*
         names (account-names config)]
     [{:name "imap_list_accounts"

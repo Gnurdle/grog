@@ -20,6 +20,10 @@ starts the tool servers. Closing the window stops all of them.
 
 ## 1. Install the prerequisites
 
+**Installing with the installer? Skip this section** — it runs all of it for you
+(see §2). Do it by hand only for an unpacked copy, or if you want to control the
+toolchain yourself.
+
 grog needs a Java runtime, a bash shell and ECA. Node.js is needed to run the
 app from a bundle; the remaining tools are optional.
 
@@ -30,12 +34,18 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser   # once, i
 irm get.scoop.sh | iex
 ```
 
-Scoop clones buckets with **git**, so install that first. It is also the bash
-shell grog needs, so it is doing double duty:
+Scoop clones buckets with **git**, so install that first. Git for Windows also
+ships `bash.exe`, which grog needs — but scoop's manifest shims only
+`sh`/`git`/`git-bash`, **not** `bash`, so the command doesn't exist until you
+add it (otherwise every tool server fails with `CreateProcess error=2`):
 
 ```powershell
-scoop install git                    # bash - required, and needed for buckets
+scoop install git                        # git - required, and needed for buckets
+scoop shim add bash "$(scoop prefix git)\bin\bash.exe"
+                                          # exposes Git for Windows' bash.exe as `bash`
 ```
+
+(`scripts\prereqs.ps1` does both for you — this section is the manual version.)
 
 Now add the buckets that hold the rest. `main` is the only one scoop starts
 with; the last of these is third-party and needs its URL:
@@ -90,27 +100,40 @@ installed, `grog doctor` lists every tool, its version, and what it unlocks.
 
 ## 2. Install grog
 
-Extract the bundle where you want it to live. Windows ships `tar` from libarchive
-(bsdtar), so it reads the `.zip` as happily as a `.tar.gz`:
+Run `grog-<version>-setup.exe` and follow the prompts. It is a **per-user**
+install — no administrator prompt — it puts **grog** on the Desktop and in the
+Start Menu with its icon, and it carries the backend, the tool bundle and the
+interface with it. Nothing else to fetch.
+
+Then start grog from the Start Menu.
+
+### Portable, instead of installed
+
+The bundle is also self-contained apart from the app runtime, so it can simply be
+unpacked and run where it lands:
 
 ```cmd
 mkdir %LOCALAPPDATA%\grog
-tar -xf grog-0.1.0-windows-x64.zip -C %LOCALAPPDATA%\grog
-```
+tar -xf "%USERPROFILE%\Downloads\grog-0.1.0-windows-x64.zip" -C %LOCALAPPDATA%\grog
 
-Right-click → *Extract All…* does the same if you prefer the GUI. Prefer `tar`
-over `Expand-Archive` here — PowerShell's cmdlet is slow with a few hundred
-files. (On Linux, `tar` is GNU tar and cannot read a zip; use `unzip` there.)
-
-Then fetch the app runtime once:
-
-```cmd
 cd %LOCALAPPDATA%\grog\clients\web
-npm install
+npm install                          :: once; fetches the app runtime
+cd %LOCALAPPDATA%\grog
+scripts\grog-client.bat
 ```
 
-The bundle already contains the two jars and the built interface, so nothing
-else is needed to run.
+Windows ships `tar` from libarchive (bsdtar), so it reads the `.zip` as happily as
+a `.tar.gz`; right-click → *Extract All…* works too, and is friendlier than
+`Expand-Archive`, which is slow with a few hundred files. (On Linux `tar` is GNU
+tar and cannot read a zip — use `unzip`.)
+
+Add a menu entry for the unpacked copy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
+```
+
+What a bundle contains:
 
 | Part | Location |
 |---|---|
@@ -123,22 +146,19 @@ Building grog from source is a separate, developer-only path — see
 
 ## 3. Run
 
-```cmd
-scripts\grog-client.bat
-```
+**Installed:** start **grog** from the Start Menu, or double-click the Desktop
+icon.
 
-To put grog on the Desktop and in the Start Menu, with its icon:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
-powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1 -Uninstall
-```
+**Portable:** `scripts\grog-client.bat`, or the menu entry created above.
 
 Icons, the Linux side, and how to verify an install: `doc/desktop-kit.md`.
 
 ## 4. Verify
 
-Open the run log (`%TEMP%\grog-client-<n>.log`) and check, in order:
+Open the run log and check, in order. The client writes one file per instance —
+`%USERPROFILE%\grog.<pid>.log`, newest match (`$GROG_LOG` overrides the
+`%USERPROFILE%\grog` base). Launching via `scripts\grog-client.bat` additionally
+keeps a stream copy at `%TEMP%\grog-client-<n>.log`:
 
 1. `[grog-client] transport up: child pid <N>` — the backend is running.
 2. `[renderer] loaded ok` — the interface loaded.
@@ -148,7 +168,7 @@ Open the run log (`%TEMP%\grog-client-<n>.log`) and check, in order:
    a model is available. `:no-available-model` means no credential is set; add
    one with `/secret set LLM_API_KEY <key>`.
 6. Ask for something that needs a tool. The log shows the call **with its
-   arguments**: `[TOOLS] Calling tool 'grog-fetch__fetch_url' with args '{…}'`.
+   arguments**: `[TOOLS] Calling tool 'grog-mcp__fetch_url' with args '{…}'`.
 
 To list every dependency grog can see — its path, version, and the feature each
 one enables — run the doctor:
@@ -165,11 +185,13 @@ does the same thing.
 
 | Symptom | Check |
 |---|---|
-| The window closes immediately | Run `scripts\grog-client.bat` from an open console so you can read the log. A process holding a stale `%TEMP%\grog-client-*.log` open can stop the launcher; close stray `java.exe`/`bash.exe` and retry. |
+| The window closes immediately | Read the newest `%USERPROFILE%\grog.<pid>.log` — it holds both the client's and the backend's output, even when a spawned process fails. Running `scripts\grog-client.bat` from an open console also prints a stream copy. A leftover process holding a stale log open can stop the launcher; close stray `java.exe`/`bash.exe` and retry. |
 | The backend never starts | `java -version` — it must be on PATH. |
-| Every tool server reports `CreateProcess error=2` | `bash --version` — it must be on PATH (Git for Windows). |
+| Every tool server reports `CreateProcess error=2` | `bash --version` — it must resolve to Git for Windows, not WSL's stub. Missing? `scoop shim add bash "$(scoop prefix git)\bin\bash.exe"` (scoop doesn't shim bash itself). |
 | Config errors mentioning `clojure.lang.Symbol` | `grog.edn` starts with a byte-order mark. Save it as UTF-8 **without** a BOM. |
 | The tool jar is missing | Re-extract the bundle, or copy `grog-mcp-<version>.jar` into `grog_mcp\target\`. |
+| Packaging dies with `Cannot create symbolic link … A required privilege is not held by the client` | electron-builder is unpacking `winCodeSign` (it contains macOS symlinks). Enable **Developer Mode** (Settings → System → For developers), or run the build elevated. |
+| The installed app uses the default Electron icon | `clients/web/build/icon.ico` is missing from the checkout — it was once gitignored. Re-pull, or copy the icons in. |
 | `/doctor` shows a tool as missing | Install it, or ignore it if you don't need that feature. |
 | OCR fails, or reports missing language data | Install `tesseract-languages` (the `tesseract` package ships no recognition data), or set `:tessdata` in `imaging.edn`. |
 | Office tools fail | Install LibreOffice, or set `:bin` in `office.edn`. |
@@ -183,7 +205,8 @@ does the same thing.
 | other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the Windows credential store; `secrets.edn` is the fallback |
 | projects | `%USERPROFILE%\grog-projects\<project>\{notes,dialog,state}` |
-| run log | `%TEMP%\grog-client-<n>.log` |
+| profile / cache | `%LOCALAPPDATA%\grog` — Chromium's private store (cache, Local Storage). Deliberately **Local**, not Roaming |
+| run log | `%USERPROFILE%\grog.<pid>.log` — client-written, newest match (`$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts\grog-client.bat` also saves a stream copy to `%TEMP%\grog-client-<n>.log` |
 | version | `VERSION` at the tree root; also inside the jars as `grog-version.edn` |
 
 ## 7. Two things worth knowing
@@ -199,14 +222,19 @@ tool ever reports a *missing* argument it should have received, run that test.
 ## 8. Building from source
 
 Only for working on grog itself. This path also needs the
-[Clojure CLI](https://clojure.org/guides/install_clojure) and Babashka; running
-grog does **not**.
+[Clojure CLI](https://clojure.org/guides/install_clojure), Babashka, and
+Node.js; running grog does **not**.
 
 ```cmd
 git clone <remote> %USERPROFILE%\grog
 cd %USERPROFILE%\grog
+cd clients\web && npm install && cd ..\..
 bb dist                   :: both jars + the interface bundle + dist/ + tarball
 ```
+
+`npm install` is once per clone: `node_modules/` is deliberately not in git.
+Skip it and `bb dist` runs it for you before the renderer build — the jar side
+self-provisions Maven deps the same way, so the build is one command either way.
 
 `bb dist` writes the two jars the app expects:
 
@@ -224,23 +252,66 @@ clojure -T:build spine :version '"0.1.0"'
 cd grog_mcp && clojure -T:build uber :version '"0.1.0"'
 ```
 
-### Making an installer
+### Making an installer for other people
 
-The bundle above can be shipped as-is, or turned into a Windows installer (a
-per-user NSIS setup that creates Desktop and Start Menu shortcuts):
+An installer is a Windows build artifact, so build it **on Windows** — NSIS runs
+natively there and there is nothing to cross-compile. One machine does this;
+everybody else just runs the file it produces.
 
-```cmd
-cd clients\web
-npm install                                   :: brings electron-builder
-npx electron-builder --win nsis --publish never -c.extraMetadata.version=0.1.0
+On the build machine, once:
+
+```powershell
+scoop install git
+scoop bucket add java
+scoop bucket add extras
+scoop bucket add scoop-clojure https://github.com/littleli/scoop-clojure
+scoop install java/temurin-lts-jdk nodejs-lts babashka clj-deps
 ```
 
-The result is `clients\web\dist\grog Setup <version>.exe`.
+`clj-deps` matters: the bucket's `clojure` package installs only a **PowerShell
+module** (no `clojure.exe`/`.cmd` anywhere on `PATH`), so PowerShell can run
+`clojure` but no other program can — `bb dist` fails with `Cannot run program
+"clojure"`. `clj-deps` shims the real `deps.exe` as `clojure`/`clj`, which every
+process can execute. (Already installed the old one? `scoop uninstall clojure`
+first.)
 
-Requirements: both jars in their expected places (above), the built interface,
-and internet — electron-builder downloads the app runtime and its packaging
-tools on first run. From Linux the same command works but needs Wine.
+then refine from the repo, and run one command:
 
-The installer embeds both jars under the app's `resources\jars\`, which is where
-the app looks for them once installed. On a machine that has grog installed,
-nothing else is needed beyond Java, bash and ECA.
+```cmd
+cd %USERPROFILE%\grog
+bb dist --target windows
+```
+
+That is the whole build. It installs the interface's npm packages if they are
+missing, builds both jars and the renderer, handles electron-builder's
+`winCodeSign` prerequisites itself (no Developer Mode or elevation required),
+and finishes by printing the one artifact to ship:
+
+```
+ARTIFACT: C:\Users\<you>\grog\clients\web\dist\grog-0.1.0-setup.exe
+```
+
+Copy that single `.exe` to the target machine and run it — the installer lays
+grog down and installs its prerequisites (Java, Git/bash, ECA) in one step.
+Nothing else to copy, nothing to set up by hand.
+
+`bb dist --bundle` also writes the portable `.tar.gz`/`.zip` under `dist/`; that
+is a developer convenience, not part of the shipping path.
+
+The three build targets (the tool jar, the spine jar and the renderer) are
+independent, so `bb dist` runs them **in parallel** — on an 8-core box that is
+roughly the time of the slowest one rather than the sum. Use `--serial` if the
+machine is short on RAM (three JVMs at once). If a build feels slow on Windows
+despite low CPU, the cost is I/O, not compute: `tools.build`'s uberjar step
+merges the whole classpath with one sequential zip stream, and antivirus
+scanning of the source tree and `~\.m2` is the dominant extra cost — excluding
+those two paths is the fix.
+
+The installer is per-user (no administrator prompt), installs to
+`%LOCALAPPDATA%\Programs\grog`, adds Desktop and Start Menu shortcuts, embeds
+both jars, and **installs the prerequisites for the user** (§1) as part of the
+install. Set `GROG_SKIP_PREREQS=1` to skip that step for an unattended install.
+
+Doing this from Linux also works, but electron-builder reaches for Wine just to
+generate the uninstaller — an extra host dependency for a Windows-shaped
+artifact.

@@ -61,7 +61,11 @@ role colours while the shell keeps the slate/Tailwind skin.
   `Ctrl+Enter` submits; drag-and-drop text in/out (web: paste + file drop).
 - **Toolbar**: Send · Stop · Mic (voice) · Terminal · Settings · Export ·
   Open-as-HTML · Clear · project button (project manager).
-- **Status bar**: model · status (idle/streaming dot) · trust/YOLO · tokens+cost.
+- **Status bar**: model · status · trust/YOLO · tokens+cost. Status is one of
+  **idle** / **waiting on model…** (violet) / **● streaming** (sky), driven by the
+  server's `running` event plus whether model output has started. The tab dot
+  carries the same four states (amber = question pending, violet = waiting,
+  sky = streaming, dim green = idle), and only the busy ones pulse.
 
 ### 3.3 Behaviour
 - **Turn model**: idle → queue prompt; running → **steer** (with resend-if-dropped);
@@ -69,7 +73,17 @@ role colours while the shell keeps the slate/Tailwind skin.
 - **Slash commands** routed by the server; their stdout is captured and shown as
   **status lines**; `/clear` wipes transcript and drops YOLO; `/quit` exits.
 - **Trust (YOLO)**: auto-approve all tool calls; toggle from toolbar/dialog/slash.
-- **Model**: change via settings or `/eca-model`; persists; footer + status bar update.
+- **Model**: change via settings or `/eca-model`; persists; footer + status bar
+  update. The settings dialog carries a **searchable model picker** (the feature
+  the Swing client had): source tabs — `ECA` (ECA's own catalogue, offline, filled
+  on connect), `OpenRouter`, `Ollama` — with a live filter over the selected
+  source's list. Click fills the field, double-click applies. The catalogue lives
+  on the server (`models` RPC) because that is where the config and the fetchers
+  are; remote sources are fetched **in the background** and arrive as a `models`
+  broadcast, so a slow network can never block the request loop or the dialog.
+  The picked model's **source travels with it** on `set-model`, so an OpenRouter
+  catalog id is never misread as a native provider of the same name
+  (`deepseek/x` → `openrouter/deepseek/x`).
 - **Usage**: per-turn and per-session tokens/cost folded from ECA `usage` content.
 
 ### 3.4 Dialogs

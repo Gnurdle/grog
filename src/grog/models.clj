@@ -7,10 +7,21 @@
             [clojure.java.io :as io]
             [clojure.pprint :as pp]
             [clojure.string :as str]
-            [grog.config :as config])
+            [grog.config :as config]
+            [grog.platform :as platform])
   (:import (java.net URL)))
 
-(defn- grogedn-file ^java.io.File [] (io/file "grog.edn"))
+(defn- grogedn-file
+  "The user's grog.edn — the CONFIG HOME, the same file `grog.config` reads.
+
+  This deliberately does NOT use `./grog.edn`. It once did, which meant a model
+  save from the settings GUI wrote into whatever directory grog happened to run
+  from — for a packaged client that is `resources/` INSIDE the app bundle, which
+  on an AppImage mount (and a per-machine Windows install) is READ-ONLY, so the
+  save died with \"Read-only file system\"; and even when it succeeded it wrote a
+  file nothing reads, so the model silently never changed."
+  ^java.io.File []
+  (io/file (platform/config-home-dir) "grog.edn"))
 
 (defn- read-map
   "Whole grog.edn map (best effort); nil if unreadable/missing."
@@ -22,13 +33,16 @@
     (catch Throwable _ nil)))
 
 (defn- persist!
-  "Atomically write `(f whole-grog.edn-map)` back to grog.edn, preserving every
-  other top-level key."
+  "Atomically write `(f whole-grog.edn-map)` back to the config-home grog.edn,
+  preserving every other top-level key. Creates the config home if it does not
+  exist yet (fresh install)."
   [f]
   (let [existing (or (read-map) {})
         updated (f existing)
         file (grogedn-file)
         tmp (io/file (str file ".tmp"))]
+    (when-let [parent (.getParentFile file)]
+      (.mkdirs parent))
     (spit tmp (with-out-str (pp/pprint updated)))
     (io/copy tmp file)
     (when (.exists tmp) (.delete tmp)))
@@ -212,3 +226,53 @@
        (if-let [p (provider-prefix-for-url url)]
          (str p "/" m)
          m)))))
+
+;; --- cached catalogue for the model picker ----------------------------------
+;;
+;; The Electron settings dialog asks the server for a source's model list. The
+;; OpenRouter/Ollama lists come from HTTP, and the server reads requests on a
+;; single loop, so a slow fetch must never happen inside a request: that would
+;; stall every other call for the length of a network timeout. Instead the
+;; request answers instantly with whatever is already cached, a background
+;; thread refreshes it, and the result is broadcast as a `models` notification.
+
+;; source -> vector of model ids. nil = never fetched (an empty vector means
+;; fetched, and that source really has none right now).
+(defonce ^:private catalogue* (atom {}))
+
+;; Sources with a fetch currently running, so repeated clicks cannot stack up
+;; duplicate network calls.
+(defonce ^:private inflight* (atom #{}))
+
+(defn fetch-async!
+  "Refresh `source` (:openrouter or :ollama) on a background thread, unless that
+  fetch is already running. Calls `(done! source models)` when it lands.
+  Returns true when a fetch was actually started."
+  [source done!]
+  (if-let [fetch (case source
+                   :openrouter fetch-openrouter-models
+                   :ollama     fetch-ollama-models
+                   nil)]
+    (if (contains? @inflight* source)
+      false
+      (do
+        (swap! inflight* conj source)
+        (future
+          (let [ms (try (vec (fetch)) (catch Throwable _ []))]
+            (swap! catalogue* assoc source ms)
+            (swap! inflight* disj source)
+            (try (done! source ms) (catch Throwable _ nil))))
+        true))
+    false))
+
+(defn catalogue
+  "What the picker can show right now.
+
+  `:eca` is ECA's own catalogue (it arrives over `config/updated` when a session
+  connects), so it needs no fetch and works offline."
+  []
+  (let [eca (when-let [ids (seq @eca-model-catalog*)]
+              (vec (sort ids)))]
+    (merge {:openrouter nil :ollama nil :eca eca
+            :loading (vec (sort @inflight*))}
+           @catalogue*)))

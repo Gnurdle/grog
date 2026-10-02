@@ -11,12 +11,19 @@
 //
 // It also forwards window focus, which the question-visibility rule needs
 // (doc/clients/web-client-plan.md §3.4.1).
-const { app, BrowserWindow, ipcMain, Menu, session } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, screen, session } = require("electron");
 const net = require("net");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
 const { execFile, spawn, spawnSync } = require("child_process");
+
+// Logging first, so everything after it (including a failed spawn) is captured.
+// One file per client instance: $GROG_LOG -> else ~/grog, as <base>.<pid>.log.
+const log = require("./log");
+const LOG = log.install();
+LOG.tee();
+console.log(`[grog-client] log file: ${LOG.path}`);
 
 // Same rendezvous the server computes (grog.server/default-socket-path):
 // GROG_SERVER_SOCKET wins; else $XDG_RUNTIME_DIR/grog-$USER.sock; else tmp.
@@ -160,6 +167,40 @@ function connect() {
 let readyResolve = null;
 const ready = new Promise((r) => { readyResolve = r; });
 
+// A tool approval or an LLM question BLOCKS the agent until the user answers.
+// The renderer only paints those dialogs while the window is focused, so when
+// the window sits behind another app the request is invisible — the "the dialog
+// pops up behind instead of in front" bug. Bring the window forward; if the OS
+// refuses focus (Windows' foreground lock), flash the taskbar as the fallback.
+function needsAttention(msg) {
+  if (msg.method === "question") return true;
+  if (msg.method === "event") {
+    const t = msg.params && msg.params.type;
+    return t === "approval" || t === "question";
+  }
+  return false;
+}
+
+function requestAttention() {
+  if (!win || win.isDestroyed()) return;
+  try {
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    if (!win.isFocused()) {
+      win.focus();      // best effort
+      win.moveTop();    // raise above other windows (no-op on some Linux WMs)
+      // If focus() was refused, the taskbar flash is the only signal left.
+      setTimeout(() => {
+        try {
+          if (win && !win.isDestroyed() && !win.isFocused()) win.flashFrame(true);
+        } catch { /* best effort */ }
+      }, 250);
+    }
+  } catch (e) {
+    console.warn("[grog-client] could not raise window for attention:", e.message);
+  }
+}
+
 function onLine(line) {
   if (!line.trim()) return;
   let msg; try { msg = JSON.parse(line); } catch (e) { return; }
@@ -170,6 +211,7 @@ function onLine(line) {
     else resolve(msg.result);
   } else if (msg.method) {
     send(msg.method, msg.params);
+    if (needsAttention(msg)) requestAttention();
   }
 }
 
@@ -179,6 +221,7 @@ function pump(stream) {
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (LOG.wire) LOG.write(`<- ${line}`);   // GROG_LOG_WIRE=1
       onLine(line);
     }
   });
@@ -229,7 +272,11 @@ function spawnSpine() {
     detached: process.platform !== "win32",
   });
   pump(spine.stdout);
-  spine.stderr.on("data", (b) => process.stderr.write(`[grog-spine] ${b}`));
+  spine.stderr.on("data", (b) => {
+    const line = `[grog-spine] ${b}`;
+    process.stderr.write(line);
+    LOG.write(line);          // the spine's diagnostics belong in the log file
+  });
   // A spawn error (ENOENT: `java`/`clojure` missing from PATH) fires here with
   // NO 'spawn' event and NO 'exit' event. Left unhandled, nothing is logged or
   // rescheduled, so every renderer call re-enters connect() and respawns
@@ -358,30 +405,77 @@ function transcribe(bytes) {
   });
 }
 
+// Window / taskbar / Alt-Tab icon. Windows wants a multi-resolution `.ico`:
+// handing it a plain PNG made the taskbar and Alt-Tab render a small,
+// non-square bitmap INSTEAD of the crisp 256px icon baked into the exe. This
+// `.ico` (256/128/64/48/32/16) ships inside the app under resources/public and
+// is used on Windows; other platforms take the PNG.
+const PUBLIC_DIR = path.join(__dirname, "..", "..", "resources", "public");
+const WINDOW_ICON = (() => {
+  const ico = path.join(PUBLIC_DIR, "icon.ico");
+  if (process.platform === "win32" && fs.existsSync(ico)) return ico;
+  return path.join(PUBLIC_DIR, "icon.png");
+})();
+
 function createWindow() {
+  // Taller by default. 900px was cramped: the title bar and Windows display
+  // scaling come off it, and the composer + status bar got squeezed. win32 asks
+  // for more, and neither dimension may exceed the work area — otherwise the
+  // window opens partly off-screen on a small display.
+  const workArea = screen.getPrimaryDisplay().workAreaSize;
+  const wantH = process.platform === "win32" ? 1200 : 1000;
   win = new BrowserWindow({
-    width: 1280, height: 900, backgroundColor: "#020617",
-    icon: path.join(__dirname, "..", "..", "resources", "public", "icon.png"),
+    width: Math.min(1280, workArea.width),
+    height: Math.min(wantH, workArea.height),
+    backgroundColor: "#020617",
+    icon: WINDOW_ICON,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true },
   });
   // surface renderer console + load failures in the terminal — a blank window
   // is otherwise indistinguishable from a failed build or a thrown init
+  let loadFailed = false;
   win.webContents.on("console-message", (_e, level, message, line, source) =>
     console.log(`[renderer:${level}] ${message} (${source}:${line})`));
-  win.webContents.on("did-fail-load", (_e, code, desc, url) =>
-    console.log(`[renderer] did-fail-load ${code} ${desc} ${url}`));
+  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    loadFailed = true;
+    console.log(`[renderer] did-fail-load ${code} ${desc} ${url}`);
+  });
   win.webContents.on("did-finish-load", () => {
-    console.log("[renderer] loaded ok");
+    // did-finish-load also fires for an ERROR page, so don't claim success then
+    // — printing "loaded ok" after a failure is exactly how a black window hid.
+    console.log(loadFailed ? "[renderer] load FAILED (see did-fail-load above)"
+                           : "[renderer] loaded ok");
     notifyRenderer();   // let the renderer paint the current attach state
   });
-  // Dev: load from the shadow-cljs dev server (it serves resources/public and
-  // /js with hot reload). Prod: load the built file directly.
+  // A BLACK/BLANK window has two very different causes and this is the only way
+  // to tell them apart from the outside: the renderer process dying (logged
+  // here) versus a live renderer that simply isn't painting (a GPU/compositor
+  // problem — see GROG_DISABLE_GPU / --disable-gpu).
+  win.webContents.on("render-process-gone", (_e, details) =>
+    console.log(`[renderer] PROCESS GONE reason=${details && details.reason} exitCode=${details && details.exitCode}`));
+  win.webContents.on("unresponsive", () => console.log("[renderer] unresponsive"));
+  // So a blank window is inspectable on a machine with no terminal attached
+  // (e.g. launched from the Start Menu): GROG_OPEN_DEVTOOLS=1 opens a detached
+  // DevTools window whose Console tab shows whatever threw.
+  if (process.env.GROG_OPEN_DEVTOOLS === "1") {
+    win.webContents.openDevTools({ mode: "detach" });
+  }
+  // Packaged installs ALWAYS load the bundled page. Nothing in a shipped app may
+  // depend on an env var being set: launching grog.exe directly (or from a Start
+  // Menu shortcut) has no NODE_ENV at all, and the old test below pointed such a
+  // window at the shadow-cljs dev server -> ERR_CONNECTION_REFUSED -> a black
+  // window painted with only the BrowserWindow background colour.
+  // Dev URL is for an UNPACKAGED tree only, and only when explicitly asked for.
   const devUrl = process.env.GROG_WEB_DEV_URL ||
-    (process.env.NODE_ENV === "production" ? null : "http://localhost:9633");
+    ((!PACKAGED && process.env.NODE_ENV !== "production") ? "http://localhost:9633" : null);
   if (devUrl) win.loadURL(devUrl);
   else win.loadFile(path.join(__dirname, "..", "..", "resources", "public", "index.html"));
   // guard against "Object has been destroyed" when the window is closing
-  win.on("focus", () => { if (!win.isDestroyed()) win.webContents.send("grog:focus", true); });
+  win.on("focus", () => {
+    if (win.isDestroyed()) return;
+    try { win.flashFrame(false); } catch { /* not flashing / unsupported */ }
+    win.webContents.send("grog:focus", true);
+  });
   win.on("blur",  () => { if (!win.isDestroyed()) win.webContents.send("grog:focus", false); });
 }
 
@@ -390,6 +484,32 @@ ipcMain.handle("grog:focused", () => !!(win && win.isFocused()));
 ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
 ipcMain.handle("grog:voice-status", () => voiceStatus());
 ipcMain.handle("grog:voice-transcribe", (_e, bytes) => transcribe(bytes));
+
+// Chromium's PRIVATE profile — HTTP cache, GPU cache, Code Cache, Local
+// Storage (the font-size pref), cookies, network state — must NOT go to
+// Electron's default `%APPDATA%\grog` (ROAMING). It is machine-specific and
+// cache-heavy, so on a domain machine a roaming profile would sync megabytes of
+// it at every logon. grog's own config deliberately lives elsewhere
+// (`%USERPROFILE%\.config\grog`); this is not that. Local AppData is the right
+// home. Must run before the app is ready (the path is read when the first
+// session is created).
+if (process.platform === "win32") {
+  try {
+    const localData = path.join(app.getPath("localAppData"), "grog");
+    app.setPath("userData", localData);
+    console.log(`[grog-client] profile dir: ${localData}`);
+  } catch (e) {
+    console.warn("[grog-client] could not relocate userData (staying in Roaming):", e.message);
+  }
+  // Give the process the same AppUserModelID the installer's shortcut uses
+  // (package.json `appId`). Without it the taskbar groups/identifies the window
+  // by electron.exe, which muddies the pinned icon and jump list.
+  try {
+    app.setAppUserModelId("dev.grog.client");
+  } catch (e) {
+    console.warn("[grog-client] could not set AppUserModelId:", e.message);
+  }
+}
 
 // A VM (or any box without working GPU acceleration) can hard-fail Electron's
 // compositor before a window ever appears; GROG_DISABLE_GPU=1 forces the safe
@@ -401,6 +521,9 @@ if (process.env.GROG_DISABLE_GPU === "1") {
   } catch (e) {
     console.warn("[grog-client] disableHardwareAcceleration failed:", e.message);
   }
+} else {
+  console.log("[grog-client] GPU acceleration enabled (if the window is black,"
+    + " relaunch with GROG_DISABLE_GPU=1 or --disable-gpu)");
 }
 
 app.whenReady().then(() => {
@@ -441,10 +564,11 @@ function killSpineTree(pid) {
 function shutdown(reason) {
   if (sock) sock.end();
   const pid = spine && spine.pid;
-  if (!pid) { app.quit(); return; }
+  console.log(`[grog-client] shutdown (${reason})`);
+  if (!pid) { LOG.close(); app.quit(); return; }
   setTimeout(() => {
     killSpineTree(pid);
-    console.log(`[grog-client] shutdown (${reason})`);
+    LOG.close();          // flush the log before the process goes away
     app.quit();
   }, 2500);
 }

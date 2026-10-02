@@ -10,9 +10,9 @@
      would have enabled plus a one-line install hint.
 
   2. CONFIG SOLVENCY, WITH PROVENANCE. `grog.edn` is merged from several files
-     (classpath resource, config-home, legacy `~/.config/grog`, `./grog.edn`),
-     later wins. That layering is exactly how a value can look set and be
-     overridden, so every effective key is reported WITH THE FILE IT CAME FROM,
+     (classpath resource, config-home, legacy `~/.config/grog`), later wins.
+     That layering is exactly how a value can look set and be overridden, so
+     every effective key is reported WITH THE FILE IT CAME FROM,
      unparseable files are reported by file, and a few known-unusable shapes
      (`:max-tokens` outside `:llm`, a model id with no `provider/` prefix, a url
      that is not a url) are flagged.
@@ -38,7 +38,7 @@
   [{:id "bash"
     :names ["bash"] :version ["--version"] :required? true
     :capability "MCP servers are spawned as `bash -lc \"cd ... && java ... --server <id>\"`"
-    :hint {:windows "scoop install git   (Git for Windows ships bash.exe)"
+    :hint {:windows "scoop install git;  scoop shim add bash \"$(scoop prefix git)\\bin\\bash.exe\"  (scoop does not shim bash itself)"
            :posix   "apt install bash  |  dnf install bash"}}
    {:id "java" :names ["java"] :version ["-version"] :required? true
     :capability "runs grog-spine.jar and the grog-mcp tool jar"
@@ -136,8 +136,7 @@
         same? (= (.getPath home) (.getPath legacy))]
     (cond-> [[:classpath (some-> (io/resource "grog.edn") str)]
              [:home (.getPath home)]]
-      (not same?) (conj [:legacy (.getPath legacy)])
-      true        (conj [:cwd "grog.edn"]))))
+      (not same?) (conj [:legacy (.getPath legacy)]))))
 
 (defn- parse-file
   "Parse one EDN file for real (NOT the silent loader): a broken file must be

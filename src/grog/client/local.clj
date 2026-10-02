@@ -83,8 +83,19 @@
             (line! state (str "[grog] resending as a prompt: " s))
             (reset! last-sent (str s))
             (.put ^LinkedBlockingQueue queue (str s)))})
+        ;; `config-stamp` as of the last successful connect (see connect-fn!)
+        cfg-stamp (atom -1)
         connect-fn!
         (fn []
+          ;; The ECA child — and every MCP server under it — bakes its config in
+          ;; at startup; editing odoo-instances.edn (or similar) cannot reach a
+          ;; running one. If those files moved since we connected, stop ECA so
+          ;; the code below respawns it. Without this the session silently keeps
+          ;; serving the OLD config, stale tool surface included.
+          (when (and @connected (> (ecacfg/config-stamp) @cfg-stamp))
+            (dbg! "startup config changed since ECA started -> restarting ECA")
+            (try (eca/disconnect! id) (catch Throwable _ nil))
+            (reset! connected false))
           (when-not @connected
             (try
               (let [cfg (ecacfg/generate-config! (ecacfg/default-eca-config-path)
@@ -105,6 +116,7 @@
                                        :trace-fn trace-fn)]
                 (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
               (reset! connected true)
+              (reset! cfg-stamp (ecacfg/config-stamp))
               (catch Throwable e
                 (line! state (str "[grog] ECA connect failed: " (.getMessage e)))
                 (reset! running? false)))))
@@ -173,19 +185,32 @@
           (cancel/cancel!)
           (reset! running? false))
         set-model-fn
-        (fn [nm]
+        (fn [nm source]
           (let [mid (models/qualify-eca-model nm
-                                              nil
-                                              (try (config/llm-url) (catch Exception _ nil)))]
+                                              source
+                                              (try (config/llm-url) (catch Exception _ nil)))
+                ;; Persisting is best-effort: a read-only / unwritable config
+                ;; home (packaged AppImage, per-machine install) must NOT stop
+                ;; the LIVE switch. It used to throw here — before the UI event
+                ;; below — so the model looked like it never changed and the
+                ;; only clue was a "Read-only file system" error.
+                save-err (when mid
+                           (try (models/save-eca-model! mid) nil
+                                (catch Throwable e (.getMessage e))))]
             (when (and @connected mid)
               (eca/selected-model! id mid {:chatId @(:chat-id state)}))
             (reset! (:model state) mid)
-            (when mid (models/save-eca-model! mid))
-            (config/reload!)
+            (try (config/reload!) (catch Throwable _ nil))
             ;; the view reacts to this event to update the footer + status line
             (chat/publish! state {:type :model
                                   :value mid
-                                  :text (str "model: " mid)})))
+                                  :text (str "model: " mid)})
+            (when save-err
+              (line! state (str "model switched for this session, but could not be saved: "
+                                save-err)))))
+        ;; slash-command seam: /eca-model has no transport, so it qualifies with
+        ;; source=nil (the url/config heuristics decide).
+        set-model-1 (fn [nm] (set-model-fn nm nil))
         set-trust-fn
         (fn [on?]
           (let [next (if (nil? on?) (not @(:trust state)) on?)]
@@ -216,7 +241,7 @@
     ;; routing; :console/:quit! are the view-provided seams
     (.start (chat/chat-worker! state queue
                                {:send send-fn
-                                :set-model! set-model-fn
+                                :set-model! set-model-1
                                 :set-yolo! set-trust-fn
                                 :console console
                                 :quit! quit!}))
@@ -256,7 +281,8 @@
     ;; tolerant: a tab closed (or a duplicate click) must never blow up a turn
     (when-let [s (get @!sessions id)]
       (chat/answer-approval! (:state s) approval-id decision)))
-  (set-model! [_ id model] ((:set-model! (sess id)) model))
+  (set-model! [_ id model] ((:set-model! (sess id)) model nil))
+  (set-model! [_ id model source] ((:set-model! (sess id)) model source))
   (set-trust! [_ id on?] ((:set-trust! (sess id)) on?))
   (subscribe! [_ id f] (chat/subscribe! (:state (sess id)) f))
   (unsubscribe! [_ id f] (chat/unsubscribe! (:state (sess id)) f)))

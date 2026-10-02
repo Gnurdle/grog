@@ -13,12 +13,16 @@
   Config is file-based: ~/.config/grog/gitlab.edn
     {:config \"~/.config/grog/gitlab-instances.edn\"}  → load an instances file
     {:url ... :token-file ...}                          → single \"default\" instance
-    {:url ... :token \"${GROG_GITLAB_TOKEN}\"}          → token injected per-process
 
-  The token is resolved per instance as: an explicit `:token` (env-interpolated,
-  e.g. `${GROG_GITLAB_TOKEN}` — preferred; grog injects it from the OS keyring
-  via `/secret set GITLAB_TOKEN <value>`) first, else the legacy `:token-file`
-  (slurped). Tokens NEVER appear in tool output or in source.
+  The token is resolved per instance as:
+    1. an explicit `:token` (a literal, or `${ENV}`-interpolated);
+    2. the OS KEYRING, account `GITLAB_TOKEN` (`/secret set GITLAB_TOKEN <value>`)
+       — the normal path, read by THIS SERVER, so the token never enters an env
+       var or a config file. (grog used to inject it as `GROG_GITLAB_TOKEN`, but
+       everything in the MCP child's env is written verbatim into the generated
+       ECA config, so the token ended up on disk in plaintext.)
+    3. the legacy `:token-file` (slurped).
+  Tokens NEVER appear in tool output or in source.
 
   where the instances file is EDN:
 
@@ -33,7 +37,8 @@
   ${ENV} / ${ENV:-default} interpolation inside the instances file is honored.
 
   Auth is PRIVATE-TOKEN (resolved per instance — see above). Every tool is
-  read-only. A model sees the tools as `grog-gitlab__<tool>`."
+  read-only. A model sees the tools as `grog-mcp__<tool>` (the single grog-mcp
+  process serves every server's tools)."
 
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
@@ -42,6 +47,7 @@
             [clj-http.client :as http])
   (:import [java.io File]
            [java.net URLEncoder]
+           [com.github.javakeyring BackendNotSupportedException Keyring PasswordAccessException]
            [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
            [io.modelcontextprotocol.server McpServer]
            [io.modelcontextprotocol.server McpServerFeatures$AsyncToolSpecification]
@@ -169,18 +175,63 @@
     (or (get by-name name)
         (throw (ex-info "No GitLab instance selected — call gitlab_use_instance first" {})))))
 
+;; --- the token comes from the OS keyring -------------------------------------
+;; Read HERE, not injected by grog as an env var. An env var is written into the
+;; generated ECA config (`~/.config/grog/sessions/<project>.json`), so the token
+;; would sit on disk in plaintext; `/secret set GITLAB_TOKEN <value>` keeps it in
+;; the OS store only. Same shape as grog-search's Brave key.
+(def ^:private service-id "grog")
+(def ^:private gitlab-token-account "GITLAB_TOKEN")
+
+;; Keyring/create can block forever without a working Secret Service / D-Bus
+;; (headless session, SSH). Time-bound the read so a hung OS backend cannot
+;; freeze the server's first tool call.
+(defonce ^:private !keyring-unreachable (atom false))
+
+(defn- fetch-secret-blocking! ^String [^String account]
+  (with-open [^Keyring kr (Keyring/create)]
+    (try
+      (let [^String p (.getPassword kr service-id account)]
+        (some-> p str str/trim not-empty))
+      (catch PasswordAccessException _ nil))))
+
+(defn- keyring-token
+  "The GitLab token from the OS keyring (service \"grog\", account
+  `GITLAB_TOKEN` — `/secret set GITLAB_TOKEN <value>`), or nil."
+  ^String []
+  (when-not @!keyring-unreachable
+    (try
+      (let [f (future
+                (try
+                  (fetch-secret-blocking! gitlab-token-account)
+                  (catch BackendNotSupportedException _ ::unsupported)
+                  (catch Exception _ ::error)))
+            v (deref f 4000 ::timeout)]
+        (cond
+          (= ::timeout v)
+          (do (reset! !keyring-unreachable true)
+              (binding [*out* *err*]
+                (println "grog-gitlab: OS keyring did not respond within 4s; secret reads disabled for this process."))
+              nil)
+          (or (= ::unsupported v) (= ::error v)) nil
+          :else v))
+      (catch Exception _ nil))))
+
 (defn- instance-token
-  "Resolve the auth token for `inst`: an explicit `:token` (env-interpolated,
-  e.g. `${GROG_GITLAB_TOKEN}` — injected by grog from the OS keyring) wins;
-  otherwise fall back to the legacy `:token-file` (slurped)."
+  "Resolve the auth token for `inst`, in order:
+    1. an explicit `:token` (a literal, or `${ENV}`-interpolated);
+    2. the OS keyring, account `GITLAB_TOKEN` — the normal path, and the only one
+       that keeps the token out of every config file;
+    3. the legacy `:token-file` (slurped)."
   [inst]
   (let [t (str/trim (or (:token inst) ""))]
     (if-not (str/blank? t)
       t
-      (if-let [tf (:token-file inst)]
-        (try (str/trim (slurp (expand-home (str tf))))
-             (catch Exception _ ""))
-        ""))))
+      (or (keyring-token)
+          (if-let [tf (:token-file inst)]
+            (try (str/trim (slurp (expand-home (str tf))))
+                 (catch Exception _ ""))
+            "")))))
 
 (defn- instance-auth!
   "Resolve the auth for `inst` lazily (cached) and return {:url :token}. The raw
@@ -468,8 +519,14 @@
   "Build the full tool list. Reads the current config once so the instance enum
   reflects exactly the pre-configured instances. Prepends the two selection tools
   (list/use) then the 15 per-instance resource tools, all of which route through
-  the active instance."
+  the active instance.
+
+  Loads the config HERE if nothing has: the bundle (`grog_mcp.main`) calls this
+  fn directly and never runs this server's `-main`/`mcp-server`, its only other
+  `load-config!` caller — so under the bundle the tools would come back with an
+  empty instance list."
   []
+  (when (nil? @config*) (load-config!))
   (let [{:keys [instances by-name]} @config*
         instance-names (mapv :name instances)
         instance-summaries (mapv (fn [i] {:name (:name i) :url (:url i)}) instances)]

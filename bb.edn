@@ -1,12 +1,81 @@
 {:tasks
- {:requires ([babashka.fs :as fs])
+ {:requires ([babashka.fs :as fs]
+             [clojure.string :as str])
+
+  ;; NOTE: there is no `sync-vendor` task any more. The bundle used to build
+  ;; from grog_mcp/vendor-src — a COPY of each grog-<x>/src tree — which drifted
+  ;; silently (grog-big and grog-gitlab once shipped stale code from the jar).
+  ;; grog_mcp now depends on the sibling projects directly with `:local/root`
+  ;; (see grog_mcp/deps.edn), so its classpath always points at the LIVE
+  ;; sources: nothing to copy, nothing to keep in sync.
 
   ;; Args are forwarded: `bb dist --target windows --no-package`.
-  dist      {:doc "Build the shippable grog: jars + renderer + a user-runnable bundle (.tar.gz and .zip) in dist/ (+ installers when electron-builder is installed). One version from ./VERSION. Flags: --target windows|linux, --skip-jars, --skip-web, --no-package, --version X.Y.Z."
+  dist      {:doc "Build the shippable grog: jars + renderer + the installer (one artifact: clients/web/dist/grog-<v>-setup.exe). Its three build JOBS (mcp jar, spine jar, renderer) are independent and run IN PARALLEL — not to be confused with --target, which picks the OS to package for. One version from ./VERSION. Flags: --target windows|linux, --skip-jars, --skip-web, --serial (one at a time — use on a RAM-starved machine), --no-package, --bundle (also write the portable .tar.gz/.zip), --version X.Y.Z."
              :task (apply shell "bb" "scripts/build_dist.clj" *command-line-args*)}
 
   dist:fast {:doc "Same as `dist` but reuse the already-built jars (--skip-jars)."
              :task (shell "bb scripts/build_dist.clj" "--skip-jars")}
+
+  ;; Full release: everything a shippable drop needs, in one command.
+  ;;   [1] rebuild BOTH jars and the renderer — done ONCE, with --no-package,
+  ;;       because the jars and the renderer bundle are shared by the two
+  ;;       installers (only the installer differs).
+  ;;   [2] Windows NSIS installer   (cross-built here; needs Wine — see below)
+  ;;   [3] Linux AppImage
+  ;; On Linux, the Windows step needs Wine: electron-builder runs the
+  ;; intermediate installer under it to extract the uninstaller, and rcedit to
+  ;; stamp the exe icon + version metadata.
+  release
+  {:doc "Full release: rebuild BOTH jars + renderer, then the Windows NSIS and Linux AppImage installers. Version from ./VERSION (or: bb release --version X.Y.Z)."
+   :task
+   (let [args *command-line-args*
+         i    (first (keep-indexed (fn [idx a] (when (= "--version" a) idx)) args))
+         ver  (when (and i (< (inc i) (count args))) ["--version" (nth args (inc i))])
+         step (fn [n msg & argv]
+                (println (str "\n==> [" n "] " msg))
+                (apply shell "bb" "scripts/build_dist.clj" (concat ver argv)))]
+     (step "1/3" "jars + renderer (no packaging)" "--no-package")
+     (step "2/3" "WINDOWS installer (NSIS)" "--target" "windows" "--skip-jars" "--skip-web")
+     (step "3/3" "LINUX installer (AppImage)" "--target" "linux" "--skip-jars" "--skip-web")
+     (println "\n==> release done — artifacts in clients/web/dist/"))}
+
+  ;; `bb dev` — run grog straight out of this dev tree, on Windows and Linux
+  ;; alike, with EVERYTHING Clojure compiled from .clj source at launch:
+  ;;   * the spine:     clojure -M -m grog.server       (GROG_SPINE_CMD/ARGS)
+  ;;   * MCP servers:   clojure -M:mcp --server <id>    (GROG_MCP_SOURCE=1)
+  ;;                    -> the bundle's OWN alias, compiled on the fly. No jar.
+  ;; The bundle's classpath is the LIVE sibling projects (`:local/root` in
+  ;; grog_mcp/deps.edn), so a server edit is picked up with no sync step.
+  ;; The RENDERER is not live: build it once with `npm run build` first, or use
+  ;; `npm run dev` (the CLJS watch + dev server) when you are editing cljs.
+  dev
+  {:doc "Run grog from this dev tree with all Clojure compiled from source at launch (Windows + Linux). Needs the renderer built once: cd clients/web && npm run build."
+   :task
+   (do
+     (let [root (System/getProperty "user.dir")
+         web  (fs/file root "clients" "web")
+         elec (fs/file web "node_modules" "electron" "dist"
+                       (if (fs/windows?) "electron.exe" "electron"))]
+     (when-not (fs/exists? elec)
+       (println "electron not installed — run:  cd clients/web && npm install")
+       (println "  Already installed? Check NODE_ENV — npm SKIPS devDependencies")
+       (println "  (electron, shadow-cljs, tailwind) when NODE_ENV=production.")
+       (println "  So:  unset NODE_ENV   (cmd: set NODE_ENV=)   then npm install")
+       (System/exit 1))
+     (when-not (fs/exists? (fs/file web "resources" "public" "js" "main.js"))
+       (println "renderer bundle missing — run:  cd clients/web && npm run build")
+       (System/exit 1))
+     (println "grog dev: spine + MCP servers compiled from source")
+     (println "          electron:" (str elec))
+     (let [pb  (ProcessBuilder. [(str elec) "."])
+           ;; `web` is already a java.io.File (fs/file), not a Path.
+           env (.environment (doto pb (.directory web)))]
+       (.put env "NODE_ENV" "production")          ; load the built bundle, not the dev server
+       (.put env "GROG_SPINE_CMD" "clojure")
+       (.put env "GROG_SPINE_ARGS" "-M -m grog.server")
+       (.put env "GROG_MCP_SOURCE" "1")
+       (.inheritIO pb)
+       (.waitFor (.start pb))))) }
 
   ;; doctor runs from the spine jar (java + the jar), NOT from `clojure` - a
   ;; machine that runs grog has a JRE and the jar, and is not expected to have a
