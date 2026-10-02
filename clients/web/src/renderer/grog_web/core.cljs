@@ -288,6 +288,22 @@
         sid (update-in [:sessions sid :transcript]
                        (fnil conj []) {:kind :line :text (str text)})))))
 
+(def ^:private model-output-types
+  "ECA content types that mean the MODEL has started producing output — the
+  moment a turn stops being 'waiting on the model' and becomes 'streaming'.
+  `usage`/`progress`/`metadata`/lifecycle chatter do not count."
+  #{"text" "thinking" "reasonText" "toolCalled" "toolCallRun"})
+
+(defn- set-running
+  "Set a session's busy flag, keeping `:waiting?` consistent with it: a NEW turn
+  (false -> true) begins in the waiting state, and any end of turn clears it."
+  [db sid on?]
+  (let [on? (boolean on?)
+        was? (boolean (get-in db [:sessions sid :running?]))]
+    (cond-> (assoc-in db [:sessions sid :running?] on?)
+      (and on? (not was?)) (assoc-in [:sessions sid :waiting?] true)
+      (not on?)            (assoc-in [:sessions sid :waiting?] false))))
+
 (rf/reg-event-db :ev
   (fn [db [_ wire]]
     (let [sid  (:sessionId wire)
@@ -296,13 +312,21 @@
       (cond
         (= :content kind)
         (let [c (:content ev)
-              db2 (append-segment db sid (line-of c))]
+              db2 (append-segment db sid (line-of c))
+              ;; output is flowing now, so it is no longer "waiting on the model"
+              db2 (cond-> db2
+                    (contains? model-output-types (str (:type c)))
+                    (assoc-in [:sessions sid :waiting?] false))]
           (if (= "usage" (:type c))
             (assoc-in db2 [:sessions sid :usage] c)
             db2))
         (= :user kind)     (append-segment db sid {:kind :user :text (str (:text ev))})
         (= :line kind)     (append-segment db sid {:kind :line :text (str (:text ev))})
-        (= :status kind)   (assoc-in db [:sessions sid :status] (str (:value ev)))
+        (= :status kind)   (let [v (str (:value ev))]
+                             ;; ECA's own "idle" is the turn-finished signal
+                             (cond-> (assoc-in db [:sessions sid :status] v)
+                               (= "idle" v) (set-running sid false)))
+        (= :running kind)  (set-running db sid (boolean (:value ev)))
         (= :trust kind)    (assoc-in db [:sessions sid :trust] (boolean (:value ev)))
         (= :model kind)    (assoc-in db [:sessions sid :model] (:value ev))
         (= :clear kind)    (assoc-in db [:sessions sid :transcript] [])
@@ -314,7 +338,7 @@
         :else db))))
 
 (rf/reg-event-db :running
-  (fn [db [_ sid on?]] (assoc-in db [:sessions sid :running?] (boolean on?))))
+  (fn [db [_ sid on?]] (set-running db sid on?)))
 
 ;; keyboard
 (rf/reg-event-db :jump
@@ -670,18 +694,29 @@
         pending @(rf/subscribe [:pending-questions]) sessions @(rf/subscribe [:sessions])]
     [:div {:class "flex items-center gap-1 px-2 pt-2 bg-slate-900/70 border-b border-slate-700"}
      (for [id order]
-       (let [pend? (contains? pending id) running? (get-in sessions [id :running?])]
+       (let [pend? (contains? pending id)
+             running? (get-in sessions [id :running?])
+             waiting? (get-in sessions [id :waiting?])
+             ;; four distinct states, so "is it working, and on what?" is
+             ;; readable at a glance: idle is a static dot, nothing else is.
+             state (cond pend? :question waiting? :waiting running? :streaming :else :idle)]
          ^{:key id}
          [:div {:on-click #(rf/dispatch [:select-tab id])
-                :title (when pend? "Question pending — dialog appears when this tab is selected and the window is focused")
+                :title (cond pend? "Question pending — dialog appears when this tab is selected and the window is focused"
+                             waiting? "Waiting on the model…"
+                             running? "Streaming"
+                             :else "Idle")
                 :class (str "group flex items-center gap-2 px-3 py-2 rounded-t-md text-sm cursor-pointer "
                             (if pend? "bg-amber-500/10 border border-amber-500/40 border-b-0 text-amber-200"
                                 (if (= id active) "bg-sky-500/15 border border-sky-500/40 border-b-0 text-sky-200"
                                     "text-slate-400 hover:bg-slate-800")))}
           [:span {:class (str "w-2 h-2 rounded-full "
-                              (cond pend? "bg-amber-400 animate-pulse"
-                                    running? "bg-sky-400 animate-pulse"
-                                    :else "bg-emerald-400"))}]
+                              (case state
+                                :question  "bg-amber-400 animate-pulse"
+                                ;; violet = sent, but no output yet
+                                :waiting   "bg-fuchsia-400 animate-pulse"
+                                :streaming "bg-sky-400 animate-pulse"
+                                "bg-emerald-500/50"))}]
           (get-in sessions [id :project])
           (when pend? [:span {:class "px-1 rounded bg-amber-500/20 text-[0.64rem] text-amber-300"} "?"])
           [:span {:class "ml-1 opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-300"
@@ -757,7 +792,10 @@
       (if connected? "server attached" "server unreachable")]
      (when sess [:span (str "model: " (or (:model sess) "?"))])
      (when-let [u (:usage sess)] [:span (str (:sessionTokens u) " tok · $" (:sessionCost u))])
-     (when sess [:span (if (:running? sess) "● streaming" "idle")])
+     (when sess
+       (let [r? (:running? sess) w? (:waiting? sess)]
+         [:span {:class (cond w? "text-fuchsia-300" r? "text-sky-300" :else "text-slate-500")}
+          (cond w? "◌ waiting on model…" r? "● streaming" :else "idle")]))
      (when sess [:span (if (:trust sess) "YOLO ON" "trust off")])
      (when (seq pending)
        [:span {:class "px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40"}

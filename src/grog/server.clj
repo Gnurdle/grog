@@ -69,6 +69,10 @@
                                         rule (a missing client can't hang a turn)
     models   {:source .. :models [..]}  a background model-catalogue refresh
                                         completing (see `models` above)
+    running  {:sessionId .. :value ..}  a turn STARTED or FINISHED. The server
+                                        owns the turn lifecycle; clients use
+                                        this for the busy indicator (tab dot /
+                                        status bar) instead of inferring it.
 
   stdout is the RPC channel in stdio mode: on startup the Clojure process
   streams are redirected to stderr so no stray println can corrupt the stream.

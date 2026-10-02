@@ -61,7 +61,11 @@ role colours while the shell keeps the slate/Tailwind skin.
   `Ctrl+Enter` submits; drag-and-drop text in/out (web: paste + file drop).
 - **Toolbar**: Send · Stop · Mic (voice) · Terminal · Settings · Export ·
   Open-as-HTML · Clear · project button (project manager).
-- **Status bar**: model · status (idle/streaming dot) · trust/YOLO · tokens+cost.
+- **Status bar**: model · status · trust/YOLO · tokens+cost. Status is one of
+  **idle** / **waiting on model…** (violet) / **● streaming** (sky), driven by the
+  server's `running` event plus whether model output has started. The tab dot
+  carries the same four states (amber = question pending, violet = waiting,
+  sky = streaming, dim green = idle), and only the busy ones pulse.
 
 ### 3.3 Behaviour
 - **Turn model**: idle → queue prompt; running → **steer** (with resend-if-dropped);

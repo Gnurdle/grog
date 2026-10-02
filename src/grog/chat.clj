@@ -45,6 +45,8 @@
 ;; Session state
 ;; ---------------------------------------------------------------------------
 
+(declare watch!)
+
 (defn make-state
   "All mutable state for one chat, as a plain map of atoms.
 
@@ -61,23 +63,31 @@
   The core calls it `:trust`; `build-session!` keeps the local name `yolo-ref`
   so its downstream references don't churn."
   [{:keys [project chat-id model]}]
-  {:project   (some-> project str)
-   :chat-id   (atom chat-id)
-   :status    (atom "idle")
-   :model     (atom model)
-   :trust     (atom false)
-   :usage     (atom {:turn-tokens 0 :turn-cost 0.0
-                     :session-tokens 0 :session-cost nil})
-   :connected (atom false)
-   :running?  (atom false)
-   :history   (atom [])
-   :last-sent (atom nil)
-   :pending-steer (atom nil)
-   ;; Pending tool-approval promises, keyed by ECA tool-call id. See
-   ;; `answer-approval!` — the core blocks here, a client answers.
-   :approvals (atom {})
-   ;; subscribers to this chat's event stream
-   :subs      (atom #{})})
+  (let [st {:project   (some-> project str)
+            :chat-id   (atom chat-id)
+            :status    (atom "idle")
+            :model     (atom model)
+            :trust     (atom false)
+            :usage     (atom {:turn-tokens 0 :turn-cost 0.0
+                              :session-tokens 0 :session-cost nil})
+            :connected (atom false)
+            :running?  (atom false)
+            :history   (atom [])
+            :last-sent (atom nil)
+            :pending-steer (atom nil)
+            ;; Pending tool-approval promises, keyed by ECA tool-call id. See
+            ;; `answer-approval!` — the core blocks here, a client answers.
+            :approvals (atom {})
+            ;; subscribers to this chat's event stream
+            :subs      (atom #{})}]
+    ;; `running?` drives every client's busy indicator (the tab dot and the
+    ;; status bar). The server owns the turn lifecycle — it is set when a prompt
+    ;; is queued and cleared when the turn finishes — so bridge it into the
+    ;; event stream. Without this a client that optimistically marks itself busy
+    ;; on send never learns the turn ended: the dot pulsed forever, the status
+    ;; bar sat on "streaming", and the toolbar's Stop button stayed enabled.
+    (watch! st (:running? st) :running)
+    st))
 
 (defn snapshot
   "Dereference the state to plain data — the read-only view a status bar or a
@@ -170,10 +180,17 @@
   This is how `:status`/`:model`/`:trust`/`:usage` become observable without
   threading callbacks through every call site — the atoms stay where they are
   and the stream does the broadcasting. Returns the watch key so the caller can
-  `unwatch!` it when the chat closes."
+  `unwatch!` it when the chat closes.
+
+  Only real changes are published: `reset!` notifies watches even when the value
+  is unchanged, and re-announcing the same value would put pointless traffic on
+  the wire (an ECA `idle` status, say, arrives more than once a turn)."
   [state ref type-kw]
   (let [k (keyword (str "grog.chat." (name type-kw)))]
-    (add-watch ref k (fn [_ _ _ nv] (publish! state {:type type-kw :value nv})))
+    (add-watch ref k
+               (fn [_ _ old new]
+                 (when (not= old new)
+                   (publish! state {:type type-kw :value new}))))
     k))
 
 (defn unwatch!
