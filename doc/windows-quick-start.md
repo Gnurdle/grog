@@ -271,31 +271,33 @@ module** (no `clojure.exe`/`.cmd` anywhere on `PATH`), so PowerShell can run
 process can execute. (Already installed the old one? `scoop uninstall clojure`
 first.)
 
-Also once, so the packaging step can unpack electron-builder's `winCodeSign`
-(its archive holds macOS symlinks, which 7-Zip can only create with the symlink
-privilege): turn on **Developer Mode** — Settings → System → For developers.
-Without it the build dies mid-packaging with `Cannot create symbolic link : A
-required privilege is not held by the client`.
-
-then, per release:
+then refine from the repo, and run one command:
 
 ```cmd
-git clone <remote> %USERPROFILE%\grog
 cd %USERPROFILE%\grog
 bb dist --target windows
 ```
 
-That builds both jars, the interface, the portable bundle, and
+That is the whole build. It installs the interface's npm packages if they are
+missing, builds both jars and the renderer, handles electron-builder's
+`winCodeSign` prerequisites itself (no Developer Mode or elevation required),
+and finishes by printing the one artifact to ship:
 
 ```
-clients\web\dist\grog-0.1.0-setup.exe
+ARTIFACT: C:\Users\<you>\grog\clients\web\dist\grog-0.1.0-setup.exe
 ```
 
-— the file you hand to anyone else. It is per-user (no administrator prompt),
-installs to `%LOCALAPPDATA%\Programs\grog`, adds Desktop and Start Menu
-shortcuts, embeds both jars, and **installs the prerequisites for the user**
-(§1) as part of the install. Set `GROG_SKIP_PREREQS=1` to skip that step for an
-unattended install.
+Copy that single `.exe` to the target machine and run it — the installer lays
+grog down and installs its prerequisites (Java, Git/bash, ECA) in one step.
+Nothing else to copy, nothing to set up by hand.
+
+`bb dist --bundle` also writes the portable `.tar.gz`/`.zip` under `dist/`; that
+is a developer convenience, not part of the shipping path.
+
+The installer is per-user (no administrator prompt), installs to
+`%LOCALAPPDATA%\Programs\grog`, adds Desktop and Start Menu shortcuts, embeds
+both jars, and **installs the prerequisites for the user** (§1) as part of the
+install. Set `GROG_SKIP_PREREQS=1` to skip that step for an unattended install.
 
 Doing this from Linux also works, but electron-builder reaches for Wine just to
 generate the uninstaller — an extra host dependency for a Windows-shaped

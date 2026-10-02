@@ -28,8 +28,6 @@ grog_mcp/*.db
 .cpcache/
 
 # Client build output and downloaded packages — never commit these.
-# NOTE: clients/web/build/ is deliberately NOT ignored: it holds the app icons
-# (icon.png / icon.ico) that electron-builder and the desktop installers read.
 node_modules/
 dist/
 *.tar.gz

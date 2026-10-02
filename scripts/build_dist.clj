@@ -17,8 +17,10 @@
 ;;
 ;; Nothing here is on a timer: all updates are manual (E5).
 (ns build-dist
-  (:require [babashka.fs :as fs]
+  (:require [babashka.curl :as curl]
+            [babashka.fs :as fs]
             [babashka.process :as p]
+            [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (def root (str (fs/canonicalize ".")))
@@ -238,25 +240,58 @@
     (say "dist dir:" (str out))
     out))
 
-(defn- can-create-symlinks?
-  "Empirically probe whether a symlink can be created here.
+(def ^:private win-code-sign-url
+  "https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z")
 
-  electron-builder downloads `winCodeSign`, whose archive contains macOS
-  symlinks. 7za cannot recreate them without SeCreateSymbolicLinkPrivilege, so
-  the extraction (and therefore the whole build) fails with 'A required
-  privilege is not held by the client'. That privilege belongs to Administrators
-  and, since Windows 10 1703, to any account with Developer Mode enabled."
+(defn- seven-zip
+  "The 7-Zip we ship with (a dependency of electron-builder), for `host` OS."
+  [host-windows?]
+  (fs/file root "clients/web/node_modules/7zip-bin"
+           (if host-windows? "win" "linux") "x64"
+           (if host-windows? "7za.exe" "7za")))
+
+(defn- ensure-win-code-sign-cache!
+  "Seed the electron-builder `winCodeSign` cache ourselves, minus the macOS tree.
+
+  Why this exists: electron-builder unpacks that archive with 7za, but it
+  contains two macOS SYMLINKS (darwin/10.12/lib/libcrypto.dylib and
+  libssl.dylib). Creating symlinks needs SeCreateSymbolicLinkPrivilege, which an
+  ordinary account does not hold, so extraction fails with 'A required privilege
+  is not held by the client' - and electron-builder retries four times before
+  dying. That must never be the operator's problem to solve by hand.
+
+  The macOS payload is irrelevant on Windows: what a Windows build needs from
+  this archive is rcedit-x64.exe (icon + version stamping) and
+  windows-10/x64/signtool.exe. So we fetch the archive and unpack it ourselves
+  with `-xr!darwin`, straight into the cache directory electron-builder reads.
+  It then skips its own download AND extraction entirely (verified)."
   []
   (when windows?
-    (let [d (fs/create-temp-dir {:prefix "grog-symlink-probe"})]
-      (try
-        (let [target (fs/file d "target")
-              link (fs/file d "link")]
-          (spit (str target) "x")
-          (fs/create-sym-link link target)
-          true)
-        (catch Exception _ false)
-        (finally (fs/delete-tree d))))))
+    (let [cache (fs/file (System/getenv "LOCALAPPDATA")
+                         "electron-builder" "Cache" "winCodeSign" "winCodeSign-2.6.0")]
+      (if (fs/exists? (fs/file cache "rcedit-x64.exe"))
+        (say "winCodeSign cache already seeded")
+        (do
+          (say "seeding the winCodeSign cache (macOS symlinks excluded)")
+          (let [seven-z (seven-zip windows?)]
+            (when-not (fs/exists? seven-z)
+              (die "7zip-bin is missing - run: cd clients/web && npm install"))
+            (let [tmp (fs/create-temp-dir)
+                  archive (fs/file tmp "winCodeSign-2.6.0.7z")]
+              (try
+                (let [r (curl/get win-code-sign-url {:as :stream})]
+                  (when-not (= 200 (:status r))
+                    (die (str "could not download winCodeSign (" (:status r) ")")))
+                  (with-open [in (:body r) out (io/output-stream (str archive))]
+                    (io/copy in out)))
+                (fs/create-dirs cache)
+                ;; -xr!darwin drops the only symlinked entries, so nothing here
+                ;; ever asks Windows for a privilege we do not have.
+                (sh! tmp (str seven-z) "x" "-bd" "-y" (str archive)
+                     (str "-o" cache) "-xr!darwin")
+                (finally (fs/delete-tree tmp))))
+            (when-not (fs/exists? (fs/file cache "rcedit-x64.exe"))
+              (die "winCodeSign cache seeding produced no rcedit - cannot package"))))))))
 
 (defn package! [{:keys [version for-os]}]
   (let [web (fs/file root "clients/web")
@@ -275,18 +310,11 @@
                         cross? (into ["-c.win.signAndEditExecutable=false"]))]
             (when cross?
               (say "cross-building for windows: disabling exe signing/editing (no Wine needed)"))
-            ;; Native Windows build: check the symlink privilege up front. It is
-            ;; needed to unpack winCodeSign, and without it electron-builder
-            ;; burns four download+extract attempts before dying with a
-            ;; confusing 7-Zip error.
+            ;; Native Windows build: make the winCodeSign cache usable up front.
+            ;; electron-builder cannot unpack it on an ordinary account (macOS
+            ;; symlinks) and would otherwise burn four retries before failing.
             (when (and (= "windows" for-os) (not cross?))
-              (when-not (can-create-symlinks?)
-                (die (str "cannot create symlinks as this account - electron-builder"
-                          " cannot unpack winCodeSign.\n"
-                          "  fix: enable Developer Mode (Settings > System > For developers),"
-                          " or run the build from an elevated shell.\n"
-                          "  Developer Mode grants SeCreateSymbolicLinkPrivilege"
-                          " (no reboot needed)."))))
+              (ensure-win-code-sign-cache!))
             (apply sh! web (str eb) "--publish" "never"
                    (str "-c.extraMetadata.version=" version) extra)))
       (do (say "electron-builder NOT installed in clients/web - skipping installers.")
@@ -306,9 +334,27 @@
               "  building on " (os-tag) "/" (arch-tag)
               "  for " for-os "/" (arch-tag)))
     (build! opts)
-    (assemble! opts)
+    ;; The deliverable is the INSTALLER (one artifact: grog-<v>-setup.exe). The
+    ;; portable tarball/zip are a developer convenience only, so they are
+    ;; opt-in via --bundle rather than part of the shipping path.
+    (when (some #{"--bundle"} args) (assemble! opts))
     (when-not (some #{"--no-package"} args) (package! opts))
-    (say "done.")))
+    ;; Report the artifact that was actually produced rather than predicting a
+    ;; name: electron-builder's ${arch} for AppImage is x86_64, not x64.
+    (let [dist (fs/file root "clients/web/dist")
+          artifact (->> (when (fs/directory? dist) (fs/list-dir dist))
+                        (filter #(re-matches
+                                   (re-pattern
+                                     (str "grog-" (java.util.regex.Pattern/quote version)
+                                          ".*\\.(exe|AppImage|deb)$"))
+                                   (str (fs/file-name %))))
+                        (sort-by #(fs/last-modified-time %) #(compare %2 %1))
+                        first)]
+      (if artifact
+        (do (say "")
+            (say "ARTIFACT:" (str artifact))
+            (say "  copy that one file to the target and run it"))
+        (say "done.")))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))

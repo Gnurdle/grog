@@ -23,8 +23,8 @@
     , { "from": "../../grog_mcp/target", "to": "jars", "filter": ["grog-mcp-*.jar"] }
     , { "from": "../../scripts/prereqs.ps1", "to": "setup/prereqs.ps1" }
     ]
-  , "icon": "build/icon"
-  , "win": { "target": ["nsis"], "icon": "build/icon.ico"
+  , "icon": "assets/icon"
+  , "win": { "target": ["nsis"], "icon": "assets/icon.ico"
            , "artifactName": "grog-${version}-setup.${ext}" }
   , "nsis":
     { "oneClick": false
@@ -33,11 +33,11 @@
     , "createDesktopShortcut": true
     , "createStartMenuShortcut": true
     , "shortcutName": "grog"
-    , "include": "build/installer.nsh"
+    , "include": "../../scripts/installer.nsh"
     }
   , "linux":
     { "target": ["AppImage", "tar.gz"]
-    , "icon": "build/icon.png"
+    , "icon": "assets/icon.png"
     , "category": "Development"
     , "artifactName": "grog-${version}-${arch}.${ext}"
     , "desktop": { "Name": "grog", "StartupWMClass": "grog" }
