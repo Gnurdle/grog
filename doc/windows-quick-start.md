@@ -20,6 +20,10 @@ starts the tool servers. Closing the window stops all of them.
 
 ## 1. Install the prerequisites
 
+**Installing with the installer? Skip this section** — it runs all of it for you
+(see §2). Do it by hand only for an unpacked copy, or if you want to control the
+toolchain yourself.
+
 grog needs a Java runtime, a bash shell and ECA. Node.js is needed to run the
 app from a bundle; the remaining tools are optional.
 
@@ -90,27 +94,40 @@ installed, `grog doctor` lists every tool, its version, and what it unlocks.
 
 ## 2. Install grog
 
-Extract the bundle where you want it to live. Windows ships `tar` from libarchive
-(bsdtar), so it reads the `.zip` as happily as a `.tar.gz`:
+Run `grog-<version>-setup.exe` and follow the prompts. It is a **per-user**
+install — no administrator prompt — it puts **grog** on the Desktop and in the
+Start Menu with its icon, and it carries the backend, the tool bundle and the
+interface with it. Nothing else to fetch.
+
+Then start grog from the Start Menu.
+
+### Portable, instead of installed
+
+The bundle is also self-contained apart from the app runtime, so it can simply be
+unpacked and run where it lands:
 
 ```cmd
 mkdir %LOCALAPPDATA%\grog
-tar -xf grog-0.1.0-windows-x64.zip -C %LOCALAPPDATA%\grog
-```
+tar -xf "%USERPROFILE%\Downloads\grog-0.1.0-windows-x64.zip" -C %LOCALAPPDATA%\grog
 
-Right-click → *Extract All…* does the same if you prefer the GUI. Prefer `tar`
-over `Expand-Archive` here — PowerShell's cmdlet is slow with a few hundred
-files. (On Linux, `tar` is GNU tar and cannot read a zip; use `unzip` there.)
-
-Then fetch the app runtime once:
-
-```cmd
 cd %LOCALAPPDATA%\grog\clients\web
-npm install
+npm install                          :: once; fetches the app runtime
+cd %LOCALAPPDATA%\grog
+scripts\grog-client.bat
 ```
 
-The bundle already contains the two jars and the built interface, so nothing
-else is needed to run.
+Windows ships `tar` from libarchive (bsdtar), so it reads the `.zip` as happily as
+a `.tar.gz`; right-click → *Extract All…* works too, and is friendlier than
+`Expand-Archive`, which is slow with a few hundred files. (On Linux `tar` is GNU
+tar and cannot read a zip — use `unzip`.)
+
+Add a menu entry for the unpacked copy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
+```
+
+What a bundle contains:
 
 | Part | Location |
 |---|---|
@@ -123,16 +140,10 @@ Building grog from source is a separate, developer-only path — see
 
 ## 3. Run
 
-```cmd
-scripts\grog-client.bat
-```
+**Installed:** start **grog** from the Start Menu, or double-click the Desktop
+icon.
 
-To put grog on the Desktop and in the Start Menu, with its icon:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
-powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1 -Uninstall
-```
+**Portable:** `scripts\grog-client.bat`, or the menu entry created above.
 
 Icons, the Linux side, and how to verify an install: `doc/desktop-kit.md`.
 
@@ -224,23 +235,42 @@ clojure -T:build spine :version '"0.1.0"'
 cd grog_mcp && clojure -T:build uber :version '"0.1.0"'
 ```
 
-### Making an installer
+### Making an installer for other people
 
-The bundle above can be shipped as-is, or turned into a Windows installer (a
-per-user NSIS setup that creates Desktop and Start Menu shortcuts):
+An installer is a Windows build artifact, so build it **on Windows** — NSIS runs
+natively there and there is nothing to cross-compile. One machine does this;
+everybody else just runs the file it produces.
 
-```cmd
-cd clients\web
-npm install                                   :: brings electron-builder
-npx electron-builder --win nsis --publish never -c.extraMetadata.version=0.1.0
+On the build machine, once:
+
+```powershell
+scoop install git
+scoop bucket add java
+scoop bucket add extras
+scoop bucket add scoop-clojure https://github.com/littleli/scoop-clojure
+scoop install java/temurin-lts-jdk nodejs-lts babashka clojure
 ```
 
-The result is `clients\web\dist\grog Setup <version>.exe`.
+then, per release:
 
-Requirements: both jars in their expected places (above), the built interface,
-and internet — electron-builder downloads the app runtime and its packaging
-tools on first run. From Linux the same command works but needs Wine.
+```cmd
+git clone <remote> %USERPROFILE%\grog
+cd %USERPROFILE%\grog
+bb dist --target windows
+```
 
-The installer embeds both jars under the app's `resources\jars\`, which is where
-the app looks for them once installed. On a machine that has grog installed,
-nothing else is needed beyond Java, bash and ECA.
+That builds both jars, the interface, the portable bundle, and
+
+```
+clients\web\dist\grog-0.1.0-setup.exe
+```
+
+— the file you hand to anyone else. It is per-user (no administrator prompt),
+installs to `%LOCALAPPDATA%\Programs\grog`, adds Desktop and Start Menu
+shortcuts, embeds both jars, and **installs the prerequisites for the user**
+(§1) as part of the install. Set `GROG_SKIP_PREREQS=1` to skip that step for an
+unattended install.
+
+Doing this from Linux also works, but electron-builder reaches for Wine just to
+generate the uninstaller — an extra host dependency for a Windows-shaped
+artifact.

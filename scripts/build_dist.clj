@@ -134,11 +134,18 @@
         eb (fs/file web "node_modules/.bin" eb-bin)]
     (if (fs/exists? eb)
       (do (say "electron-builder present: producing installers")
-          ;; stamp the collective version WITHOUT rewriting package.json, and
-          ;; build for the requested target (Windows from Linux needs Wine)
-          (apply sh! web (str eb) "--publish" "never"
-                 (str "-c.extraMetadata.version=" version)
-                 (if (= "windows" for-os) ["--win" "nsis"] [])))
+          ;; Cross-building a Windows target from Linux: electron-builder only
+          ;; reaches for Wine to *sign and rewrite* the exe (the winCodeSign /
+          ;; rcedit step). We ship unsigned, so skip it and the build stays
+          ;; wine-free. Building ON Windows keeps the metadata and icon.
+          (let [cross? (and (= "windows" for-os) (not= "windows" (os-tag)))
+                extra (cond-> []
+                        (= "windows" for-os) (into ["--win" "nsis"])
+                        cross? (into ["-c.win.signAndEditExecutable=false"]))]
+            (when cross?
+              (say "cross-building for windows: disabling exe signing/editing (no Wine needed)"))
+            (apply sh! web (str eb) "--publish" "never"
+                   (str "-c.extraMetadata.version=" version) extra)))
       (do (say "electron-builder NOT installed in clients/web - skipping installers.")
           (say "  enable: (cd clients/web && npm install)   ; adds electron-builder")
           (say "  the bundle above is already runnable (the user runs npm install once)")))))
