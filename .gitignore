@@ -36,5 +36,3 @@ dist/
 
 # Per-instance run logs
 *.pid.log
-
-clients/web/build

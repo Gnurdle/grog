@@ -204,6 +204,12 @@
 (defn assemble! [{:keys [version for-os]}]
   (let [out (fs/file root "dist")
         base (str "grog-" version "-" for-os "-" (arch-tag))
+        ;; RELATIVE archive names on purpose: tar reads a leading `C:\...` as a
+        ;; REMOTE archive (host `C`) and dies with "Cannot connect to C: resolve
+        ;; failed". tar and zip run with :dir root, so a relative name lands in
+        ;; dist\ just the same, and no tar flavour parses it as a host.
+        tgz-rel (str "dist/" base ".tar.gz")
+        zp-rel (str "dist/" base ".zip")
         tgz (fs/file out (str base ".tar.gz"))
         zp (fs/file out (str base ".zip"))
         spine (fs/file root "target/grog-spine.jar")
@@ -214,10 +220,10 @@
     (fs/delete-if-exists tgz)
     (fs/delete-if-exists zp)
     (say "packing the bundle (tree + both jars, no node_modules)")
-    (apply sh! root "tar" "-czf" (str tgz) (concat tar-excludes ["."]))
+    (apply sh! root "tar" "-czf" tgz-rel (concat tar-excludes ["."]))
     (say "tarball:" (str tgz))
     (if (fs/which "zip")
-      (do (apply sh! root "zip" "-q" "-r" (str zp) "." "-x" zip-excludes)
+      (do (apply sh! root "zip" "-q" "-r" zp-rel "." "-x" zip-excludes)
           (say "zip:" (str zp)))
       (say "zip not installed - skipping the .zip (the tarball is equivalent)"))
     (spit (fs/file out (str base "-manifest.edn"))
@@ -231,6 +237,26 @@
                    :next "extract, then follow doc/windows-quick-start.md"}))
     (say "dist dir:" (str out))
     out))
+
+(defn- can-create-symlinks?
+  "Empirically probe whether a symlink can be created here.
+
+  electron-builder downloads `winCodeSign`, whose archive contains macOS
+  symlinks. 7za cannot recreate them without SeCreateSymbolicLinkPrivilege, so
+  the extraction (and therefore the whole build) fails with 'A required
+  privilege is not held by the client'. That privilege belongs to Administrators
+  and, since Windows 10 1703, to any account with Developer Mode enabled."
+  []
+  (when windows?
+    (let [d (fs/create-temp-dir {:prefix "grog-symlink-probe"})]
+      (try
+        (let [target (fs/file d "target")
+              link (fs/file d "link")]
+          (spit (str target) "x")
+          (fs/create-sym-link link target)
+          true)
+        (catch Exception _ false)
+        (finally (fs/delete-tree d))))))
 
 (defn package! [{:keys [version for-os]}]
   (let [web (fs/file root "clients/web")
@@ -249,6 +275,18 @@
                         cross? (into ["-c.win.signAndEditExecutable=false"]))]
             (when cross?
               (say "cross-building for windows: disabling exe signing/editing (no Wine needed)"))
+            ;; Native Windows build: check the symlink privilege up front. It is
+            ;; needed to unpack winCodeSign, and without it electron-builder
+            ;; burns four download+extract attempts before dying with a
+            ;; confusing 7-Zip error.
+            (when (and (= "windows" for-os) (not cross?))
+              (when-not (can-create-symlinks?)
+                (die (str "cannot create symlinks as this account - electron-builder"
+                          " cannot unpack winCodeSign.\n"
+                          "  fix: enable Developer Mode (Settings > System > For developers),"
+                          " or run the build from an elevated shell.\n"
+                          "  Developer Mode grants SeCreateSymbolicLinkPrivilege"
+                          " (no reboot needed)."))))
             (apply sh! web (str eb) "--publish" "never"
                    (str "-c.extraMetadata.version=" version) extra)))
       (do (say "electron-builder NOT installed in clients/web - skipping installers.")

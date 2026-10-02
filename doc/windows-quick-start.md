@@ -187,6 +187,8 @@ does the same thing.
 | Every tool server reports `CreateProcess error=2` | `bash --version` — it must resolve to Git for Windows, not WSL's stub. Missing? `scoop shim add bash "$(scoop prefix git)\bin\bash.exe"` (scoop doesn't shim bash itself). |
 | Config errors mentioning `clojure.lang.Symbol` | `grog.edn` starts with a byte-order mark. Save it as UTF-8 **without** a BOM. |
 | The tool jar is missing | Re-extract the bundle, or copy `grog-mcp-<version>.jar` into `grog_mcp\target\`. |
+| Packaging dies with `Cannot create symbolic link … A required privilege is not held by the client` | electron-builder is unpacking `winCodeSign` (it contains macOS symlinks). Enable **Developer Mode** (Settings → System → For developers), or run the build elevated. |
+| The installed app uses the default Electron icon | `clients/web/build/icon.ico` is missing from the checkout — it was once gitignored. Re-pull, or copy the icons in. |
 | `/doctor` shows a tool as missing | Install it, or ignore it if you don't need that feature. |
 | OCR fails, or reports missing language data | Install `tesseract-languages` (the `tesseract` package ships no recognition data), or set `:tessdata` in `imaging.edn`. |
 | Office tools fail | Install LibreOffice, or set `:bin` in `office.edn`. |
@@ -268,6 +270,12 @@ module** (no `clojure.exe`/`.cmd` anywhere on `PATH`), so PowerShell can run
 "clojure"`. `clj-deps` shims the real `deps.exe` as `clojure`/`clj`, which every
 process can execute. (Already installed the old one? `scoop uninstall clojure`
 first.)
+
+Also once, so the packaging step can unpack electron-builder's `winCodeSign`
+(its archive holds macOS symlinks, which 7-Zip can only create with the symlink
+privilege): turn on **Developer Mode** — Settings → System → For developers.
+Without it the build dies mid-packaging with `Cannot create symbolic link : A
+required privilege is not held by the client`.
 
 then, per release:
 

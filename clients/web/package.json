@@ -1,6 +1,7 @@
 { "name": "grog-web"
 , "version": "0.0.1"
 , "private": true
+, "author": "grog"
 , "description": "grog web/Electron client — P0 skeleton (see doc/clients/web-client-plan.md)"
 , "main": "src/main/main.js"
 , "scripts":
