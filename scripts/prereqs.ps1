@@ -73,45 +73,62 @@ function Scoop-Which([string]$Cmd) {
   return ($LASTEXITCODE -eq 0)
 }
 
-# Last resort for tools scoop did not install: does it actually answer?
+# Does the tool actually answer? Exit code AND output, so a stale shim that
+# prints an error is not counted as a working tool.
 function Tool-Works($Probe, $VersionArgs) {
   if (-not $Probe) { return $false }
   if (-not (Get-Command $Probe -ErrorAction SilentlyContinue)) { return $false }
-  try { return [bool]((& $Probe @VersionArgs 2>&1 | Out-String) -match '\S') }
-  catch { return $false }
+  try {
+    $out = & $Probe @VersionArgs 2>&1 | Out-String
+    return ($LASTEXITCODE -eq 0) -and [bool]($out -match '\S')
+  } catch { return $false }
 }
 
-function Usable($Probe, $VersionArgs) {
+# A tool is usable when EITHER
+#   * scoop has it properly (its list says ok, not failed) and its shim resolves
+#     to a real target - the cheap path, no cold-start of the program, OR
+#   * it runs, whoever installed it (a Java from elsewhere is left alone).
+# `scoop which` on its own is NOT enough: it can resolve a stale shim for an app
+# scoop has already written off - which is exactly how a cleaned-up LibreOffice
+# managed to be reported "already present" without being reinstalled.
+function Usable($Name, $Probe, $VersionArgs) {
   if (-not $Probe) { return $false }
-  return (Scoop-Which $Probe) -or (Tool-Works $Probe $VersionArgs)
+  if ((Scoop-Status $Name) -eq 'ok' -and (Scoop-Which $Probe)) { return $true }
+  return (Tool-Works $Probe $VersionArgs)
 }
 
 # --- the one rule: install only what is missing --------------------------------
 function Ensure($App, $Probe, $VersionArgs) {
   $name = ($App -split '/')[-1]
   $state = Scoop-Status $name
+  $mustInstall = $false
 
   # scoop says the last install failed: the directory is there, the app is not.
   if ($state -eq 'failed') {
     Note ("{0,-26} scoop reports a FAILED install - cleaning up" -f $App)
     & $scoop uninstall $App
     $script:ScoopList = $null
+    # Cleaned up means GONE: installing is not optional now, and no shim check is
+    # allowed to talk us out of it.
     $state = 'absent'
+    $mustInstall = $true
   }
 
-  if (-not $Probe) {
-    # No program to run (language data). Scoop's word is all there is.
-    if ($state -eq 'ok') { Note ("{0,-26} installed (no version check available)" -f $App); return }
-  } elseif (Usable $Probe $VersionArgs) {
-    Note ("{0,-26} already present" -f $App)
-    return
-  }
+  if (-not $mustInstall) {
+    if (-not $Probe) {
+      # No program to run (language data). Scoop's word is all there is.
+      if ($state -eq 'ok') { Note ("{0,-26} installed (no version check available)" -f $App); return }
+    } elseif (Usable $name $Probe $VersionArgs) {
+      Note ("{0,-26} already present" -f $App)
+      return
+    }
 
-  # Registered, but nothing answers: usually stale shims from a moved install.
-  if ($state -eq 'ok') {
-    Note ("{0,-26} installed but not answering - resetting shims" -f $App)
-    & $scoop reset $App
-    if (Usable $Probe $VersionArgs) { Note ("{0,-26} ok after reset" -f $App); return }
+    # Registered, but nothing answers: usually stale shims from a moved install.
+    if ($state -eq 'ok') {
+      Note ("{0,-26} installed but not answering - resetting shims" -f $App)
+      & $scoop reset $App
+      if (Usable $name $Probe $VersionArgs) { Note ("{0,-26} ok after reset" -f $App); return }
+    }
   }
 
   Note ("{0,-26} installing" -f $App)
@@ -119,7 +136,7 @@ function Ensure($App, $Probe, $VersionArgs) {
   $script:ScoopList = $null
 
   if (-not $Probe) { Note ("{0,-26} installed (no version check available)" -f $App); return }
-  if (Usable $Probe $VersionArgs) { Note ("{0,-26} installed ok" -f $App); return }
+  if (Usable $name $Probe $VersionArgs) { Note ("{0,-26} installed ok" -f $App); return }
 
   Note ("{0,-26} INSTALLED BUT NOT WORKING - check it by hand" -f $App)
   $script:Broken += $App
@@ -190,9 +207,21 @@ if (Tool-Works 'eca' @('--version')) {
 
 # --- report ---------------------------------------------------------------------
 Step 'summary'
+# Deliberately does NOT judge by this shell's PATH alone: scoop may have changed
+# PATH since this session started, so a tool it just installed would look
+# missing. Scoop's own view is reported alongside.
 foreach ($c in @('bash','java','node','bb','eca','rg','jq','tesseract','pdftoppm','soffice')) {
-  $src = (Get-Command $c -ErrorAction SilentlyContinue).Source
-  Note ("{0,-12} {1}" -f $c, ($(if ($src) { $src } else { 'not found' })))
+  $onPath = (Get-Command $c -ErrorAction SilentlyContinue).Source
+  if ($onPath) {
+    Note ("{0,-12} {1}" -f $c, $onPath)
+  } elseif (Scoop-Which $c) {
+    $shim = & $scoop which $c 2>$null | Select-Object -First 1
+    Note ("{0,-12} {1}   (not on this shell's PATH yet)" -f $c, $shim)
+  } elseif ($c -eq 'eca' -and (Test-Path (Join-Path $env:LOCALAPPDATA 'eca\eca.exe'))) {
+    Note ("{0,-12} {1}   (not on this shell's PATH yet)" -f $c, (Join-Path $env:LOCALAPPDATA 'eca\eca.exe'))
+  } else {
+    Note ("{0,-12} not found" -f $c)
+  }
 }
 
 if ($script:Broken.Count -gt 0) {
