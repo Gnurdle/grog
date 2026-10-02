@@ -74,8 +74,8 @@ wins).
 ## 3. Run
 
 ```sh
-scripts/grog-client --console     # stream the log to this terminal
-scripts/grog-client               # log to $XDG_STATE_HOME/grog/client.log
+scripts/grog-client --console     # stream to this terminal (client log still written)
+scripts/grog-client               # stream copy to $XDG_STATE_HOME/grog/client.log
 ```
 
 To add grog to the application menu, the dock and the taskbar with its icon:
@@ -89,7 +89,8 @@ Icons, the Windows side, and how to verify an install: `doc/desktop-kit.md`.
 
 ## 4. Verify
 
-Open the run log and check, in order:
+Open the run log and check, in order. The client writes one file per instance —
+`~/grog.<pid>.log`, newest match (`$GROG_LOG` overrides the base):
 
 1. `[grog-client] transport up: child pid <N>` — the backend is running.
 2. `[renderer] loaded ok` — the interface loaded.
@@ -122,7 +123,7 @@ Open the run log and check, in order:
 | other config | `~/.config/grog/{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the OS secret store (Secret Service); `secrets.edn` is the fallback |
 | projects | `~/grog-projects/<project>/{notes,dialog,state}` |
-| run log | `$XDG_STATE_HOME/grog/client.log` (default `~/.local/state/grog/client.log`) |
+| run log | the client's `~/grog.<pid>.log` (newest; `$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts/grog-client` also saves a stream copy to `$XDG_STATE_HOME/grog/client.log` |
 | version | `VERSION` at the tree root; also inside the jars as `grog-version.edn` |
 
 ## 7. Two things worth knowing

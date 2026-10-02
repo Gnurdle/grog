@@ -42,10 +42,11 @@
               a b))
 
 (defn- config-debug!
-  "One-line config-loading trace written to the **real** stderr so it always
-  lands in the grog debug log (`grog.<pid>.log`, or `$GROG_LOG`, via
-  grog.log's in-process tee) even when the caller's `*out*`/`*err*` are rebound
-  to the transcript pane."
+  "One-line config-loading trace written to the **real** stderr so it survives
+  even when the caller's `*out*`/`*err*` are rebound to the transcript pane.
+  On a console run these lines go to the terminal; the desktop client redirects
+  the backend's stderr into its per-instance log (`<base>.<pid>.log` — see
+  clients/web/src/main/log.js)."
   [& xs]
   (.println System/err (str "[grog-config] " (apply str (interpose " " (map str xs))))))
 
@@ -636,30 +637,6 @@
       (let [v (:idle-timeout-ms (mcp-cfg))]
         (when (and (number? v) (pos? (long v))) (long v)))
       900000))
-
-(defn- log-cfg [] (:log (grog) {}))
-
-(defn log-base
-  "Base path (no extension) for the per-instance GUI logs (`:log :dir`, default
-  `~/grog`). `~` is expanded and a `*.log` extension is stripped.
-  Env override: `GROG_LOG`."
-  ^String []
-  (let [raw (or (some-> (System/getenv "GROG_LOG") str str/trim not-empty)
-                (some-> (:dir (log-cfg)) str str/trim not-empty)
-                "~/grog")
-        s   (platform/expand-home raw)]
-    (if (str/ends-with? (str/lower-case s) ".log")
-      (subs s 0 (- (count s) 4))
-      s)))
-
-(defn log-keep
-  "How many per-instance logs to keep (`:log :keep`, default 5).
-  Env override: `GROG_UI_LOG_KEEP`."
-  []
-  (or (some-> (System/getenv "GROG_UI_LOG_KEEP") str str/trim parse-long)
-      (let [v (:keep (log-cfg))]
-        (when (and (number? v) (pos? (long v))) (long v)))
-      5))
 
 (defn- terminal-cfg [] (:terminal (grog) {}))
 

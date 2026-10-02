@@ -2,7 +2,7 @@
  {:requires ([babashka.fs :as fs])
 
   ;; Args are forwarded: `bb dist --target windows --no-package`.
-  dist      {:doc "Build the shippable grog: jars + renderer + the installer (one artifact: clients/web/dist/grog-<v>-setup.exe). One version from ./VERSION. Flags: --target windows|linux, --skip-jars, --skip-web, --no-package, --bundle (also write the portable .tar.gz/.zip), --version X.Y.Z."
+  dist      {:doc "Build the shippable grog: jars + renderer + the installer (one artifact: clients/web/dist/grog-<v>-setup.exe). The three build targets are independent and run IN PARALLEL. One version from ./VERSION. Flags: --target windows|linux, --skip-jars, --skip-web, --serial (one at a time — use on a RAM-starved machine), --no-package, --bundle (also write the portable .tar.gz/.zip), --version X.Y.Z."
              :task (apply shell "bb" "scripts/build_dist.clj" *command-line-args*)}
 
   dist:fast {:doc "Same as `dist` but reuse the already-built jars (--skip-jars)."

@@ -189,13 +189,14 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
   or `$GROG_CONFIG_HOME`).
-- **Log files**: each running grog writes its own log — `<base>.<pid>.log` — so
-  concurrent instances never share a file. `<base>` defaults to `~/grog`
-  (`%USERPROFILE%\grog` on Windows) and is set by `:log {:dir … :keep …}` in
-  `grog.edn` (`GROG_LOG` / `GROG_UI_LOG_KEEP` override for one-off runs). On
-  startup the oldest instance logs are pruned, keeping `:keep` (default 5).
-  Logging is in-process (`grog.log`), which tees stdout/stderr to both the console
-  and the file, so `tail -f ~/grog.<pid>.log` shows live output.
+- **Log files**: the client writes one log per running instance —
+  `<base>.<pid>.log` — so concurrent instances never share a file. `<base>` is
+  `$GROG_LOG` (a trailing `.log` is stripped) else `~/grog`
+  (`%USERPROFILE%\grog` on Windows). The client captures its own messages **and**
+  the backend's stdout/stderr into the file, so `tail -f ~/grog.<pid>.log` shows
+  live output. On startup the oldest instance logs are pruned, keeping
+  `$GROG_UI_LOG_KEEP` (default 5). Set `GROG_LOG_WIRE=1` to also record the raw
+  driver traffic (NDJSON — off by default; high volume).
 - **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
   PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
   `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
@@ -210,6 +211,8 @@ That's all you need for any OpenAI-compatible cloud provider.
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`).
 - **Launch**: `scripts/grog-client` (add `--console` to stream the log here).
+- **Log files**: same rule as Windows — `<base>.<pid>.log`, where `<base>` is
+  `$GROG_LOG` else `~/grog`.
 - **Secret backend**: Secret Service if a desktop session with a keyring is
   running; otherwise falls back to `~/.config/grog/secrets.edn`.
 
@@ -246,6 +249,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | Config changes "not applied" | grog reads config at startup. After editing `grog.edn`, restart (or use `/soul reload` where applicable). |
 | Windows: no config found | Your user `grog.edn` should be under `C:\Users\you\.config\grog\` (not AppData). |
 | Where's my `secrets.edn`? | `/secret file` prints its absolute path. |
+| Where's my client log? | `<base>.<pid>.log` — base is `$GROG_LOG` else `~/grog` (`%USERPROFILE%\grog`). The newest file is the running instance; the client prints its path at startup (`[grog-client] log file: …`). |
 
 ---
 
@@ -278,6 +282,10 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
 | `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
 | `approved-tools.edn` | permanently-allowed tool names |
+
+Per-instance **client logs** live outside the config home: `<base>.<pid>.log` in
+`~/grog` by default (`%USERPROFILE%\grog` on Windows), or wherever `$GROG_LOG`
+points — see §5.
 
 ---
 

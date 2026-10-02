@@ -1,8 +1,8 @@
 # Desktop integration
 
 How grog becomes an app on the system: an icon in the menu, dock or taskbar that
-launches it. Brings up the client with its own log file, no terminal and no
-hand-typed command.
+launches it. Brings up the client without a terminal and without a hand-typed
+command; the client writes its own per-instance log (`<base>.<pid>.log`).
 
 There are two install paths, and both use the same launcher and icon:
 
@@ -85,7 +85,9 @@ directory (`clients/web/package.json`):
 4. Write a fresh log file each run, and show its tail if the app exits with an
    error. A fresh name each time matters on Windows: if a stale process holds
    the log file open, the launcher cannot redirect into it and the app would not
-   start at all.
+   start at all. Separately, the client always writes its own per-instance log
+   (`<base>.<pid>.log`; `$GROG_LOG` / `$GROG_UI_LOG_KEEP`) — that file, not the
+   launcher's copy, is the primary place to look (see the quick-start guides).
 
 ## Verifying an install
 

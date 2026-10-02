@@ -60,13 +60,13 @@ that reaches `running`.
 - Approval dialog options: **Approve / Reject / YOLO** (YOLO approves and turns
   trust on).
 - **`/clear`** and the Clear button wipe the transcript **and** reset YOLO off.
-- **Logging is per-instance and in-process** (`grog.log`): each running grog
-  writes its own `<base>.<pid>.log` (`~/grog.<pid>.log` on Linux,
+- **Logging is per-instance**: the Electron client main process writes its own
+  `<base>.<pid>.log` (`~/grog.<pid>.log` on Linux,
   `%USERPROFILE%\grog.<pid>.log` on Windows) so concurrent instances never
-  interleave. On startup the oldest instance logs are pruned, keeping
-  `GROG_UI_LOG_KEEP` (default 5). The JVM tees `System.out`/`System.err` to the
-  console **and** the file — no shell redirection, no rotation scripts, no
-  platform-specific PID logic.
+  interleave. `<base>` is `$GROG_LOG` else `~/grog`; on startup the oldest
+  instance logs are pruned, keeping `GROG_UI_LOG_KEEP` (default 5). The client
+  tees its own messages and the backend's `stdout`/`stderr` into the file — no
+  shell redirection, no rotation scripts. See `clients/web/src/main/log.js`.
 
 ## Invariant: the chat log is never standing context
 

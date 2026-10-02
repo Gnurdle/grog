@@ -155,7 +155,10 @@ Icons, the Linux side, and how to verify an install: `doc/desktop-kit.md`.
 
 ## 4. Verify
 
-Open the run log (`%TEMP%\grog-client-<n>.log`) and check, in order:
+Open the run log and check, in order. The client writes one file per instance —
+`%USERPROFILE%\grog.<pid>.log`, newest match (`$GROG_LOG` overrides the
+`%USERPROFILE%\grog` base). Launching via `scripts\grog-client.bat` additionally
+keeps a stream copy at `%TEMP%\grog-client-<n>.log`:
 
 1. `[grog-client] transport up: child pid <N>` — the backend is running.
 2. `[renderer] loaded ok` — the interface loaded.
@@ -182,7 +185,7 @@ does the same thing.
 
 | Symptom | Check |
 |---|---|
-| The window closes immediately | Run `scripts\grog-client.bat` from an open console so you can read the log. A process holding a stale `%TEMP%\grog-client-*.log` open can stop the launcher; close stray `java.exe`/`bash.exe` and retry. |
+| The window closes immediately | Read the newest `%USERPROFILE%\grog.<pid>.log` — it holds both the client's and the backend's output, even when a spawned process fails. Running `scripts\grog-client.bat` from an open console also prints a stream copy. A leftover process holding a stale log open can stop the launcher; close stray `java.exe`/`bash.exe` and retry. |
 | The backend never starts | `java -version` — it must be on PATH. |
 | Every tool server reports `CreateProcess error=2` | `bash --version` — it must resolve to Git for Windows, not WSL's stub. Missing? `scoop shim add bash "$(scoop prefix git)\bin\bash.exe"` (scoop doesn't shim bash itself). |
 | Config errors mentioning `clojure.lang.Symbol` | `grog.edn` starts with a byte-order mark. Save it as UTF-8 **without** a BOM. |
@@ -202,7 +205,7 @@ does the same thing.
 | other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the Windows credential store; `secrets.edn` is the fallback |
 | projects | `%USERPROFILE%\grog-projects\<project>\{notes,dialog,state}` |
-| run log | `%TEMP%\grog-client-<n>.log` |
+| run log | `%USERPROFILE%\grog.<pid>.log` — client-written, newest match (`$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts\grog-client.bat` also saves a stream copy to `%TEMP%\grog-client-<n>.log` |
 | version | `VERSION` at the tree root; also inside the jars as `grog-version.edn` |
 
 ## 7. Two things worth knowing
@@ -293,6 +296,15 @@ Nothing else to copy, nothing to set up by hand.
 
 `bb dist --bundle` also writes the portable `.tar.gz`/`.zip` under `dist/`; that
 is a developer convenience, not part of the shipping path.
+
+The three build targets (the tool jar, the spine jar and the renderer) are
+independent, so `bb dist` runs them **in parallel** — on an 8-core box that is
+roughly the time of the slowest one rather than the sum. Use `--serial` if the
+machine is short on RAM (three JVMs at once). If a build feels slow on Windows
+despite low CPU, the cost is I/O, not compute: `tools.build`'s uberjar step
+merges the whole classpath with one sequential zip stream, and antivirus
+scanning of the source tree and `~\.m2` is the dominant extra cost — excluding
+those two paths is the fix.
 
 The installer is per-user (no administrator prompt), installs to
 `%LOCALAPPDATA%\Programs\grog`, adds Desktop and Start Menu shortcuts, embeds

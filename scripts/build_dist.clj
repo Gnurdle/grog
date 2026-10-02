@@ -170,20 +170,83 @@
       (die (str "npm install completed but shadow-cljs is still missing -"
                 " check npm's output above for blocked scripts or network errors")))))
 
-(defn build! [{:keys [version skip-jars? skip-web?]}]
+(defn- resolve-argv
+  "Resolve the program to a real path; arguments untouched. Dies if it is
+  missing, so the failure is ours rather than ProcessBuilder's."
+  [args]
+  (let [args (mapv str args)
+        prog (find-on-path (first args))]
+    (when-not prog
+      (die (str "program not found on PATH: " (first args))))
+    (into [prog] (rest args))))
+
+(defn- sh-capture!
+  "Run `argv` in `dir`, capturing stdout+stderr instead of streaming it.
+
+  `b/uber` — the real cost of a jar build — merges the whole classpath into one
+  jar with a single sequential JarOutputStream, so a jar build is roughly one
+  core's worth of work and cannot be sped up inside tools.build. The leverage we
+  DO have is running the independent build targets at the same time, which needs
+  buffered output: three interleaved streams would be unreadable.
+
+  Never throws on a non-zero exit — the caller collects every result and reports
+  them together, so one failure cannot hide another."
+  [dir argv]
+  (try
+    (let [r (apply p/sh {:dir dir :out :string :err :string :continue true
+                         :program-resolver (fn [{:keys [program]}] program)}
+                   argv)]
+      {:exit (long (or (:exit r) 1))
+       :out (str (:out r) (:err r))})
+    (catch Exception e
+      {:exit 1 :out (str "could not run: " (.getMessage e))})))
+
+(defn build! [{:keys [version skip-jars? skip-web? serial?]}]
   (let [web (fs/file root "clients/web")]
-    (if skip-jars?
-      (say "skipping jar builds (--skip-jars)")
-      (do
-        (say "building the MCP tool bundle")
-        (sh! (fs/file root "grog_mcp") "clojure" "-T:build" "uber" ":version" (pr-str version))
-        (say "building the spine")
-        (sh! root "clojure" "-T:build" "spine" ":version" (pr-str version))))
-    (if skip-web?
-      (say "skipping the renderer build (--skip-web)")
-      (do (ensure-web-deps! web)
-          (say "building the renderer bundle")
-          (sh! web (npm-cmd) "run" "build")))
+    ;; npm deps first: it may have to run `npm install` (slow, network), and it
+    ;; must not race the renderer build it feeds.
+    (when-not skip-web? (ensure-web-deps! web))
+    (let [jobs (->> (cond-> []
+                      (not skip-jars?)
+                      (conj {:name "mcp" :dir (fs/file root "grog_mcp")
+                             :args ["clojure" "-T:build" "uber" ":version" (pr-str version)]})
+
+                      (not skip-jars?)
+                      (conj {:name "spine" :dir root
+                             :args ["clojure" "-T:build" "spine" ":version" (pr-str version)]})
+
+                      (not skip-web?)
+                      (conj {:name "web" :dir web :args [(npm-cmd) "run" "build"]}))
+                    ;; resolve + announce in the MAIN thread, so the plan reads
+                    ;; cleanly instead of interleaving across the futures
+                    (mapv (fn [j] (assoc j :argv (resolve-argv (:args j))))))]
+      (when skip-jars? (say "skipping jar builds (--skip-jars)"))
+      (when skip-web? (say "skipping the renderer build (--skip-web)"))
+      (when (seq jobs)
+        (say (if (and serial? (> (count jobs) 1))
+               (str "building " (count jobs) " targets, one at a time (--serial)")
+               (str "building " (count jobs) " independent target"
+                    (when (> (count jobs) 1) "s")
+                    (when (> (count jobs) 1) " in parallel"))))
+        (doseq [j jobs] (say "$" (str/join " " (:argv j))))
+        (let [run (fn [{:keys [name dir argv]}]
+                    (assoc (sh-capture! dir argv) :name name))
+              ;; These touch disjoint outputs (grog_mcp/target, target/,
+              ;; clients/web/resources/public) and only READ the shared dep
+              ;; caches, so running them together is safe — a multi-core box
+              ;; finishes all of them in about the time of the slowest one.
+              results (if serial?
+                        (mapv run jobs)
+                        (->> jobs (mapv #(future (run %))) (mapv deref)))]
+          (doseq [{:keys [name out]} results]
+            (when (seq (str/trim (str out)))
+              (println (str "----- " name " -----"))
+              (print (str out))
+              (flush)))
+          (let [bad (remove #(zero? (:exit %)) results)]
+            (when (seq bad)
+              (die (str "build failed: " (str/join ", " (map :name bad))
+                        " (exit " (str/join ", " (map :exit bad)) ")")))))))
     true))
 
 ;; What a user gets: the whole tree plus both jars, minus everything that is
@@ -327,7 +390,8 @@
         opts {:version version
               :for-os for-os
               :skip-jars? (boolean (some #{"--skip-jars"} args))
-              :skip-web? (boolean (some #{"--skip-web"} args))}]
+              :skip-web? (boolean (some #{"--skip-web"} args))
+              :serial? (boolean (some #{"--serial"} args))}]
     (when-not (#{"windows" "linux"} for-os)
       (die (str "--target must be windows or linux (got " (pr-str for-os) ")")))
     (say (str "grog build_dist  version " version

@@ -18,6 +18,13 @@ const path = require("path");
 const fs = require("fs");
 const { execFile, spawn, spawnSync } = require("child_process");
 
+// Logging first, so everything after it (including a failed spawn) is captured.
+// One file per client instance: $GROG_LOG -> else ~/grog, as <base>.<pid>.log.
+const log = require("./log");
+const LOG = log.install();
+LOG.tee();
+console.log(`[grog-client] log file: ${LOG.path}`);
+
 // Same rendezvous the server computes (grog.server/default-socket-path):
 // GROG_SERVER_SOCKET wins; else $XDG_RUNTIME_DIR/grog-$USER.sock; else tmp.
 const SOCKET_PATH =
@@ -179,6 +186,7 @@ function pump(stream) {
     let i;
     while ((i = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (LOG.wire) LOG.write(`<- ${line}`);   // GROG_LOG_WIRE=1
       onLine(line);
     }
   });
@@ -229,7 +237,11 @@ function spawnSpine() {
     detached: process.platform !== "win32",
   });
   pump(spine.stdout);
-  spine.stderr.on("data", (b) => process.stderr.write(`[grog-spine] ${b}`));
+  spine.stderr.on("data", (b) => {
+    const line = `[grog-spine] ${b}`;
+    process.stderr.write(line);
+    LOG.write(line);          // the spine's diagnostics belong in the log file
+  });
   // A spawn error (ENOENT: `java`/`clojure` missing from PATH) fires here with
   // NO 'spawn' event and NO 'exit' event. Left unhandled, nothing is logged or
   // rescheduled, so every renderer call re-enters connect() and respawns
@@ -467,10 +479,11 @@ function killSpineTree(pid) {
 function shutdown(reason) {
   if (sock) sock.end();
   const pid = spine && spine.pid;
-  if (!pid) { app.quit(); return; }
+  console.log(`[grog-client] shutdown (${reason})`);
+  if (!pid) { LOG.close(); app.quit(); return; }
   setTimeout(() => {
     killSpineTree(pid);
-    console.log(`[grog-client] shutdown (${reason})`);
+    LOG.close();          // flush the log before the process goes away
     app.quit();
   }, 2500);
 }

@@ -438,9 +438,10 @@
   be written to a log).
 
   Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
-  lands in the real debug log (`grog.<pid>.log`, via grog.log's in-process
-  tee), even when called from a worker thread whose `*err*` is bound to the
-  transcript pane.
+  reaches the real stderr — the desktop client redirects the backend's stderr
+  into its per-instance log (`<base>.<pid>.log`; see
+  clients/web/src/main/log.js) — even when called from a worker thread whose
+  `*err*` is bound to the transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]
   (.println System/err (str "==== grog: ECA config (re)written -> " path))
@@ -546,9 +547,9 @@
     cfg))
 
 (defn- eca-config-debug! [& xs]
-  "One-line ECA-config trace written to the **real** stderr so it lands in the
-  grog debug log (`grog.<pid>.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
-  rebinding."
+  "One-line ECA-config trace written to the **real** stderr so it survives
+  regardless of `*out*`/`*err*` rebinding; the desktop client redirects the
+  backend's stderr into its per-instance log (`<base>.<pid>.log`)."
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 
 (defn generate-config!
