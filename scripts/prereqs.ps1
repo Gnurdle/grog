@@ -20,9 +20,15 @@ anything else - is left alone.
                       install.
 
   -Minimal   required pieces only (git/bash, Java, ECA); skip the optional tools
+  -Full      also install LibreOffice (~350 MB from a mirror redirector; aria2 is
+             installed first, because a single-connection download of that size
+             is what tends to come back as a 504 Gateway Timeout)
 #>
 [CmdletBinding()]
-param([switch]$Minimal)
+param(
+  [switch]$Minimal,   # required pieces only: git/bash, Java, ECA
+  [switch]$Full       # also LibreOffice (~350 MB - see the aria2 note below)
+)
 
 $ErrorActionPreference = 'Continue'
 $ecaVersion = '0.134.2'
@@ -158,7 +164,25 @@ if (-not $Minimal) {
   # tesseract-languages is separate on purpose: tesseract ships the OCR engine
   # but no recognition data, and OCR fails without it.
   Ensure 'tesseract-languages' $null      @()
-  Ensure 'extras/libreoffice' 'soffice'   @('--version')
+
+  Step 'LibreOffice'
+  if ($Full) {
+    # ~350 MB from a mirror redirector, fetched in ONE connection by default -
+    # which is how a 504 Gateway Timeout kills the whole download. aria2 fetches
+    # in segments with retries and resume, and scoop switches to it automatically
+    # once it is installed.
+    Ensure 'aria2' 'aria2c' @('--version')
+    Ensure 'extras/libreoffice' 'soffice' @('--version')
+  } else {
+    # Optional, and large: do not make the installer hostage to that download.
+    # Clear a previous failed attempt anyway, so scoop's list stays honest.
+    if ((Scoop-Status 'libreoffice') -eq 'failed') {
+      Note ("{0,-26} clearing a previous FAILED install" -f 'extras/libreoffice')
+      & $scoop uninstall extras/libreoffice
+      $script:ScoopList = $null
+    }
+    Note ("{0,-26} skipped (optional, ~350 MB) - add with -Full" -f 'extras/libreoffice')
+  }
 }
 
 # --- ECA -----------------------------------------------------------------------
