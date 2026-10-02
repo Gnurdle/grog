@@ -248,8 +248,15 @@ scoop install git
 scoop bucket add java
 scoop bucket add extras
 scoop bucket add scoop-clojure https://github.com/littleli/scoop-clojure
-scoop install java/temurin-lts-jdk nodejs-lts babashka clojure
+scoop install java/temurin-lts-jdk nodejs-lts babashka clj-deps
 ```
+
+`clj-deps` matters: the bucket's `clojure` package installs only a **PowerShell
+module** (no `clojure.exe`/`.cmd` anywhere on `PATH`), so PowerShell can run
+`clojure` but no other program can — `bb dist` fails with `Cannot run program
+"clojure"`. `clj-deps` shims the real `deps.exe` as `clojure`/`clj`, which every
+process can execute. (Already installed the old one? `scoop uninstall clojure`
+first.)
 
 then, per release:
 

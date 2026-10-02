@@ -90,10 +90,11 @@
                           (when (fs/exists? f) (str f))))
                       exts))
               dirs)
-        (or (where-on-path prog)
-            (do (when windows?
-                  (say "WARNING:" prog "not on PATH (searched .exe/.cmd/.bat/.com, then where.exe)"))
-                prog))))))
+        ;; nil = not on PATH (and where.exe agrees). sh! turns this into a
+        ;; clean die with a hint; returning the bare name would only defer to
+        ;; ProcessBuilder, which on Windows does no PATH/PATHEXT search at all
+        ;; and throws the raw 'Cannot run program' IOException instead.
+        (where-on-path prog)))))
 
 (defn sh!
   "Run argv in `dir`, streaming output. Throws on a non-zero exit."
@@ -102,9 +103,20 @@
         ;; resolve the program, not the rest of argv: babashka passes arguments
         ;; through untouched, and going via `cmd /c` would let cmd re-parse them
         ;; (it would strip the quotes from e.g. :version "0.1.0").
-        prog (find-on-path (first args))
-        args (into [prog] (rest args))]
-    (say "$" (str/join " " args))
+        prog (find-on-path (first args))]
+    (when-not prog
+      ;; Windows gotcha: scoop's `clojure` package installs only a PowerShell
+      ;; MODULE - no clojure.exe/.cmd exists, PowerShell autoloads a clojure
+      ;; function - so no file search can ever find it and ProcessBuilder
+      ;; cannot run it. clj-deps shims deps.exe as clojure/clj instead.
+      (die (str "program not found on PATH: " (first args)
+                (if (contains? #{"clojure" "clj" "deps"} (first args))
+                  (str " - on Windows, scoop's `clojure` package is PowerShell-only"
+                       " (no executable); run: scoop install clj-deps"
+                       " (scoop uninstall clojure first if it is installed)")
+                  ""))))
+    (let [args (into [prog] (rest args))]
+      (say "$" (str/join " " args))
     ;; Skip babashka's own resolver: we already resolved the program, and its
     ;; Windows path re-runs fs/which (bare-name-only, executable? check) which
     ;; is precisely what was throwing 'Cannot resolve program: ...'. Ours
@@ -113,7 +125,7 @@
                             :program-resolver (fn [{:keys [program]}] program)}
                    args)]
       (when-not (zero? (:exit r))
-        (die (str "command failed (" (:exit r) "): " (str/join " " args)))))))
+        (die (str "command failed (" (:exit r) "): " (str/join " " args))))))))
 
 (defn- npm-cmd [] (if windows? "npm.cmd" "npm"))
 
