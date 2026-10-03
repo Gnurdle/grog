@@ -173,6 +173,11 @@
 
 ;; --- console publisher -----------------------------------------------------
 
+(def ^:private ^Class char-array-class
+  "Class of a primitive char array - `write(char[])` is the third one-arg
+  overload a Writer proxy cannot tell apart from the others."
+  (Class/forName "[C"))
+
 (defn- console-publisher
   "Server-side stand-in for the GUI's console-writer: buffers *out*/*err*
   output for one turn and emits it as a `:line` event on flush/close, so slash
@@ -187,8 +192,18 @@
                       (chat/publish! state {:type :line :text s})))))]
     (proxy [java.io.Writer] []
       (write
+        ;; java.io.Writer has TWO one-arg overloads - write(int c) and
+        ;; write(String s) - and a proxy dispatches on ARITY alone, so the int
+        ;; has to be decoded by hand. Clojure's println separates its arguments
+        ;; with write(32): with the naive (str x) every multi-arg println in a
+        ;; slash command reached the transcript with the separator rendered as
+        ;; the literal text "32" (e.g. "·  32BRAVE_SEARCH_API32— 32Brave …").
         ([x]
-         (.append sb (str x)))
+         (.append sb (cond
+                       (integer? x) (char (int x))
+                       (string? x) ^String x
+                       (instance? char-array-class x) (String. ^chars x)
+                       :else (str x))))
         ([x off len]
          (.append sb (if (string? x)
                        (subs ^String x (int off) (int (+ (long off) (long len))))
