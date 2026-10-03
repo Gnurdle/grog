@@ -33,6 +33,7 @@
        ;; type-specific
        :value   ...}"
   (:require [clojure.string :as str]
+            [grog.config :as config]
             [grog.core :as core]
             [grog.eca :as eca]
             [grog.eca-config :as ecacfg]
@@ -358,12 +359,24 @@
   ["OPENROUTER_API_KEY" "MOONSHOT_API_KEY" "XAI_API_KEY"])
 
 (defn provider-env
-  "Per-process env vars for the ECA server, pulled from the OS keyring."
+  "Per-process env vars for the ECA server.
+
+  `GROG_LLM_API_KEY` is ALWAYS set, from grog's own resolved LLM key (`:llm
+  :api-key`, else the `LLM_API_KEY` secret). The provider entry grog generates
+  references `${env:GROG_LLM_API_KEY}`, so the base case is: enter ONE secret
+  (`/secret set LLM_API_KEY …`) and chat — no eca/config.json, no provider block,
+  and no key ever written to a file.
+
+  The provider-specific accounts are still injected when present, for people who
+  keep a separate key per provider."
   []
-  (into {} (keep (fn [acct]
-                   (when-let [v (secrets/get-secret acct)]
-                     [acct v])))
-        provider-env-accounts))
+  (let [keys (into {} (keep (fn [acct]
+                              (when-let [v (secrets/get-secret acct)]
+                                [acct v])))
+                   provider-env-accounts)]
+    (if-let [k (config/llm-api-key)]
+      (assoc keys "GROG_LLM_API_KEY" k)
+      keys)))
 
 ;; ---------------------------------------------------------------------------
 ;; ECA server→client requests

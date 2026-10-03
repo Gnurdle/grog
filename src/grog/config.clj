@@ -214,6 +214,21 @@
   (let [m (get-in (grog) [:eca :model])]
     (when (seq (str/trim (str m))) (str/trim (str m)))))
 
+(defn eca-provider-overrides
+  "`:eca :providers` from grog.edn — provider entries grog merges into the
+  generated ECA config, so a fresh install needs no `eca/config.json`.
+
+  Values are ordinary ECA provider maps, e.g.
+    :providers {\"openrouter\" {:api \"openai-chat\"
+                               :url \"https://openrouter.ai/api/v1\"
+                               :key \"${env:GROG_LLM_API_KEY}\"}}
+  A `:key` should be an env REFERENCE, never a literal secret. Keys are
+  normalized to strings (JSON keys)."
+  []
+  (let [p (get-in (grog) [:eca :providers])]
+    (when (map? p)
+      (into {} (map (fn [[k v]] [(name k) v])) p))))
+
 (declare interpolate-env-var)
 
 (defn eca-binary

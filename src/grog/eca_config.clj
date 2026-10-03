@@ -552,6 +552,42 @@
   backend's stderr into its per-instance log (`<base>.<pid>.log`)."
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 
+(def ^:private eca-built-in-providers
+  "Providers ECA ships a built-in default URL for. Adding our own entry for one
+  of these would CLOBBER that default, so we never do."
+  #{"openai" "anthropic" "github-copilot" "google" "ollama"})
+
+(defn- model-provider
+  "The provider half of a `provider/model` id, or nil."
+  [model]
+  (when-let [m (re-matches #"([^/]+)/.+" (str model))]
+    (second m)))
+
+(defn- ensure-provider
+  "Make sure `cfg` carries a provider entry for `model`'s provider half.
+
+  This is what makes the base case work with ONE secret and no eca/config.json:
+  ECA ships defaults for openai/anthropic/google/github-copilot/ollama but NOT,
+  say, openrouter — so an `openrouter/…` model has no URL to resolve, and the
+  user was left hand-writing a provider block.
+
+  Precedence: a provider already in the user's ECA config wins (their config,
+  their call) -> an explicit `:eca :providers` entry -> derived from grog's own
+  `:llm :url`. The derived `:key` is an env REFERENCE; grog injects the value
+  into the ECA child (see `chat/provider-env`), so no secret lands in a file."
+  [cfg model]
+  (let [p (model-provider model)]
+    (cond
+      (nil? p)                            cfg
+      (contains? (:providers cfg) p)      cfg
+      (contains? eca-built-in-providers p) cfg
+      :else
+      (let [explicit (get (config/eca-provider-overrides) p)
+            derived  {:api "openai-chat"
+                      :url (try (config/llm-url) (catch Exception _ nil))
+                      :key "${env:GROG_LLM_API_KEY}"}]
+        (assoc-in cfg [:providers p] (or explicit derived))))))
+
 (defn generate-config!
   "Produce the merged ECA config map and write it to `out-path`
   (default `(generated-config-path)`), dumping it to the debug log. The
@@ -593,10 +629,13 @@
                               " qualified=" (pr-str model)
                               " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
          merged (-> base
+                    (ensure-provider model)
                     (assoc :mcpServers (grog-mcp-servers project))
                     (cond-> model (assoc :defaultModel model))
                     (add-approval!)
                     (add-rules! project))
+         _ (eca-config-debug! "providers in generated config:"
+                              (pr-str (sort (keys (:providers merged {})))))
          out (or out-path (generated-config-path))]
      (spit (io/file out) (json/generate-string merged {:pretty true}))
      (debug-dump-config! out merged)
