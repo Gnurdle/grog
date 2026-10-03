@@ -205,6 +205,7 @@ does the same thing.
 | other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the Windows credential store; `secrets.edn` is the fallback |
 | projects | `%USERPROFILE%\grog-projects\<project>\{notes,dialog,state}` |
+| profile / cache | `%LOCALAPPDATA%\grog` — Chromium's private store (cache, Local Storage). Deliberately **Local**, not Roaming |
 | run log | `%USERPROFILE%\grog.<pid>.log` — client-written, newest match (`$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts\grog-client.bat` also saves a stream copy to `%TEMP%\grog-client-<n>.log` |
 | version | `VERSION` at the tree root; also inside the jars as `grog-version.edn` |
 

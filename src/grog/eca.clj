@@ -166,21 +166,26 @@
        (remove str/blank?)
        (map msys-path->windows)))
 
-(defn- path-executable?
-  "True if `name` (optionally with a platform executable extension) resolves to
-  an executable file on the OS PATH."
-  [name]
+(defn- path-executable-file
+  "The executable File for `name` (trying the platform executable extensions) on
+  the OS PATH, or nil. Returning the FILE rather than a boolean is what lets the
+  startup log name the exact ECA in use instead of a bare `eca`."
+  ^java.io.File [name]
   (try
     (let [win? (windows?)
           exts (if win? ["exe" "cmd" "bat" ""] [""])]
-      (boolean
-        (some (fn [d]
-                (some (fn [ext]
-                        (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
-                          (and (.isFile f) (.canExecute f))))
-                      exts))
-              (path-dirs))))
-    (catch Throwable _ false)))
+      (some (fn [d]
+              (some (fn [ext]
+                      (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
+                        (when (and (.isFile f) (.canExecute f)) f)))
+                    exts))
+            (path-dirs)))
+    (catch Throwable _ nil)))
+
+(defn- path-executable?
+  "True if `name` resolves to an executable file on the OS PATH."
+  [name]
+  (boolean (path-executable-file name)))
 
 (defn- extension-eca-dirs
   "Candidate ECA directories found in a VS Code `extensions` folder: every
@@ -217,7 +222,14 @@
       [(java.io.File. home ".local/bin")
        (java.io.File. home "bin")
        (java.io.File. "/usr/local/bin")
-       (java.io.File. "/usr/bin")])))
+       (java.io.File. "/usr/bin")]
+      ;; The installer's own copy (%LOCALAPPDATA%\eca). It is normally on PATH,
+      ;; but probe it here too so resolution survives a stale PATH. LOWEST
+      ;; priority: an ECA the user installed (PATH, or the VS Code extension
+      ;; above) is always preferred - this copy only exists because nothing else
+      ;; did at install time.
+      (when-let [localappdata (System/getenv "LOCALAPPDATA")]
+        [(java.io.File. localappdata "eca")]))))
 
 (defn- known-eca-candidates
   "Absolute File objects for likely ECA binaries across OSes."
@@ -243,8 +255,12 @@
     (cond
       explicit (.getAbsolutePath explicit)
 
+      ;; PATH: the user's own install wins (this is also where our fallback dir
+      ;; lands on installs made by an older prereqs.ps1). Return the ABSOLUTE
+      ;; path so the startup log names the binary, not the word "eca".
       (or (nil? (seq eca-binary)) (path-executable? eca-binary))
-      (if (seq eca-binary) (msys-path->windows eca-binary) "eca")
+      (or (when (seq eca-binary) (some-> (path-executable-file eca-binary) .getAbsolutePath))
+          (if (seq eca-binary) (msys-path->windows eca-binary) "eca"))
 
       :else
       (or (when-let [f (some (fn [^java.io.File f] (and (.isFile f) (.getAbsolutePath f)))

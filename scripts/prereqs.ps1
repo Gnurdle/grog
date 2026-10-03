@@ -19,6 +19,11 @@ anything else - is left alone.
   and, of course,      actually running the tool, for anything scoop did not
                       install.
 
+ECA is the one that needs care: it often arrives as a VS Code extension
+(editor-code-assistant.eca-*), whose binary lives in a versioned folder and is
+never added to PATH. grog finds that copy at runtime (grog.eca/candidate-dirs),
+so this script must not download a second one - it is used and left alone.
+
   -Minimal   required pieces only (git/bash, Java, ECA); skip the optional tools
   -Full      also install LibreOffice (~350 MB from a mirror redirector; aria2 is
              installed first, because a single-connection download of that size
@@ -91,6 +96,28 @@ function Tool-Works($Probe, $VersionArgs) {
     $out = & $Probe @VersionArgs 2>&1 | Out-String
     return ($LASTEXITCODE -eq 0) -and [bool]($out -match '\S')
   } catch { return $false }
+}
+
+# An ECA that exists but is NOT on PATH - most importantly the VS Code
+# extension. Returns the newest match, or $null. Mirrors grog.eca's own
+# extension-eca-dirs so the installer and the runtime agree on what "already
+# there" means.
+function Find-VsCodeEca {
+  $roots = @(
+    (Join-Path $env:USERPROFILE '.vscode\extensions'),
+    (Join-Path $env:USERPROFILE '.vscode-insiders\extensions'),
+    (Join-Path $env:USERPROFILE '.vscode-server\extensions')
+  )
+  foreach ($root in $roots) {
+    if (-not (Test-Path $root)) { continue }
+    $hit = Get-ChildItem $root -Directory -Filter 'editor-code-assistant.eca-*' -ErrorAction SilentlyContinue |
+             Sort-Object Name -Descending |
+             ForEach-Object { @((Join-Path $_.FullName 'bin\eca.exe'), (Join-Path $_.FullName 'eca.exe')) } |
+             Where-Object { Test-Path $_ } |
+             Select-Object -First 1
+    if ($hit) { return $hit }
+  }
+  return $null
 }
 
 # --- the one rule: install only what is missing --------------------------------
@@ -229,8 +256,25 @@ if (-not $Minimal) {
 Step "ECA $ecaVersion"
 $ecaDir = Join-Path $env:LOCALAPPDATA 'eca'
 $ecaExe = Join-Path $ecaDir 'eca.exe'
+$script:VsCodeEca = Find-VsCodeEca
+
+# Our copy must never sit on PATH: PATH is checked BEFORE the VS Code extension
+# dir, so an entry here would let the fallback shadow an ECA the user installs
+# later. Older prereqs.ps1 added it - take it back out (idempotent, and it runs
+# even when nothing needs downloading).
+$userPath = [Environment]::GetEnvironmentVariable('Path','User')
+if ($userPath -like "*$ecaDir*") {
+  $trimmed = ($userPath -split ';' |
+              Where-Object { $_ -and ($_.TrimEnd('\') -ne $ecaDir.TrimEnd('\')) }) -join ';'
+  [Environment]::SetEnvironmentVariable('Path', $trimmed, 'User')
+  Note "removed $ecaDir from PATH (grog's fallback copy)"
+}
+
 if (Tool-Works 'eca' @('--version')) {
   Note "already answering: $((Get-Command eca).Source)"
+} elseif ($script:VsCodeEca) {
+  Note "already present as a VS Code extension: $($script:VsCodeEca)"
+  Note 'using that copy - not installing a second one (grog finds it at runtime)'
 } elseif (Test-Path $ecaExe) {
   Note "already at $ecaDir"
 } else {
@@ -243,11 +287,7 @@ if (Tool-Works 'eca' @('--version')) {
     # the archive may nest the binary; hoist it
     $nested = Get-ChildItem $ecaDir -Recurse -Filter eca.exe | Select-Object -First 1
     if ($nested -and $nested.DirectoryName -ne $ecaDir) { Copy-Item $nested.FullName $ecaExe -Force }
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if ($userPath -notlike "*$ecaDir*") {
-      [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $ecaDir), 'User')
-    }
-    if (Tool-Works $ecaExe @('--version')) { Note "ECA -> $ecaDir (added to your PATH)" }
+    if (Tool-Works $ecaExe @('--version')) { Note "ECA -> $ecaDir (grog finds it)" }
     else { Note "ECA unpacked but not answering - check $ecaDir"; $script:Broken += 'eca' }
   } catch {
     Note "ECA download failed: $($_.Exception.Message)"
@@ -282,8 +322,10 @@ foreach ($c in $Checks) {
     Note ("{0,-11} installed - a NEW shell will have it on PATH" -f $c.Label)
   } elseif ($state -eq 'failed') {
     Note ("{0,-11} scoop reports a FAILED install" -f $c.Label)
+  } elseif ($c.Probe -eq 'eca' -and $script:VsCodeEca) {
+    Note ("{0,-11} {1}   (VS Code extension - grog finds it)" -f $c.Label, $script:VsCodeEca)
   } elseif ($c.Probe -eq 'eca' -and (Test-Path $ecaExe)) {
-    Note ("{0,-11} {1}   (a NEW shell will have it on PATH)" -f $c.Label, $ecaExe)
+    Note ("{0,-11} {1}   (grog's fallback copy)" -f $c.Label, $ecaExe)
   } else {
     Note ("{0,-11} not found" -f $c.Label)
   }

@@ -426,6 +426,24 @@ ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
 ipcMain.handle("grog:voice-status", () => voiceStatus());
 ipcMain.handle("grog:voice-transcribe", (_e, bytes) => transcribe(bytes));
 
+// Chromium's PRIVATE profile — HTTP cache, GPU cache, Code Cache, Local
+// Storage (the font-size pref), cookies, network state — must NOT go to
+// Electron's default `%APPDATA%\grog` (ROAMING). It is machine-specific and
+// cache-heavy, so on a domain machine a roaming profile would sync megabytes of
+// it at every logon. grog's own config deliberately lives elsewhere
+// (`%USERPROFILE%\.config\grog`); this is not that. Local AppData is the right
+// home. Must run before the app is ready (the path is read when the first
+// session is created).
+if (process.platform === "win32") {
+  try {
+    const localData = path.join(app.getPath("localAppData"), "grog");
+    app.setPath("userData", localData);
+    console.log(`[grog-client] profile dir: ${localData}`);
+  } catch (e) {
+    console.warn("[grog-client] could not relocate userData (staying in Roaming):", e.message);
+  }
+}
+
 // A VM (or any box without working GPU acceleration) can hard-fail Electron's
 // compositor before a window ever appears; GROG_DISABLE_GPU=1 forces the safe
 // software path. Must be called before the app is ready.

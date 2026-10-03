@@ -197,11 +197,18 @@ That's all you need for any OpenAI-compatible cloud provider.
   live output. On startup the oldest instance logs are pruned, keeping
   `$GROG_UI_LOG_KEEP` (default 5). Set `GROG_LOG_WIRE=1` to also record the raw
   driver traffic (NDJSON — off by default; high volume).
-- **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
-  PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
-  `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
-  `:eca :binary` in your `grog.edn` to the full path (e.g.
-  `C:\Users\you\scoop\shims\eca.exe`).
+- **Profile & cache**: Chromium's private store (HTTP/GPU/Code caches, Local
+  Storage) is kept in `%LOCALAPPDATA%\grog` — **Local** AppData, not Roaming, so
+  it never bloats a roaming/domain profile. This is not grog's config; that
+  stays in `~/.config/grog`.
+- **If the chat shows `ECA connect failed`**: grog resolves the `eca` binary
+  **at every launch** — `:eca :binary` (if set), else PATH, else
+  `~/.vscode/extensions` (`editor-code-assistant.eca-*`, the VS Code extension),
+  else scoop shims, npm global, and last the installer's own copy in
+  `%LOCALAPPDATA%\eca`. An ECA you install later is therefore picked up on the
+  next launch, and the installer never downloads a second copy when one is
+  already present. If it's somewhere else, set `:eca :binary` to the full path
+  (e.g. `C:\Users\you\scoop\shims\eca.exe`).
 - **Secret backend**: Windows Credential Manager; falls back to
   `~/.config/grog/secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
