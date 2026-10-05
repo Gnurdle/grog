@@ -6,7 +6,7 @@
 #
 # The FULL install (electron-builder / NSIS) creates these itself for a packaged
 # build; this script is the dev-tree path and stays useful after `bb dist`
-# produces win-unpacked.
+# produces the unpacked tree (repo-root dist/win-unpacked).
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
@@ -17,7 +17,10 @@ $ErrorActionPreference = 'Stop'
 $repo   = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $web    = Join-Path $repo 'clients\web'
 $target = if ($ExePath) { $ExePath } else { Join-Path $PSScriptRoot 'grog-client.bat' }
-$ico    = Join-Path $web 'build\icon.ico'
+# assets\ holds the multi-resolution .ico (256/128/64/48/32/16). There is no
+# clients\web\build\ dir — electron-builder's buildResources default is unused
+# because every icon is named explicitly in package.json.
+$ico    = Join-Path $web 'assets\icon.ico'
 
 $desktop  = [Environment]::GetFolderPath('Desktop')
 $startDir = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'

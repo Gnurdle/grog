@@ -49,3 +49,69 @@ example can confuse the runtime — delete them from `~/.config/grog` instead:
   `${ENV}` / `${ENV:-default}` interpolation in many EDN fields.
 - After changing any server config, **restart grog** (MCP tool lists and config
   are snapshotted at session start).
+
+## grog.edn — the rest of the knobs
+
+`grog.edn.example` is kept deliberately short: it mirrors a *working* config, so
+you can read it in one go. Everything below is optional and lives in the same
+file — add a key when you need it.
+
+```clojure
+;; --- the LLM block ---
+:llm {:url    "https://openrouter.ai/api/v1"
+      :model  "moonshotai/kimi-k3"          ; grog's OWN model, not the chat's
+      :temperature 0.7
+      :max-tokens 4096
+      :max-context-tokens 200000            ; token budget; oldest msgs dropped
+      :max-tool-result-chars 50000          ; cap tool-result length
+      :conn-timeout-sec 60
+      :socket-timeout-sec 300
+      :provider-name "OpenRouter · DeepSeek"
+      :ollama-host "http://localhost:11434" ; used to list local models
+      :extra-payload {:transforms ["middle-out"]}
+      :profiles {:local {:url "http://localhost:11434/v1"
+                         :model "qwen3:8b"
+                         :api-key nil}}}    ; named alternate endpoints
+
+;; --- ECA (the agent) ---
+:binary "C:\\Users\\you\\scoop\\shims\\eca.exe"   ; if `eca` isn't on PATH
+:eca {:model "openrouter/deepseek/deepseek-v4.1-flash"}
+;;   ^ OPTIONAL — there is ONE model by default (:llm :model), used by both
+;;     grog's own calls and the agent. Set :eca :model only to run the AGENT on
+;;     a different model. Provider-qualified: openrouter/… ollama/… openai/…
+
+;; --- optional features ---
+:edn-store {:root "edn-store"}              ; memory_* tools, MCP persistence, /jobs
+:chron     {:enabled true
+            :tasks [{:id "rss-tech"
+                     :every-minutes 240
+                     :instruction "Check https://hnrss.org/frontpage and flag the top items."}]}
+:projects  {:dir "~/grog-projects" :default "gmail-cleanup"}
+:mcp       {:idle-timeout-ms 900000}        ; stop idle MCP servers
+:terminal  {:shell "bash"}                  ; terminal + /shell
+:imaging   {:tessdata "/usr/share/tesseract-ocr/5/tessdata"}
+:jobs      {:max-thread-turns 40}
+:secrets   {:accounts [{:account "GITHUB_TOKEN"
+                        :description "GitHub PAT for with_api_key"}]}
+:soul      {:path "SOUL.md"}
+:skills    {:roots ["skills"]}
+
+;; --- voice (push-to-talk) ---
+:voice {:enabled true
+        :command ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
+        :sample-rate 16000
+        :max-seconds 60
+        ;; press = record, release = transcribe. Avoid alt+SPACE (window menu)
+        ;; and ctrl+SPACE (Linux IME toggle).
+        :push-to-talk-key "ctrl shift SPACE"}
+
+;; --- appearance (normally edited via the GUI Settings panel) ---
+:appearance {:chat {:font-family "Monospaced" :font-size 18
+                    :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
+                    :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
+             :terminal {:font-family "Monospaced" :font-size 18}}
+```
+
+Client logs are controlled by **environment variables**, not this file:
+`$GROG_LOG` (base path, default `~/grog`), `$GROG_UI_LOG_KEEP` (default 5), and
+`$GROG_LOG_WIRE=1` to also record the raw NDJSON driver traffic.

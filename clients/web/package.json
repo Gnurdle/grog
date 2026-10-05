@@ -20,11 +20,13 @@
 , "build":
   { "appId": "dev.grog.client"
   , "productName": "grog"
+  , "directories": { "output": "../../dist" }
   , "files": ["src/**/*", "resources/**/*", "package.json"]
   , "extraResources":
     [ { "from": "../../target/grog-spine.jar", "to": "jars/grog-spine.jar" }
     , { "from": "../../grog_mcp/target", "to": "jars", "filter": ["grog-mcp-*.jar"] }
     , { "from": "../../scripts/prereqs.ps1", "to": "setup/prereqs.ps1" }
+    , { "from": "../../resources/config.examples", "to": "config.examples" }
     ]
   , "icon": "assets/icon"
   , "win": { "target": ["nsis"], "icon": "assets/icon.ico"

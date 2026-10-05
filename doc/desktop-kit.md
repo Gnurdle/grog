@@ -76,7 +76,8 @@ directory (`clients/web/package.json`):
 `scripts/grog-client` and `scripts/grog-client.bat` behave the same way:
 
 1. Run a packaged build if there is one (`dist/linux-unpacked/grog`,
-   `dist\win-unpacked\grog.exe`); otherwise run from `clients/web`.
+   `dist\win-unpacked\grog.exe` — both under the repo-root `dist/`); otherwise
+   run from `clients/web`.
 2. Put `java` and `bash` on PATH — the backend is started with `java`, and each
    tool server is started through `bash`. On Windows the launcher also adds the
    JDK `bin` directory, which is not on PATH by default.

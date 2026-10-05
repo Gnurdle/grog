@@ -152,8 +152,12 @@
     (reset! eca-model-catalog* (set ids)))
   model-ids)
 
-(defn- provider-prefix-for-url
-  "Guess the ECA provider prefix from an OpenAI-compatible base URL, or nil."
+(defn provider-prefix-for-url
+  "Guess the ECA provider prefix from an OpenAI-compatible base URL, or nil.
+
+  Public because `grog.eca-config` uses it to qualify a model that came from the
+  `:llm` block: `:llm :model` is a RAW catalog id, and its provider is whatever
+  `:llm :url` points at."
   ^String [url]
   (when url
     (let [u (str/lower-case (str url))]
@@ -202,8 +206,13 @@
        ;; already exactly what ECA exposes
        (contains? catalog m) m
 
-       ;; explicit picker transport wins over every guess
-       (#{"ollama" "openrouter"} src)
+       ;; An explicit provider wins over every guess. That means a picker
+       ;; transport (`ollama`/`openrouter`) AND the provider grog derived from
+       ;; `:llm :url` — the latter matters because rule 5 below would otherwise
+       ;; read an OpenRouter org that shares a name with a native provider
+       ;; (`deepseek/deepseek-v4.1-flash` ⇒ a nonexistent "deepseek" provider)
+       ;; before ECA's catalogue has arrived to disambiguate it.
+       (contains? eca-provider-segments src)
        (if (str/starts-with? m (str src "/"))
          m
          (str src "/" m))

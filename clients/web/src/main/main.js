@@ -11,7 +11,7 @@
 //
 // It also forwards window focus, which the question-visibility rule needs
 // (doc/clients/web-client-plan.md §3.4.1).
-const { app, BrowserWindow, ipcMain, Menu, screen, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, screen, session, shell } = require("electron");
 const net = require("net");
 const os = require("os");
 const path = require("path");
@@ -21,6 +21,7 @@ const { execFile, spawn, spawnSync } = require("child_process");
 // Logging first, so everything after it (including a failed spawn) is captured.
 // One file per client instance: $GROG_LOG -> else ~/grog, as <base>.<pid>.log.
 const log = require("./log");
+const configSeed = require("./config-seed");
 const LOG = log.install();
 LOG.tee();
 console.log(`[grog-client] log file: ${LOG.path}`);
@@ -479,6 +480,84 @@ function createWindow() {
   win.on("blur",  () => { if (!win.isDestroyed()) win.webContents.send("grog:focus", false); });
 }
 
+// --- first-run config --------------------------------------------------------
+//
+// grog needs `<config home>/grog.edn`, and the annotated examples that make it
+// easy ship INSIDE the app bundle — for an AppImage, a read-only squashfs mount
+// no user can browse. So ASK: offer to write the file, name the exact path, and
+// reveal the folder. A silent copy would be worse than nothing, because a config
+// grog created for you still has no model, provider or API key — it cannot work
+// until you edit it, so you have to know it exists and where it went.
+function offerConfigCreation() {
+  let plan;
+  try {
+    // The examples ship in the app bundle (package.json extraResources).
+    // No tree lookup, no GROG_HOME: an unpackaged dev tree simply has nothing
+    // to offer from, and config still lands in the config home either way.
+    plan = configSeed.planOffer({});
+  } catch (e) {
+    console.warn("[grog-client] could not inspect the config home:", e && e.message);
+    return;
+  }
+  if (!plan.needsMain) return;   // already configured: say nothing, change nothing
+
+  const parent = win && !win.isDestroyed() ? win : undefined;
+  const lines = [
+    "grog has no configuration file yet.",
+    "",
+    "Create it from the bundled example? It will be written to:",
+    "",
+    `    ${plan.grogEdn}`,
+    "",
+    "grog runs on built-in defaults until you edit it, so expect model and",
+    "provider errors until you set :llm :url, :llm :model and your API key —",
+    "then restart grog.",
+  ];
+  if (plan.optional.length) {
+    lines.push("",
+      `The optional examples (odoo, imap, gitlab, imaging, secrets) are placed`,
+      `alongside it in ${plan.home} as *.example — copy the ones you need.`);
+  }
+
+  const answer = dialog.showMessageBoxSync(parent, {
+    type: "question",
+    buttons: ["Create it", "Not now"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "grog — no configuration yet",
+    message: "grog has no configuration yet",
+    detail: lines.join("\n"),
+  });
+  if (answer !== 0) {
+    console.log(`[grog-client] config not created - running on defaults (create ${plan.grogEdn} when ready)`);
+    return;
+  }
+
+  try {
+    const written = configSeed.createConfig(plan);
+    console.log(`[grog-client] created ${written.length} file(s):`);
+    for (const f of written) console.log(`  ${f}`);
+    shell.showItemInFolder(plan.grogEdn);   // land the user in the folder, file selected
+    dialog.showMessageBoxSync(parent, {
+      type: "info",
+      buttons: ["OK"],
+      title: "grog - configuration created",
+      message: "Now edit it, then restart grog",
+      detail: `Edit ${plan.grogEdn} — at least :llm :url, :llm :model and your API key —`
+        + `\nthen restart grog. Until then it cannot reach a model.`,
+    });
+  } catch (e) {
+    console.error("[grog-client] could not create the config:", e && e.message);
+    dialog.showMessageBoxSync(parent, {
+      type: "error",
+      buttons: ["OK"],
+      title: "grog - could not create the config",
+      message: "Could not write the configuration file",
+      detail: `${plan.grogEdn}\n\n${e && e.message}`,
+    });
+  }
+}
+
 ipcMain.handle("grog:call", (_e, method, params) => call(method, params));
 ipcMain.handle("grog:focused", () => !!(win && win.isFocused()));
 ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
@@ -536,6 +615,9 @@ app.whenReady().then(() => {
     cb(permission === "media"));
   connect();
   createWindow();
+  // AFTER the window exists, so the dialog has a parent and the app is visibly
+  // running behind it while the user decides.
+  offerConfigCreation();
 });
 // Kill the spine AND everything it spawned. Necessary because the MCP servers
 // are GRANDCHILDREN: spine (java) -> eca -> bash -> java. Killing only the spine

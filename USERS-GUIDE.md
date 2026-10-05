@@ -69,11 +69,25 @@ machine is "copy one folder + set one env var".
 
 ## 3. Full annotated config
 
-Copy `resources/config.examples/grog.edn.example` to your user config path, then
-edit. Everything is optional except `:llm :url` and `:llm :model`. For a complete
-starter bundle (imaging tessdata, gitlab, odoo, imap, secrets prototypes), copy
-the whole `resources/config.examples/` directory into your config home — see its
-`README.md`.
+On first run — when there is no `grog.edn` — the client **asks** whether to create
+one, names the exact path, and then opens the folder:
+
+```text
+grog has no configuration file yet.
+Create it from the bundled example? It will be written to:
+
+    ~/.config/grog/grog.edn
+```
+
+It is never written silently. A config grog made for you is still missing a
+model, a provider and an API key, so it cannot work until you edit it — say yes,
+edit the file, then restart grog. The optional examples (odoo, imap, gitlab,
+imaging, secrets) are written alongside it as `*.example`; copy the ones you need.
+
+Everything is optional except `:llm :url` and `:llm :model`.
+
+*(From a source tree the same files live at `resources/config.examples/`, and
+there is no first-run offer — the packaged copies do not exist there.)*
 
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
@@ -313,5 +327,5 @@ points — see §5.
 ---
 
 *See also:* the `README.md` (full feature listing, quick start, MCP) and
-`resources/config.examples/grog.edn.example` (annotated template with every
-option).
+`grog.edn.example` (annotated template with every option) — placed in your
+config home on first run, or at `resources/config.examples/` in a source tree.

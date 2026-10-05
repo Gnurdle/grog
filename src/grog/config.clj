@@ -214,11 +214,30 @@
        (io/file (repo-root) (platform/fix-drive-relative (str f)))))))
 
 (defn eca-model
-  "`:eca :model` from grog.edn — the `<provider>/<model>` string passed to ECA's
-  `chat/prompt`. nil when unset (ECA falls back to its own default)."
+  "The model the ECA agent runs — `:eca :model`, else `:llm :model`.
+
+  ONE MODEL BY DEFAULT: `:llm :model` is the model, and both grog's own calls
+  and the agent use it. `:eca :model` exists only to run the agent on a
+  DIFFERENT model than grog's own calls — set it and it wins.
+
+  nil when neither is set (ECA then falls back to the `defaultModel` in its own
+  ~/.config/eca/config.json)."
   []
-  (let [m (get-in (grog) [:eca :model])]
-    (when (seq (str/trim (str m))) (str/trim (str m)))))
+  (or (some-> (get-in (grog) [:eca :model]) str str/trim not-empty)
+      (some-> (get-in (grog) [:llm :model]) str str/trim not-empty)))
+
+(defn eca-model-source
+  "Which key `eca-model` took its value from: `:eca`, `:llm`, or nil.
+
+  `grog.eca-config` needs this to qualify a `:llm`-sourced model correctly: its
+  provider is then whatever `:llm :url` points at, and saying so explicitly
+  stops an OpenRouter org like `deepseek/…` being read as a native provider of
+  that name."
+  []
+  (cond
+    (some-> (get-in (grog) [:eca :model]) str str/trim not-empty) :eca
+    (some-> (get-in (grog) [:llm :model]) str str/trim not-empty) :llm
+    :else nil))
 
 (defn eca-provider-overrides
   "`:eca :providers` from grog.edn — provider entries grog merges into the

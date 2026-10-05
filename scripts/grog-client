@@ -27,11 +27,13 @@ export GROG_MCP_BASE_PORT="${GROG_MCP_BASE_PORT:-9800}"
 [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || export GROG_DISABLE_GPU=1
 
 # --- pick a runtime ----------------------------------------------------------
+# Packaged artifacts live in the repo-root dist/ (electron-builder's
+# directories.output = ../../dist), not clients/web/dist.
 cmd=()
-if [ -x "$web/dist/linux-unpacked/grog" ]; then
-  cmd=("$web/dist/linux-unpacked/grog")
-elif ls "$web"/dist/*.AppImage >/dev/null 2>&1; then
-  apk=$(ls -t "$web"/dist/*.AppImage | head -1)
+if [ -x "$repo/dist/linux-unpacked/grog" ]; then
+  cmd=("$repo/dist/linux-unpacked/grog")
+elif ls "$repo"/dist/*.AppImage >/dev/null 2>&1; then
+  apk=$(ls -t "$repo"/dist/*.AppImage | head -1)
   chmod +x "$apk" 2>/dev/null || true
   cmd=("$apk")
 elif [ -x "$web/node_modules/electron/dist/electron" ]; then

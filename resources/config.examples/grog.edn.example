@@ -1,101 +1,63 @@
-;; grog.edn.example — a real, copy-paste-starting config.
-;;
-;; Install: place this as ./grog.edn (or the user-level grog.edn per the location
-;; notes below), tweak the model URL/key, and run `grog`.
-;;
-;; Config location is platform-aware:
-;;   every OS: ${XDG_CONFIG_HOME:-~/.config}/grog/grog.edn
-;;   Windows:  C:\Users\you\.config\grog\grog.edn   (same path as Linux;
-;;             the old %APPDATA%\grog default is no longer used)
-;;   override: $GROG_CONFIG_HOME/grog.edn
-;; Merge order (later wins): bundled defaults -> the file above -> ./grog.edn in the run dir.
+;; grog.edn — copy to ~/.config/grog/grog.edn  ($GROG_CONFIG_HOME overrides).
+;; Every key is optional; grog runs on built-in defaults without this file.
 
-;; If the `eca` server binary isn't on PATH (e.g. it lives inside a VS Code
-;; extension or a scoop/npm install), point at it explicitly. ${ENV} + leading ~
-;; are supported. Omit if `eca` is already on PATH.
-;; :binary "C:\\Users\\you\\scoop\\shims\\eca.exe"
+{:llm {:url   "https://openrouter.ai/api/v1"   ; OpenAI-compatible endpoint
+       :model "moonshotai/kimi-k3"             ; THE model: chat + grog's own calls
+       ;; No :api-key on purpose — absent means "read the OS keyring", so store it
+       ;; once:  /secret set LLM_API_KEY sk-or-v1-…   (`false` = no key at all)
+       :profiles                               ; named alternate endpoints
+       {:local {:url "http://localhost:11434/v1"
+                :model "qwen3:8b"
+                :api-key nil}}}                ; nil = needs no key (local server)
 
-{:llm {:url "https://openrouter.ai/api/v1"
-       :model "deepseek/deepseek-v4-flash-0731"}
+ :babashka {:enabled true}                     ; the run_babashka tool
 
- :eca {:model "openrouter/deepseek/deepseek-v4-flash-0731"}
+ :soul   {:path "SOUL.md"}                     ; persona text loaded into prompts
+ :skills {:roots ["skills"]}                   ; skill dirs: <root>/<name>/SKILL.md
 
- :soul {:path "SOUL.md"}
+ :edn-store {:root "edn-store"}                ; memory_* tools, MCP registry, /jobs
+ :jobs      {:max-thread-turns 40}             ; dialog turns fed to /jobs + chron
 
- :skills {:roots ["skills"]}
+ :chron {:enabled false                        ; scheduled agent tasks
+         :tasks [{:id "heartbeat"
+                  :every-minutes 60            ; how often it runs
+                  :instruction                 ; what the agent should do
+                  "Review project memory if useful (memory_namespaces / memory_list_keys / memory_load). If nothing needs attention, one-line OK."}]}
 
- :babashka {}
+ :voice {:enabled true                         ; push-to-talk mic button
+         :command                              ; WAV in ({wav}), text on stdout
+         ["whisper-cli" "-m" "~/.config/grog/models/ggml-base.en.bin"
+          "-f" "{wav}" "-nt"]
+         :sample-rate 16000
+         :max-seconds 60}                      ; auto-stop after this long
 
- :cli {:chat-history-turns 12
-       :chat-show-thinking true
-       :chat-stream-live-thinking true
-       :chat-stream-live-content true
-       :chat-stream-live-markdown false
-       :format-markdown true}}
+ :appearance
+ {:theme {:name "flat-dark"}                   ; colour preset
+  :chat
+  {:font-family "Fira Code SemiBold"           ; transcript font
+   :font-size   20                             ; transcript size
+   :background  {:rgb [0 0 0]}                 ; window background
+   :text        {:rgb [216 224 234]}           ; default text
+   :user        {:rgb [255 153 102]}           ; your messages
+   :thinking    {:rgb [153 153 0]}             ; reasoning traces
+   :answer      {:rgb [0 153 153]}             ; assistant replies
+   :tool-call   {:rgb [255 0 255]}             ; tool-call lines
+   :snark       {:rgb [128 128 140]}           ; startup snark line
+   :code-bg     {:rgb [22 30 36]}              ; code blocks
+   :bubble-bg   {:rgb [43 44 54]}              ; message bubbles
+   :card-bg     {:rgb [26 29 35]}              ; dialogs / cards
+   :border      {:rgb [60 66 78]}              ; borders
+   :selection   {:rgb [185 205 240]}           ; selected text background
+   :selection-fg {:rgb [15 20 28]}}            ; selected text colour
+  :terminal
+  {:font-family "Fira Code SemiBold"
+   :font-size   20
+   :foreground  {:rgb [153 255 0]}             ; terminal text
+   :background  {:rgb [51 0 51]}}}             ; terminal background
 
-;; ----------------------------------------------------------------------------
-;; Commonly-tuned knobs (uncomment in your ./grog.edn to use):
-;;
-;;   ;:api-key "${OPENROUTER_API_KEY}"       ; prefer /secret keyring over inline
-;;   ;:temperature 0.7
-;;   ;:max-tokens 4096
-;;   ;:max-context-tokens 200000             ; token budget; oldest msgs dropped
-;;   ;:max-tool-result-chars 50000           ; cap tool-result length
-;;   ;:conn-timeout-sec 60
-;;   ;:socket-timeout-sec 300
-;;   ;:provider-name "OpenRouter · DeepSeek"
-;;   ;:extra-payload {:transforms ["middle-out"]}
-;;   ;:profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}}
-;;
-;; Optional: edn-store for memory_* tools, MCP persistence, /jobs.
-;;   ;:edn-store {:root "edn-store"}
-;;
-;; Project home — where per-project context lives, OUTSIDE the source tree.
-;; Each immediate subdir is a project. Default ~/grog-projects.
-;;   ;:projects {:dir "~/grog-projects" :default "gmail-cleanup"}
-;;
-;; Optional: voice input (push-to-talk). The toolbar mic button records the
-;; microphone (no extra deps — JVM audio) and transcribes via :command, which
-;; must read a WAV and print the text on stdout. {wav} is substituted with the
-;; recorded file. Examples:
-;;   whisper.cpp : ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
-;;   whisper     : ["whisper" "{wav}" "--model" "base" "--output_format" "txt"]
-;;   cloud CLI   : ["your-cli" "--file" "{wav}"]
-;; :voice {:enabled true
-;;         :command ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
-;;         :sample-rate 16000
-;;         :max-seconds 60
-;;         ;; hold-to-talk chord (press = record, release = transcribe). Default
-;;         ;; "ctrl shift SPACE"; change it if that clashes on your box, e.g.
-;;         ;; "F9" or "ctrl shift V". (Avoid alt+SPACE = window menu and
-;;         ;; ctrl+SPACE = Linux IME toggle.)
-;;         :push-to-talk-key "ctrl shift SPACE"}
-
-;; Per-instance client logs (`<base>.<pid>.log`) are controlled by ENV, not by
-;; this file: GROG_LOG (base path; default ~/grog) and GROG_UI_LOG_KEEP (default
-;; 5). Set GROG_LOG_WIRE=1 to also record the raw NDJSON driver traffic.
-
-;; Operational knobs (all optional; env vars remain overrides for one-off runs):
-;;   ;:mcp {:idle-timeout-ms 900000}           ; stop idle MCP servers after 15 min
-;;   ;:terminal {:shell "bash"}                ; terminal + /shell (default $SHELL)
-;;   ;:imaging {:tessdata "/usr/share/tesseract-ocr/5/tessdata"}
-;;
-;; Ollama host used to list local models (default http://localhost:11434):
-;;   ;:llm {:url "…" :model "…" :ollama-host "http://localhost:11434"}
-
-;; Optional: extra named secret accounts for /secret + with_api_key.
-;; Built-ins: BRAVE_SEARCH_API, LLM_API_KEY.
-;;   ;:secrets {:accounts [{:account "GITHUB_TOKEN" :description "GitHub PAT for with_api_key"}]}
-;;
-;; Appearance — normally edited via the GUI Settings panel.
-;;   ;:appearance {:chat {:font-family "Monospaced" :font-size 18
-;;                        :user {:rgb [165 138 25]} :thinking {:rgb [55 165 95]}
-;;                        :answer {:rgb [100 220 255]} :tool-call {:rgb [255 0 255]}}
-;;               :terminal {:font-family "Monospaced" :font-size 18}}
-;;
-;; Optional: recurring feed monitor. The agent can call grog-rss's fetch_feed
-;; itself, so a chron task only tells it which feeds to watch.
-;;   ;:chron {:enabled true
-;;            :tasks [{:id "rss-tech"
-;;                     :every-minutes 240
-;;                     :instruction "Check https://feeds.bbci.co.uk/news/technology/rss.xml and https://hnrss.org/frontpage. Flag the 1-2 most important items for me in a 3-line summary."}]}
+ :cli {:chat-history-turns 96                  ; prior turns kept; 0 = none, omit = all
+       :chat-show-thinking true                ; show reasoning traces
+       :chat-stream-live-thinking true         ; stream reasoning as it arrives
+       :chat-stream-live-content true          ; stream answer tokens (plain-text mode)
+       :chat-stream-live-markdown true         ; stream markdown block by block
+       :format-markdown true}}                 ; render the answer as ANSI markdown

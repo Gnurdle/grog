@@ -740,12 +740,19 @@
          ;; provider-qualified (`ollama/…`, `openrouter/…`). A bare local id such
          ;; as `qwen3.5:4b-tweaked` would make ECA fail with
          ;; "API url not found … provider 'qwen3.5:4b-tweaked'".
-         model (models/qualify-eca-model raw-model
-                                         nil
-                                         (try (config/llm-url) (catch Exception _ nil)))
+         llm-url (try (config/llm-url) (catch Exception _ nil))
+         ;; A model taken from the :llm block (the single-model case) is a RAW
+         ;; catalog id, and its provider is whatever :llm :url points at — pass
+         ;; that explicitly, so an OpenRouter org that shares a native provider's
+         ;; name (`deepseek/deepseek-v4.1-flash`) is not read as a provider of
+         ;; that name. The catalog that would otherwise disambiguate it only
+         ;; arrives once ECA is already running.
+         src (when (= :llm (config/eca-model-source))
+               (models/provider-prefix-for-url llm-url))
+         model (models/qualify-eca-model raw-model src llm-url)
          _ (eca-config-debug! "raw model=" (pr-str raw-model)
                               " qualified=" (pr-str model)
-                              " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
+                              " source=" (name (or (config/eca-model-source) :base-config-default)))
          merged (-> base
                     (ensure-provider model)
                     (assoc :mcpServers (grog-mcp-servers project))

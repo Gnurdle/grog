@@ -1,15 +1,28 @@
 #!/usr/bin/env bb
 ;; build_dist -- ONE entry point that produces a shippable grog (decision E1).
 ;;
-;;   bb scripts/build_dist.clj [--skip-jars] [--no-package] [--version X.Y.Z]
+;;   bb scripts/build_dist.clj [--target windows|linux|all] [--skip-jars]
+;;                             [--skip-web] [--no-package] [--bundle]
+;;                             [--version X.Y.Z]
+;;
+;; --target defaults to `all` (--win nsis AND --linux) — a plain `bb dist`
+;; builds the WHOLE release. It used to default to the host OS, so running it
+;; on Linux silently produced no Windows installer.
+;;
+;; EVERYTHING lands in the repo-root ./dist (clients/web/package.json sets
+;; electron-builder's `directories.output = ../../dist`); it used to scatter
+;; installers into clients/web/dist while this script wrote the portable
+;; bundle to ./dist.
 ;;
 ;; What it produces:
 ;;   target/grog-spine.jar            the headless backend (what the client owns)
 ;;   grog_mcp/target/grog-mcp-<v>.jar the MCP tool bundle (POI/PDFBox/OCR/keyring…)
 ;;   clients/web/resources/public/js/main.js + css/output.css   the renderer bundle
-;;   dist/grog-<v>/                   a runnable directory (jars + web assets + manifest)
-;;   dist/grog-<v>-<os>-<arch>.tar.gz a portable tarball
-;;   an installer (NSIS / AppImage) IF electron-builder is installed in clients/web
+;;   dist/grog-<v>-setup.exe          the Windows installer (electron-builder/NSIS)
+;;   dist/grog-<v>-<arch>.AppImage    the Linux installer
+;;   dist/grog-<v>-<os>-<arch>.tar.gz a portable tarball — ONLY with --bundle
+;;   (installers require electron-builder in clients/web; without it the jars
+;;    and renderer are still built and the packaging step is skipped)
 ;;
 ;; One collective version (E2) lives in ./VERSION; it is stamped into the jar
 ;; classpath as grog-version.edn so a running spine — and `grog doctor` — can
@@ -389,7 +402,11 @@
           ;; "wine is required". Verified: `bb dist --target windows` on Linux.
           (let [cross? (and (= "windows" for-os) (not= "windows" (os-tag)))
                 extra (cond-> []
-                        (= "windows" for-os) (into ["--win" "nsis"]))]
+                        (= "windows" for-os) (into ["--win" "nsis"])
+                        ;; Explicit: without it electron-builder builds for the
+                        ;; HOST platform, so `--target linux` only worked because
+                        ;; this build happens to run on Linux.
+                        (= "linux" for-os)   (into ["--linux"]))]
             (when cross?
               (when-not (wine-on-path?)
                 (die (str "building the Windows installer on Linux needs Wine — "
@@ -429,40 +446,54 @@
 
 (defn -main [& args]
   (let [version (resolve-version args)
-        for-os (or (arg-value args "--target") (os-tag))
+        ;; Default is BOTH installers. It used to default to the HOST os, so
+        ;; `bb dist` on Linux quietly produced no Windows installer at all —
+        ;; people reasonably expected a build to build the release.
+        target (or (arg-value args "--target") "all")
+        targets (case target
+                  "all"               ["windows" "linux"]
+                  ("windows" "linux") [target]
+                  (die (str "--target must be windows, linux or all (got "
+                            (pr-str target) ")")))
         opts {:version version
-              :for-os for-os
               :skip-jars? (boolean (some #{"--skip-jars"} args))
               :skip-web? (boolean (some #{"--skip-web"} args))
               :serial? (boolean (some #{"--serial"} args))}]
-    (when-not (#{"windows" "linux"} for-os)
-      (die (str "--target must be windows or linux (got " (pr-str for-os) ")")))
     (say (str "grog build_dist  version " version
               "  building on " (os-tag) "/" (arch-tag)
-              "  for " for-os "/" (arch-tag)))
+              "  for " (str/join " + " targets) "/" (arch-tag)))
     (build! opts)
-    ;; The deliverable is the INSTALLER (one artifact: grog-<v>-setup.exe). The
-    ;; portable tarball/zip are a developer convenience only, so they are
-    ;; opt-in via --bundle rather than part of the shipping path.
-    (when (some #{"--bundle"} args) (assemble! opts))
+    ;; The deliverable is the INSTALLER. The portable tarball/zip are a
+    ;; developer convenience only, so they are opt-in via --bundle rather than
+    ;; part of the shipping path.
+    (when (some #{"--bundle"} args)
+      (assemble! (assoc opts :for-os (os-tag))))
     (let [packaged? (not (some #{"--no-package"} args))]
-      (when packaged? (package! opts))
-      ;; Report the artifact that was actually produced rather than predicting a
-      ;; name: electron-builder's ${arch} for AppImage is x86_64, not x64.
-      (let [dist (fs/file root "clients/web/dist")
-            artifact (when packaged?
-                       (->> (when (fs/directory? dist) (fs/list-dir dist))
-                            (filter #(re-matches
-                                      (re-pattern
-                                        (str "grog-" (java.util.regex.Pattern/quote version)
-                                             ".*\\.(exe|AppImage|deb)$"))
-                                      (str (fs/file-name %))))
-                            (sort-by #(fs/last-modified-time %) #(compare %2 %1))
-                            first))]
-        (if artifact
+      (when packaged?
+        (doseq [t targets] (package! (assoc opts :for-os t))))
+      ;; Report the artifacts that were actually produced rather than
+      ;; predicting names: electron-builder's ${arch} differs per target
+      ;; (x64 for the Windows installer, x86_64 for the AppImage).
+      ;; Everything lands in ONE place — the repo-root ./dist — because
+      ;; clients/web/package.json sets `directories.output = ../../dist`
+      ;; (electron-builder otherwise defaults to clients/web/dist, which split
+      ;; the installers away from the portable bundle this script writes here).
+      (let [dist (fs/file root "dist")
+            artifacts (when packaged?
+                        (->> (when (fs/directory? dist) (fs/list-dir dist))
+                             (filter #(re-matches
+                                       (re-pattern
+                                         (str "grog-" (java.util.regex.Pattern/quote version)
+                                              ".*\\.(exe|AppImage|deb)$"))
+                                       (str (fs/file-name %))))
+                             (sort-by #(str (fs/file-name %)))
+                             vec))]
+        (if (seq artifacts)
           (do (say "")
-              (say "ARTIFACT:" (str artifact))
-              (say "  copy that one file to the target and run it"))
+              (say (str "ARTIFACT" (when (> (count artifacts) 1) "S")
+                        " (" (count artifacts) ") in " (str dist) ":"))
+              (doseq [a artifacts] (say "  " (fs/file-name a)))
+              (say "  .exe -> Windows, .AppImage -> Linux"))
           (say "done."))))))
 
 (when (= *file* (System/getProperty "babashka.file"))

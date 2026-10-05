@@ -26,8 +26,9 @@ set "GROG_DISABLE_GPU=1"
 set "NODE_ENV=production"
 set "GROG_MCP_BASE_PORT=9800"
 
-rem packaged build wins
-for %%D in ("%WEB%\dist\win-unpacked") do if exist "%%~fD\grog.exe" (
+rem packaged build wins — electron-builder now writes to the repo-root dist/
+rem (clients/web/package.json sets directories.output = ../../dist)
+for %%D in ("%ROOT%\dist\win-unpacked") do if exist "%%~fD\grog.exe" (
   echo Launching packaged grog...
   "%%~fD\grog.exe" >>"%PLAYER%" 2>&1
   goto done

@@ -10,34 +10,20 @@
   ;; sources: nothing to copy, nothing to keep in sync.
 
   ;; Args are forwarded: `bb dist --target windows --no-package`.
-  dist      {:doc "Build the shippable grog: jars + renderer + the installer (one artifact: clients/web/dist/grog-<v>-setup.exe). Its three build JOBS (mcp jar, spine jar, renderer) are independent and run IN PARALLEL — not to be confused with --target, which picks the OS to package for. One version from ./VERSION. Flags: --target windows|linux, --skip-jars, --skip-web, --serial (one at a time — use on a RAM-starved machine), --no-package, --bundle (also write the portable .tar.gz/.zip), --version X.Y.Z."
+  dist      {:doc "Build the shippable grog: jars + renderer + BOTH installers (dist/grog-<v>-setup.exe for Windows, dist/grog-<v>-<arch>.AppImage for Linux). Its three build JOBS (mcp jar, spine jar, renderer) are independent and run IN PARALLEL. Everything lands in the repo-root ./dist. One version from ./VERSION. Flags: --target windows|linux|all (default: all), --skip-jars, --skip-web, --serial (one at a time — use on a RAM-starved machine), --no-package, --bundle (also write the portable .tar.gz/.zip), --version X.Y.Z."
              :task (apply shell "bb" "scripts/build_dist.clj" *command-line-args*)}
 
   dist:fast {:doc "Same as `dist` but reuse the already-built jars (--skip-jars)."
              :task (shell "bb scripts/build_dist.clj" "--skip-jars")}
 
-  ;; Full release: everything a shippable drop needs, in one command.
-  ;;   [1] rebuild BOTH jars and the renderer — done ONCE, with --no-package,
-  ;;       because the jars and the renderer bundle are shared by the two
-  ;;       installers (only the installer differs).
-  ;;   [2] Windows NSIS installer   (cross-built here; needs Wine — see below)
-  ;;   [3] Linux AppImage
-  ;; On Linux, the Windows step needs Wine: electron-builder runs the
+  ;; `bb dist` now builds BOTH installers by default, so `release` is just a
+  ;; readable alias for it — one implementation, two names people reach for.
+  ;; On Linux the Windows step needs Wine: electron-builder runs the
   ;; intermediate installer under it to extract the uninstaller, and rcedit to
   ;; stamp the exe icon + version metadata.
   release
-  {:doc "Full release: rebuild BOTH jars + renderer, then the Windows NSIS and Linux AppImage installers. Version from ./VERSION (or: bb release --version X.Y.Z)."
-   :task
-   (let [args *command-line-args*
-         i    (first (keep-indexed (fn [idx a] (when (= "--version" a) idx)) args))
-         ver  (when (and i (< (inc i) (count args))) ["--version" (nth args (inc i))])
-         step (fn [n msg & argv]
-                (println (str "\n==> [" n "] " msg))
-                (apply shell "bb" "scripts/build_dist.clj" (concat ver argv)))]
-     (step "1/3" "jars + renderer (no packaging)" "--no-package")
-     (step "2/3" "WINDOWS installer (NSIS)" "--target" "windows" "--skip-jars" "--skip-web")
-     (step "3/3" "LINUX installer (AppImage)" "--target" "linux" "--skip-jars" "--skip-web")
-     (println "\n==> release done — artifacts in clients/web/dist/"))}
+  {:doc "Alias for `bb dist` — rebuild both jars + renderer, then the Windows NSIS and Linux AppImage installers into ./dist. Version from ./VERSION (or: bb release --version X.Y.Z)."
+   :task (apply shell "bb" "scripts/build_dist.clj" *command-line-args*)}
 
   ;; `bb dev` — run grog straight out of this dev tree, on Windows and Linux
   ;; alike, with EVERYTHING Clojure compiled from .clj source at launch:

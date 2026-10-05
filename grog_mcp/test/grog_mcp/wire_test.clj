@@ -95,7 +95,11 @@
                                         (if-let [l (take-line err 200)] (recur (conj acc l) (dec n)) acc)
                                         acc))))
           (send! w {:jsonrpc "2.0" :method "notifications/initialized"})
-          (Thread/sleep 2500)
+          ;; NO sleep here. Asking immediately is the point: the bundle compiles
+          ;; each server namespace at runtime (non-AOT), so if the stdio transport
+          ;; is alive before the tools are registered, an immediate `tools/list`
+          ;; returns a PARTIAL list (observed: 0 tools). A 2500ms sleep used to
+          ;; hide exactly that bug.
           (send! w {:jsonrpc "2.0" :id 2 :method "tools/list" :params {}})
           (let [tools-line (take-matching out read-timeout-ms #(= 2 (:id %)))]
             (is (some? tools-line) "no tools/list response from the jar")

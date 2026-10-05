@@ -120,6 +120,7 @@ Open the run log and check, in order. The client writes one file per instance �
 | Thing | Path |
 |---|---|
 | settings | `~/.config/grog/grog.edn` |
+| first run | If `grog.edn` is missing the client **offers** to create it there (a native dialog naming the path), then opens the folder. Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are written alongside as `*.example`. |
 | other config | `~/.config/grog/{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the OS secret store (Secret Service); `secrets.edn` is the fallback |
 | projects | `~/grog-projects/<project>/{notes,dialog,state}` |

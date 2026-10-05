@@ -143,12 +143,26 @@
   (let [ids (if only [(keyword only)] (keys servers))
         _ (when (not-every? server-ids ids)
             (throw (ex-info (str "unknown --server; choose from " (sort (map name server-ids))) {})))
+        ;; REALIZE the tool specs FIRST — this is the slow step. The bundle is
+        ;; deliberately non-AOT, so `collect-tools` compiles each server's
+        ;; namespace at runtime (seconds). `collect-tools` returns a LAZY
+        ;; mapcat, so without this `vec` that compilation happens inside the
+        ;; `doseq` below — i.e. AFTER the transport exists.
+        ;;
+        ;; The StdioServerTransportProvider answers requests the moment it is
+        ;; constructed, so a client that issues `tools/list` in the first seconds
+        ;; used to get a PARTIAL list and cache it: measured 0 tools immediately
+        ;; after `initialize`, 9 for the real client, 80 after the dust settled.
+        ;; That is the "the model cannot see the odoo/imap/… tools" bug.
+        ;; Compile everything, THEN open the transport.
+        specs (vec (collect-tools ids))
         transport-provider (StdioServerTransportProvider. (ObjectMapper.))
         server (-> (McpServer/async transport-provider)
                    (.serverInfo "grog-mcp" "0.1.0")
                    (.capabilities (-> (McpSchema$ServerCapabilities/builder) (.tools true) (.build)))
                    (.build))]
-    (doseq [t (collect-tools ids)]
+    ;; registering already-realised specs is fast (no compilation here)
+    (doseq [t specs]
       (-> (.addTool server (tool t)) (.subscribe)))
     server))
 

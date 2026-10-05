@@ -202,6 +202,7 @@ does the same thing.
 | Thing | Path |
 |---|---|
 | settings | `%USERPROFILE%\.config\grog\grog.edn` |
+| first run | If `grog.edn` is missing the client **offers** to create it there (a native dialog naming the path), then opens the folder. Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are written alongside as `*.example`. |
 | other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the Windows credential store; `secrets.edn` is the fallback |
 | projects | `%USERPROFILE%\grog-projects\<project>\{notes,dialog,state}` |
@@ -288,7 +289,7 @@ missing, builds both jars and the renderer, handles electron-builder's
 and finishes by printing the one artifact to ship:
 
 ```
-ARTIFACT: C:\Users\<you>\grog\clients\web\dist\grog-0.1.0-setup.exe
+ARTIFACT: C:\Users\<you>\grog\dist\grog-0.1.0-setup.exe
 ```
 
 Copy that single `.exe` to the target machine and run it — the installer lays
