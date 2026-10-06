@@ -6,35 +6,39 @@
   NO token — both are personal config under ~/.config/grog.
 
   Multiple GitLab *instances* can be configured. The model can only ever select
-  one of the pre-configured instance *names* (never a URL / endpoint). Tokens are
-  per-instance, read from token files referenced by path; they NEVER appear in
-  tool output or in source.
+  one of the pre-configured instance *names* (never a URL / endpoint). Each
+  instance NAMES the store account that holds its token (`:token-secret`), and
+  this server reads the value from grog's secret store. Tokens NEVER appear in
+  tool output, in source, or in a config file.
 
   Config is file-based: ~/.config/grog/gitlab.edn
     {:config \"~/.config/grog/gitlab-instances.edn\"}  → load an instances file
-    {:url ... :token-file ...}                          → single \"default\" instance
+    {:url ... :token-secret ...}                        → single \"default\" instance
 
-  The token is resolved per instance as:
-    1. an explicit `:token` (a literal, or `${ENV}`-interpolated);
-    2. the OS KEYRING, account `GITLAB_TOKEN` (`/secret set GITLAB_TOKEN <value>`)
-       — the normal path, read by THIS SERVER, so the token never enters an env
-       var or a config file. (grog used to inject it as `GROG_GITLAB_TOKEN`, but
-       everything in the MCP child's env is written verbatim into the generated
-       ECA config, so the token ended up on disk in plaintext.)
-    3. the legacy `:token-file` (slurped).
-  Tokens NEVER appear in tool output or in source.
+  The token for an instance is resolved from the OS keyring by THIS SERVER:
+    1. the account named by the instance's `:token-secret`, when it declares one
+       (`:token-secret \"GITLAB_STAGE_TOKEN\"` ← `/secret set GITLAB_STAGE_TOKEN <value>`);
+    2. otherwise the well-known account `GITLAB_TOKEN` (`/secret set GITLAB_TOKEN <value>`).
+  Both live in the store. There is no `:token` literal, no `${ENV}` and no
+  `:token-file` any more, so several instances can hold several distinct tokens
+  without any of them reaching a config file or a child process env. (grog used
+  to inject `GROG_GITLAB_TOKEN`, but everything in an MCP child's env is written
+  verbatim into the generated ECA config, so the token landed on disk in
+  plaintext.)
+  Tokens NEVER appear in tool output, in source, or in a config file.
 
   where the instances file is EDN:
 
     {:instances [
         {:name \"prod\", :url \"https://gitlab.example.com/api/v4\",
-         :token-file \"~/.config/grog/keys/gitlab-prod.token\"},
+         :token-secret \"GITLAB_PROD_TOKEN\"},
         {:name \"stage\", :url \"https://stage.example.com/api/v4\",
-         :token-file \"~/.config/grog/keys/gitlab-stage.token\"}]}
+         :token-secret \"GITLAB_STAGE_TOKEN\"}]}
 
   Single-instance fallback (when gitlab.edn has no :config and no :url), or the
   default instances file ~/.config/grog/gitlab-instances.edn is used.
-  ${ENV} / ${ENV:-default} interpolation inside the instances file is honored.
+  ${ENV} / ${ENV:-default} interpolation inside the instances file is honored for
+  `:url` only — never for a credential.
 
   Auth is PRIVATE-TOKEN (resolved per instance — see above). Every tool is
   read-only. A model sees the tools as `grog-mcp__<tool>` (the single grog-mcp
@@ -90,8 +94,24 @@
 (defn- normalize-url [url]
   (str/replace (str url) #"/+$" ""))
 
-(defn- expand-home ^String [^String p]
-  (str/replace p "~" (or (System/getenv "HOME") "")))
+(defn- reject-inline-token!
+  "Refuse an instance that still carries an inline credential (`:token`, a literal
+  or `${ENV}`) or the legacy `:token-file`.
+
+  Both were store-free escape hatches. Ignoring them would surface as an
+  unauthorized request — which reads like a bad token rather than a config that
+  needs migrating — so say so."
+  [^String path name i]
+  (let [legacy (cond (contains? i :token) :token
+                     (contains? i :token-file) :token-file)]
+    (when legacy
+      (let [acct (str "GITLAB_" (str/upper-case name) "_TOKEN")]
+        (throw (ex-info (str "Instance '" name "' in " path " sets `" legacy "`, which is NO "
+                             "longer supported — a token must live in grog's secret store and be "
+                             "named here, never written in the config file (or via `${ENV}`). Fix:  "
+                             "/secret set " acct " <value>   then use  :token-secret "
+                             (pr-str acct) "  (or use the shared account GITLAB_TOKEN).")
+                        {:path path :instance name :account acct}))))))
 
 (defn- gitlab-config-file ^File []
   (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
@@ -110,8 +130,9 @@
 (defn- read-instances-file!
   "Load instances from the config file at `path`. Accepts EDN (the current grog
   writer format) or legacy JSON. Returns a vector of instance maps with
-  :name / :url / :token-file. `${ENV}` / `${ENV:-default}` references in string
-  fields are interpolated from the process environment."
+  :name / :url / :token-secret. `${ENV}` / `${ENV:-default}` references in string
+  fields are interpolated from the process environment for `:url` only — an
+  inline `:token` / `:token-file` is REFUSED."
   [path]
   (let [raw (slurp (java.io.File. path))
         data (try
@@ -124,35 +145,36 @@
       (throw (ex-info (str "GitLab instances file contains no instances: " path) {:path path})))
     (mapv (fn [i]
             (let [name (str (or (:name i) "default"))
+                  _    (reject-inline-token! path name i)
                   url  (normalize-url (interp (or (:url i) (throw (ex-info (str "instance '" name "' missing :url") {})))))]
               {:name name
                :url url
-               :token (str (interp (or (:token i) "")))
-               :token-file (str (expand-home (str (interp (or (:token-file i) "")))))}))
+               ;; the secret-store ACCOUNT NAME, not the token itself
+               :token-secret (some-> (:token-secret i) str str/trim not-empty)}))
           insts)))
 
 (defn- load-config!
   "Populate `config*` from ~/.config/grog/gitlab.edn:
       {:config \"path\"}                        → load that instances file
-      {:url ... :token-file ...}                → single \"default\" instance
+      {:url ... :token-secret ...}              → single \"default\" instance
     If gitlab.edn is missing or carries no :config/:url, the default instances
     file ~/.config/grog/gitlab-instances.edn is used. ${ENV} interpolation inside
-    the instances file is still honored."
+    the instances file is still honored for `:url` — never for a credential."
   []
   (let [cfg (load-config-file!)
         home (or (System/getenv "HOME") (System/getProperty "user.home"))
         instances
         (cond
           (and (not (:config cfg))
-               (or (:url cfg) (:token cfg) (:token-file cfg)))
-          (let [missing (remove (fn [k] (not (str/blank? (str (get cfg k))))) [:url])]
+               (or (:url cfg) (:token cfg) (:token-file cfg) (:token-secret cfg)))
+          (let [_ (reject-inline-token! (.getPath (gitlab-config-file)) "default" cfg)
+                missing (remove (fn [k] (not (str/blank? (str (get cfg k))))) [:url])]
             (when (seq missing)
               (throw (ex-info (str "gitlab.edn single-instance config is missing: "
                                    (str/join ", " (map name missing))) {})))
             [{:name "default"
               :url (normalize-url (interp (:url cfg)))
-              :token (str (interp (or (:token cfg) "")))
-              :token-file (str (expand-home (str (interp (or (:token-file cfg) "")))))}])
+              :token-secret (some-> (:token-secret cfg) str str/trim not-empty)}])
 
           :else
           (let [cfg-file (not-empty (str/trim (str (or (:config cfg) "~/.config/grog/gitlab-instances.edn"))))
@@ -160,7 +182,7 @@
             (read-instances-file! cfg-file)))
         by-name (into {} (map (fn [i] [(:name i) i])) instances)]
     (when-not (seq instances)
-      (throw (ex-info "No GitLab instances configured. Add :config (or :url/:token-file) to ~/.config/grog/gitlab.edn." {})))
+      (throw (ex-info "No GitLab instances configured. Add :config (or :url/:token-secret) to ~/.config/grog/gitlab.edn." {})))
     (reset! config* {:instances instances :by-name by-name})
     (reset! current* nil)
     @config*))
@@ -196,14 +218,16 @@
       (catch PasswordAccessException _ nil))))
 
 (defn- keyring-token
-  "The GitLab token from the OS keyring (service \"grog\", account
-  `GITLAB_TOKEN` — `/secret set GITLAB_TOKEN <value>`), or nil."
-  ^String []
+  "Read `account` from the OS keyring (service \"grog\"), or nil.
+
+  The account is what the instance's `:token-secret` names; when an instance
+  declares none, `instance-token` falls back to the shared `GITLAB_TOKEN`."
+  ^String [^String account]
   (when-not @!keyring-unreachable
     (try
       (let [f (future
                 (try
-                  (fetch-secret-blocking! gitlab-token-account)
+                  (fetch-secret-blocking! account)
                   (catch BackendNotSupportedException _ ::unsupported)
                   (catch Exception _ ::error)))
             v (deref f 4000 ::timeout)]
@@ -218,20 +242,23 @@
       (catch Exception _ nil))))
 
 (defn- instance-token
-  "Resolve the auth token for `inst`, in order:
-    1. an explicit `:token` (a literal, or `${ENV}`-interpolated);
-    2. the OS keyring, account `GITLAB_TOKEN` — the normal path, and the only one
-       that keeps the token out of every config file;
-    3. the legacy `:token-file` (slurped)."
+  "Resolve the auth token for `inst` from grog's secret store: the account named
+  by the instance's `:token-secret`, else the shared `GITLAB_TOKEN` account. Both
+  are store lookups — there is no literal / `${ENV}` token and no token file.
+
+  Throws rather than returning an empty token, so a missing credential reads as
+  a missing credential instead of an unauthorized request."
   [inst]
-  (let [t (str/trim (or (:token inst) ""))]
-    (if-not (str/blank? t)
-      t
-      (or (keyring-token)
-          (if-let [tf (:token-file inst)]
-            (try (str/trim (slurp (expand-home (str tf))))
-                 (catch Exception _ ""))
-            "")))))
+  (let [acct (or (some-> (:token-secret inst) str str/trim not-empty)
+                 gitlab-token-account)]
+    (or (keyring-token acct)
+        (throw (ex-info (str "Instance '" (:name inst) "' has no GitLab token: nothing is stored for "
+                             "account '" acct "' in the OS keyring (service '" service-id "'). Set it "
+                             "with:  /secret set " acct " <value>"
+                             (if (= acct gitlab-token-account)
+                               "  — or point this instance at its own account with :token-secret."
+                               "."))
+                        {:instance (:name inst) :account acct})))))
 
 (defn- instance-auth!
   "Resolve the auth for `inst` lazily (cached) and return {:url :token}. The raw

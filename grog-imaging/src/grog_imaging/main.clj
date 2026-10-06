@@ -105,6 +105,15 @@
     :image-out? true   ; hand the written PNG back as an MCP image block (see grog_mcp.main)
     :fn (fn [a] (tools/run-write-workspace-png! a))}
 
+   {:name "show_image"
+    :description "Show an image that ALREADY EXISTS (PNG/JPG) inline in the chat. Call this whenever the user asks to see an image, or after producing one — never just describe an image you can show. Optional `max_width` downscales the displayed copy (the source file is untouched)."
+    :schema (json/write-str {:type :object
+                             :properties {:path {:type :string}
+                                          :max_width {:type :integer}}
+                             :required [:path]})
+    :image-out? true   ; hand the image back as an MCP image block
+    :fn (fn [a] (tools/run-show-image! a))}
+
    {:name "crop_workspace_image"
     :description "Crop an image/PDF at `source_path` to a box (x y width height), write PNG to `out_path`. For PDF, `page` (1-based) and `dpi` are required."
     :schema (json/write-str {:type :object

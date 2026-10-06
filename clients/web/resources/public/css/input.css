@@ -61,3 +61,7 @@ body{ background:#020617; color:#eaf7f8;
            display:block; width:max-content; max-width:100%; overflow-x:auto }
 .md th,.md td{ border:1px solid var(--grog-border); padding:.25em .6em; vertical-align:top }
 .md th{ background:rgba(255,255,255,.06); font-weight:600 }
+
+/* inline images (markdown ![alt](src)) — capped, never swallow the transcript */
+.md img{ max-width:100%; height:auto; border:1px solid var(--grog-border);
+         border-radius:.4rem; vertical-align:middle }

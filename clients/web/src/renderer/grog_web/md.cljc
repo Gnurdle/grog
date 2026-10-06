@@ -90,6 +90,16 @@
                      (or (>= (inc j) n) (not (alnum? (nth s (inc j))))))
             [(into [:em] (inline (subs s (inc i) j))) (inc j)])))
 
+      ;; image ![alt](src) — MUST precede the link branch (the '[' is preceded by
+      ;; '!'). Rendered as a bare <img>: NOT wrapped in an <a>, so clicking it
+      ;; can't navigate the window away (which looked like a crash).
+      (and (= one "!") (< (inc i) n) (= "[" (subs s (inc i) (+ i 2))))
+      (when-let [j (str/index-of s "](" (+ i 2))]
+        (when-let [k (str/index-of s ")" (+ j 2))]
+          [[:img {:src (str/trim (subs s (+ j 2) k))
+                  :alt (str/trim (subs s (+ i 2) j))}]
+           (inc k)]))
+
       (= one "[")
       (when-let [j (str/index-of s "](" (inc i))]
         (when-let [k (str/index-of s ")" (+ j 2))]

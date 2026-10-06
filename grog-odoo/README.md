@@ -76,13 +76,13 @@ Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
    :url "https://exclave.cmsaero.com"
    :db "odoo18_stage"
    :user "admin"
-   :password "secret-or-api-key"
+   :password-secret "ODOO_STAGE_PASSWORD"
    :allow-write false}
   {:name "prod"
    :url "https://odoo.example.com"
    :db "odoo18"
    :user "admin"
-   :password "..."
+   :password-secret "ODOO_PROD_PASSWORD"
    :allow-write false}
 ]}
 ```
@@ -94,6 +94,12 @@ Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
   argument. There is no "first configured" fallback — a bare call is REFUSED, so
   nothing can silently hit the wrong database. With exactly one instance the
   argument is optional, since it is unambiguous.
+- `:password-secret` names an **account in grog's secret store** — the password
+  itself is never in this file. Store each one once:
+  `/secret set ODOO_STAGE_PASSWORD <value>` (OS keyring; grog's `secrets.edn` is
+  the headless fallback). This is the **only** credential source: there is no
+  `:password` field, no `${ENV}` credential and no credential file, because
+  several instances can be configured and each carries the NAME of its account.
 - `:allow-write` (default **false**) is the per-instance write switch. False
   refuses any statement that could modify data *before Odoo is called*. True
   passes mutating SQL through to Select-O-Matic, which still requires the Odoo
@@ -102,18 +108,25 @@ Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
   `select_o_matic` addon over the Odoo API, using the instance's own login — so
   no database host/port/credentials are involved at all.
 
-### Legacy single instance (backwards compatible)
+### Single instance
 
-When `GROG_ODOO_CONFIG` is unset, the server falls back to env vars:
+`~/.config/grog/odoo.edn` can carry one instance directly:
 
-| Env | Meaning |
-|-----|---------|
-| `GROG_ODOO_URL` | Odoo server base URL |
-| `GROG_ODOO_DB` | Odoo database name |
-| `GROG_ODOO_USER` | login / uid |
-| `GROG_ODOO_PASSWORD` | password or API key |
+```edn
+{:url "https://odoo.example.com"
+ :db "odoo18"
+ :user "admin"
+ :password-secret "ODOO_DEFAULT_PASSWORD"}
+```
 
-Connection/auth is resolved lazily on the first tool call, per instance.
+Otherwise the default instances file `~/.config/grog/odoo-instances.edn` is used
+(`GROG_ODOO_CONFIG` overrides that path). Connection/auth is resolved lazily on
+the first tool call, per instance — no credential is read at registration time.
+
+Note: the `GROG_ODOO_URL` / `GROG_ODOO_DB` / `GROG_ODOO_USER` env vars are **not
+read by this server**; put the connection details in one of the two files above.
+There is deliberately **no `GROG_ODOO_PASSWORD`** — a password in the process env
+would be written verbatim into the generated ECA config.
 
 ## Tools
 

@@ -29,6 +29,7 @@
     , { "from": "../../grog_mcp/target", "to": "jars", "filter": ["grog-mcp-*.jar"] }
     , { "from": "../../scripts/prereqs.ps1", "to": "setup/prereqs.ps1" }
     , { "from": "../../resources/config.examples", "to": "config.examples" }
+    , { "from": "../../resources/models", "to": "models", "filter": ["*.bin"] }
     , { "from": "assets/icon.png", "to": "icon.png" }
     , { "from": "../../README.md", "to": "docs/README.md" }
     , { "from": "../../USERS-GUIDE.md", "to": "docs/USERS-GUIDE.md" }

@@ -14,7 +14,7 @@
   grog.eca-config)."
   (:require [clojure.tools.build.api :as b]))
 
-(def default-version "0.2.0")
+(def default-version "0.2.1")
 (def class-dir "target/classes")
 ;; Just the bundle's own sources: the 12 servers arrive on the classpath as
 ;; `:local/root` deps (see deps.edn), NOT as a vendored copy.

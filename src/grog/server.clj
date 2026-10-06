@@ -95,6 +95,7 @@
             [grog.config :as config]
             [grog.docs :as docs]
             [grog.mcp-http :as mcp-http]
+            [grog.mcps :as mcps]
             [grog.models :as models]
             [grog.projects :as projects]
             [grog.providers :as providers]
@@ -268,68 +269,57 @@
 
 ;; --- request handling ------------------------------------------------------
 
-(defn- eca-config-provider-urls
-  "Provider base URLs ECA already knows, read from ECA's OWN config
-  (`${XDG_CONFIG_HOME:-~/.config}/eca/config.json`).
-
-  This exists because grog is not the only home of a key: ECA can hold a
-  provider (and its key) that grog never sees, so a key missing from grog's
-  secret store does NOT mean grog cannot reach a model — a working developer box
-  is exactly that case, and misreading it would hide a live transcript behind the
-  onboarding page."
-  []
-  (try
-    (let [base (or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
-                   (str (System/getProperty "user.home") "/.config"))
-          f (File. base "eca/config.json")]
-      (when (.exists f)
-        (->> (:providers (json/parse-string (slurp f :encoding "UTF-8") true))
-             vals
-             (keep #(some-> (:url %) str str/trim not-empty)))))
-    (catch Throwable _ nil)))
-
 (def ^:private local-url-re
   #"(?i)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)")
 
-(defn- llm-configured?
-  "True when grog is plausibly able to reach a model: a model AND a URL are
-  configured, and a key is available from somewhere grog can see.
+(defn- grog-llm-ready?
+  "True when GROG ITSELF has a usable brain: a model AND a URL are configured,
+  and a key is available from something grog owns.
 
-  A key counts if it resolves in grog's own store, the endpoint is local (no key
-  needed), `:llm :api-key` is explicitly `false`, or ECA's own config already
-  declares a provider for the same URL. Requiring a GROG-side key would be wrong:
-  ECA can hold the key itself, and then a working setup would be misread as
-  unconfigured and hidden behind the 'Job 1' page.
+  A key counts if it resolves in grog's own secret store (keyring / secrets.edn),
+  the endpoint is local (no key needed), or `:llm :api-key` is explicitly
+  `false`. ECA's OWN config is deliberately NOT consulted: onboarding exists to
+  set up GROG's secret store, so a fresh grog whose only key lives in ECA's
+  config (which a reset or a config-home wipe does NOT touch) must still read as
+  unconfigured and show the 'Job 1' steps — otherwise the user is never told
+  where grog's own credentials go.
 
   Without a model or URL, no turn can work at all — that is the real 'Job 1'.
   Every accessor is wrapped: `llm-url`/`eca-model` THROW when unset, and
   `llm-api-key` may consult the OS keyring. This must never throw."
   []
   (let [url   (try (some-> (config/llm-url) str str/trim not-empty) (catch Throwable _ nil))
-        model (try (some-> (config/eca-model) str str/trim not-empty) (catch Throwable _ nil))
-        norm  (fn [u] (str/replace (str/lower-case (str u)) #"/+$" ""))]
+        model (try (some-> (config/eca-model) str str/trim not-empty) (catch Throwable _ nil))]
     (boolean
      (and url model
           (or (try (some-> (config/llm-api-key) str str/trim not-empty) (catch Throwable _ nil))
               (false? (get-in (config/grog) [:llm :api-key]))
-              (boolean (re-find local-url-re (str url)))
-              (some #(= (norm %) (norm url)) (eca-config-provider-urls)))))))
+              (boolean (re-find local-url-re (str url))))))))
 
 (defn- bootstrap-info
   "The `:bootstrap` block the client needs to decide between the onboarding page
   and the normal splash.
 
-  `:needed?` is true when no LLM is reachable (the real 'Job 1'), OR when this
-  launch was started by an EXPLICIT onboarding request — a factory reset asks for
-  the getting-started landing even though ECA's own config (which a reset does
-  NOT touch) may still hold a working key. `:configured?` reports the raw
-  reachability so that landing can say so honestly instead of pretending there is
-  no brain. `:docs-dir` lets the offline page point at the shipped docs."
+  `:needed?` is true when THIS launch wants onboarding — a fresh install (no
+  projects) or an explicit request (the reset marker, or the first-run config
+  seed), tracked by `grog.bootstrap/onboarding-wanted-this-session?`. It is NOT
+  simply 'no LLM reachable': a returning user whose key lives only in ECA's
+  config must not be re-onboarded on every launch.
+
+  `:configured?` reports whether GROG ITSELF has a brain (a grog-side key or a
+  local endpoint — see `grog-llm-ready?`), so the landing shows the real 'Job 1'
+  steps when grog's own credentials are missing, even if ECA's untouched config
+  could still reach a model. `:docs-dir` lets the offline page point at the
+  shipped docs."
   []
-  (let [configured? (llm-configured?)]
-    {:needed? (or (bootstrap/onboarding-requested-this-session?) (not configured?))
+  (let [configured? (grog-llm-ready?)]
+    {:needed? (bootstrap/onboarding-wanted-this-session?)
      :configured? configured?
-     :docs-dir (some-> (docs/docs-dir) .getPath)}))
+     :docs-dir (some-> (docs/docs-dir) .getPath)
+     ;; the MCP servers grog ships, so the onboarding page can list what is
+     ;; available and what might be worth setting up. Curated + file-checked —
+     ;; see grog.mcps (no secret-store probes on this path).
+     :mcps (mcps/available)}))
 
 (defn- handle-request
   "Dispatch one JSON-RPC request. `send!` writes the response back to the
@@ -351,6 +341,12 @@
                        ;; `disconnect-fn!`; a shutdown does not (see the guard).
                        (when-let [p (some-> (:project snap) str str/trim not-empty)]
                          (projects/write-last-used! p))
+                       ;; Onboarding is tied to the getting-started project:
+                       ;; opening any OTHER project ends it for this launch (so a
+                       ;; user who moves on, or a returning daemon, is not dragged
+                       ;; back to the landing). Do this BEFORE `bootstrap-info`, so
+                       ;; this snapshot reflects the decision.
+                       (bootstrap/note-opened-project! (:project snap))
                        ;; banner = the startup snark line; the renderer seeds
                        ;; it as the first transcript line. :version rides along
                        ;; so every client can show which build it is talking to
@@ -383,6 +379,14 @@
               "create-project" (do (projects/create-project! (:name params)
                                                              (:description params))
                                    nil)
+              ;; Persist an assistant image into the SESSION'S PROJECT as a real
+              ;; file (projects/save-image!), so it is a durable artifact rather
+              ;; than a data: URL the client can only re-materialise into temp.
+              ;; Returns {:path :rel :bytes} for the renderer to caption/open.
+              "save-image" (let [sid (:id params)
+                                 proj (:project (client/session sid))]
+                             (when (and proj (:base64 params))
+                               (projects/save-image! proj (:media-type params) (:base64 params))))
               "session" (client/session (:id params))
               "connect" (do (client/connect! (:id params)) nil)
               ;; :contexts is ECA's ChatContext list (inline images as

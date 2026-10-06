@@ -4,7 +4,8 @@
   Nobody reads a docs folder. So the first experience is a PROJECT: an ordinary
   grog project whose `SOUL.md` makes the agent the onboarding guide and whose ECA
   workspace includes grog's shipped documentation (`grog.docs`). The app
-  bootstraps itself by talking to itself — that is the ouroboros.
+  bootstraps itself by talking to itself — that is the ouroboros. That's what
+  grog is — a deliberate vicious cycle.
 
   Two invariants:
     * `seed!` is IDEMPOTENT and never overwrites — re-running it, or running it
@@ -86,13 +87,24 @@
   ^String []
   (str
    "# START HERE\n\n"
-   "You are in **" project-name "**, grog's getting-started project.\n"
-   "Your documentation is the workspace folder `" docs-workspace-name "/`.\n\n"
-   "## Job 1 — get the LLM online\n\n"
-   "A provider + model in `grog.edn`, and the API key in the secret store\n"
-   "(`/secret set LLM_API_KEY <value>`). Until then there is no brain and no\n"
-   "chat. See `" docs-workspace-name "/doc/linux-quick-start.md` or\n"
-   "`" docs-workspace-name "/doc/windows-quick-start.md`.\n\n"
+   "You are in **" project-name "**, grog's getting-started project — an ordinary\n"
+   "project, not a special mode. A project is where grog keeps its memory of one\n"
+   "thing you work on: its notes, the conversation, its workspace, and the tools it\n"
+   "may touch. Everything grog remembers belongs to a project, so two projects never\n"
+   "bleed into each other.\n\n"
+   "This one exists to get you running. Once the brain is online, start the project\n"
+   "you actually care about with `/project new <name>` and get on with it — this one\n"
+   "stays behind as your reference copy of grog's documentation.\n\n"
+   "## Job 1 — get the brain online\n\n"
+   "Two settings, both yours to make: open **Settings (⚙)** and pick the provider\n"
+   "and model to match what you actually have; then hand grog the key with\n"
+   "`/secret set LLM_API_KEY <value>`. The key goes to the OS keychain and is never\n"
+   "echoed back. Until then there is no brain and no chat.\n\n"
+   "## Getting help\n\n"
+   "Type `/help` for every command. `/project` lists, switches and creates projects;\n"
+   "`/model` shows or switches the model for this session; `/clear` starts a fresh\n"
+   "conversation; `/doctor` checks whether the setup holds together; `/reset` is the\n"
+   "factory reset if things get too wonky.\n\n"
    "## Documentation map\n\n"
    (docs/doc-map-markdown (str docs-workspace-name "/"))
    "\n"))
@@ -146,44 +158,66 @@
   (try (let [^File f (onboarding-requested-file)] (when (.exists f) (.delete f)))
        (catch Throwable _ nil)))
 
-;; True while the CURRENT launch was started by an EXPLICIT onboarding request
-;; (a factory-reset marker).
+;; True while onboarding is WANTED for the CURRENT launch — either an EXPLICIT
+;; request (a factory-reset marker, or the first-run config seed) or a genuinely
+;; fresh install (no projects at all).
 ;;
-;; Why this exists: a reset moves grog's own state aside but does NOT touch ECA's
-;; config, and the seeded `grog.edn` already names an endpoint and a model — so
-;; `llm-configured?` can still be true, and if the onboarding page were gated on
-;; it alone the user would land in the getting-started project with NO onboarding
-;; (exactly the reported bug). Remembering the request lets `startup` and every
-;; `open` snapshot agree that onboarding is wanted.
+;; Why this exists: the onboarding page must not be gated on reachability alone.
+;; A reset (or a wiped config home) moves grog's OWN state aside but does NOT
+;; touch ECA's config, and the seeded `grog.edn` already names an endpoint and a
+;; model — so a model can still be reachable, and the user would land in the
+;; getting-started project with NO onboarding (exactly the reported bug).
+;; Remembering that onboarding is wanted lets `startup` and every `open` snapshot
+;; agree, regardless of whether a model happens to be reachable.
 ;;
-;; It is (re)computed on every `startup-info` call, so its lifetime is one launch:
-;; a long-lived daemon serving a later client does NOT keep forcing onboarding.
-(defonce ^:private !onboarding-forced (atom false))
+;; It ESCALATES within a launch and is only cleared when the user leaves the
+;; getting-started project (`note-opened-project!`). It is deliberately NOT
+;; reset on every `startup-info` call: `startup` consumes the marker, so a
+;; SECOND call (the client asks once at init and again on attach) would see no
+;; marker and recompute `false` — silently dropping the onboarding landing and
+;; leaving the empty-transcript splash in its place.
+(defonce ^:private !onboarding-wanted (atom false))
 
-(defn onboarding-requested-this-session?
-  "True when the current launch was started by an explicit onboarding request
-  (see `!onboarding-forced`). The client must show the getting-started landing
-  even if an LLM happens to be reachable already."
+(defn onboarding-wanted-this-session?
+  "True when THIS launch should show the getting-started onboarding — a fresh
+  install (no projects) or an explicit request (the reset marker, or the
+  first-run config seed). The client shows the landing even when a model is
+  already reachable."
   []
-  (boolean @!onboarding-forced))
+  (boolean @!onboarding-wanted))
+
+(defn note-opened-project!
+  "Record which project a client just opened. Onboarding is tied to the
+  getting-started project: opening any OTHER project ends it for this launch, so
+  a user who moves on to their own work is never dragged back to the landing.
+  (This is also what stops a long-lived socket daemon onboarding forever — once
+  anyone opens a normal project, it is over.)"
+  [project]
+  (when-not (projects/bootstrap-project? project)
+    (reset! !onboarding-wanted false)))
 
 (defn startup-info
   "What the client should OPEN at launch, and whether this is a first run.
 
-  Onboarding (seed + open `ouroboros`) happens when the reset REQUESTED it, or on
-  a genuinely fresh install (no projects at all). Otherwise open the resolved
-  active project and never touch the getting-started project, so a returning user
-  is never flipped into onboarding — and a reset never hijacks their projects.
+  Onboarding (seed + open `ouroboros`) happens when the config home was just
+  seeded or reset (the `onboarding-requested` marker), or on a genuinely fresh
+  install (no projects at all). Otherwise open the resolved active project and
+  never touch the getting-started project, so a returning user is never flipped
+  into onboarding — and a reset never hijacks their projects.
 
-  An EXPLICIT request (the reset marker) is additionally remembered for the rest
-  of THIS launch (`onboarding-requested-this-session?`), so the client keeps
-  showing the getting-started landing even when an LLM is already reachable."
+  Whether onboarding is wanted is remembered for the rest of THIS launch
+  (`onboarding-wanted-this-session?`), so `startup` and every `open` snapshot
+  agree and the landing keeps showing even when a model is already reachable."
   []
   (let [requested?       (onboarding-requested?)
         want-onboarding? (or requested? (first-run?))]
-    ;; A fresh `startup` supersedes the previous launch's request: only a marker
-    ;; present NOW can force onboarding, so a daemon cannot force it forever.
-    (reset! !onboarding-forced (boolean requested?))
+    ;; ESCALATE only — never downgrade within a launch. The first `startup`
+    ;; consumes the marker; a duplicate/retried call must not read the now-absent
+    ;; marker and conclude onboarding is off (that dropped the landing behind the
+    ;; splash). It is cleared later by `note-opened-project!` when the client
+    ;; opens a non-getting-started project.
+    (when want-onboarding?
+      (reset! !onboarding-wanted true))
     (if want-onboarding?
       (do (clear-onboarding-request!)
           (seed!)

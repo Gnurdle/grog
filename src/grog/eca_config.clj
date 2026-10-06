@@ -53,19 +53,30 @@
   (some-> v str env-interp str/trim not-empty))
 
 (defn- clean-inst
-  "Interpolate + drop blank scalar fields of an instance map."
+  "Interpolate + drop blank scalar fields of an instance map.
+
+  `:password-secret` is a store ACCOUNT NAME, not a value, so it is copied
+  through verbatim and never `${ENV}`-interpolated — a credential must not be
+  reachable through the environment by way of its name."
   [m]
   (into {}
-        (keep (fn [[k v]] (when-let [v (interp-inst v)] [(keyword (name k)) v])))
+        (keep (fn [[k v]]
+                (let [k (keyword (name k))]
+                  (if (= :password-secret k)
+                    (let [v (some-> v str str/trim not-empty)]
+                      (when v [k v]))
+                    (when-let [v (interp-inst v)] [k v])))))
         m))
 
 (defn- odoo-instances-data
   "Instances list from grog.edn's `:odoo`, used as a one-time migration fallback
   — Odoo config otherwise lives in `odoo-instances.edn`.
 
-  Shape: `:instances [{:name ... :url ... :db ... :user ... :password ...
+  Shape: `:instances [{:name ... :url ... :db ... :user ... :password-secret ...
                        :allow-write false} ...]`.
-  A flat shape (`:url`/`:db`/`:user`/`:password` at the top level) is treated
+  `:password-secret` is a store ACCOUNT NAME, never a credential, so nothing this
+  writer produces ever contains a password.
+  A flat shape (`:url`/`:db`/`:user`/`:password-secret` at the top level) is treated
   as a single instance named \"default\".
 
   There is deliberately no `:sql` block any more: SQL goes through the
@@ -82,9 +93,9 @@
                        (contains? src :allow-write)
                        (assoc :allow-write (boolean (:allow-write src)))))]
     (if (seq (:instances o))
-      (mapv (fn [i] (with-write (clean-inst (select-keys i [:name :url :db :user :password])) i))
+      (mapv (fn [i] (with-write (clean-inst (select-keys i [:name :url :db :user :password-secret])) i))
             (:instances o))
-      (let [inst (with-write (clean-inst (select-keys o [:name :url :db :user :password])) o)]
+      (let [inst (with-write (clean-inst (select-keys o [:name :url :db :user :password-secret])) o)]
         (when (and (:url inst) (:db inst) (:user inst))
           [(merge {:name "default"} inst)])))))
 
@@ -298,12 +309,19 @@
       (when (.exists f) f))))
 
 (defn- clean-imap-account
-  "Interpolate env refs in string fields; preserve numbers/booleans as-is."
+  "Interpolate env refs in string fields; preserve numbers/booleans as-is.
+
+  `:password-secret` / `:refresh-secret` are STORE ACCOUNT NAMES, not values, so
+  they are copied through verbatim and never `${ENV}`-interpolated — a credential
+  must not be reachable through the environment by way of its name."
   [m]
   (into {}
         (keep (fn [[k v]]
                 (when (some? v)
-                  [k (if (string? v) (interp-inst v) v)])))
+                  [k (if (and (string? v)
+                              (not (contains? #{:password-secret :refresh-secret} k)))
+                       (interp-inst v)
+                       v)])))
         m))
 
 (defn imap-instances-path
@@ -381,22 +399,30 @@
       :else nil)))
 
 (defn- imap-accounts-data
-  "Account *metadata* (never secrets). Source of truth is the email project file
-  at `~/grog-projects/email/state/imap-accounts.edn` (a `.json` file is also
-  accepted); falls back to grog.edn's `:imap :accounts`."
+  "Account *metadata* (never secrets) for the grog-imap MCP server. Source of
+  truth is the email project file at
+  `~/grog-projects/email/state/imap-accounts.edn` (a `.json` file is also
+  accepted); falls back to grog.edn's `:imap :accounts`.
+
+  `:password-secret` / `:refresh-secret` are carried through — they are the
+  NAMES of store accounts, not credentials (see grog-imap.main)."
   []
   (let [accts (or (read-imap-accts)
                   (get-in (config/grog) [:imap :accounts]))]
     (when (seq accts)
       {:accounts (mapv #(clean-imap-account
                          (select-keys % [:name :host :port :tls :user :sasl
-                                         :oauth :read-only]))
+                                         :oauth :read-only
+                                         :password-secret :refresh-secret]))
                        accts)})))
 
 (defn- imap-env
   "Env map for the grog-imap MCP server: write account *metadata* to the grog
   config home (`imap-accounts.edn`, EDN) and hand it via GROG_IMAP_CONFIG. The
-  server resolves the secret itself from its per-account file — never here."
+  metadata carries only the NAME of the store account holding each credential
+  (`:password-secret` / `:refresh-secret`); the server resolves the value itself
+  from grog's secret store — never here, since everything in this env map is
+  written verbatim into the generated ECA config."
   []
   (let [data (imap-accounts-data)
         path (imap-instances-path)]

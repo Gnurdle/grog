@@ -34,5 +34,9 @@ node_modules/
 dist/
 *.tar.gz
 
+# Speech models: large, platform-neutral INPUTS that ARE shipped (packaged via
+# extraResources) but must never be committed.
+resources/models/*.bin
+
 # Per-instance run logs
 *.pid.log

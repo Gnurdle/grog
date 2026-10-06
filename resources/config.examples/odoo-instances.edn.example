@@ -2,10 +2,17 @@
 ;;
 ;; Source of truth for the grog-odoo MCP server (GROG_ODOO_CONFIG env points at
 ;; this file; grog also rewrites it from grog.edn's legacy :odoo block once).
-;; Credentials live HERE, in the config home — never in grog.edn / git.
+;; This file holds METADATA ONLY — never a password.
 ;;
 ;; - `:name` is the only identifier the model may use. Selection is locked to
 ;;   these names; no tool accepts a URL/host/db from the model.
+;; - `:password-secret` is REQUIRED and names an ACCOUNT in grog's secret store —
+;;   the password itself lives there and nowhere else. Store it once:
+;;       /secret set ODOO_STAGE_PASSWORD <value>
+;;   (OS keyring; grog's secrets.edn is the headless fallback.) There is no
+;;   `:password` field, no `${ENV}` credential and no credential file: several
+;;   Odoo instances can be configured, so each one carries the NAME of its
+;;   account rather than a value.
 ;; - With MORE THAN ONE instance configured, EVERY odoo_* call must name one
 ;;   with the `instance` argument. There is no default: a bare call is refused,
 ;;   so nothing can silently hit the wrong database.
@@ -21,12 +28,12 @@
    :url "https://exclave.cmsaero.com"
    :db "odoo18_stage"
    :user "admin"
-   :password "secret-or-api-key"
+   :password-secret "ODOO_STAGE_PASSWORD"
    :allow-write false}
 
   {:name "prod"
    :url "https://odoo.example.com"
    :db "odoo18"
    :user "admin"
-   :password "..."
+   :password-secret "ODOO_PROD_PASSWORD"
    :allow-write false}]}

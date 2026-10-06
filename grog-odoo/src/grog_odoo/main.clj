@@ -34,8 +34,11 @@
     cleartext.
   * A missing secret THROWS, naming the instance + account + the exact fix. It
     never authenticates with a blank password — that fails later, silently.
-  * `:password` (a literal, or `${ENV}`) still works for anyone not using the
-    store. `:password-secret` wins when both are present.
+  * `:password-secret` is REQUIRED and is the ONLY credential source. There is
+    no `:password` (literal or `${ENV}`) fallback, no env var and no credential
+    file: one instance, one named account in the store. Because several Odoo
+    instances can be configured without bound, the account name has to be
+    carried in the config rather than derived from it.
   * `:allow-write` (default FALSE) is the per-instance write switch. With it
     false, any statement that could modify data is refused before Odoo is even
     called. With it true, mutating SQL is passed through to Select-O-Matic
@@ -46,7 +49,8 @@
     `instance` argument — there is no \"first configured\" fallback, so a bare
     call can never silently hit the wrong database. With exactly one instance
     the name is optional (it is unambiguous).
-  ${ENV} / ${ENV:-default} interpolation inside the config is honored.
+  ${ENV} / ${ENV:-default} interpolation is honored for the non-secret fields
+  (`:url` / `:db` / `:user`) only — never for a credential.
 
   Requires the `select_o_matic` addon on the Odoo instance, and the configured
   Odoo user to be in its `group_select_o_matic` group."
@@ -78,8 +82,11 @@
   (atom {}))
 
 (defn- interp
-  "Interpolate `${ENV}` / `${ENV:-default}` references in string fields from the
-  process environment (so credentials can be injected per-process)."
+  "Interpolate `${ENV}` / `${ENV:-default}` references in the non-secret string
+  fields of an instance (`:url` / `:db` / `:user`) from the process
+  environment. Credentials are NEVER resolved this way: they are named in the
+  config (`:password-secret`) and read from grog's secret store by
+  `instance-password`."
   [v]
   (if (string? v)
     (str/replace v #"\$\{([^}]+)\}"
@@ -124,15 +131,24 @@
           v (deref f keyring-read-timeout-ms ::timeout)]
       (when-not (= ::timeout v) v))))
 
+(defn- config-home-dir
+  "grog's config home: $GROG_CONFIG_HOME, else $XDG_CONFIG_HOME/grog, else
+  ~/.config/grog. Mirrors grog.platform/config-home-dir, so the fallback file is
+  found even on a relocated config home."
+  ^String []
+  (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
+      (if-let [xdg (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)]
+        (str xdg "/grog")
+        (str (or (some-> (System/getenv "HOME") str str/trim not-empty)
+                 (System/getProperty "user.home"))
+             "/.config/grog"))))
+
 (defn- secrets-file
   "grog's file fallback: `<config-home>/secrets.edn`, an EDN map of
   {account password}. Mirrors grog.secrets/secrets-file so a headless Linux box
   — where the keyring backend is unreachable — still works."
   ^java.io.File []
-  (let [home (or (some-> (System/getenv "XDG_CONFIG_HOME") str not-empty)
-                 (str (or (some-> (System/getenv "HOME") str not-empty) "~")
-                      "/.config"))]
-    (io/file home "grog" "secrets.edn")))
+  (io/file (config-home-dir) "secrets.edn"))
 
 (defn- file-secret ^String [^String account]
   (try
@@ -147,11 +163,28 @@
   ^String [^String account]
   (or (keyring-secret account) (file-secret account)))
 
+(defn- reject-inline-password!
+  "Refuse an instance that still carries an inline `:password`.
+
+  `:password` was the store-free escape hatch. Silently ignoring it would surface
+  as a rejected login (the server would have no credential at all), which reads
+  like a wrong password rather than a config that needs migrating — so say so."
+  [^String path name i]
+  (when (contains? i :password)
+    (let [acct (str "ODOO_" (str/upper-case name) "_PASSWORD")]
+      (throw (ex-info (str "Instance '" name "' in " path " sets `:password`, which is NO "
+                           "longer supported — a credential must live in grog's secret store and be "
+                           "named here, never written in the config file (or via `${ENV}`). Fix:  "
+                           "/secret set " acct " <value>   then use  :password-secret \"" acct "\".")
+                      {:path path :instance name :account acct})))))
+
 (defn- read-config-file!
   "Load instances from the config file at `path`. Accepts EDN (the current grog
   writer format, `*` `.edn`) or legacy JSON. Returns a vector of instance maps.
-  `${ENV}` / `${ENV:-default}` references in string fields are interpolated from
-  the process environment (so credentials can be injected per-process)."
+
+  `${ENV}` / `${ENV:-default}` interpolation applies to the non-secret fields
+  (`:url` / `:db` / `:user`). A credential is only ever NAMED (`:password-secret`);
+  an inline `:password` is REFUSED."
   [path]
   (let [raw (slurp (java.io.File. path))
         data (try
@@ -164,21 +197,32 @@
       (throw (ex-info (str "Odoo instances file contains no instances: " path) {:path path})))
     (mapv (fn [i]
             (let [name (str (or (:name i) "default"))
+                  _    (reject-inline-password! path name i)
                   url  (normalize-url (interp (or (:url i) (throw (ex-info (str "instance '" name "' missing :url") {})))))
                   db   (str (interp (or (:db i) (throw (ex-info (str "instance '" name "' missing :db") {})))))]
               {:name name
                :url url
                :db db
                :user (str (interp (or (:user i) (throw (ex-info (str "instance '" name "' missing :user") {})))))
-               :password (str (or (interp (:password i)) ""))
                ;; the secret-store ACCOUNT NAME, not the secret itself
                :password-secret (some-> (:password-secret i) str str/trim not-empty)
                :allow-write (allowed-to-write? i)}))
           insts)))
 
-(defn- odoo-config-file []
-  (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
-           ".config/grog/odoo.edn"))
+(defn- home-dir
+  "The user's home directory, preferring the JVM property over HOME. Under
+  Windows Git-Bash/MSYS, HOME is an MSYS path like `/c/Users/…`, which Java
+  cannot open; `user.home` is the canonical `C:\\Users\\…`."
+  []
+  (or (some-> (System/getProperty "user.home") str str/trim not-empty)
+      (some-> (System/getenv "HOME") str str/trim not-empty)
+      "~"))
+
+(defn- odoo-config-file
+  "The main odoo config, `~/.config/grog/odoo.edn` (home resolved via `home-dir`
+  so it works on Windows)."
+  []
+  (io/file (home-dir) ".config/grog/odoo.edn"))
 
 (defn- load-config-file!
   "Load ~/.config/grog/odoo.edn. Returns {} when missing (normal — we fall back
@@ -193,18 +237,22 @@
 (defn- load-config!
   "Populate `config*` from ~/.config/grog/odoo.edn:
       {:config \"path\"}                       → load that instances file
-      {:url ... :db ... :user ... :password ...} → single \"default\" instance
-    If odoo.edn is missing or carries no `:config`, the default instances file
-    ~/.config/grog/odoo-instances.edn is used (legacy GROG_ODOO_CONFIG behavior).
-    ${ENV} interpolation inside the instances file is still honored."
+      {:url ... :db ... :user ... :password-secret ...} → single \"default\" instance
+    If odoo.edn is missing or carries no `:config`, the instances file is taken
+    from `GROG_ODOO_CONFIG` when set (the client sets it), else the default
+    ~/.config/grog/odoo-instances.edn is used.
+    ${ENV} interpolation inside the instances file is still honored — for the
+    non-secret fields only. There is no credential field here either:
+    `:password-secret` NAMES the store account (see `instance-password`)."
   []
   (let [cfg (load-config-file!)
-        home (or (System/getenv "HOME") (System/getProperty "user.home"))
+        home (home-dir)
         instances
         (cond
           (and (not (:config cfg))
-               (or (:url cfg) (:db cfg) (:user cfg) (:password cfg)))
-          (let [missing (remove (fn [k] (not (str/blank? (str (get cfg k)))))
+               (or (:url cfg) (:db cfg) (:user cfg) (:password-secret cfg) (:password cfg)))
+          (let [_ (reject-inline-password! (.getPath ^java.io.File (odoo-config-file)) "default" cfg)
+                missing (remove (fn [k] (not (str/blank? (str (get cfg k)))))
                                 [:url :db :user])]
             (when (seq missing)
               (throw (ex-info (str "odoo.edn single-instance config is missing: "
@@ -213,16 +261,18 @@
               :url  (normalize-url (interp (:url cfg)))
               :db   (str (interp (:db cfg)))
               :user (str (interp (:user cfg)))
-              :password (str (or (interp (:password cfg)) ""))
+              :password-secret (some-> (:password-secret cfg) str str/trim not-empty)
               :allow-write (allowed-to-write? cfg)}])
 
           :else
-          (let [cfg-file (not-empty (str/trim (str (or (:config cfg) "~/.config/grog/odoo-instances.edn"))))
+          (let [cfg-file (not-empty (str/trim (str (or (:config cfg)
+                                                       (System/getenv "GROG_ODOO_CONFIG")
+                                                       "~/.config/grog/odoo-instances.edn"))))
                 cfg-file (str/replace-first cfg-file #"^~(?=/|$)" home)]
             (read-config-file! cfg-file)))
         by-name (into {} (map (fn [i] [(:name i) i])) instances)]
     (when-not (seq instances)
-      (throw (ex-info "No Odoo instances configured. Add :config (or :url/:db/:user/:password) to ~/.config/grog/odoo.edn." {})))
+      (throw (ex-info "No Odoo instances configured. Add :config (or :url/:db/:user/:password-secret) to ~/.config/grog/odoo.edn." {})))
     (reset! config* {:instances instances :by-name by-name})
     @config*))
 
@@ -257,9 +307,11 @@
                       {:instances (map :name instances)})))))
 
 (defn- instance-password
-  "The password to authenticate `inst` with: the per-instance secret-store entry
-  when `:password-secret` is configured, otherwise the literal / `${ENV}`
-  `:password`.
+  "The password to authenticate `inst` with: the store entry NAMED by the
+  instance's `:password-secret`. That is the ONLY source — there is no literal /
+  `${ENV}` `:password`, no env var and no credential file. Several instances can
+  be configured without bound, so the account name is carried in the config
+  rather than derived from it.
 
   Throws — naming the instance and the account — rather than authenticating with
   a blank password, which fails later and silently. Resolution is LAZY (at auth
@@ -273,12 +325,13 @@
                              "or in " (.getPath (secrets-file)) ". Set it with:  "
                              "/secret set " acct " <value>")
                         {:instance (:name inst) :secret acct})))
-    (let [p (str (:password inst))]
-      (when (str/blank? p)
-        (throw (ex-info (str "Instance '" (:name inst) "' has no credentials: configure "
-                             ":password-secret (preferred) or :password.")
-                        {:instance (:name inst)})))
-      p)))
+    (let [suggested (str "ODOO_" (str/upper-case (str (:name inst))) "_PASSWORD")]
+      (throw (ex-info (str "Instance '" (:name inst) "' has no `:password-secret`, so it has no "
+                           "credential. A credential is only ever NAMED in the config, never "
+                           "written into it. Give the instance the name of an account in grog's "
+                           "secret store:  /secret set " suggested " <value>   then add  "
+                           ":password-secret " (pr-str suggested) "  to the instance.")
+                      {:instance (:name inst)})))))
 
 (defn- instance-auth!
   "Authenticate `inst` lazily (cached) and return {:url :db :uid :password}."
@@ -286,12 +339,28 @@
   (let [name (:name inst)]
     (if-let [c (get @auth* name)]
       c
-      (let [pw (instance-password inst)
-            uid (xrpc/xmlrpc-call! (:url inst) "common" "authenticate"
-                                   [(:db inst) (:user inst) pw {}])]
-        (when-not (pos? (long uid))
-          (throw (ex-info (str "Odoo authentication failed for " name "/" (:user inst)) {})))
-        (let [c {:url (:url inst) :db (:db inst) :uid (long uid) :password pw :name name}]
+      (let [pw  (instance-password inst)
+            raw (xrpc/xmlrpc-call! (:url inst) "common" "authenticate"
+                                   [(:db inst) (:user inst) pw {}])
+            ;; XML-RPC authenticate returns an integer uid on success, or the
+            ;; boolean `false` when the credential is rejected. Cast ONLY when it
+            ;; is a number — `(long false)` used to throw a ClassCastException
+            ;; here, which reached the model as an unrelated Java type error and
+            ;; hid the real "login rejected" diagnosis.
+            uid (when (number? raw) (long raw))]
+        (when-not (and uid (pos? uid))
+          (throw (ex-info
+                  (str "Odoo authentication failed for instance '" name
+                       "' as user '" (:user inst) "' on db '" (:db inst) "' ("
+                       (:url inst) "). authenticate returned " (pr-str raw)
+                       (if (false? raw)
+                         (str " — the credential was REJECTED. Check that "
+                              ":password-secret names the account holding the "
+                              "CURRENT password, and that :user / :db / :url are right.")
+                         (str " — expected an integer uid; is the URL a real Odoo "
+                              "/xmlrpc/2/common and is the db name correct?")))
+                  {:instance name :db (:db inst) :url (:url inst) :user (:user inst)})))
+        (let [c {:url (:url inst) :db (:db inst) :uid uid :password pw :name name}]
           (swap! auth* assoc name c)
           c)))))
 
@@ -306,6 +375,21 @@
 (defn- text-content [^String s] (McpSchema$TextContent. s))
 (defn- text-result [^String s] (McpSchema$CallToolResult. [(text-content s)] false))
 (defn- error-result [^String s] (McpSchema$CallToolResult. [(text-content s)] true))
+
+(defn- error-detail
+  "The most useful detail from `t`: an XML-RPC faultString, an ex-info message,
+  else the exception message — and NEVER an empty string (a blank value is
+  truthy in `or`, which used to yield 'Error executing tool odoo_x: ' with
+  nothing after the colon). Falls back to the exception class."
+  ^String [t]
+  (or (not-empty (str (:message (ex-data t))))
+      (not-empty (str (:faultString (ex-data t))))
+      (not-empty (str (.getMessage t)))
+      (str (class t))))
+
+(defn- error-result-for [name t]
+  (error-result (str "Error executing tool " name ": " (error-detail t))))
+
 (defn- ok [data] (json/write-str data))
 
 (defn- kargs
@@ -329,11 +413,7 @@
                      ;; permission error degrades to the useless "Odoo XML-RPC
                      ;; fault" and the caller cannot tell a bad query from a
                      ;; missing group on the target.
-                     (.success sink (error-result
-                                     (str "Error executing tool " name ": "
-                                          (or (:message (ex-data t))
-                                              (:faultString (ex-data t))
-                                              (.getMessage t))))))))))))))
+                     (.success sink (error-result-for name t)))))))))))
 
 ;; --- SQL, via the Select-O-Matic addon (no direct database access) ----------
 

@@ -9,8 +9,14 @@
 // So the client SEEDS the config home at startup: grog.edn (renamed from the
 // example) plus the optional files as `*.example`. Nothing is overwritten, and
 // the caller logs the exact path, so the user always knows the starter exists
-// and where it went. That starter still has no model/provider/key, so it cannot
-// reach a model until it is edited — the caller says so plainly.
+// and where it went. The starter names a provider and a model but carries no
+// API KEY, so it cannot reach a model until the user stores one — the caller
+// says so plainly.
+//
+// A fresh grog.edn also means a FRESH GROG, so seeding writes the same
+// `onboarding-requested` marker `grog.reset` does: the spine reads it at
+// `startup` and shows the getting-started onboarding. Without it, deleting
+// ~/.config/grog would silently drop the user into an old project, unwelcomed.
 //
 // This module only plans and writes; resolving the example directory (packaged
 // vs source tree) and reporting the paths is the caller's job (main.js).
@@ -21,6 +27,10 @@ const path = require("path");
 
 const MAIN_CONFIG = "grog.edn";
 const EXAMPLE_SUFFIX = ".example";
+// The marker the spine checks at `startup` to force the getting-started
+// onboarding. Mirrors `grog.bootstrap/onboarding-requested-file` — keep the two
+// in step. Written only when a fresh grog.edn is actually seeded.
+const ONBOARDING_MARKER = "onboarding-requested";
 
 /**
  * grog's config home. Mirrors `grog.platform/config-home-dir`:
@@ -95,9 +105,11 @@ function planOffer(opts) {
 function createConfig(plan) {
   const written = [];
   fs.mkdirSync(plan.home, { recursive: true });
+  let seededMain = false;
   if (plan.mainExample && !fs.existsSync(plan.grogEdn)) {
     fs.copyFileSync(plan.mainExample.from, plan.grogEdn);
     written.push(plan.grogEdn);
+    seededMain = true;
   }
   for (const e of plan.optional) {
     const dest = path.join(plan.home, e.name);
@@ -105,7 +117,14 @@ function createConfig(plan) {
     fs.copyFileSync(e.from, dest);
     written.push(dest);
   }
+  // A fresh grog.edn = a fresh grog: ask the spine to onboard on the next start.
+  // (`grog.bootstrap/startup-info` consumes the marker once, then deletes it.)
+  // Not added to `written` — that is the list of CONFIG files to report.
+  if (seededMain) {
+    const marker = path.join(plan.home, ONBOARDING_MARKER);
+    if (!fs.existsSync(marker)) fs.writeFileSync(marker, String(Date.now()));
+  }
   return written;
 }
 
-module.exports = { configHome, availableExamples, planOffer, createConfig };
+module.exports = { configHome, availableExamples, planOffer, createConfig, ONBOARDING_MARKER };

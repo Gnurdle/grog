@@ -1,12 +1,12 @@
 // sync-assets.js — keep the renderer's SERVED image assets in sync with the
 // repo-root sources.
 //
-// Why two copies exist: the splash image's SOURCE is <repo>/logo.jpg, but an
-// Electron renderer can only load files from its own static root
-// (clients/web/resources/public/), so the served copy has to be a real file
-// there. Nothing linked the two, so they silently drifted — the served copy was
-// still the old 1248x832 art after the new 1728x1152 logo was planted at the
-// root. This script makes the served copy a PRODUCT of the source.
+// Why two copies exist: an Electron renderer can only load files from its own
+// static root (clients/web/resources/public/), so every image it shows has to be
+// a real file there — while the SOURCE art lives at the repo root. Nothing
+// linked the two, so they silently drifted (the served logo was still the old
+// 1248x832 art after a new one was planted at the root). This script makes each
+// served copy a PRODUCT of its source.
 //
 // Deliberately NOT synced: clients/web/assets/icon.{png,ico} — those are the
 // application/packaging icons (electron-builder `icon`), a different asset set.
@@ -21,7 +21,8 @@ const repoRoot = path.resolve(webRoot, "..", "..");
 
 // [source, relative to <repo>] -> [destination, relative to <web>]
 const ASSETS = [
-  ["logo.jpg", "resources/public/logo.jpg"],
+  ["logo.jpg", "resources/public/logo.jpg"],   // the splash art
+  ["snake.png", "resources/public/snake.png"], // the ouroboros emblem (onboarding)
 ];
 
 for (const [from, to] of ASSETS) {

@@ -30,4 +30,9 @@ contextBridge.exposeInMainWorld("grogAPI", {
   // or save it to the Downloads folder. Both take (mediaType, base64).
   openImage: (mediaType, base64) => ipcRenderer.invoke("grog:open-image", mediaType, base64),
   saveImage: (mediaType, base64) => ipcRenderer.invoke("grog:save-image", mediaType, base64),
+  // open an absolute path (e.g. an image the spine wrote into the project)
+  openPath: (p) => ipcRenderer.invoke("grog:open-path", p),
+  // dump the whole session to a standalone .html (renderer builds it, main
+  // writes ~/grog-sessions/… and opens it)
+  exportHtml: (payload) => ipcRenderer.invoke("grog:export-html", payload),
 });

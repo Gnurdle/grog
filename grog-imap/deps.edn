@@ -2,6 +2,12 @@
  :deps {org.clojure/clojure {:mvn/version "1.11.1"}
         org.clojure/data.json {:mvn/version "2.5.1"}
         io.modelcontextprotocol.sdk/mcp {:mvn/version "0.8.0"}
+        ;; OS keyring: macOS Keychain / Windows Credential Manager / Linux Secret
+        ;; Service. Per-account credentials are read from grog's secret store by
+        ;; THIS server (the account metadata only carries the store account
+        ;; name), so the dependency is not optional. The bundle already carries
+        ;; it (grog-search/grog-odoo); this is for standalone runs.
+        com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
         org.slf4j/slf4j-nop {:mvn/version "2.0.3"}}
  :aliases
  {:mcp {:main-opts ["-m" "grog-imap.main"]}

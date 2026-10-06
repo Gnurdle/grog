@@ -10,6 +10,7 @@
             [reagent.dom :as rdom]
             [re-frame.core :as rf]
             [grog-web.voice :as voice]
+            [grog-web.export :as export]
             [grog-web.md :as md]))
 
 ;; --- helpers ---------------------------------------------------------------
@@ -62,18 +63,53 @@
     (map? o)    (str (or (:label o) (:value o) (:text o) (pr-str o)))
     :else       (str o)))
 
+;; --- the command reference (ONE source of truth) ---------------------------
+;;
+;; Both the onboarding panel AND `/help` render from this, so they can never
+;; drift. `[command description trigger]`; `trigger` is the UI/keyboard
+;; equivalent where one exists ("—" = command line only). The renderer answers
+;; `/help` LOCALLY from this, instead of round-tripping the spine's text dump.
+(def ^:private help-rows
+  [["/help"    "this list — everything grog can be told to do"           "—"]
+   ["/project" "list · switch · create (/project new <name>) · delete"   "Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1‑9 jump"]
+   ["/model"   "show or switch this session's model"                     "⚙ Settings"]
+   ["/secret"  "store or remove a key — values are never printed"        "—"]
+   ["/clear"   "start a fresh conversation"                              "—"]
+   ["/doctor"  "check what is installed and whether it holds together"   "—"]
+   ["/reset"   "factory reset, if things get too wonky"                  "—"]])
+
+;; Pure UI — no slash command, just a control or a key.
+(def ^:private ui-shortcuts
+  [["Ctrl+Enter" "send (Enter is a newline)"]
+   ["Ctrl+E" "copy the whole transcript"]
+   ["Ctrl+Shift+E" "export the session to a standalone HTML file"]
+   ["Ctrl+= / Ctrl+- / Ctrl+0" "transcript font size"]
+   ["Ctrl+Shift+Space" "voice input (local speech-to-text)"]
+   ["📎 / paste / drop" "attach a file or an image"]])
+
+(defn- help-markdown
+  "The `/help` reply — built from `help-rows`+`ui-shortcuts` so it matches the
+  onboarding panel exactly. Markdown (the transcript renders it)."
+  []
+  (str "**Commands** — anything starting with `/` is a command, not a message to "
+       "the model. Most also have a UI trigger.\n\n"
+       "| Command | Does | Also via |\n|---|---|---|\n"
+       (apply str (for [[c d t] help-rows] (str "| `" c "` | " d " | " t " |\n")))
+       "\n**Keys / controls with no command:**\n\n"
+       (apply str (for [[k d] ui-shortcuts] (str "- `" k "` — " d "\n")))))
+
 ;; --- db / events -----------------------------------------------------------
 
 (rf/reg-event-db :init
   (fn [_ _]
-    {:sessions {} :order [] :active nil :focused? true :input ""
+    {:sessions {} :order [] :active nil :focused? true
      :connected? false :socket-path "" :opened? false :font-size 16
      :dialog nil :dialog-input "" :q-input "" :projects []
      ;; startup (from the spine's `startup` call): which project to open, and
      ;; whether an LLM is even reachable — if not, the client shows the "Job 1"
      ;; onboarding page instead of a transcript.
      :home-project nil :bootstrap-needed? false :bootstrap-configured? false
-     :bootstrap-dismissed? false :docs-dir nil :first-run? false
+     :bootstrap-dismissed? false :bootstrap-mcps nil :docs-dir nil :first-run? false
      ;; model picker (settings dialog): catalogue from the server, which source
      ;; is being browsed, and the search string. `:model-sources` also comes from
      ;; the server — Local and Remote only, never a hard-coded provider.
@@ -82,9 +118,10 @@
      ;; provider picker (settings dialog): the shipped catalogue (resources/
      ;; providers.edn via the server's `providers` method) + what :llm points at.
      :providers nil :provider-current nil
-     ;; composer attachments: pasted images ({:kind :image :media_type :base64})
-     ;; and picked/dropped files ({:kind :file :path}). Sent as ECA contexts.
-     :attachments []
+     ;; The composer draft and its attachments are PER SESSION
+     ;; ([:sessions sid :input] / [:sessions sid :attachments]) so swapping
+     ;; projects cannot leak one project's text or image into another — they are
+     ;; not top-level keys. See the :input / :attach-* events and their subs.
      :voice nil :recording? false :transcribing? false}))
 
 (rf/reg-sub :db (fn [db _] db))
@@ -124,6 +161,7 @@
                     :bootstrap-needed? (and (not (:bootstrap-dismissed? db))
                                             (boolean (get-in s [:bootstrap :needed?])))
                     :bootstrap-configured? (boolean (get-in s [:bootstrap :configured?]))
+                    :bootstrap-mcps (vec (or (get-in s [:bootstrap :mcps]) []))
                     :docs-dir (get-in s [:bootstrap :docs-dir])))
      :dispatch [:open (:project s)]}))
 
@@ -140,6 +178,8 @@
                                              false
                                              (boolean (get-in snap [:bootstrap :needed?])))
                         :bootstrap-configured? (boolean (get-in snap [:bootstrap :configured?]))
+                        :bootstrap-mcps (or (seq (get-in snap [:bootstrap :mcps]))
+                                            (:bootstrap-mcps db))
                         :docs-dir (or (get-in snap [:bootstrap :docs-dir])
                                       (:docs-dir db))))]
       (if (contains? (:sessions db) id)
@@ -167,7 +207,7 @@
 
 (rf/reg-event-db :select-tab (fn [db [_ id]] (assoc db :active id)))
 (rf/reg-event-db :focus     (fn [db [_ f]] (assoc db :focused? f)))
-(rf/reg-event-db :input     (fn [db [_ s]] (assoc db :input s)))
+(rf/reg-event-db :input     (fn [db [_ s]] (assoc-in db [:sessions (:active db) :input] s)))
 
 ;; --- attachments (images pasted, files picked/dropped) ---------------------
 ;;
@@ -196,23 +236,25 @@
                              (bytes->base64 (js/Uint8Array. buf))])))
       (.catch (fn [_] nil))))
 
+;; Attachments are PER SESSION: swapping projects must not carry a pasted image
+;; or a picked file into the other project's composer.
 (rf/reg-event-db :attach-image
   (fn [db [_ media-type base64]]
-    (update db :attachments (fnil conj [])
-            {:kind :image :media_type (or media-type "image/png") :base64 base64})))
+    (update-in db [:sessions (:active db) :attachments] (fnil conj [])
+               {:kind :image :media_type (or media-type "image/png") :base64 base64})))
 
 (rf/reg-event-db :attach-files
   (fn [db [_ paths]]
-    (update db :attachments (fnil into [])
-            (map (fn [p] {:kind :file :path (str p)})) paths)))
+    (update-in db [:sessions (:active db) :attachments] (fnil into [])
+               (map (fn [p] {:kind :file :path (str p)})) paths)))
 
 (rf/reg-event-db :attach-remove
   (fn [db [_ i]]
-    (update db :attachments
-            (fn [xs] (vec (keep-indexed (fn [j x] (when (not= j i) x)) (or xs [])))))))
+    (update-in db [:sessions (:active db) :attachments]
+               (fn [xs] (vec (keep-indexed (fn [j x] (when (not= j i) x)) (or xs [])))))))
 
 (rf/reg-event-db :attach-clear
-  (fn [db _] (assoc db :attachments [])))
+  (fn [db _] (assoc-in db [:sessions (:active db) :attachments] [])))
 
 (rf/reg-event-fx :attach-pick
   (fn [_ _]
@@ -236,6 +278,56 @@
         (.then (fn [p] (rf/dispatch [:status-line nil (str "[grog] saved image to " p)])))
         (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] save image failed: " (.-message e))]))))
     {}))
+
+;; --- assistant images: persisted INTO THE PROJECT ---------------------------
+;;
+;; An image arrives as base64 with no path. We write it into the SESSION'S
+;; PROJECT (images/, via the spine's `save-image` RPC) so it becomes a durable
+;; artifact that travels with the project — then show a SMALL inline thumbnail
+;; and let a click open the full-size project file in the OS viewer.
+;;
+;; Persisting is idempotent, keyed by the image bytes, so re-rendering the
+;; transcript never writes a second copy.
+
+(defn- img-key
+  "Stable key for one assistant image (media type + byte count + content hash)."
+  [media-type base64]
+  (str (or media-type "image/png") ":" (count (str base64)) ":" (hash (str base64))))
+
+(rf/reg-event-db :image-saved
+  (fn [db [_ sid k info]]
+    (assoc-in db [:sessions sid :image-paths k] info)))
+
+(rf/reg-event-fx :persist-image
+  "Write the image into the project's images/ dir once. No-op when it is already
+  there (idempotent by byte key)."
+  (fn [{:keys [db]} [_ sid media-type base64]]
+    (let [k (img-key media-type base64)]
+      (if (or (nil? sid) (nil? base64) (get-in db [:sessions sid :image-paths k]))
+        {}
+        (do
+          (-> (.call js/window.grogAPI "save-image"
+                     (clj->js {:id sid :media-type (or media-type "image/png") :base64 base64}))
+              (.then (fn [r] (when r (rf/dispatch [:image-saved sid k (js->clj r :keywordize-keys true)]))))
+              (.catch (fn [_] nil)))
+          {})))))
+
+(rf/reg-event-fx :open-image-file
+  "Open an assistant image FULL SIZE: the copy written into the project if it is
+  there, otherwise persist it first and then open."
+  (fn [{:keys [db]} [_ sid media-type base64]]
+    (let [k (img-key media-type base64)
+          saved (get-in db [:sessions sid :image-paths k])]
+      (if-let [p (:path saved)]
+        (-> (.openPath js/window.grogAPI p)
+            (.catch (fn [e] (rf/dispatch [:status-line sid (str "[grog] open failed: " (.-message e))]))))
+        (-> (.call js/window.grogAPI "save-image"
+                   (clj->js {:id sid :media-type (or media-type "image/png") :base64 base64}))
+            (.then (fn [r] (when r
+                             (rf/dispatch [:image-saved sid k (js->clj r :keywordize-keys true)])
+                             (rf/dispatch [:open-image-file sid media-type base64]))))
+            (.catch (fn [e] (rf/dispatch [:status-line sid (str "[grog] image failed: " (.-message e))])))))
+      {})))
 (rf/reg-event-db :q-input   (fn [db [_ s]] (assoc db :q-input s)))
 (rf/reg-event-db :connected (fn [db [_ on? path]]
                               (assoc db :connected? on? :socket-path (or path (:socket-path db)))))
@@ -261,9 +353,9 @@
 
 (rf/reg-event-db :insert-transcript
   (fn [db [_ text]]
-    (let [cur (str (:input db))
+    (let [cur (str (get-in db [:sessions (:active db) :input]))
           sep (if (and (seq cur) (not (str/ends-with? cur " "))) " " "")]
-      (assoc db :input (str cur sep text)))))
+      (assoc-in db [:sessions (:active db) :input] (str cur sep text)))))
 
 ;; auto-stop: a forgotten recording shouldn't run forever
 (rf/reg-event-fx :voice-auto-stop
@@ -303,7 +395,8 @@
           {})
 
         (not enabled?)
-        {:dispatch [:status-line nil "[grog] voice off — set GROG_VOICE_COMMAND"]}
+        {:dispatch [:status-line nil (str "[grog] voice off — "
+                                          (or (:reason st) "set GROG_VOICE_COMMAND"))]}
 
         (not (voice/supported?))
         {:dispatch [:status-line nil "[grog] microphone unavailable in this window"]}
@@ -607,14 +700,23 @@
 
 (rf/reg-event-fx :send
   (fn [{:keys [db]} _]
-    (let [id (:active db) txt (:input db) atts (or (:attachments db) [])
+    (let [id (:active db)
+          txt  (or (get-in db [:sessions id :input]) "")
+          atts (or (get-in db [:sessions id :attachments]) [])
           ;; ECA ChatContext: {type image mediaType base64} | {type file path}
           contexts (mapv (fn [{:keys [kind media_type base64 path]}]
                            (if (= kind :file)
                              {:type "file" :path path}
                              {:type "image" :mediaType media_type :base64 base64}))
                          atts)]
-      (if (and id (or (seq (str/trim txt)) (seq atts)))
+      (cond
+        ;; `/help` is answered LOCALLY — the same table as the onboarding panel,
+        ;; UI triggers and all — instead of the spine's long text dump.
+        (and id (empty? atts) (= "/help" (str/lower-case (str/trim txt))))
+        (do (rf/dispatch [:help id])
+            {:db (assoc-in db [:sessions id :input] "")})
+
+        (and id (or (seq (str/trim txt)) (seq atts)))
         (do
           (rf/dispatch [:running id true])
           (-> (.call js/window.grogAPI "prompt"
@@ -623,8 +725,18 @@
               (.catch (fn [e]
                         (rf/dispatch [:running id false])
                         (rf/dispatch [:status-line id (str "[grog] prompt failed: " (.-message e))]))))
-          {:db (-> db (assoc :input "") (assoc :attachments []))})
-        {}))))
+          {:db (-> db (assoc-in [:sessions id :input] "")
+                    (assoc-in [:sessions id :attachments] []))})
+
+        :else {}))))
+
+(rf/reg-event-db :help
+  "Render the command reference (`help-rows`) into the transcript, locally."
+  (fn [db [_ sid]]
+    (let [sid (or sid (:active db))]
+      (-> db
+          (append-segment sid {:kind :user   :text "/help"})
+          (append-segment sid {:kind :answer :text (help-markdown)})))))
 
 (rf/reg-event-fx :stop
   (fn [{:keys [db]} _]
@@ -689,6 +801,31 @@
         {:dispatch [:write-clipboard txt "[grog] transcript copied to clipboard"]}
         {}))))
 
+(rf/reg-event-fx :export-html
+  "Dump the WHOLE session to a standalone .html and open it — something you can
+  hand to somebody, including another grog.
+
+  The HTML is built here (pure: `grog-web.export`) and WRITTEN by the main
+  process, which owns the filesystem and the browser. No dialog: main picks
+  ~/grog-sessions/<project>-<yyyyMMdd-HHmm>.html."
+  (fn [{:keys [db]} [_ sid]]
+    (let [sid (or sid (:active db))
+          s (get-in db [:sessions sid])]
+      (if (seq (:transcript s))
+        (let [html (export/->standalone-html
+                    {:project   (:project s)
+                     :session-id sid
+                     :model     (:model s)
+                     :version   (:version s)
+                     :segments  (:transcript s)
+                     :usage     (:usage s)
+                     :exported-at (.toLocaleString (js/Date.))})]
+          (-> (.exportHtml js/window.grogAPI (clj->js {:project (:project s) :html html}))
+              (.then (fn [p] (rf/dispatch [:status-line sid (str "[grog] session dumped to " p)])))
+              (.catch (fn [e] (rf/dispatch [:status-line sid (str "[grog] export failed: " (.-message e))])))))
+        (rf/dispatch [:status-line sid "[grog] nothing to export yet"]))
+      {})))
+
 (rf/reg-event-fx :open-doc
   "Open a shipped documentation file (docs-relative) in the OS handler — or the
   docs folder itself when `rel` is blank. Confined to the docs dir in main."
@@ -723,8 +860,10 @@
 (rf/reg-sub :order   (fn [db _] (:order db)))
 (rf/reg-sub :active  (fn [db _] (:active db)))
 (rf/reg-sub :focused (fn [db _] (:focused? db)))
-(rf/reg-sub :input   (fn [db _] (:input db)))
-(rf/reg-sub :attachments (fn [db _] (:attachments db)))
+;; composer draft + attachments live on the ACTIVE session, so swapping projects
+;; does not carry one project's text/image into another.
+(rf/reg-sub :input   (fn [db _] (get-in db [:sessions (:active db) :input] "")))
+(rf/reg-sub :attachments (fn [db _] (get-in db [:sessions (:active db) :attachments] [])))
 (rf/reg-sub :q-input (fn [db _] (:q-input db)))
 (rf/reg-sub :connected? (fn [db _] (:connected? db)))
 (rf/reg-sub :voice (fn [db _] (:voice db)))
@@ -735,6 +874,7 @@
 (rf/reg-sub :retry (fn [db _] (:retry db)))
 (rf/reg-sub :bootstrap-needed? (fn [db _] (:bootstrap-needed? db)))
 (rf/reg-sub :bootstrap-configured? (fn [db _] (:bootstrap-configured? db)))
+(rf/reg-sub :bootstrap-mcps (fn [db _] (:bootstrap-mcps db)))
 (rf/reg-sub :docs-dir (fn [db _] (:docs-dir db)))
 (rf/reg-sub :sessions (fn [db _] (:sessions db)))
 (rf/reg-sub :sess (fn [db [_ id]] (get-in db [:sessions id])))
@@ -757,7 +897,7 @@
   (case kind :answer "answer" :thinking "think" :tool "tool"
         :user "user" :usage "usage" "·"))
 
-(defn- segment-view [{:keys [kind text media_type base64]}]
+(defn- segment-view [sid {:keys [kind text media_type base64]}]
   (cond
     (= :snark kind)
     [:div {:class "text-center seg-snark italic text-sm py-1"} text]
@@ -774,21 +914,29 @@
                               (if (= :thinking kind) "seg-think" "seg-answer"))}]
            (md/->hiccup text))]
 
-    ;; an inline image from the assistant (data: URL — no filesystem access).
-    ;; Inline is capped (~70vh) so it can't swallow the transcript; click to
-    ;; open it FULL SIZE in the OS viewer/browser (real pan + zoom), or save it.
+    ;; an assistant image: shown SMALL inline (a preview — it must not swallow
+    ;; the transcript), captioned with the copy the SPINE writes into the
+    ;; project's images/ dir. Clicking opens that full-size PROJECT file in the
+    ;; OS viewer (real pan + zoom). Persisting happens on load, so the file is
+    ;; there "right then".
     (= :image kind)
-    [:div {:class "py-1 space-y-1"}
-     [:img {:src (str "data:" (or media_type "image/png") ";base64," base64)
-            :alt "image"
-            :title "click to open full size (pan/zoom)"
-            :on-click #(rf/dispatch [:open-image media_type base64])
-            :class "max-w-full max-h-[70vh] rounded-md border border-slate-700 bg-[#121212] cursor-zoom-in"}]
-     [:div {:class "flex items-center gap-3 text-[0.7rem]"}
-      [:button {:class "text-sky-300 hover:underline"
-                :on-click #(rf/dispatch [:open-image media_type base64])} "↗ open full size"]
-      [:button {:class "text-slate-400 hover:underline"
-                :on-click #(rf/dispatch [:save-image media_type base64])} "↓ save to Downloads"]]]
+    (let [k (img-key media_type base64)
+          saved (get-in @(rf/subscribe [:sess sid]) [:image-paths k])]
+      [:div {:class "py-1 space-y-1"}
+       [:img {:src (str "data:" (or media_type "image/png") ";base64," base64)
+              :alt "image"
+              :title "click to open full size (pan/zoom)"
+              :on-load #(rf/dispatch [:persist-image sid media_type base64])
+              :on-click #(rf/dispatch [:open-image-file sid media_type base64])
+              :class "max-h-40 max-w-[22rem] w-auto rounded-md border border-slate-700 bg-[#121212] cursor-zoom-in"}]
+       [:div {:class "flex items-center gap-3 text-[0.7rem]"}
+        [:button {:class "text-sky-300 hover:underline"
+                  :on-click #(rf/dispatch [:open-image-file sid media_type base64])} "↗ open full size"]
+        (if-let [rel (:rel saved)]
+          [:span {:class "text-slate-500 font-mono truncate max-w-[16rem]"} (str "grog: " rel)]
+          [:span {:class "text-slate-500"} "saving into the project…"])
+        [:button {:class "text-slate-400 hover:underline"
+                  :on-click #(rf/dispatch [:save-image media_type base64])} "↓ Downloads"]]])
 
     :else
     [:div {:class (str "text-sm " (if (= :user kind) "text-right" ""))}
@@ -952,7 +1100,7 @@
            :class "relative flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-3"}
            (if (has-messages? segs)
              (for [[i seg] (map-indexed vector segs)]
-               ^{:key i} [segment-view seg])
+               ^{:key i} [segment-view sid seg])
              [splash segs (:version s)])]))
 
 (defn- tab-strip []
@@ -1011,7 +1159,7 @@
                :title (cond transcribing? "Transcribing…"
                             recording? "Recording — click to stop"
                             voice? (str "Voice input — click to record, click again to stop · " (:engine st))
-                            :else "Voice off — set GROG_VOICE_COMMAND")
+                            :else (str "Voice off — " (or (:reason st) "no transcription engine")))
                :class (str "px-3 py-1.5 rounded-md border "
                            (cond recording? "bg-rose-500/20 border-rose-500/50 text-rose-200 animate-pulse"
                                  (not voice?) "bg-slate-800 border-slate-700 text-slate-500 opacity-60"
@@ -1037,7 +1185,10 @@
       "⚙"]
      [:button {:disabled (not active) :title "Copy transcript (Ctrl+E)"
                :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
-               :on-click #(rf/dispatch [:copy-transcript])} "⧉"]]))
+               :on-click #(rf/dispatch [:copy-transcript])} "⧉"]
+     [:button {:disabled (not active) :title "Dump the whole session to a standalone HTML file (Ctrl+Shift+E)"
+               :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
+               :on-click #(rf/dispatch [:export-html])} "⤓"]]))
 
 (defn- composer []
   (let [txt @(rf/subscribe [:input]) active @(rf/subscribe [:active])
@@ -1257,7 +1408,7 @@
                :on-change #(rf/dispatch [:dialog-input (.. % -target -value)])
                :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:set-model active in]))
                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-      [:div {:class "text-[0.7rem] text-slate-500"} "applies to this tab's session only — the default comes from grog.edn"]
+      [:div {:class "text-[0.7rem] text-slate-500"} "sets the DEFAULT model — saved to grog.edn, used by this and every new session"]
 
       ;; provider picker — the shipped catalogue (resources/providers.edn, over
       ;; the server's `providers` method). Picking one writes :llm :url to
@@ -1269,16 +1420,17 @@
         [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
          [:label {:class "text-xs text-slate-400"} "provider"]
          (if (seq ps)
-           (into [:div {:class "flex flex-wrap gap-1"}]
-                 (for [{:keys [id label url]} ps]
-                   ^{:key id}
-                   [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
-                                         (if (= id cur-id)
-                                           "bg-emerald-600/30 border-emerald-500 text-emerald-100"
-                                           "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"))
-                             :title url
-                             :on-click #(rf/dispatch [:set-provider id])}
-                    label]))
+           ;; a combo-box, not a wall of buttons — one control, and it scales to
+           ;; the whole catalogue without re-flowing the dialog.
+           [:select {:value (or cur-id "")
+                     :on-change #(let [v (.. % -target -value)]
+                                   (when (seq v) (rf/dispatch [:set-provider v])))
+                     :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}
+            (when-not cur-id
+              [:option {:value ""} "— pick a provider —"])
+            (for [{:keys [id label url]} ps]
+              ^{:key id}
+              [:option {:value id :title url} label])]
            [:div {:class "text-xs text-slate-500"} "loading…"])
          [:div {:class "text-[0.7rem] text-slate-500"}
           (if cur
@@ -1347,7 +1499,7 @@
         (let [st @(rf/subscribe [:voice])]
           (if (and st (:enabled st))
             (str "on · " (:engine st) " · max " (:maxSeconds st) "s")
-            "off — set GROG_VOICE_COMMAND"))]
+            (str "off — " (or (:reason st) "set GROG_VOICE_COMMAND"))))]
        [:div {:class "text-[0.7rem] text-slate-500"}
         "mic + transcription stay on this machine; nothing is sent to the server"]]
       [:div {:class "flex gap-2 justify-end text-sm"}
@@ -1356,52 +1508,148 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
                  :on-click #(rf/dispatch [:set-model active in])} "Save"]]]]))
 
-(defn- bootstrap-panel
-  "The getting-started landing: shown instead of the transcript when grog has no
-  usable LLM ('Job 1'), or when a factory reset asked for the onboarding. Renders
-  fully OFFLINE — no model, no network. The composer stays live underneath,
-  because `/secret` is handled locally and needs no brain.
+(defn- mcp-row
+  "One shipped MCP server: label, what it gives you, and either a readiness word
+  or the thing it wants first. `:configured?` is true/false when the spine could
+  check cheaply, nil when it would need a secret-store probe (show the hint
+  instead of a status)."
+  [m]
+  (let [c (:configured? m)
+        n (:needs m)]
+    ^{:key (:id m)}
+    [:div {:class "flex items-baseline gap-3 text-sm"}
+     [:span {:class "font-mono text-slate-300 shrink-0 w-32 truncate"} (:label m)]
+     [:span {:class "text-slate-400 flex-1 min-w-0"} (:what m)]
+     (cond
+       (true? c)  [:span {:class "text-teal-300 text-[0.7rem] shrink-0"} "ready"]
+       (false? c) [:span {:class "text-amber-300 text-[0.7rem] shrink-0 max-w-[14rem] text-right"}
+                   (or n "needs setup")]
+       n          [:span {:class "text-slate-500 text-[0.7rem] shrink-0 max-w-[14rem] text-right"} n]
+       :else      [:span {:class "text-slate-500 text-[0.7rem] shrink-0"} "ready"])]))
 
-  A reset does not touch ECA's own config, so an LLM can already be reachable when
-  this page appears; it then says so plainly and offers a way through to the
-  transcript, rather than claiming there is no brain."
+(defn- bootstrap-panel
+  "The getting-started landing: shown instead of the transcript when THIS launch
+  wants onboarding (a fresh install, or a config home that was just seeded or
+  reset). Renders fully OFFLINE — no model, no network. The composer stays live
+  underneath, because `/secret` is handled locally and needs no brain.
+
+  `configured?` reflects whether GROG ITSELF has a brain (its own key or a local
+  endpoint). When it already does — a key survived the reset — the page says so
+  and offers a way through to the transcript, rather than claiming there is no
+  brain."
   []
   (let [docs @(rf/subscribe [:docs-dir])
-        configured? @(rf/subscribe [:bootstrap-configured?])]
+        configured? @(rf/subscribe [:bootstrap-configured?])
+        mcps @(rf/subscribe [:bootstrap-mcps])]
     [:div {:class "flex-1 min-h-0 overflow-y-auto px-6 py-10 flex justify-center"}
      [:div {:class "max-w-2xl w-full space-y-5"}
+      ;; the ouroboros emblem — the snake eating its own tail, the loop that says
+      ;; "the app bootstraps itself". Art is <repo>/snake.png, kept current in
+      ;; resources/public by scripts/sync-assets.js so it actually SHIPS with the
+      ;; renderer. The on-error guard keeps the page intact if the art is ever
+      ;; missing, rather than showing a broken-image glyph.
+      [:div {:class "flex items-center gap-4"}
+       [:img {:src "snake.png" :alt "ouroboros"
+              :class "h-16 sm:h-20 w-auto max-w-[10rem] shrink-0 object-contain"
+              :style {:filter "drop-shadow(0 0 18px rgba(46,199,205,0.35))"}
+              :on-error (fn [e] (set! (.. e -target -style -display) "none"))}]
+       [:div {:class "space-y-1"}
+        [:div {:class "text-[0.7rem] uppercase tracking-widest seg-snark"} "getting started"]
+        [:div {:class "text-2xl font-semibold text-slate-100"} "Bootstrap grog"]]]
+
+      ;; what this actually IS — the wider point, not a vague "walk you through it"
+      [:div {:class "text-sm text-slate-300 space-y-2"}
+       [:p
+        "This project is " [:span {:class "font-medium text-slate-100"} "ouroboros"]
+        " — the snake eating its own tail. What is happening here is grog "
+        [:span {:class "font-medium text-slate-100"}
+         "bootstrapping an LLM to work inside this project"]
+        ": me talking to myself, reading grog's own documentation, until there is a brain living here."]
+       ;; THE point, stated plainly instead of buried in prose — the whole app in
+       ;; one sentence. "Project by project" is load-bearing: each project is its
+       ;; own loop, its own memory, its own chance to get smarter.
+       [:p {:class "rounded-lg border border-teal-800/50 bg-teal-950/30 px-4 py-3 text-slate-100"}
+        "Concept of GROG: a " [:span {:class "font-medium"} "vicious, deliberate cycle"]
+        " that has the LLM eat its own tail and get smarter — "
+        [:span {:class "font-medium"} "project by project"] "."]
+       [:p
+        "A " [:span {:class "font-medium text-slate-100"} "project"]
+        " is where grog keeps its memory of one thing you work on — its notes, the conversation, "
+        "its workspace, and the tools it is allowed to touch. Everything grog remembers belongs to a "
+        "project, so two projects never bleed into each other. Keep as many as you like and move "
+        "between them with " [:code "/project"] "."]
+       [:p
+        "ouroboros exists to get you running — it is not where your work lives. Once the brain is "
+        "online, start the project you actually care about with "
+        [:code "/project new <name>"] " and get on with it. This one stays behind as your reference "
+        "copy of the documentation; come back whenever you want to read it."]]
+
+      ;; the concrete job — or the all-clear
       (if configured?
-        [:div {:class "space-y-2"}
-         [:div {:class "text-[0.7rem] uppercase tracking-widest seg-snark"} "getting started"]
-         [:div {:class "text-2xl font-semibold text-slate-100"} "Fresh start"]
-         [:div {:class "text-sm text-slate-300"}
-          "You reset grog, so this is the getting-started project again. A model is already "
-          "reachable — ECA's own config outlived the reset — so there is nothing to fix before "
-          "you talk to me. Ask me anything, or point me at the docs."]]
-        [:div {:class "space-y-2"}
-         [:div {:class "text-[0.7rem] uppercase tracking-widest seg-snark"} "bootstrap"]
-         [:div {:class "text-2xl font-semibold text-slate-100"} "Job 1 — get your LLM online"]
-         [:div {:class "text-sm text-slate-300"}
-          "I can't think yet: no provider, no model, no key — so there's no brain to talk to. "
-          "Sort that out and I'll grow one, then walk you through the rest of the setup."]])
-      (when-not configured?
+        [:div {:class "rounded-xl border border-teal-700/60 bg-teal-950/40 p-4 text-sm text-teal-200"}
+         "The brain is already online — grog found a working key (or a local endpoint). Nothing to fix: "
+         "ask me anything, or point me at the docs."]
         [:div {:class "card rounded-xl p-4 space-y-3"}
-         [:div {:class "text-slate-200 text-sm font-medium"} "Three steps"]
+         [:div {:class "text-slate-200 text-sm font-medium"} "Job 1 — get the brain online"]
+         [:div {:class "text-sm text-slate-400"}
+          "Two things, both yours to set. Nothing here guesses on your behalf."]
          [:ol {:class "list-decimal ml-5 space-y-2 text-sm text-slate-300"}
-          [:li "Point grog at a provider and a model — set " [:code ":llm :url"] " and "
-           [:code ":llm :model"] " in " [:code "grog.edn"] " (or use ⚙ Settings)."]
-          [:li "Put the key in the secret store: type "
+          [:li "Open " [:span {:class "text-slate-100"} "⚙ Settings"] " and set the provider and model "
+           "to match what you actually have — grog thinks with whatever model you point it at, so this "
+           "is the one setting that has to be right."]
+          [:li "Hand grog the key with "
            [:code "/secret set LLM_API_KEY <value>"]
-           " below. It goes to your OS keyring, never to a file."]
-          [:li "Restart grog. This page retires the moment a model is reachable."]]])
+           " — type it straight into the composer below. It goes to your OS keychain and stays there; "
+           "grog never echoes it back."]
+          [:li "Restart grog. This page retires the moment the brain is reachable."]]])
+
+      ;; slash commands + how to get help
+      [:div {:class "card rounded-xl p-4 space-y-3"}
+       [:div {:class "text-slate-200 text-sm font-medium"} "Commands and help"]
+       [:div {:class "text-sm text-slate-400"}
+        "Anything you type that starts with " [:code "/"] " is a command, not a message to the model. "
+        "Most of them ALSO have a UI trigger — a tab, a dialog, a key. Type " [:code "/help"] " any time "
+        "and this exact list prints into the conversation — the two never drift."]
+       ;; rows come from `help-rows` — the SAME data `/help` renders (see help-markdown)
+       (into [:div {:class "grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm"}]
+             (mapcat (fn [[c d t]]
+                       [(with-meta [:code {:class "text-slate-300"} c] {:key (str c ":cmd")})
+                        (with-meta [:span {:class "text-slate-400"}
+                                    d (when-not (= "—" t)
+                                        [:span {:class "text-slate-500"} (str "  ·  " t)])]
+                          {:key (str c ":desc")})])
+                     help-rows))
+       [:div {:class "text-[0.7rem] text-slate-500"}
+        "Bare UI, no command: "
+        (str/join " · " (map (fn [[k d]] (str k " — " d)) ui-shortcuts))]]
+
+      ;; what else you can switch on — the MCP servers grog ships
+      (when (seq mcps)
+        [:div {:class "card rounded-xl p-4 space-y-3"}
+         [:div {:class "text-slate-200 text-sm font-medium"} "Tools you can switch on"]
+         [:div {:class "text-sm text-slate-400"}
+          "These are grog's own MCP servers — capabilities I can use on this machine. They are all "
+          "shipped and available; the ones with a note just want something first. Nothing here is "
+          "required to chat."]
+         ;; `into` (not a bare vector child) — a vector ON its own line would be read as a nested
+         ;; element, not a list of children. Same rule that bit the markdown renderer.
+         (into [:div {:class "space-y-2"}] (map mcp-row mcps))])
+
+      ;; the short version, stated plainly
+      [:div {:class "text-sm text-slate-300"}
+       "The core of it: " [:span {:class "font-medium text-slate-100"} "⚙ Settings set to match your model"]
+       ", and the " [:span {:class "font-medium text-slate-100"} "/secret"] " key. Everything else is optional."]
+
       [:div {:class "flex flex-wrap gap-2"}
        (when configured?
          [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium text-sm"
                    :on-click #(rf/dispatch [:dismiss-bootstrap])} "Start chatting"])
        [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium text-sm"
-                 :on-click #(rf/dispatch [:open-doc ""])} "Open the docs folder"]
+                 :on-click #(rf/dispatch [:open-doc "README.md"])} "Open README"]
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm"
-                 :on-click #(rf/dispatch [:open-doc "USERS-GUIDE.md"])} "Users guide"]]
+                 :on-click #(rf/dispatch [:open-doc "USERS-GUIDE.md"])} "Users guide"]
+       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm"
+                 :on-click #(rf/dispatch [:open-doc ""])} "Docs folder"]]
       (when docs
         [:div {:class "text-[0.7rem] text-slate-500 font-mono"} (str "docs: " docs)])]]))
 
@@ -1447,6 +1695,7 @@
          (and ctrl (= k "w")) (do (.preventDefault e) (rf/dispatch [:close-active]))
          (and ctrl (= k "Tab")) (do (.preventDefault e) (rf/dispatch [:cycle (if shift -1 1)]))
          (and ctrl (re-matches #"[1-9]" k)) (do (.preventDefault e) (rf/dispatch [:jump (js/parseInt k)]))
+         (and ctrl shift (= (str/lower-case k) "e")) (do (.preventDefault e) (rf/dispatch [:export-html]))
          (and ctrl (= k "e")) (do (.preventDefault e) (rf/dispatch [:copy-transcript]))
          (and ctrl (or (= k "=") (= k "+"))) (do (.preventDefault e) (rf/dispatch [:bump-font 1]))
          (and ctrl (= k "-")) (do (.preventDefault e) (rf/dispatch [:bump-font -1]))

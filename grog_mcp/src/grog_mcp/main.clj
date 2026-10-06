@@ -205,7 +205,7 @@
         specs (vec (collect-tools ids))
         transport-provider (StdioServerTransportProvider. (ObjectMapper.))
         server (-> (McpServer/async transport-provider)
-                   (.serverInfo "grog-mcp" "0.2.0")
+                   (.serverInfo "grog-mcp" "0.2.1")
                    (.capabilities (-> (McpSchema$ServerCapabilities/builder) (.tools true) (.build)))
                    (.build))]
     ;; registering already-realised specs is fast (no compilation here)

@@ -99,19 +99,23 @@ schema), so existing `mem.db` files work as-is.
 
 ### grog-odoo — enterprise records (read-only)
 Query Odoo records and metadata. **Strictly read-only**; SQL limited to
-`SELECT/WITH/SHOW/EXPLAIN/DESCRIBE/VALUES/TABLE`. Credentials in your instance config.
+`SELECT/WITH/SHOW/EXPLAIN/DESCRIBE/VALUES/TABLE`. Each instance NAMES the store
+account holding its password with `:password-secret`
+(`/secret set ODOO_STAGE_PASSWORD <value>`) — never a password in the file.
 
 | Tool | Description |
 |---|---|
 | `odoo_list_instances` | List configured instances |
-| `odoo_use_instance` | Select the active instance |
-| `odoo_authenticate` | Authenticate → uid |
+| `odoo_authenticate` | Authenticate an instance → uid |
 | `odoo_search_read` | Search/read records |
 | `odoo_get_fields` | Field metadata for a model |
 | `odoo_execute_sql` | SQL via the Select-O-Matic addon (read-only unless the instance allows writes) |
 
 ### grog-imap — email (IMAP)
-Email account setup, read/search, flag, move/copy/append, with OAuth.
+Email account setup, read/search, flag, move/copy/append, with OAuth. Each
+account NAMES the store account holding its credential with `:password-secret`
+(LOGIN/PLAIN) or `:refresh-secret` (XOAUTH2); the server reads the value from
+grog's secret store (`/secret set IMAP_GMAIL_PASSWORD <value>`).
 
 | Tool | Description |
 |---|---|
@@ -135,8 +139,10 @@ Config in `~/.config/grog/gitlab.edn` (`:url` only — the token is separate).
 The token is a **system secret**: store it with `/secret set GITLAB_TOKEN <value>`
 (OS keyring). The server reads it from the keyring **itself**, so it never enters
 an env var or any generated config file — anything grog injects as env is written
-verbatim into `~/.config/grog/sessions/<project>.json`. A `:token-file` remains
-as a legacy fallback.
+verbatim into `~/.config/grog/sessions/<project>.json`. Give an instance its own
+account with `:token-secret` (`/secret set GITLAB_STAGE_TOKEN <value>`), or let it
+use the shared `GITLAB_TOKEN`. There is no `:token` literal, no `${ENV}` and no
+`:token-file`.
 
 | Tool | Description |
 |---|---|

@@ -40,7 +40,8 @@
   (`~/grog-projects/grog` is where grog is developed), so the onboarding project
   must not collide with it. `ouroboros` — the snake that eats its tail — is the
   self-referential joke made real: the app bootstraps itself by talking to
-  itself about its own documentation."
+  itself about its own documentation. That's what grog is — a deliberate vicious
+  cycle."
   "ouroboros")
 
 (defn bootstrap-project?
@@ -197,6 +198,42 @@
   ^File []
   (let [p (resolve-active-project)]
     (when p (project-root p))))
+
+(defn extension-for-media-type
+  "File extension for an image media type (no dot). Unknown types fall back to
+  `png` — a wrong extension is better than losing the image."
+  ^String [media-type]
+  (case (str/lower-case (str media-type))
+    "image/jpeg" "jpg"
+    "image/jpg"  "jpg"
+    "image/webp" "webp"
+    "image/gif"  "gif"
+    "image/svg+xml" "svg"
+    "image/bmp"  "bmp"
+    "image/tiff" "tiff"
+    "png"))
+
+(defn save-image!
+  "Write base64 image bytes into `project`'s `images/` dir — a DURABLE artifact
+  beside notes/ and state/, not a temp file, so it travels with the project and
+  can be handed to somebody (or read back by another grog).
+
+  Returns `{:path <absolute> :rel <project-relative> :bytes n}`, or nil when the
+  project cannot be resolved or the bytes are missing."
+  [project media-type base64]
+  (when-let [root (project-root (or project (project-name)))]
+    (let [^String b64 (some-> base64 str not-empty)]
+      (when b64
+        (let [dir (io/file root "images")
+              _ (.mkdirs dir)
+              f (io/file dir (str "grog-image-" (System/currentTimeMillis) "."
+                                  (extension-for-media-type media-type)))
+              bytes (.decode (java.util.Base64/getDecoder) b64)]
+          (with-open [os (io/output-stream f)]
+            (.write os ^bytes bytes))
+          {:path (.getPath f)
+           :rel (str "images/" (.getName f))
+           :bytes (alength ^bytes bytes)})))))
 
 (defn workspace-folders
   "ECA `workspaceFolders` for the active project: a one-element vector of

@@ -98,7 +98,25 @@ Then in `config.json`:
 }
 ```
 
-### Odoo — single instance (simplest; no config file)
+### Odoo — single instance (simplest)
+
+`GROG_ODOO_CONFIG` points at an instances file; with exactly one instance the
+`instance` argument on each call is optional. The file holds **metadata only**:
+
+```edn
+{:instances [{:name "default"
+              :url "https://your-odoo.example.com"
+              :db "odoo18"
+              :user "admin"
+              :password-secret "ODOO_DEFAULT_PASSWORD"}]}
+```
+
+The password itself never goes in a file or an env var — store it once and name
+the account:
+
+```
+/secret set ODOO_DEFAULT_PASSWORD <value>
+```
 
 ```json
 "mcpServers": {
@@ -106,12 +124,7 @@ Then in `config.json`:
     "command": "java",
     "args": ["-cp", "C:/path/to/grog-odoo/target/grog-odoo.jar",
              "clojure.main", "-m", "grog-odoo.main"],
-    "env": {
-      "GROG_ODOO_URL": "https://your-odoo.example.com",
-      "GROG_ODOO_DB": "odoo18",
-      "GROG_ODOO_USER": "admin",
-      "GROG_ODOO_PASSWORD": "CHANGE_ME"
-    }
+    "env": { "GROG_ODOO_CONFIG": "C:/Users/you/.config/odoo-instances.edn" }
   }
 }
 ```

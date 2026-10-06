@@ -82,8 +82,16 @@ things happen on that first launch, both fully offline:
    `grog doctor`, and a first smoke test.
 
 The docs are **referenced, never copied** — the app bundle is the single source of
-truth, so upgrading grog upgrades the docs the agent reads. `ouroboros` is created
-only when you have **no projects at all**; it never displaces your own work.
+truth, so upgrading grog upgrades the docs the agent reads. `ouroboros` is
+(re)created when you have **no projects at all**, or when grog's config home has
+just been seeded or reset — so deleting `~/.config/grog` and relaunching brings the
+welcome back. It never displaces your own work.
+
+The bootstrap page shows again on any fresh config home, and it reports *grog's*
+readiness only: the "three steps" retire once **grog** has its own key (or points
+at a local endpoint). A key that lives only in ECA's own config does **not** count —
+onboarding exists to set up *grog's* secret store, so a fresh grog still walks you
+through it even if an inherited ECA key could reach a model.
 
 > Guided setup is much easier with a capable model. On a small local model, expect
 > to lean on `grog doctor` and the docs rather than the model's reasoning. The

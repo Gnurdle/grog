@@ -25,10 +25,11 @@ the MCP SDK (it stays reusable in ordinary JVM/Clojure/babashka apps).
 
 ## Config and secrets
 
-`GROG_IMAP_CONFIG` (a path or inline JSON) holds account **metadata** only —
-`{:name :host :port :tls :user}` — with strict selection by pre-selected account
-**name** against an allowlist (never a host the model supplies). Authentication
-is lazy.
+`GROG_IMAP_CONFIG` (a path or inline EDN/JSON) holds account **metadata** only —
+`{:name :host :port :tls :user :sasl}` plus the NAME of the store account that
+holds the credential (`:password-secret` / `:refresh-secret`) — with strict
+selection by pre-selected account **name** against an allowlist (never a host the
+model supplies). Authentication is lazy.
 
 **The library never acquires secrets itself.** It separates account metadata
 from credentials and is always handed a living credential by its caller, so the
@@ -38,11 +39,14 @@ application-code and MCP paths are disjoint:
   connects in-process:
   `(imap/connect (assoc account :password (app/get-secret ...)))`. The secret
   never leaves the app process and never touches the MCP or the model.
-- **The MCP** (`main.clj`) holds account metadata plus a **credential provider**
-  wired at process startup — per-account env `GROG_IMAP_PASSWORD_<NAME>` /
-  `GROG_IMAP_REFRESH_<NAME>`, or a credential file `~/.grog-imap-<name>` /
-  `GROG_IMAP_PASSWORD_FILE_<NAME>`, or a pluggable secret-resolver fn — and
-  injects the resolved credential into the same `core` connect call.
+- **The MCP** (`main.clj`) resolves the credential itself from **grog's secret
+  store** — the OS keyring (service `grog`), with `<config-home>/secrets.edn` as
+  the headless fallback — using the store account each account's metadata NAMES
+  (`:password-secret` for LOGIN/PLAIN, `:refresh-secret` for XOAUTH2), and
+  injects the resolved credential into the same `core` connect call. There is
+  deliberately no env-var and no `~/.grog-imap-<name>` credential file: mail
+  accounts are unbounded, so the account name is carried in the config rather
+  than derived from it. Same shape as grog-odoo's `:password-secret`.
 
 **Hard rule:** credentials are never (a) accepted as MCP tool arguments, (b)
 returned in tool results, or (c) included in account-listing / selection

@@ -372,10 +372,65 @@ const call = async (method, params) => {
 const VOICE_ENABLED = process.env.GROG_VOICE_ENABLED !== "0";
 const VOICE_MAX_SECONDS = Number(process.env.GROG_VOICE_MAX_SECONDS || 60);
 
+// The whisper model nothing provides by default. A PACKAGED install has no
+// ~/.config/grog/models/ggml-base.en.bin, and nothing seeds one — so voice was
+// silently "enabled" and only failed on first use. Look for a model, in order:
+//   $GROG_VOICE_MODEL           explicit override
+//   <config home>/models/…      what the docs / grog.edn examples name
+//   <resourcesPath>/models/…    a model shipped INSIDE a packaged app
+//   <repo>/resources/models/…   the same, running from a source tree
+// The last two let a distro build ship a model (drop one in resources/models);
+// if none is found we still return the conventional path so the error NAMES it.
+function voiceModelCandidates() {
+  const names = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-small.en.bin", "ggml-base.bin"];
+  const dirs = [
+    // honour GROG_CONFIG_HOME / XDG_CONFIG_HOME, exactly like the rest of grog
+    path.join(configSeed.configHome(), "models"),
+    path.join(process.resourcesPath || "", "models"),
+    path.join(__dirname, "..", "..", "..", "..", "resources", "models"),
+  ];
+  const cands = [];
+  if (process.env.GROG_VOICE_MODEL) cands.push(process.env.GROG_VOICE_MODEL);
+  for (const d of dirs) for (const n of names) cands.push(path.join(d, n));
+  return cands;
+}
+
+function voiceModelPath() {
+  const found = voiceModelCandidates().find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  });
+  return found || path.join(configSeed.configHome(), "models", "ggml-base.en.bin");
+}
+
+// Resolve an executable: an explicit path is checked directly, a bare name is
+// looked up on PATH. Returns the path or null — used to say WHICH is missing.
+//
+// Windows does NOT append PATHEXT here (nor does CreateProcess): a bare
+// `whisper-cli` never resolves to `whisper-cli.exe`, which is exactly why voice
+// was dead on Windows. Try the executable extensions explicitly.
+const EXE_EXTS = process.platform === "win32"
+  ? [".exe", ".cmd", ".bat", ".com", ""]
+  : [""];
+
+function whichBin(bin) {
+  if (!bin) return null;
+  if (bin.includes("/") || bin.includes("\\")) {
+    try { return fs.existsSync(bin) ? bin : null; } catch { return null; }
+  }
+  for (const d of (process.env.PATH || "").split(path.delimiter)) {
+    if (!d) continue;
+    for (const ext of EXE_EXTS) {
+      try { if (fs.existsSync(path.join(d, bin + ext))) return path.join(d, bin + ext); }
+      catch { /* ignore */ }
+    }
+  }
+  return null;
+}
+
 function voiceCommand() {
   // GROG_VOICE_COMMAND: a JSON array (["whisper-cli","-m",…,"{wav}"]) or a plain
   // string; "{wav}" is replaced with the recorded file. Default: whisper-cli on
-  // PATH, else the common local build, with the model under ~/.config/grog.
+  // PATH, else the common local build, with a model located by voiceModelPath.
   const raw = process.env.GROG_VOICE_COMMAND;
   if (raw) {
     try {
@@ -383,19 +438,41 @@ function voiceCommand() {
         .map(String).filter(Boolean);
     } catch { return raw.split(/\s+/).map(String).filter(Boolean); }
   }
-  const model = process.env.GROG_VOICE_MODEL ||
-    path.join(os.homedir(), ".config", "grog", "models", "ggml-base.en.bin");
-  const built = path.join(os.homedir(), "whisper.cpp", "build", "bin", "whisper-cli");
-  const bin = fs.existsSync(built) ? built : "whisper-cli";
+  const model = voiceModelPath();
+  // The binary name differs by platform (`.exe`), and an MSVC build lands under
+  // build/bin/Release — both were missed, so a Windows whisper.cpp install was
+  // never found even when present.
+  const name = process.platform === "win32" ? "whisper-cli.exe" : "whisper-cli";
+  const built = [
+    path.join(os.homedir(), "whisper.cpp", "build", "bin", name),
+    path.join(os.homedir(), "whisper.cpp", "build", "bin", "Release", name),
+    path.join(os.homedir(), "whisper.cpp", "build", "bin", "whisper-cli"),
+  ].find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+  const bin = built || "whisper-cli";
   return [bin, "-m", model, "-f", "{wav}", "-nt"];
+}
+
+function voiceModelIn(argv) {
+  const i = argv.indexOf("-m");
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
 }
 
 function voiceStatus() {
   const argv = voiceCommand();
+  const model = voiceModelIn(argv);
+  let reason = null;
+  if (!VOICE_ENABLED) reason = "voice disabled (GROG_VOICE_ENABLED=0)";
+  else if (!argv.length) reason = "no transcription command configured";
+  else if (!whichBin(argv[0]))
+    reason = `engine not found: ${argv[0]} — install whisper.cpp, or set GROG_VOICE_COMMAND`;
+  else if (model && !fs.existsSync(model))
+    reason = `speech model not found: ${model} — put a ggml model there or set GROG_VOICE_MODEL`;
   return {
-    enabled: VOICE_ENABLED && argv.length > 0,
+    enabled: VOICE_ENABLED && argv.length > 0 && !reason,
+    reason,
     maxSeconds: VOICE_MAX_SECONDS,
     engine: argv.length ? path.basename(argv[0]) : null,
+    model: model || null,
   };
 }
 
@@ -475,6 +552,21 @@ function createWindow() {
   win.webContents.on("render-process-gone", (_e, details) =>
     console.log(`[renderer] PROCESS GONE reason=${details && details.reason} exitCode=${details && details.exitCode}`));
   win.webContents.on("unresponsive", () => console.log("[renderer] unresponsive"));
+  // Never let the renderer navigate away from the app. An <a href> (or a
+  // markdown link) in a transcript would otherwise replace the whole window —
+  // which looks exactly like a crash. Open http(s) in the OS browser instead,
+  // and block everything else (file:, javascript:, unknown schemes).
+  win.webContents.on("will-navigate", (e, url) => {
+    if (win.isDestroyed()) return;
+    if (url !== win.webContents.getURL()) {
+      e.preventDefault();
+      if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
+    }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
+    return { action: "deny" };
+  });
   // So a blank window is inspectable on a machine with no terminal attached
   // (e.g. launched from the Start Menu): GROG_OPEN_DEVTOOLS=1 opens a detached
   // DevTools window whose Console tab shows whatever threw.
@@ -595,6 +687,7 @@ function offerConfigCreation() {
     const written = configSeed.createConfig(plan);
     console.log("[grog-client] no grog.edn yet - seeded the config home from the example:");
     for (const f of written) console.log(`  ${f}`);
+    console.log("[grog-client] fresh grog: requested getting-started onboarding (marker written)");
     console.log(`[grog-client] edit ${plan.grogEdn} - at least :llm :url, :llm :model and an`
       + ` API key - then restart grog; until then it cannot reach a model.`);
     if (plan.optional.length) {
@@ -657,6 +750,38 @@ ipcMain.handle("grog:save-image", (_e, mediaType, base64) => {
   shell.showItemInFolder(file);
   return file;
 });
+// Open an absolute path the renderer already knows about — an assistant image
+// that the SPINE wrote into the project's images/ dir (grog:call "save-image").
+// Deliberately simple (the renderer is our own code), but it refuses to open
+// something that is not there, so a stale path reports an error instead of
+// silently doing nothing.
+ipcMain.handle("grog:open-path", async (_e, p) => {
+  const target = String(p || "");
+  if (!target || !fs.existsSync(target)) throw new Error(`no such file: ${target}`);
+  const err = await shell.openPath(target);
+  if (err) throw new Error(err);
+  return target;
+});
+// Dump the whole session to a standalone .html and open it in the browser — the
+// "hand it to somebody" artifact. The renderer BUILDS the HTML (pure,
+// grog-web.export); main owns the filesystem and the browser. No dialog:
+// ~/grog-sessions/<project>-<yyyyMMdd-HHmm>.html.
+function htmlStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+ipcMain.handle("grog:export-html", async (_e, payload) => {
+  const { project, html } = payload || {};
+  const dir = path.join(os.homedir(), "grog-sessions");
+  const safe = String(project || "session").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "session";
+  const file = path.join(dir, `${safe}-${htmlStamp()}.html`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, String(html || ""), "utf8");
+  const err = await shell.openPath(file);   // .html -> the default browser
+  if (err) throw new Error(err);
+  return file;
+});
 
 // Chromium's PRIVATE profile — HTTP cache, GPU cache, Code Cache, Local
 // Storage (the font-size pref), cookies, network state — must NOT go to
@@ -707,12 +832,14 @@ app.whenReady().then(() => {
   // by default, but be explicit so getUserMedia can't silently fail.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) =>
     cb(permission === "media"));
+  // Seed the config home FIRST: it writes grog.edn and — on a fresh home — the
+  // onboarding marker the spine reads at `startup`. It must land before the
+  // spine is spawned and the renderer asks which project to open.
+  offerConfigCreation();
   connect();
   createWindow();
-  // Both first-run prompts are parented to the window, in order of how quickly
-  // they are answered. Each also self-heals a previous "yes" on later runs.
+  // The desktop-integration prompt is parented to the window.
   maybeOfferDesktopIntegration();
-  offerConfigCreation();
 });
 // Kill the spine AND everything it spawned. Necessary because the MCP servers
 // are GRANDCHILDREN: spine (java) -> eca -> bash -> java. Killing only the spine

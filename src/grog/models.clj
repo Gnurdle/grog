@@ -81,14 +81,14 @@
   (sort (map name (keys (or (:profiles (llm-config)) {})))))
 
 (defn save-eca-model!
-  "Persist the GUI/ECA model as `:eca :model` in grog.edn atomically, preserving
-  every other key — a GLOBAL default for the GUI's ECA chat.
+  "Persist the chosen model as `:eca :model` in grog.edn atomically, preserving
+  every other key — the DEFAULT model for the GUI's ECA chat.
 
-  NOTE: nothing calls this any more. Choosing a model is a per-session choice
-  (`grog.client.local/set-model!`), and writing it here made one tab's pick the
-  default for every other tab and every future session. Kept for an explicit
-  \"make this the default\" action; the ordinary default is grog.edn's
-  `:eca :model`, falling back to `:llm :model` (see `grog.config/eca-model`)."
+  CALLED whenever the user picks a model (`grog.client.local/set-model!`): a
+  pick is the default from then on, so every new session and every restart uses
+  it until the user picks again. It wins over `:llm :model` (see
+  `grog.config/eca-model`); the picker writes the provider-QUALIFIED id
+  (`openrouter/…`, `ollama/…`) so ECA can resolve it without guessing."
   [m]
   (persist! #(assoc-in % [:eca :model] (str m)))
   m)

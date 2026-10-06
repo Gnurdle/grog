@@ -20,7 +20,13 @@
   ({:password \"...\"} for LOGIN/PLAIN, {:access-token \"...\"} or
   {:oauth {...} :refresh-token \"...\"} for XOAUTH2) or a fn
   [account] -> credential map. Secrets never transit this namespace's config
-  or results."
+  or results.
+
+  Where that credential COMES FROM is the caller's business: the MCP server
+  (`grog-imap.main`) reads grog's secret store for the store account NAMED in
+  the account metadata (`:password-secret` for LOGIN/PLAIN, `:refresh-secret`
+  for XOAUTH2). This namespace never touches the store itself — it authenticates
+  with whatever credential it was handed."
   (:require [clojure.string :as str]
             [clojure.data.json :as json]
             [clojure.edn :as edn]

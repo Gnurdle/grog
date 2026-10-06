@@ -214,12 +214,18 @@
           (let [mid (models/qualify-eca-model nm
                                               source
                                               (try (config/llm-url) (catch Exception _ nil)))]
-            ;; PER SESSION, deliberately. This used to also write `:eca :model`
-            ;; into grog.edn, which made one tab's pick the default for every
-            ;; other tab and for every future session — the selection is a
-            ;; per-session choice. The global default is grog.edn's `:eca :model`
-            ;; (or `:llm :model`); use models/save-eca-model! if you ever want an
-            ;; explicit "make this the default" action.
+            ;; A PICK IS THE DEFAULT from now on. Persisting it (`:eca :model` in
+            ;; grog.edn) means every NEW session and every restart uses it — not
+            ;; just this tab — until the user picks again. That is what the
+            ;; settings dialog promises; per-session-only was the old behaviour.
+            (when mid
+              (try (models/save-eca-model! mid)
+                   ;; grog.config caches the merged config and only re-reads on
+                   ;; `reload!`; without this, a NEW session in this same process
+                   ;; (swap projects, new tab) would still generate its ECA config
+                   ;; from the STALE cache and ignore the freshly-chosen default.
+                   (config/reload!)
+                   (catch Throwable e (dbg! "save default model failed:" (.getMessage e)))))
             (when (and @connected mid)
               (eca/selected-model! id mid {:chatId @(:chat-id state)}))
             (reset! (:model state) mid)

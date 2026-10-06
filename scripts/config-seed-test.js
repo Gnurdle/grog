@@ -12,7 +12,7 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { configHome, availableExamples, planOffer, createConfig } =
+const { configHome, availableExamples, planOffer, createConfig, ONBOARDING_MARKER } =
   require("../clients/web/src/main/config-seed");
 
 let pass = 0;
@@ -88,6 +88,18 @@ check("createConfig writes grog.edn + the optional *.example files", () => {
   assert.ok(fs.existsSync(path.join(home, "secrets.edn.example")));
   assert.ok(!fs.existsSync(path.join(home, "README.md")), "README.md must not be copied");
   assert.strictEqual(fs.readFileSync(path.join(home, "grog.edn"), "utf8"), "{:llm {:url \"\" :model \"\"}}\n");
+});
+check("a fresh seed writes the onboarding marker (a fresh grog must onboard)", () => {
+  const onboard = path.join(tmp, "onboard-home");
+  createConfig(planOffer({ resourcesPath: res, configHome: onboard }));
+  assert.ok(fs.existsSync(path.join(onboard, ONBOARDING_MARKER)),
+    "seeding a fresh grog.edn must write " + ONBOARDING_MARKER);
+});
+check("re-seeding an existing home does NOT write the marker", () => {
+  const onboard = path.join(tmp, "onboard-home");
+  fs.rmSync(path.join(onboard, ONBOARDING_MARKER));
+  createConfig(planOffer({ resourcesPath: res, configHome: onboard })); // grog.edn now exists
+  assert.ok(!fs.existsSync(path.join(onboard, ONBOARDING_MARKER)));
 });
 check("createConfig never overwrites an existing file", () => {
   fs.writeFileSync(path.join(home, "grog.edn"), "MY EDITS\n");

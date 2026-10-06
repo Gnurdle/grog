@@ -11,8 +11,8 @@
 
 (def expected-tool-names
   ["imap_list_accounts" "imap_use_account" "imap_authenticate"
-   "imap_list_mailboxes" "imap_search" "imap_fetch"
-   "imap_set_flags" "imap_delete" "imap_move" "imap_copy" "imap_append"])
+   "imap_list_mailboxes" "imap_count" "imap_search" "imap_fetch"
+   "imap_set_flags" "imap_delete" "imap_move" "imap_move_sender" "imap_copy" "imap_append"])
 
 (defn- reset-mcp! [config]
   (reset! @#'grog-imap.main/config* config)
@@ -126,9 +126,44 @@
         config (fake-config port)]
     (reset-mcp! config)
     (let [tools (main/build-tools)]
-      ;; provider throws like the real env! when GROG_IMAP_PASSWORD_* is unset
+      ;; provider throws like the real store-secret when no :password-secret is declared
       (with-redefs [main/credential-provider
-                    (fn [_] (throw (ex-info "Missing env GROG_IMAP_PASSWORD_DEV" {})))]
+                    (fn [_] (throw (ex-info "Mail account 'dev' authenticates with LOGIN/PLAIN, but declares no :password-secret" {})))]
         (is (thrown? clojure.lang.ExceptionInfo
                      (invoke tools "imap_authenticate" {})))))
     (core/disconnect-all!)))
+
+;; --- credentials are a NAMED store entry -----------------------------------
+
+(defn- with-store
+  "Run `f` with the private store lookup stubbed for `value-for-account` (a fn of
+  the store account name). ns-resolve + alter-var-root so it works on a private var."
+  [value-for-account f]
+  (let [v (ns-resolve 'grog-imap.main 'lookup-secret)
+        orig @v]
+    (try
+      (alter-var-root v (constantly value-for-account))
+      (f)
+      (finally (alter-var-root v (constantly orig))))))
+
+(deftest credential-is-a-named-store-entry
+  (testing "no store NAME declared -> refused, and the message says what to add"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"declares no :password-secret"
+                          (main/credential-provider {:name "dev" :sasl :login})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"declares no :refresh-secret"
+                          (main/credential-provider {:name "work" :sasl :xoauth2}))))
+  (testing "a declared NAME is resolved from the store (never from env/a file)"
+    (with-store (fn [acct] (str "value-for:" acct))
+                (fn []
+                  (is (= {:password "value-for:IMAP_DEV_PASSWORD"}
+                         (main/credential-provider {:name "dev" :sasl :login
+                                                    :password-secret "IMAP_DEV_PASSWORD"})))
+                  (is (= {:refresh-token "value-for:IMAP_WORK_REFRESH"}
+                         (main/credential-provider {:name "work" :sasl :xoauth2
+                                                    :refresh-secret "IMAP_WORK_REFRESH"}))))))
+  (testing "a declared NAME that is absent from the store -> error names it"
+    (with-store (fn [_] nil)
+                (fn []
+                  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nothing is stored under that name"
+                                        (main/credential-provider {:name "dev" :sasl :login
+                                                                   :password-secret "IMAP_DEV_PASSWORD"})))))))
