@@ -8,6 +8,12 @@
 ; The script is idempotent, so re-running the installer (or installing on a
 ; machine that already has them) is quick. For unattended installs, set
 ; GROG_SKIP_PREREQS=1 and the step is skipped.
+;
+; NOTE: this directory must not contain a `build/` folder with NSIS templates
+; shadowing electron-builder's. A workaround for the per-user installer crash
+; (electron-builder #8536, 0xC0000005 in System.dll) lived here briefly; the
+; real fix is the dependency bump to electron-builder 26.17.0, which ships the
+; bounded read (upstream #9769 / a356198). Do not re-add it.
 
 !macro customInstall
   ReadEnvStr $0 "GROG_SKIP_PREREQS"

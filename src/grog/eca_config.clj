@@ -407,7 +407,7 @@
   "The grog MCP server specs for `project` — ONE entry, ONE process.
 
   `grog_mcp.main` registers every server's tools in a single McpServer, so the
-  whole toolbelt is one JVM per session instead of one per server id (13 of
+  whole toolbelt is one JVM per session instead of one per server id (12 of
   them). The entry is keyed `grog-mcp`, which is the prefix ECA puts on every
   tool (`grog-mcp__odoo_search_read`).
 

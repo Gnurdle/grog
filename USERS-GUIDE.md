@@ -65,29 +65,55 @@ machine is "copy one folder + set one env var".
 4. **Talk to it.** If your provider needs an API key, store it (section 4) before
    chatting.
 
+### First run — the getting-started project (`ouroboros`)
+
+A brand-new grog has no provider, model or key, so it cannot think yet. Two
+things happen on that first launch, both fully offline:
+
+1. **The bootstrap page.** Instead of a transcript you get *Job 1 — get your LLM
+   online*: it names the three steps (set `:llm :url` and `:llm :model`, store the
+   key with `/secret set LLM_API_KEY <value>`, restart). The composer stays usable,
+   because `/secret` is handled locally and needs no model.
+2. **`ouroboros`.** grog seeds ONE project, named after the snake that eats its
+   tail — the getting-started project. Its `SOUL.md` makes the agent your
+   onboarding guide, and grog's **own documentation is mounted into it** as a
+   workspace folder named `grog-docs/`. The agent therefore reads the *shipped*
+   docs (they travel inside the application) and walks you through setup,
+   `grog doctor`, and a first smoke test.
+
+The docs are **referenced, never copied** — the app bundle is the single source of
+truth, so upgrading grog upgrades the docs the agent reads. `ouroboros` is created
+only when you have **no projects at all**; it never displaces your own work.
+
+> Guided setup is much easier with a capable model. On a small local model, expect
+> to lean on `grog doctor` and the docs rather than the model's reasoning. The
+> choice of model is yours.
+
 ---
 
 ## 3. Full annotated config
 
-On first run — when there is no `grog.edn` — the client **asks** whether to create
-one, names the exact path, and then opens the folder:
+On first run — when there is no `grog.edn` — the client **writes one for you**
+from the bundled example, names the exact path in its log, and leaves the
+optional examples beside it:
 
 ```text
-grog has no configuration file yet.
-Create it from the bundled example? It will be written to:
-
-    ~/.config/grog/grog.edn
+[grog-client] no grog.edn yet - seeded the config home from the example:
+  ~/.config/grog/grog.edn
+[grog-client] edit ~/.config/grog/grog.edn - at least :llm :url, :llm :model and
+  an API key - then restart grog; until then it cannot reach a model.
 ```
 
-It is never written silently. A config grog made for you is still missing a
-model, a provider and an API key, so it cannot work until you edit it — say yes,
-edit the file, then restart grog. The optional examples (odoo, imap, gitlab,
-imaging, secrets) are written alongside it as `*.example`; copy the ones you need.
+Nothing is overwritten, and the starter is still missing a model, a provider and
+an API key, so it cannot work until you edit it — edit the file, then restart
+grog. The optional examples (odoo, imap, gitlab, imaging, secrets) are left
+alongside it as `*.example`; copy the ones you need.
 
 Everything is optional except `:llm :url` and `:llm :model`.
 
-*(From a source tree the same files live at `resources/config.examples/`, and
-there is no first-run offer — the packaged copies do not exist there.)*
+*(From a source tree the same files live at `resources/config.examples/` and the
+client seeds from there too, so a dev checkout gets a starter `grog.edn` just
+like a packaged install.)*
 
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
@@ -305,6 +331,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | `/model reset` | revert session override to config file values |
 | `/model <name>` / `/model <profile>` | switch provider/model/profile for the session |
 | `/project`, `/project <name>` | switch per-project context home |
+| `/reset` / `/reset --yes` | factory reset — plan first, then perform (see §10) |
 
 ---
 
@@ -316,6 +343,7 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 |---|---|
 | `grog.edn` | your config (user-level) |
 | `secrets.edn` | fallback secret store (owner-only perms) |
+| `secret-ledger.edn` | names of secrets **grog itself wrote** (never values) — lets `/reset` remove exactly those |
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
 | `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
 | `approved-tools.edn` | permanently-allowed tool names |
@@ -326,6 +354,31 @@ points — see §5.
 
 ---
 
+## 10. Factory reset (the airbag)
+
+If the state gets too wonky, reset grog to a fresh install:
+
+- in chat: `/reset` prints a **plan** and changes nothing; `/reset --yes` performs it;
+- from a shell: `clojure -M -m grog.reset [--yes]`.
+
+It removes **only what grog made**:
+
+| Removed | Note |
+|---|---|
+| the getting-started project (`ouroboros`) | copied into the backup dir first |
+| the config home (`~/.config/grog`) | MOVED into the backup — `grog.edn` and `secrets.edn` survive there |
+| saved session configs | they live under the config home |
+| credentials **grog created** | read from `secret-ledger.edn` (§9) and deleted from the keyring |
+
+Nothing is destroyed outright: everything is moved into
+`~/.config/grog.reset-<timestamp>/`. **Secret values are never exported** — the
+keyring entries grog wrote are deleted, so re-enter them with `/secret`. Your other
+projects (including a developer's own `grog` project) are never touched.
+**Restart grog afterwards** — it comes up on defaults, re-seeds `ouroboros`, and
+the client writes a fresh starter `grog.edn` into the (new) config home.
+
+---
+
 *See also:* the `README.md` (full feature listing, quick start, MCP) and
 `grog.edn.example` (annotated template with every option) — placed in your
-config home on first run, or at `resources/config.examples/` in a source tree.
+config home on first run, and at `resources/config.examples/` in a source tree.

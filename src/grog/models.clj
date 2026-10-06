@@ -8,7 +8,8 @@
             [clojure.pprint :as pp]
             [clojure.string :as str]
             [grog.config :as config]
-            [grog.platform :as platform])
+            [grog.platform :as platform]
+            [grog.providers :as providers])
   (:import (java.net URL)))
 
 (defn- grogedn-file
@@ -81,23 +82,43 @@
 
 (defn save-eca-model!
   "Persist the GUI/ECA model as `:eca :model` in grog.edn atomically, preserving
-  every other key — this is the model the GUI's ECA chat uses."
+  every other key — a GLOBAL default for the GUI's ECA chat.
+
+  NOTE: nothing calls this any more. Choosing a model is a per-session choice
+  (`grog.client.local/set-model!`), and writing it here made one tab's pick the
+  default for every other tab and every future session. Kept for an explicit
+  \"make this the default\" action; the ordinary default is grog.edn's
+  `:eca :model`, falling back to `:llm :model` (see `grog.config/eca-model`)."
   [m]
   (persist! #(assoc-in % [:eca :model] (str m)))
   m)
 
-;; --- fetching available models (OpenRouter + local Ollama) ------------------
+;; --- fetching available models ----------------------------------------------
+;;
+;; There is deliberately no per-provider fetcher here. The configured provider is
+;; listed from its own OpenAI-compatible `GET <:llm :url>/models`, and ollama from
+;; its `/api/tags`. Nothing in this section names a specific host.
 
-(defn fetch-openrouter-models
-  "Return a sorted, deduped list of model ids available on OpenRouter (best
-  effort; empty on failure/offline)."
+(defn fetch-provider-models
+  "The model ids the CONFIGURED provider advertises, via its OpenAI-compatible
+  `GET <:llm :url>/models`.
+
+  There is nothing provider-specific here on purpose: openrouter, fireworks, a
+  self-hosted server and everything else in between expose that endpoint and the
+  `{:data [{:id …}]}` shape, so the same call works for all of them. The
+  Authorization header is sent when a key resolves (a public listing ignores it).
+
+  Best effort: `[]` on failure, offline, or an unparseable body."
   []
   (try
-    (let [resp (http/get "https://openrouter.ai/api/v1/models"
-                         {:as :json :throw-exceptions false :socket-timeout 15000 :conn-timeout 5000})]
+    (let [base (-> (str (config/llm-url)) str/trim (str/replace #"/+$" ""))
+          key  (try (config/llm-api-key) (catch Throwable _ nil))
+          resp (http/get (str base "/models")
+                         (cond-> {:as :json :throw-exceptions false
+                                  :socket-timeout 15000 :conn-timeout 5000}
+                           (seq key) (assoc :headers {"Authorization" (str "Bearer " key)})))]
       (->> (get-in resp [:body :data])
-           (map :id)
-           (remove nil?)
+           (keep (fn [m] (some-> (:id m) str str/trim not-empty)))
            (distinct)
            (sort)))
     (catch Throwable _ [])))
@@ -115,12 +136,6 @@
            (remove nil?)
            (sort)))
     (catch Throwable _ [])))
-
-(defn fetch-models
-  "Combine OpenRouter + Ollama model lists, labelled for the picker."
-  []
-  (concat (map #(hash-map :model % :source "openrouter") (fetch-openrouter-models))
-          (map #(hash-map :model % :source "ollama") (fetch-ollama-models))))
 
 ;; --- ECA model id qualification --------------------------------------------
 ;;
@@ -152,8 +167,47 @@
     (reset! eca-model-catalog* (set ids)))
   model-ids)
 
+;; Per-model IMAGE-INPUT capability, from ECA's `providers/list` (or the
+;; `providers/updated` notification). ECA's `config/updated` carries only model
+;; IDS, so this is the only source that says whether a model can actually SEE an
+;; image. Used to warn a user who attaches an image to a text-only model, where
+;; ECA would otherwise drop it silently.
+(defonce ^:private vision* (atom {}))
+
+(defn register-provider-vision!
+  "Record image-input capability from an ECA providers payload — a map
+  `{:providers [{:id <provider> :models [{:id <model> :capabilities {:vision bool}}]}]}`
+  (the shape of both `providers/list` and `providers/updated`). Returns the map
+  of `<provider>/<model>` → boolean it recorded."
+  [providers-result]
+  (let [m (into {}
+                (for [{pid :id :keys [models]} (:providers providers-result)
+                      {mid :id :keys [capabilities]} models
+                      :when (and pid mid)]
+                  [(str pid "/" mid) (boolean (:vision capabilities))]))]
+    (when (seq m) (reset! vision* m))
+    m))
+
+(defn vision-for
+  "`true`/`false` when ECA reported image input for `model-id`, `nil` when
+  unknown (no providers payload yet, or the id doesn't match)."
+  [model-id]
+  (get @vision* (some-> model-id str)))
+
 (defn provider-prefix-for-url
   "Guess the ECA provider prefix from an OpenAI-compatible base URL, or nil.
+
+  The shipped catalogue (`grog.providers`) is consulted FIRST: a base that
+  matches a known entry takes that entry's canonical id, which is the only way
+  a host like `integrate.api.nvidia.com` (-> `nvidia`, not `integrate`) or
+  `api.z.ai` (-> `zai`) comes out right. Anything the catalogue does not know
+  falls back to the host heuristic, so ANY OpenAI-compatible endpoint still
+  works — grog generates the provider entry from `:llm :url` (see
+  `grog.eca-config/ensure-provider`), it only has to be named consistently:
+
+      https://api.fireworks.ai/inference/v1  ->  fireworks
+      https://openrouter.ai/api/v1           ->  openrouter
+      http://localhost:11434/v1              ->  ollama
 
   Public because `grog.eca-config` uses it to qualify a model that came from the
   `:llm` block: `:llm :model` is a RAW catalog id, and its provider is whatever
@@ -161,18 +215,35 @@
   ^String [url]
   (when url
     (let [u (str/lower-case (str url))]
-      (cond
-        (or (str/includes? u "11434")
-            (str/includes? u "localhost")
-            (str/includes? u "127.0.0.1")) "ollama"
-        (str/includes? u "openrouter.ai") "openrouter"
-        (str/includes? u "api.kimi.com") "moonshot"
-        (str/includes? u "api.deepseek.com") "deepseek"
-        (str/includes? u "api.anthropic.com") "anthropic"
-        (str/includes? u "api.openai.com") "openai"
-        (str/includes? u "generativelanguage.googleapis.com") "google"
-        (str/includes? u "api.x.ai") "xai"
-        :else nil))))
+      (or
+       ;; The catalogue knows this exact base — take its canonical id before the
+       ;; host heuristic can mangle it.
+       (providers/id-for-url url)
+       (cond
+         (or (str/includes? u "11434")
+             (str/includes? u "localhost")
+             (str/includes? u "127.0.0.1")) "ollama"
+         (str/includes? u "openrouter.ai") "openrouter"
+         (str/includes? u "api.kimi.com") "moonshot"
+         (str/includes? u "api.deepseek.com") "deepseek"
+         (str/includes? u "api.anthropic.com") "anthropic"
+         (str/includes? u "api.openai.com") "openai"
+         (str/includes? u "generativelanguage.googleapis.com") "google"
+         (str/includes? u "api.x.ai") "xai"
+         :else nil)
+       ;; Unknown host — name the provider after it, minus the noise labels:
+       ;;   api.fireworks.ai        -> fireworks
+       ;;   inference.acme-llm.com  -> acme-llm
+       ;; IP literals are left alone (no sensible provider name in "192").
+       (let [host (some-> (re-find #"(?i)^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^/:?#]+)"
+                                   (str url))
+                          second)]
+         (when (and host (seq host) (not (re-matches #"\d+(\.\d+){3}" host)))
+           (let [label (->> (str/split (str/lower-case host) #"\.")
+                            (remove #(contains? #{"api" "www" "inference" "v1" "openai-compatible"} %))
+                            first)]
+             (when (and label (re-matches #"[a-z][a-z0-9-]*" label))
+               label))))))))
 
 (defn qualify-eca-model
   "Translate a raw model id — as stored in grog.edn, picked from a transport, or
@@ -181,15 +252,22 @@
 
   Rules, in order, when the input isn't blank:
   1. Exactly matches a model in ECA's catalog → returned unchanged.
-  2. An explicit picker `source` (`ollama` / `openrouter`) wins — the raw ids
-     returned by the OpenRouter fetch must be scoped to `openrouter/…` even when
-     their org slug collides with a native provider name (`deepseek/…`, `openai/…`).
-  3. A catalog lookup resolves the input as `openrouter/<id>` or `ollama/<id>`.
-  4. The id already carries a known ECA provider prefix is returned unchanged.
-  5. A multi-segment id whose first segment isn't a provider is an OpenRouter
-     catalog id that lost its prefix (`moonshotai/kimi-k3`) → `openrouter/…`.
-  6. Otherwise a bare id is scoped to the grog `:llm :url` default provider
-     (localhost → `ollama/…`, openrouter.ai → `openrouter/…`, …).
+  2. An explicit `source` wins: the picker transport (`ollama` / `openrouter`),
+     or the provider grog derived from `:llm :url`. A raw catalog id must be
+     scoped to it, even when its first segment collides with a native provider
+     name (`deepseek/…`).
+  3. ECA's catalog knows it as `openrouter/<id>` or `ollama/<id>` → prefixed.
+  4. The id already carries a known ECA provider prefix → returned unchanged.
+  5. Otherwise it is scoped to the provider `:llm :url` points at — whatever
+     host that is (openrouter.ai, api.fireworks.ai, a local server, …). A
+     multi-segment id that merely LOOKS like a path
+     (`moonshotai/kimi-k3`, `accounts/fireworks/models/…`) is a catalog id that
+     lost its prefix, and gets exactly the same treatment.
+
+  There is deliberately NO hard-coded fallback to `openrouter`: that is one host
+  among many, and assuming it sent every user on another OpenAI-compatible
+  endpoint to \"API url not found … provider 'openrouter'\". When the URL names
+  no provider, the id is left alone rather than scoped to something wrong.
 
   Returns nil for blank input."
   ([model] (qualify-eca-model model nil nil))
@@ -198,7 +276,7 @@
    (let [m (str/trim (str (or model "")))
          seg (first (str/split m #"/"))
          src (some-> source str str/lower-case)
-         multi? (> (count (str/split m #"/")) 1)
+         prov (provider-prefix-for-url url)
          catalog @eca-model-catalog*]
      (cond
        (str/blank? m) nil
@@ -208,7 +286,7 @@
 
        ;; An explicit provider wins over every guess. That means a picker
        ;; transport (`ollama`/`openrouter`) AND the provider grog derived from
-       ;; `:llm :url` — the latter matters because rule 5 below would otherwise
+       ;; `:llm :url` — the latter matters because rule 4 below would otherwise
        ;; read an OpenRouter org that shares a name with a native provider
        ;; (`deepseek/deepseek-v4.1-flash` ⇒ a nonexistent "deepseek" provider)
        ;; before ECA's catalogue has arrived to disambiguate it.
@@ -217,23 +295,25 @@
          m
          (str src "/" m))
 
-       ;; catalog knows this id under a concrete provider
-       (contains? catalog (str "openrouter/" m))
-       (str "openrouter/" m)
+       (and prov (contains? catalog (str prov "/" m)))
+       (str prov "/" m)
 
-       (contains? catalog (str "ollama/" m))
+       ;; Ollama's catalogue — only meaningful when ollama IS the provider. A
+       ;; REMOTE model whose id happens to match a local one (`qwen2.5-coder:7b`
+       ;; is served by OpenRouter and installed in your ollama) must not be
+       ;; scoped to ollama just because your ECA lists it there.
+       (and (= prov "ollama") (contains? catalog (str "ollama/" m)))
        (str "ollama/" m)
 
        ;; already carries a known ECA provider prefix (native provider or manual)
        (contains? eca-provider-segments (str/lower-case (str seg))) m
 
-       ;; multi-segment non-provider first segment → OpenRouter catalog id
-       multi?
-       (str "openrouter/" m)
-
+       ;; Everything else — a bare id, or a multi-segment catalog id that lost
+       ;; its prefix — is scoped to the provider `:llm :url` points at. NOT
+       ;; hard-coded to `openrouter`.
        :else
-       (if-let [p (provider-prefix-for-url url)]
-         (str p "/" m)
+       (if prov
+         (str prov "/" m)
          m)))))
 
 ;; --- cached catalogue for the model picker ----------------------------------
@@ -253,15 +333,67 @@
 ;; duplicate network calls.
 (defonce ^:private inflight* (atom #{}))
 
+(defn- configured-url []
+  (try (config/llm-url) (catch Throwable _ nil)))
+
+(defn- configured-provider
+  "The provider `:llm :url` points at, as a name, or nil."
+  []
+  (provider-prefix-for-url (configured-url)))
+
+(defn picker-source->provider
+  "Translate a picker SOURCE into the PROVIDER to qualify a model with.
+
+  The picker's sources name PLACES, not companies:
+    \"local\"  -> \"ollama\"        (that is what a local server is, here)
+    \"remote\" -> the provider `:llm :url` points at (openrouter, fireworks, …)
+  A provider name, nil, or anything else passes through unchanged.
+
+  Without this the source is lost, and qualification falls back to guessing —
+  which scoped a REMOTE model to ollama whenever its id happened to also exist
+  in the local ollama (`qwen2.5-coder:7b` is on OpenRouter *and* in your ollama)."
+  [source]
+  (case (str source)
+    "local"  "ollama"
+    "remote" (configured-provider)
+    (let [s (str source)]
+      (when (seq s) s))))
+
+(defn- local-url?
+  "True when `:llm :url` is a server on THIS machine — loopback only.
+
+  A private-range address is deliberately NOT local: a model server on the LAN is
+  somewhere else, and treating it as \"this machine\" would make the local tab
+  list ollama's models instead of the ones that server actually serves."
+  [url]
+  (let [u (str/lower-case (str url))]
+    (boolean (or (str/includes? u "localhost")
+                 (str/includes? u "127.0.0.1")
+                 (str/includes? u "[::1]")
+                 (str/includes? u "0.0.0.0")))))
+
+(defn- source-fetcher
+  "The fetch fn for a picker `source`, or nil when there is none.
+
+  There are only two sources, and neither is a host name:
+    :local   this machine      — ollama's `/api/tags`
+    :remote  the provider `:llm :url` points at — its OpenAI-compatible `/models`
+  A provider NAME is still accepted, so an older client asking for \"openrouter\"
+  gets the right list rather than nothing."
+  [source]
+  (let [s (name source)]
+    (cond
+      (= s "local")               fetch-ollama-models
+      (= s "remote")              fetch-provider-models
+      (= s (configured-provider)) fetch-provider-models
+      :else                       nil)))
+
 (defn fetch-async!
-  "Refresh `source` (:openrouter or :ollama) on a background thread, unless that
-  fetch is already running. Calls `(done! source models)` when it lands.
-  Returns true when a fetch was actually started."
+  "Refresh `source` on a background thread, unless that fetch is already running.
+  Calls `(done! source models)` when it lands. Returns true when a fetch was
+  actually started."
   [source done!]
-  (if-let [fetch (case source
-                   :openrouter fetch-openrouter-models
-                   :ollama     fetch-ollama-models
-                   nil)]
+  (if-let [fetch (source-fetcher source)]
     (if (contains? @inflight* source)
       false
       (do
@@ -275,13 +407,29 @@
     false))
 
 (defn catalogue
-  "What the picker can show right now.
+  "What the picker can show right now, keyed by SOURCE — `:local` and `:remote`.
 
-  `:eca` is ECA's own catalogue (it arrives over `config/updated` when a session
-  connects), so it needs no fetch and works offline."
+  Both start as nil (never fetched). ECA's own catalogue is deliberately NOT a
+  source here: which models ECA can resolve is an implementation detail of the
+  agent, not somewhere a user picks a model."
   []
-  (let [eca (when-let [ids (seq @eca-model-catalog*)]
-              (vec (sort ids)))]
-    (merge {:openrouter nil :ollama nil :eca eca
-            :loading (vec (sort @inflight*))}
-           @catalogue*)))
+  (merge (cond-> {:local nil}
+           (not (local-url? (configured-url))) (assoc :remote nil))
+         {:loading (vec (sort @inflight*))}
+         @catalogue*))
+
+(defn model-sources
+  "The picker's sources as `[[id label] …]` — LOCAL and REMOTE, nothing else.
+
+  `local` is the machine you are on (ollama). `remote` is whatever provider
+  `:llm :url` points at: openrouter for one user, fireworks for the next —
+  the LABEL does not change, because what the user is choosing is where the
+  model runs, not which company hosts it.
+
+  When the configured provider already IS local, only `local` is offered — two
+  tabs onto the same list is noise. There is no `eca` source: that was an
+  implementation detail leaking into a user-facing choice."
+  []
+  (if (local-url? (configured-url))
+    [["local" "Local"]]
+    [["local" "Local"] ["remote" "Remote"]]))

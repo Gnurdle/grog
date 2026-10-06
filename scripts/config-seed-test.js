@@ -3,10 +3,10 @@
 //
 // Run: node scripts/config-seed-test.js
 //
-// Why a unit test rather than an app run: the offer only fires in a PACKAGED
-// app (a dev tree may have no resources/config.examples), and it is a native
-// modal dialog. This exercises the real planning + writing against a fake
-// resources dir and config home.
+// Why a unit test rather than an app run: main.js seeds the config home on
+// first run from the example directory (packaged or source tree). This
+// exercises the real planning + writing against a fake resources dir and
+// config home.
 "use strict";
 const assert = require("assert");
 const fs = require("fs");

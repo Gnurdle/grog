@@ -22,6 +22,7 @@ const { execFile, spawn, spawnSync } = require("child_process");
 // One file per client instance: $GROG_LOG -> else ~/grog, as <base>.<pid>.log.
 const log = require("./log");
 const configSeed = require("./config-seed");
+const desktopInstall = require("./desktop-install");
 const LOG = log.install();
 LOG.tee();
 console.log(`[grog-client] log file: ${LOG.path}`);
@@ -84,6 +85,24 @@ if (!PACKAGED && !looksLikeGrogRoot(GROG_HOME)) {
 // it beside the app; from a source tree the backend finds it itself.
 const MCP_JAR = PACKAGED ? packagedJar("grog-mcp-") : null;
 
+// grog's OWN documentation travels in the bundle (electron-builder
+// extraResources -> resources/docs). A packaged AppImage mounts it read-only
+// inside the squashfs, so the spine cannot find it by searching — the client
+// tells it where the bundle put it. From a source tree there is no bundle, so
+// the tree root IS the docs root. Nothing is copied: the bootstrap project
+// REFERENCES this directory (grog.docs / grog.bootstrap), so a rebuild flows
+// straight through. GROG_DOCS_DIR is what grog.docs/docs-dir reads.
+const DOCS_DIR = PACKAGED ? path.join(process.resourcesPath, "docs") : GROG_HOME;
+
+// The starter config examples. A packaged install ships them beside the app
+// (electron-builder extraResources -> resources/config.examples); from a source
+// tree they live in the repo's own resources/config.examples. Either way the
+// client seeds the user's config home from them on first run, so a fresh
+// install OR a factory reset is never left with an empty config home and no
+// file to edit. `config-seed.js` appends "config.examples", so this is the
+// directory that CONTAINS it.
+const CONFIG_EXAMPLES_ROOT = PACKAGED ? process.resourcesPath : path.join(GROG_HOME, "resources");
+
 // A client-owned spine: no TCP socket, no MCP HTTP endpoint (tools reach ECA
 // through the generated config instead), and its own MCP port range.
 const SPINE_ENV_EXTRA = Object.assign(
@@ -91,6 +110,7 @@ const SPINE_ENV_EXTRA = Object.assign(
     GROG_SERVER_NO_SOCKET: "1",
     GROG_MCP_HTTP: "0",
     GROG_MCP_BASE_PORT: process.env.GROG_MCP_BASE_PORT || "9800",
+    GROG_DOCS_DIR: DOCS_DIR,
   },
   MCP_JAR ? { GROG_MCP_JAR: MCP_JAR } : {},
 );
@@ -480,89 +500,163 @@ function createWindow() {
   win.on("blur",  () => { if (!win.isDestroyed()) win.webContents.send("grog:focus", false); });
 }
 
+// --- application-menu integration (AppImage) ---------------------------------
+//
+// An AppImage is a single file: nothing installs it, so nothing puts it in the
+// menu. Rather than depend on AppImageLauncher/appimaged or a hand-written
+// .desktop, the app writes its own entry — it knows the one thing a helper is
+// needed for, its own absolute path ($APPIMAGE).
+//
+//   install -> no entry yet: ask once, then write entry + icon
+//   update  -> an entry exists (we moved, or an OLDER grog installed it):
+//              re-point it silently. The user already said yes once.
+function maybeOfferDesktopIntegration() {
+  let plan;
+  try {
+    plan = desktopInstall.plan({ resourcesPath: process.resourcesPath });
+  } catch (e) {
+    console.warn("[grog-client] desktop integration check failed:", e && e.message);
+    return;
+  }
+  if (plan.state === "n/a" || plan.state === "ok" || plan.state === "foreign") return;
+
+  const parent = win && !win.isDestroyed() ? win : undefined;
+
+  if (plan.state === "update") {
+    try {
+      desktopInstall.install(plan);
+      const refreshed = desktopInstall.refresh();
+      console.log(`[grog-client] menu entry re-pointed: ${plan.previousProgram || "?"} -> ${plan.appImage}`
+        + (refreshed.length ? ` (refreshed: ${refreshed.join(", ")})` : ""));
+    } catch (e) {
+      console.warn("[grog-client] could not re-point the menu entry:", e && e.message);
+    }
+    return;
+  }
+
+  // state === "install"
+  if (plan.declined || process.env.GROG_DESKTOP_INSTALL === "0") return;
+  const forced = process.env.GROG_DESKTOP_INSTALL === "1";
+  if (!forced) {
+    const answer = dialog.showMessageBoxSync(parent, {
+      type: "question",
+      buttons: ["Add to menu", "Not now"],
+      defaultId: 0,
+      cancelId: 1,
+      title: "grog — application menu",
+      message: "Add grog to your application menu?",
+      detail: `grog is running from an AppImage:\n\n    ${plan.appImage}\n\n`
+        + `This writes an entry and an icon:\n    ${plan.desktopFile}\n    ${plan.iconDest}\n\n`
+        + "so grog shows up in your launcher. The entry follows the file if you move it later,\n"
+        + "and it also takes over an entry written by an older copy of grog.",
+    });
+    if (answer !== 0) {
+      try {
+        desktopInstall.decline(plan);
+      } catch (_e) { /* best effort */ }
+      return;
+    }
+  }
+  try {
+    const written = desktopInstall.install(plan);
+    const refreshed = desktopInstall.refresh();
+    console.log(`[grog-client] menu entry installed: ${written.join(", ")}`
+      + (refreshed.length ? ` (refreshed: ${refreshed.join(", ")})` : ""));
+  } catch (e) {
+    console.error("[grog-client] could not install the menu entry:", e && e.message);
+  }
+}
+
 // --- first-run config --------------------------------------------------------
 //
 // grog needs `<config home>/grog.edn`, and the annotated examples that make it
-// easy ship INSIDE the app bundle — for an AppImage, a read-only squashfs mount
-// no user can browse. So ASK: offer to write the file, name the exact path, and
-// reveal the folder. A silent copy would be worse than nothing, because a config
-// grog created for you still has no model, provider or API key — it cannot work
-// until you edit it, so you have to know it exists and where it went.
+// easy ship INSIDE the app bundle (electron-builder extraResources ->
+// resources/config.examples) — for an AppImage, a read-only squashfs mount no
+// user can browse. From a source tree they live in resources/config.examples.
+//
+// So the client SEEDS the config home on first run: it writes grog.edn (renamed
+// from the example) plus the optional files as `*.example`, and names the exact
+// path in the log. Nothing is asked and nothing is overwritten, so a fresh
+// install — OR a factory reset — is left with a real file to edit instead of an
+// empty directory. grog still runs on built-in defaults until you edit it, so
+// expect model/provider errors until :llm :url, :llm :model and an API key are
+// set; restart grog afterwards.
 function offerConfigCreation() {
   let plan;
   try {
-    // The examples ship in the app bundle (package.json extraResources).
-    // No tree lookup, no GROG_HOME: an unpackaged dev tree simply has nothing
-    // to offer from, and config still lands in the config home either way.
-    plan = configSeed.planOffer({});
+    plan = configSeed.planOffer({ resourcesPath: CONFIG_EXAMPLES_ROOT });
   } catch (e) {
     console.warn("[grog-client] could not inspect the config home:", e && e.message);
     return;
   }
   if (!plan.needsMain) return;   // already configured: say nothing, change nothing
 
-  const parent = win && !win.isDestroyed() ? win : undefined;
-  const lines = [
-    "grog has no configuration file yet.",
-    "",
-    "Create it from the bundled example? It will be written to:",
-    "",
-    `    ${plan.grogEdn}`,
-    "",
-    "grog runs on built-in defaults until you edit it, so expect model and",
-    "provider errors until you set :llm :url, :llm :model and your API key —",
-    "then restart grog.",
-  ];
-  if (plan.optional.length) {
-    lines.push("",
-      `The optional examples (odoo, imap, gitlab, imaging, secrets) are placed`,
-      `alongside it in ${plan.home} as *.example — copy the ones you need.`);
-  }
-
-  const answer = dialog.showMessageBoxSync(parent, {
-    type: "question",
-    buttons: ["Create it", "Not now"],
-    defaultId: 0,
-    cancelId: 1,
-    title: "grog — no configuration yet",
-    message: "grog has no configuration yet",
-    detail: lines.join("\n"),
-  });
-  if (answer !== 0) {
-    console.log(`[grog-client] config not created - running on defaults (create ${plan.grogEdn} when ready)`);
-    return;
-  }
-
   try {
     const written = configSeed.createConfig(plan);
-    console.log(`[grog-client] created ${written.length} file(s):`);
+    console.log("[grog-client] no grog.edn yet - seeded the config home from the example:");
     for (const f of written) console.log(`  ${f}`);
-    shell.showItemInFolder(plan.grogEdn);   // land the user in the folder, file selected
-    dialog.showMessageBoxSync(parent, {
-      type: "info",
-      buttons: ["OK"],
-      title: "grog - configuration created",
-      message: "Now edit it, then restart grog",
-      detail: `Edit ${plan.grogEdn} — at least :llm :url, :llm :model and your API key —`
-        + `\nthen restart grog. Until then it cannot reach a model.`,
-    });
+    console.log(`[grog-client] edit ${plan.grogEdn} - at least :llm :url, :llm :model and an`
+      + ` API key - then restart grog; until then it cannot reach a model.`);
+    if (plan.optional.length) {
+      console.log(`[grog-client] optional examples (odoo, imap, gitlab, imaging, secrets) are in`
+        + ` ${plan.home} as *.example - copy the ones you need.`);
+    }
   } catch (e) {
-    console.error("[grog-client] could not create the config:", e && e.message);
-    dialog.showMessageBoxSync(parent, {
-      type: "error",
-      buttons: ["OK"],
-      title: "grog - could not create the config",
-      message: "Could not write the configuration file",
-      detail: `${plan.grogEdn}\n\n${e && e.message}`,
-    });
+    console.error("[grog-client] could not seed the config:", e && e.message);
   }
 }
 
 ipcMain.handle("grog:call", (_e, method, params) => call(method, params));
 ipcMain.handle("grog:focused", () => !!(win && win.isFocused()));
 ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
+// Open a documentation file that ships INSIDE the app bundle (the onboarding
+// page and, later, the desktop entry point at these). `rel` is docs-relative and
+// is CONFINED to DOCS_DIR, so the renderer cannot ask us to open arbitrary paths.
+// An empty/absent `rel` opens the docs folder itself.
+ipcMain.handle("grog:open-doc", (_e, rel) => {
+  const base = path.resolve(DOCS_DIR);
+  const target = rel ? path.resolve(base, String(rel)) : base;
+  if (target !== base && !target.startsWith(base + path.sep)) {
+    throw new Error("refusing to open outside the docs directory");
+  }
+  return shell.openPath(target);
+});
+// Native file picker for the composer's attach button. Returns absolute paths;
+// the renderer turns each into an ECA FileContext ({type:"file", path}). Multiple
+// selection allowed. Cancelled → [].
+ipcMain.handle("grog:pick-files", async () => {
+  const parent = win && !win.isDestroyed() ? win : undefined;
+  const res = await dialog.showOpenDialog(parent, {
+    title: "Attach files",
+    properties: ["openFile", "multiSelections", "dontAddToRecent"],
+  });
+  return res.canceled ? [] : res.filePaths;
+});
 ipcMain.handle("grog:voice-status", () => voiceStatus());
 ipcMain.handle("grog:voice-transcribe", (_e, bytes) => transcribe(bytes));
+
+// Assistant images arrive as base64 in the transcript event, with no path. To
+// let a user see one FULL SIZE (the in-app <img> is capped) or keep it, we write
+// the bytes to disk: open → a temp file handed to the OS default handler
+// (browser/image viewer → real pan+zoom); save → the Downloads folder, revealed.
+const IMAGE_EXT = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
+function writeImageTo(dir, mediaType, base64) {
+  const ext = IMAGE_EXT[mediaType] || "png";
+  const file = path.join(dir, `grog-image-${Date.now()}.${ext}`);
+  fs.writeFileSync(file, Buffer.from(String(base64), "base64"));
+  return file;
+}
+ipcMain.handle("grog:open-image", async (_e, mediaType, base64) => {
+  const file = writeImageTo(app.getPath("temp"), mediaType, base64);
+  const err = await shell.openPath(file);
+  if (err) throw new Error(err);
+  return file;
+});
+ipcMain.handle("grog:save-image", (_e, mediaType, base64) => {
+  const file = writeImageTo(app.getPath("downloads"), mediaType, base64);
+  shell.showItemInFolder(file);
+  return file;
+});
 
 // Chromium's PRIVATE profile — HTTP cache, GPU cache, Code Cache, Local
 // Storage (the font-size pref), cookies, network state — must NOT go to
@@ -615,8 +709,9 @@ app.whenReady().then(() => {
     cb(permission === "media"));
   connect();
   createWindow();
-  // AFTER the window exists, so the dialog has a parent and the app is visibly
-  // running behind it while the user decides.
+  // Both first-run prompts are parented to the window, in order of how quickly
+  // they are answered. Each also self-heals a previous "yes" on later runs.
+  maybeOfferDesktopIntegration();
   offerConfigCreation();
 });
 // Kill the spine AND everything it spawned. Necessary because the MCP servers

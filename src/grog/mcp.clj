@@ -289,7 +289,7 @@
   (let [init (rpc! srv "initialize"
                     {:protocolVersion "2024-11-05"
                      :capabilities {:roots {:listChanged false}}
-                     :clientInfo {:name "grog" :version "0.1.0"}})]
+                     :clientInfo {:name "grog" :version "0.2.0"}})]
     (if (:error init)
       init
       (do (notify! srv "notifications/initialized" {})

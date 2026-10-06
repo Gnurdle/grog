@@ -40,7 +40,7 @@
 
 ;; Config is file-based: ~/.config/grog/project-search.edn
 ;;   {:projects-dir "~/grog-projects" :project nil}
-;; (env vars are intentionally NOT read — file-config normalization, like grog-big.)
+;; (env vars are intentionally NOT read — file-config normalization, like the other grog MCP servers.)
 ;; `:project` optionally pins the project dir to search under :projects-dir;
 ;; when absent, the first subdirectory of the projects home is used.
 (defn- config-file []

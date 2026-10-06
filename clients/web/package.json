@@ -1,15 +1,17 @@
 { "name": "grog-web"
-, "version": "0.0.1"
+, "version": "0.2.0"
 , "private": true
 , "author": "grog"
 , "description": "grog web/Electron client — P0 skeleton (see doc/clients/web-client-plan.md)"
+, "desktopName": "grog.desktop"
 , "main": "src/main/main.js"
 , "scripts":
   { "css": "tailwindcss -i resources/public/css/input.css -o resources/public/css/output.css --watch"
   , "cljs": "shadow-cljs watch app"
   , "electron": "electron ."
-  , "dev": "concurrently -k \"npm:cljs\" \"npm:css\" \"wait-on tcp:9633 http://localhost:9633/js/main.js && npm run electron\""
-  , "build": "shadow-cljs release app && tailwindcss -i resources/public/css/input.css -o resources/public/css/output.css --minify"
+  , "assets": "node scripts/sync-assets.js"
+  , "dev": "npm run assets && concurrently -k \"npm:cljs\" \"npm:css\" \"wait-on tcp:9633 http://localhost:9633/js/main.js && npm run electron\""
+  , "build": "npm run assets && shadow-cljs release app && tailwindcss -i resources/public/css/input.css -o resources/public/css/output.css --minify"
   , "start": "NODE_ENV=production electron ."
   , "start:win": "set NODE_ENV=production&& electron ."
   , "source": "NODE_ENV=production GROG_SPINE_CMD=clojure GROG_SPINE_ARGS=\"-M -m grog.server\" electron ."
@@ -27,6 +29,15 @@
     , { "from": "../../grog_mcp/target", "to": "jars", "filter": ["grog-mcp-*.jar"] }
     , { "from": "../../scripts/prereqs.ps1", "to": "setup/prereqs.ps1" }
     , { "from": "../../resources/config.examples", "to": "config.examples" }
+    , { "from": "assets/icon.png", "to": "icon.png" }
+    , { "from": "../../README.md", "to": "docs/README.md" }
+    , { "from": "../../USERS-GUIDE.md", "to": "docs/USERS-GUIDE.md" }
+    , { "from": "../../operating-model.md", "to": "docs/operating-model.md" }
+    , { "from": "../../mcp-servers.md", "to": "docs/mcp-servers.md" }
+    , { "from": "../../eca-users-guide.md", "to": "docs/eca-users-guide.md" }
+    , { "from": "../../SOUL.md", "to": "docs/SOUL.md" }
+    , { "from": "../../doc", "to": "docs/doc" }
+    , { "from": "../../skills/SKILL-TEMPLATE.md", "to": "docs/skills/SKILL-TEMPLATE.md" }
     ]
   , "icon": "assets/icon"
   , "win": { "target": ["nsis"], "icon": "assets/icon.ico"
@@ -47,13 +58,14 @@
     { "target": ["AppImage", "tar.gz"]
     , "icon": "assets/icon.png"
     , "category": "Development"
+    , "syncDesktopName": true
     , "artifactName": "grog-${version}-${arch}.${ext}"
-    , "desktop": { "Name": "grog", "StartupWMClass": "grog" }
+    , "desktop": { "entry": { "Name": "grog", "StartupWMClass": "grog" } }
     }
   }
 , "devDependencies":
   { "electron": "31.7.7"
-  , "electron-builder": "25.1.8"
+  , "electron-builder": "26.17.0"
   , "shadow-cljs": "2.28.19"
   , "tailwindcss": "3.4.17"
   , "postcss": "8.4.47"

@@ -22,6 +22,8 @@
   ECA config correspondingly registers ONE mcpServers entry (\"grog-mcp\") pointing
   at this process instead of the individual grog-* entries."
   (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
             [grog-mcp.memory])
   (:import [io.modelcontextprotocol.server.transport StdioServerTransportProvider]
            [io.modelcontextprotocol.server McpServer]
@@ -29,9 +31,10 @@
            [io.modelcontextprotocol.spec
             McpSchema$ServerCapabilities McpSchema$Tool McpSchema$CallToolResult
             McpSchema$JsonSchema
-            McpSchema$TextContent]
+            McpSchema$TextContent McpSchema$ImageContent]
            [reactor.core.publisher Mono]
-           [com.fasterxml.jackson.databind ObjectMapper]))
+           [com.fasterxml.jackson.databind ObjectMapper]
+           [java.util Base64]))
 
 (set! *warn-on-reflection* true)
 
@@ -41,11 +44,14 @@
 
 (def servers
   ;; NOTE: resolved at RUNTIME (requiring-resolve) rather than compile-time
-  ;; requires — the AOT analyzer mis-reads `grog-big.main` as a class FQN when
-  ;; the sibling artifact is mounted on the classpath, so we avoid static
+  ;; requires — the AOT analyzer can mis-read a sibling namespace name as a
+  ;; class FQN when the project is mounted on the classpath, so we avoid static
   ;; references entirely and `require` + resolve each ns when the bundle boots.
+  ;;
+  ;; (A remote "big model as a tool" server once lived here as `:grog-big`; that
+  ;; path was abandoned and the server and its `big_model_ask` tool were
+  ;; removed. Re-approaching it, if ever, should look different.)
   {:grog-babashka       {:name "grog-babashka" :version "0.1.0" :tools 'grog-babashka.main/tool-spec}
-   :grog-big            {:name "grog-big" :version "0.1.0" :tools 'grog-big.main/tool-spec}
    :grog-fetch          {:name "grog-fetch" :version "0.1.0" :tools 'grog-fetch.main/tool-spec}
    :grog-rss            {:name "grog-rss" :version "0.1.0" :tools 'grog-rss.main/tool-spec}
    :grog-search         {:name "grog-search" :version "0.1.0" :tools 'grog-search.main/tool-spec}
@@ -68,9 +74,48 @@
 (defn- text-result ^McpSchema$CallToolResult [^String s] (McpSchema$CallToolResult. [(text-content s)] false))
 (defn- error-result ^McpSchema$CallToolResult [^String s] (McpSchema$CallToolResult. [(text-content s)] true))
 
+(defn- file->image-block
+  "Read `path` and build an MCP ImageContent block, or nil. Never throws."
+  ^McpSchema$ImageContent [^String path]
+  (try
+    (let [f (io/file path)]
+      (when (.isFile f)
+        (with-open [in (io/input-stream f)]
+          (let [b64 (.encodeToString (Base64/getEncoder) (.readAllBytes in))
+                l (str/lower-case path)
+                mt (cond (or (str/ends-with? l ".jpg") (str/ends-with? l ".jpeg")) "image/jpeg"
+                         (str/ends-with? l ".webp") "image/webp"
+                         (str/ends-with? l ".gif") "image/gif"
+                         :else "image/png")]
+            ;; ctor is (audience, priority, data, mimeType) — see McpSchema records
+            (McpSchema$ImageContent. nil nil b64 mt)))))
+    (catch Throwable _ nil)))
+
+(defn- result-content
+  "Content blocks for a finished tool result: always the text; when the tool is
+  flagged `:image-out?` and the text is a SUCCESSFUL JSON result naming an output
+  file (`out_path`, or `path` — `write_workspace_png` uses `path`), that file is
+  appended as an MCP image block. ECA turns such a block into a ChatImageContent
+  the client renders inline. Image failures are swallowed so the text is never
+  lost to a bad image."
+  ^java.util.List [^String text image-out?]
+  (let [blocks (java.util.ArrayList.)]
+    (.add blocks (text-content text))
+    (when image-out?
+      (try
+        (let [m (json/parse-string text)
+              p (or (get m "out_path") (get m "path"))]
+          (when (and (nil? (get m "error")) (string? p))
+            (when-let [^McpSchema$ImageContent img (file->image-block p)]
+              (.add blocks img))))
+        (catch Throwable _ nil)))
+    blocks))
+
 (defn- tool
-  "Wrap a single tool-spec map {:name :description :schema :fn} as an MCP AsyncToolSpecification."
-  [{:keys [name description schema] tool-fn :fn}]
+  "Wrap a single tool-spec map {:name :description :schema :fn} as an MCP AsyncToolSpecification.
+  A spec may also carry `:image-out? true` — its result then includes the image
+  file it produced (see `result-content`)."
+  [{:keys [name description schema image-out?] tool-fn :fn}]
   (McpServerFeatures$AsyncToolSpecification.
     ;; CRITICAL: `:schema` arrives as a JSON **string**. The SDK's String
     ;; constructor (Tool/String,String,String) ships it verbatim, so
@@ -97,7 +142,9 @@
           (reify java.util.function.Consumer
             (accept [_ sink]
               (try
-                (.success sink (text-result (tool-fn arguments)))
+                (.success sink (McpSchema$CallToolResult.
+                                (result-content (str (tool-fn arguments)) image-out?)
+                                false))
                 (catch Throwable t
                   ;; `:faultString` matters: XML-RPC faults (Odoo permission and
                   ;; validation errors) carry their only useful text there, and
@@ -158,7 +205,7 @@
         specs (vec (collect-tools ids))
         transport-provider (StdioServerTransportProvider. (ObjectMapper.))
         server (-> (McpServer/async transport-provider)
-                   (.serverInfo "grog-mcp" "0.1.0")
+                   (.serverInfo "grog-mcp" "0.2.0")
                    (.capabilities (-> (McpSchema$ServerCapabilities/builder) (.tools true) (.build)))
                    (.build))]
     ;; registering already-realised specs is fast (no compilation here)

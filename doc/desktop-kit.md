@@ -35,6 +35,43 @@ magick clients/web/build/icon.png -define icon:auto-resize=256,128,64,48,32,16 c
 
 ## Linux
 
+### AppImage — it installs itself (no helper needed)
+
+Running the AppImage, grog offers once, on first launch:
+
+```
+Add grog to your application menu?
+```
+
+Say yes and it writes its own entry + icon and refreshes the caches — **no
+AppImageLauncher, no appimaged, no hand-written `.desktop`**. It can do this
+because at runtime it knows the one thing those helpers exist for: its own
+absolute path (`$APPIMAGE`).
+
+```sh
+# what it writes
+~/.local/share/applications/grog.desktop
+~/.local/share/icons/hicolor/512x512/apps/grog.png
+```
+
+The entry is marked `X-Grog-Managed=true` and carries an **absolute** `Exec=`:
+
+```ini
+Exec="/path/to/grog-<version>-x86_64.AppImage" --no-sandbox --class=grog %U
+```
+
+- **It follows the file.** Move or rename the AppImage and the next launch
+  re-points the entry automatically.
+- **It takes over older copies.** An entry written by an earlier grog (no
+  marker, `Exec=AppRun`) is re-pointed to the running one rather than ignored.
+- It never touches a `grog.desktop` that isn't grog's.
+
+Say "Not now" and it writes `~/.config/grog/.desktop-prompt-declined` so you are
+asked exactly once; delete that file to be asked again. `GROG_DESKTOP_INSTALL=1`
+installs without asking, `=0` never asks (for scripted setups).
+
+### From a source tree
+
 ```sh
 ./install-desktop.sh              # install
 ./install-desktop.sh --debug      # print the generated entry
@@ -43,11 +80,13 @@ magick clients/web/build/icon.png -define icon:auto-resize=256,128,64,48,32,16 c
 
 It installs the icon into the hicolor theme at 16–512 px (plus a scalable copy),
 writes `~/.local/share/applications/grog.desktop`, validates it, and refreshes
-the menu, icon and task-manager caches.
+the menu, icon and task-manager caches. Its `Exec=` is `scripts/grog-client`,
+which prefers a packaged build (`dist/linux-unpacked/grog`, then the newest
+`dist/*.AppImage`) and falls back to the dev tree — so it is tied to the
+checkout, unlike the AppImage's self-install above.
 
-The entry uses `StartupWMClass=grog`, and the launcher starts the app with
-`--class=grog`, so the window is grouped under the grog icon in the dock and
-taskbar.
+Both use `StartupWMClass=grog` and start the app with `--class=grog`, so the
+window is grouped under the grog icon in the dock and taskbar.
 
 ## Windows
 

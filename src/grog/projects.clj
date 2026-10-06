@@ -25,10 +25,29 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [grog.config :as cfg]
+            [grog.docs :as docs]
             [grog.platform :as platform])
   (:import (java.io File)))
 
 ;; ---------------------------------------------------------------------------
+;; The getting-started project
+;; ---------------------------------------------------------------------------
+
+(def bootstrap-project-name
+  "The name of the FIRST-RUN getting-started project (`grog.bootstrap`).
+
+  Deliberately NOT `grog`: that name belongs to the developer's own checkout
+  (`~/grog-projects/grog` is where grog is developed), so the onboarding project
+  must not collide with it. `ouroboros` — the snake that eats its tail — is the
+  self-referential joke made real: the app bootstraps itself by talking to
+  itself about its own documentation."
+  "ouroboros")
+
+(defn bootstrap-project?
+  "True when `proj` names the getting-started project."
+  [proj]
+  (= (str/trim (str proj)) bootstrap-project-name))
+
 ;; Projects home
 ;; ---------------------------------------------------------------------------
 
@@ -184,13 +203,23 @@
   {:uri <file://…> :name <project>} rooted at the active project's primary
   directory (`project-root`). This abandons the repo-root workspace — the agent
   operates purely on the active project. Falls back to the projects home if the
-  project dir cannot be resolved. Always returns a non-empty seq."
+  project dir cannot be resolved. Always returns a non-empty seq.
+
+  The getting-started project (`ouroboros`) gets a SECOND folder: grog's own
+  documentation, resolved at runtime by `grog.docs` (it lives in the app bundle,
+  so a packaged client cannot find it by searching). REFERENCED, never copied —
+  the shipped docs stay the single source of truth, so a rebuild flows straight
+  into the project and the project can never drift."
   [proj]
   (let [proj (or proj (project-name) "default")
         root (or (project-root proj)
-                 (ensure-project-dir! proj))]
-    [{:uri (str (.toURI (platform/canonical-file root)))
-      :name proj}]))
+                 (ensure-project-dir! proj))
+        base [{:uri (str (.toURI (platform/canonical-file root)))
+               :name proj}]
+        docs (when (bootstrap-project? proj) (docs/docs-dir))]
+    (cond-> base
+      docs (conj {:uri (str (.toURI (platform/canonical-file docs)))
+                  :name "grog-docs"}))))
 
 (defn manifest-for
   "The manifest for a project by name (or {} if no project)."

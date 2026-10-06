@@ -38,6 +38,15 @@
                                         qualified exactly, never mistaken for a
                                         native provider of the same name)
     set-trust       {:id .. :on ..}                     -> nil
+    providers       {}                                  -> {:providers [catalogue ..]
+                                                            :current {:url .. :provider ..}}
+                                        the shipped provider catalogue (grog.providers)
+                                        plus what :llm currently points at.
+    set-provider    {:id? .. :url? .. :model? ..}       -> {:url .. :model ..
+                                                            :restart-required true}
+                                        write :llm :url (+ :model) for a catalogue
+                                        :id (or an explicit :url). GLOBAL change,
+                                        applied on the NEXT start.
     models          {:source? .. :force? ..}            -> {:eca [..]
                                                             :openrouter [..]
                                                             :ollama [..]
@@ -80,13 +89,17 @@
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [grog.chat :as chat]
+            [grog.bootstrap :as bootstrap]
             [grog.client :as client]
             [grog.client.local :as local]
             [grog.config :as config]
+            [grog.docs :as docs]
             [grog.mcp-http :as mcp-http]
             [grog.models :as models]
             [grog.projects :as projects]
-            [grog.soul :as soul])
+            [grog.providers :as providers]
+            [grog.soul :as soul]
+            [grog.version :as version])
   (:import (java.io BufferedReader BufferedWriter File InputStreamReader
                     OutputStreamWriter PrintWriter)
            (java.net StandardProtocolFamily UnixDomainSocketAddress)
@@ -255,6 +268,69 @@
 
 ;; --- request handling ------------------------------------------------------
 
+(defn- eca-config-provider-urls
+  "Provider base URLs ECA already knows, read from ECA's OWN config
+  (`${XDG_CONFIG_HOME:-~/.config}/eca/config.json`).
+
+  This exists because grog is not the only home of a key: ECA can hold a
+  provider (and its key) that grog never sees, so a key missing from grog's
+  secret store does NOT mean grog cannot reach a model — a working developer box
+  is exactly that case, and misreading it would hide a live transcript behind the
+  onboarding page."
+  []
+  (try
+    (let [base (or (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)
+                   (str (System/getProperty "user.home") "/.config"))
+          f (File. base "eca/config.json")]
+      (when (.exists f)
+        (->> (:providers (json/parse-string (slurp f :encoding "UTF-8") true))
+             vals
+             (keep #(some-> (:url %) str str/trim not-empty)))))
+    (catch Throwable _ nil)))
+
+(def ^:private local-url-re
+  #"(?i)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)")
+
+(defn- llm-configured?
+  "True when grog is plausibly able to reach a model: a model AND a URL are
+  configured, and a key is available from somewhere grog can see.
+
+  A key counts if it resolves in grog's own store, the endpoint is local (no key
+  needed), `:llm :api-key` is explicitly `false`, or ECA's own config already
+  declares a provider for the same URL. Requiring a GROG-side key would be wrong:
+  ECA can hold the key itself, and then a working setup would be misread as
+  unconfigured and hidden behind the 'Job 1' page.
+
+  Without a model or URL, no turn can work at all — that is the real 'Job 1'.
+  Every accessor is wrapped: `llm-url`/`eca-model` THROW when unset, and
+  `llm-api-key` may consult the OS keyring. This must never throw."
+  []
+  (let [url   (try (some-> (config/llm-url) str str/trim not-empty) (catch Throwable _ nil))
+        model (try (some-> (config/eca-model) str str/trim not-empty) (catch Throwable _ nil))
+        norm  (fn [u] (str/replace (str/lower-case (str u)) #"/+$" ""))]
+    (boolean
+     (and url model
+          (or (try (some-> (config/llm-api-key) str str/trim not-empty) (catch Throwable _ nil))
+              (false? (get-in (config/grog) [:llm :api-key]))
+              (boolean (re-find local-url-re (str url)))
+              (some #(= (norm %) (norm url)) (eca-config-provider-urls)))))))
+
+(defn- bootstrap-info
+  "The `:bootstrap` block the client needs to decide between the onboarding page
+  and the normal splash.
+
+  `:needed?` is true when no LLM is reachable (the real 'Job 1'), OR when this
+  launch was started by an EXPLICIT onboarding request — a factory reset asks for
+  the getting-started landing even though ECA's own config (which a reset does
+  NOT touch) may still hold a working key. `:configured?` reports the raw
+  reachability so that landing can say so honestly instead of pretending there is
+  no brain. `:docs-dir` lets the offline page point at the shipped docs."
+  []
+  (let [configured? (llm-configured?)]
+    {:needed? (or (bootstrap/onboarding-requested-this-session?) (not configured?))
+     :configured? configured?
+     :docs-dir (some-> (docs/docs-dir) .getPath)}))
+
 (defn- handle-request
   "Dispatch one JSON-RPC request. `send!` writes the response back to the
   originating connection; `broadcast!` fans notifications out to all."
@@ -269,9 +345,34 @@
             (case method
               "open" (let [snap (or (session-by-project (:project params))
                                     (open-session! broadcast! questions params))]
+                       ;; Remember the SELECTED project as last-used — the
+                       ;; deterministic signal that survives a relaunch (and a
+                       ;; crash). An explicit close refines it via
+                       ;; `disconnect-fn!`; a shutdown does not (see the guard).
+                       (when-let [p (some-> (:project snap) str str/trim not-empty)]
+                         (projects/write-last-used! p))
                        ;; banner = the startup snark line; the renderer seeds
-                       ;; it as the first transcript line
-                       (assoc snap :banner (soul/startup-snark-line)))
+                       ;; it as the first transcript line. :version rides along
+                       ;; so every client can show which build it is talking to
+                       ;; (nil when the running spine carries no build stamp).
+                       (assoc snap
+                              :banner (soul/startup-snark-line)
+                              :version (version/label)
+                              ;; which model sources the picker should offer:
+                              ;; eca + whatever provider :llm :url implies +
+                              ;; ollama. Never a hard-coded provider list.
+                              :model-sources (models/model-sources)
+                              ;; whether an LLM is actually reachable (else the
+                              ;; client shows the Job 1 onboarding page) + where
+                              ;; the docs are.
+                              :bootstrap (bootstrap-info)))
+              ;; Which project the client should OPEN at launch, resolved by the
+              ;; spine (so no client hard-codes a project name — the renderer
+              ;; used to open a literal "grog", which is the developer's own
+              ;; project and exists on nobody else's machine). On a genuinely
+              ;; fresh install this seeds the getting-started project.
+              "startup" (merge (bootstrap/startup-info)
+                               {:bootstrap (bootstrap-info)})
               "close" (do (client/close! (:id params)) nil)
               "sessions" (client/sessions)
               "projects" (mapv (fn [n]
@@ -284,7 +385,9 @@
                                    nil)
               "session" (client/session (:id params))
               "connect" (do (client/connect! (:id params)) nil)
-              "prompt" (do (client/prompt! (:id params) (:text params)) nil)
+              ;; :contexts is ECA's ChatContext list (inline images as
+              ;; {type image mediaType base64}, files as {type file path}, …).
+              "prompt" (do (client/prompt! (:id params) (:text params) (:contexts params)) nil)
               "steer" (do (client/steer! (:id params) (:text params)) nil)
               "stop" (do (client/stop! (:id params)) nil)
               "answer" (do (client/answer! (:id params)
@@ -292,25 +395,54 @@
                                             :decision (keyword (:decision params))})
                            nil)
               ;; Model catalogue for the settings picker. Answers from cache and
-              ;; refreshes OpenRouter/Ollama on a BACKGROUND thread, because a
-              ;; network fetch here would block this single request loop (and so
-              ;; every other client) for up to the HTTP timeout. The refreshed
-              ;; list arrives as a `models` broadcast. `:source eca` is ECA's own
+              ;; refreshes the source on a BACKGROUND thread, because a network
+              ;; fetch here would block this single request loop (and so every
+              ;; other client) for up to the HTTP timeout. The refreshed list
+              ;; arrives as a `models` broadcast. `:source eca` is ECA's own
               ;; catalogue (populated on connect) and needs no fetch.
+              ;; Any source `models` knows how to fetch is allowed — that is the
+              ;; configured provider by name, not just openrouter/ollama.
               "models" (let [src (keyword (or (:source params) "eca"))
                              known (models/catalogue)]
-                         (when (and (#{:openrouter :ollama} src)
-                                    (or (boolean (:force params))
-                                        (nil? (get known src))))
+                         (when (or (boolean (:force params))
+                                   (nil? (get known src)))
                            (models/fetch-async!
                             src
                             (fn [s ms]
                               (broadcast! "models" {:source (name s) :models ms}))))
                          known)
+              ;; The picker sends a PLACE ("local"/"remote"); qualification needs
+              ;; a PROVIDER. Translate here, where the config is known — losing
+              ;; that signal made remote picks fall through to the ollama
+              ;; catalogue whenever the id also existed locally.
               "set-model" (do (client/set-model! (:id params) (:model params)
-                                                 (:source params))
+                                                 (models/picker-source->provider
+                                                  (:source params)))
                               nil)
               "set-trust" (do (client/set-trust! (:id params) (boolean (:on params))) nil)
+              ;; The settings provider picker. `providers` is the shipped
+              ;; catalogue (grog.providers), plus what :llm currently points at.
+              ;; `set-provider` writes :llm :url (+ :model) into grog.edn — a
+              ;; GLOBAL change, applied on the next start (config is snapshotted
+              ;; per session); the client is told that and says so.
+              "providers" (let [llm (models/llm-config)]
+                            {:providers (providers/entries)
+                             :current {:url (:url llm) :model (:model llm)
+                                       :provider (models/provider-prefix-for-url (:url llm))}})
+              "set-provider"
+              (let [{:keys [id url model]} params
+                    entry (when id (providers/by-id id))
+                    new-url (or url (:url entry))
+                    new-model (or model (:sample entry))]
+                (when (str/blank? (str new-url))
+                  (throw (ex-info "set-provider needs :id or :url" {:id id})))
+                (models/save-fields! (cond-> {:url new-url}
+                                       (and new-model (not (str/blank? (str new-model))))
+                                       (assoc :model new-model)))
+                (let [llm (models/llm-config)]
+                  (assoc llm
+                         :provider (models/provider-prefix-for-url (:url llm))
+                         :restart-required true)))
               "answer-question"
               (do (when-let [p (get @questions (:question-id params))]
                     (deliver p (or (:result params) {:cancelled true :answer nil})))
@@ -471,6 +603,7 @@
     (.addShutdownHook
      (Runtime/getRuntime)
      (Thread. (fn []
+                (local/mark-shutting-down!)
                 (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
                      (catch Throwable _ nil))
                 (try (mcp-http/stop!) (catch Throwable _ nil))
@@ -489,6 +622,7 @@
         (try
           (serve-stdio! hub questions)
           (finally
+            (local/mark-shutting-down!)
             (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
                  (catch Throwable _ nil))
             (try (mcp-http/stop!) (catch Throwable _ nil))

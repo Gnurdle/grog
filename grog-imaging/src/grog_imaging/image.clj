@@ -57,8 +57,8 @@
 
 ;; Optional file-based Tesseract data dir: ~/.config/grog/imaging.edn
 ;;   {:tessdata "/path/to/tessdata"}
-;; (env vars are intentionally NOT read — file-config normalization, like
-;; grog-big.)
+;; (env vars are intentionally NOT read — file-config normalization, like the
+;; other grog MCP servers.)
 (defn- imaging-config-file ^java.io.File []
   (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
            ".config/grog/imaging.edn"))

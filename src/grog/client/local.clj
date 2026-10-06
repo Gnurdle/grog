@@ -41,6 +41,18 @@
   connection id (`<project>#<nanoTime>`), exactly as minted in build-session!."
   (atom {}))
 
+;; Set true just before the process exits and closes every session. On exit the
+;; spine closes ALL sessions in arbitrary order, so per-session close must NOT
+;; rewrite the last-used marker from whichever tab happens to be last — that is
+;; how a session got stuck reopening `ouroboros`.
+(defonce ^:private !shutting-down (atom false))
+
+(defn mark-shutting-down!
+  "Tell the local adapter the process is exiting (see `!shutting-down`). Called by
+  the server right before it closes every session on shutdown."
+  []
+  (reset! !shutting-down true))
+
 (defn- sess
   "The session for `id`, or a clear ex-info — a wrong id is a programming
   error, not a runtime condition to paper over."
@@ -82,7 +94,7 @@
             ;; re-issue as a normal prompt
             (line! state (str "[grog] resending as a prompt: " s))
             (reset! last-sent (str s))
-            (.put ^LinkedBlockingQueue queue (str s)))})
+            (.put ^LinkedBlockingQueue queue {:text (str s)}))})
         ;; `config-stamp` as of the last successful connect (see connect-fn!)
         cfg-stamp (atom -1)
         connect-fn!
@@ -117,11 +129,23 @@
                 (dbg! "ECA started ok, init model=" (get-in init [:ok :model])))
               (reset! connected true)
               (reset! cfg-stamp (ecacfg/config-stamp))
+              ;; Learn image-input capability OFF the connect path, so the client
+              ;; can warn before sending an image to a text-only model (ECA drops
+              ;; it silently otherwise). A slow/failed call must not block.
+              (future
+                (try
+                  (let [resp (eca/send-request! id "providers/list" {})]
+                    (when-let [provs (:providers (:ok resp))]
+                      (models/register-provider-vision! {:providers provs})
+                      (chat/publish! state {:type :vision
+                                            :value (models/vision-for @(:model state))})))
+                  (catch Throwable e
+                    (dbg! "providers/list (vision) failed:" (.getMessage e)))))
               (catch Throwable e
                 (line! state (str "[grog] ECA connect failed: " (.getMessage e)))
                 (reset! running? false)))))
         send-fn
-        (fn [history text]
+        (fn [history text contexts]
           (connect-fn!)
           (if-not @connected
             (do (reset! running? false)
@@ -155,7 +179,8 @@
                 (try
                   (let [resp (eca/prompt! id text {:chatId @(:chat-id state)
                                                    :model model
-                                                   :trust @(:trust state)})
+                                                   :trust @(:trust state)
+                                                   :contexts contexts})
                         ;; ECA reports model/backend failures IN-BAND as
                         ;; {:ok {:model "error" :status "error"}} (no JSON-RPC
                         ;; :error key) — surface those instead of swallowing.
@@ -188,26 +213,20 @@
         (fn [nm source]
           (let [mid (models/qualify-eca-model nm
                                               source
-                                              (try (config/llm-url) (catch Exception _ nil)))
-                ;; Persisting is best-effort: a read-only / unwritable config
-                ;; home (packaged AppImage, per-machine install) must NOT stop
-                ;; the LIVE switch. It used to throw here — before the UI event
-                ;; below — so the model looked like it never changed and the
-                ;; only clue was a "Read-only file system" error.
-                save-err (when mid
-                           (try (models/save-eca-model! mid) nil
-                                (catch Throwable e (.getMessage e))))]
+                                              (try (config/llm-url) (catch Exception _ nil)))]
+            ;; PER SESSION, deliberately. This used to also write `:eca :model`
+            ;; into grog.edn, which made one tab's pick the default for every
+            ;; other tab and for every future session — the selection is a
+            ;; per-session choice. The global default is grog.edn's `:eca :model`
+            ;; (or `:llm :model`); use models/save-eca-model! if you ever want an
+            ;; explicit "make this the default" action.
             (when (and @connected mid)
               (eca/selected-model! id mid {:chatId @(:chat-id state)}))
             (reset! (:model state) mid)
-            (try (config/reload!) (catch Throwable _ nil))
             ;; the view reacts to this event to update the footer + status line
             (chat/publish! state {:type :model
                                   :value mid
-                                  :text (str "model: " mid)})
-            (when save-err
-              (line! state (str "model switched for this session, but could not be saved: "
-                                save-err)))))
+                                  :text (str "model: " mid)})))
         ;; slash-command seam: /eca-model has no transport, so it qualifies with
         ;; source=nil (the url/config heuristics decide).
         set-model-1 (fn [nm] (set-model-fn nm nil))
@@ -226,6 +245,13 @@
           (reset! connected false)
           (session/release! project)
           (swap! !sessions dissoc id)
+          ;; Remember the project the user just CLOSED as last-used — UNLESS the
+          ;; whole process is exiting (see !shutting-down). A normal
+          ;; (non-onboarding) launch then reopens it. Written here, NOT via
+          ;; `set-project!`, so a multi-tab close moves only the "reopen me"
+          ;; marker and never steals the ACTIVE project.
+          (when-not @!shutting-down
+            (try (projects/write-last-used! project) (catch Throwable _ nil)))
           nil)
         sess-map
         {:id id
@@ -268,7 +294,10 @@
       ((:disconnect! s))
       nil))
   (prompt! [_ id text]
-    (.put ^LinkedBlockingQueue (:queue (sess id)) (str text)))
+    (.put ^LinkedBlockingQueue (:queue (sess id)) {:text (str text)}))
+  (prompt! [_ id text contexts]
+    (.put ^LinkedBlockingQueue (:queue (sess id))
+          {:text (str text) :contexts (vec contexts)}))
   (steer! [_ id text]
     (let [s (sess id)
           st (:state s)]

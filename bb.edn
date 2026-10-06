@@ -4,7 +4,7 @@
 
   ;; NOTE: there is no `sync-vendor` task any more. The bundle used to build
   ;; from grog_mcp/vendor-src — a COPY of each grog-<x>/src tree — which drifted
-  ;; silently (grog-big and grog-gitlab once shipped stale code from the jar).
+  ;; silently (grog-gitlab once shipped stale code from the jar).
   ;; grog_mcp now depends on the sibling projects directly with `:local/root`
   ;; (see grog_mcp/deps.edn), so its classpath always points at the LIVE
   ;; sources: nothing to copy, nothing to keep in sync.
@@ -51,6 +51,11 @@
      (when-not (fs/exists? (fs/file web "resources" "public" "js" "main.js"))
        (println "renderer bundle missing — run:  cd clients/web && npm run build")
        (System/exit 1))
+     ;; keep the renderer's served images in sync with the repo-root sources
+     ;; (the splash logo is authored at <repo>/logo.jpg but must be served from
+     ;; resources/public/ — see clients/web/scripts/sync-assets.js)
+     (when (fs/which "node")
+       (shell "node" (str (fs/file web "scripts" "sync-assets.js"))))
      (println "grog dev: spine + MCP servers compiled from source")
      (println "          electron:" (str elec))
      (let [pb  (ProcessBuilder. [(str elec) "."])

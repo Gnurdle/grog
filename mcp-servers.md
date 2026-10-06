@@ -47,14 +47,6 @@ Keyword search over the active project's `notes/` text files and `dialog/thread.
 |---|---|
 | `project_search` | Ranked keyword search over the active project's notes + dialog |
 
-### grog-big — the big model as a tool
-*Local orchestrator, remote specialist.* Exposes a strong remote model as a callable
-tool so a small local agent can delegate hard problems. Config via `GROG_BIG_*` env.
-
-| Tool | Description |
-|---|---|
-| `big_model_ask` | Ask a large remote model for a self-contained response |
-
 ### grog-imaging — PDF / OCR / computer vision
 PDF text + raster OCR + line/geometry extraction + image ops. Needs Tesseract.
 
@@ -187,7 +179,6 @@ The bundle delivers ~52 tools including the SQLite `assoc_*` memory store.
 | grog-fetch | Clojure | 1 | `fetch_url` |
 | grog-rss | Clojure | 1 | `fetch_feed` |
 | grog-project-search | Clojure | 1 | `project_search` |
-| grog-big | Clojure | 1 | `big_model_ask` |
 | grog-imaging | Clojure | 10 | pdf/ocr/vision |
 | grog-office | Clojure | 10 | docx editing |
 | grog-memory | Clojure/SQLite | 7 | assoc kv-store |

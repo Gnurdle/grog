@@ -815,7 +815,7 @@
 
 (declare help-text handle-shell-command! handle-jobs-command! handle-chron-command!
          handle-mcp-command! handle-project-command! handle-secret-command!
-         handle-doctor-command!
+         handle-doctor-command! handle-reset-command!
          handle-soul-command! handle-model-command! handle-tasks-command!)
 
 (defn- kv-save-state!
@@ -883,6 +883,7 @@
       (handle-mcp-command! line)    ::handled
       (handle-secret-command! line) ::handled
       (handle-doctor-command! line) ::handled
+      (handle-reset-command! line)  ::handled
       (handle-soul-command! line)   ::handled
       (handle-model-command! line)  ::handled
       :else ::llm)))
@@ -966,6 +967,7 @@
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
     "  /secret — list known secret keys and set/unset status (values never printed); /secret set <KEY> <value> (or /secret <KEY> <value>) stores in the OS keyring, falling back to <config-home>/secrets.edn on headless/unsupported systems; /secret rm <KEY> removes; /secret file|backend | status"
     "  /doctor — probe external dependencies (bash/java/bb/eca/soffice/tesseract/pdftoppm/rg/jq/node) with paths+versions, and audit config solvency with provenance (which file each effective key came from); broken EDN is reported by file"
+    "  /reset — FACTORY RESET (airbag): /reset prints a plan and changes nothing; /reset --yes moves the config home + the getting-started project into a timestamped backup, removes the saved sessions, and deletes the credentials grog created (from the secret ledger). Your other projects are untouched. Restart after."
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
     "  /model — show current LLM model and URL, plus any :llm :profiles"
@@ -1398,6 +1400,16 @@
       ((requiring-resolve 'grog.doctor/print-human!))
       (catch Throwable e
         (println "grog:/doctor error:" (or (.getMessage e) (str (class e))))))
+    true))
+
+(defn- handle-reset-command! [line]
+  (when-let [[_ args] (re-matches #"(?i)^/reset(?:\s+(.*))?$" (str/trim line))]
+    (try
+      ;; loaded lazily: this is destructive, so keep it off the hot path until
+      ;; it is actually asked for. Dry-run by default; `--yes` performs it.
+      ((requiring-resolve 'grog.reset/run-command!) args)
+      (catch Throwable e
+        (println "grog:/reset error:" (or (.getMessage e) (str (class e))))))
     true))
 
 (defn- handle-soul-command! [line]

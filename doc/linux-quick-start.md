@@ -18,6 +18,16 @@ grog                                  the desktop app
 The app starts the spine as its child; the spine starts the agent loop, which
 starts the tool servers. Closing the window stops all of them.
 
+## First run
+
+With no configuration yet you get two offline things: a short **bootstrap page**
+(*Job 1 — get your LLM online*: set a provider + model, then `/secret set
+LLM_API_KEY <value>`, then restart), and a getting-started project named
+**`ouroboros`** whose agent reads grog's own shipped documentation (mounted as
+`grog-docs/`) and walks you through the rest. If it all goes sideways, `/reset`
+(plan) and `/reset --yes` (do it) reset grog to a fresh install — see
+`USERS-GUIDE.md` §10.
+
 ## 1. Prerequisites
 
 | Need | Check | Notes |
@@ -63,8 +73,8 @@ cd clients/web && npm install   # first time only
 To build them alone:
 
 ```sh
-clojure -T:build spine :version '"0.1.0"'
-(cd grog_mcp && clojure -T:build uber :version '"0.1.0"')
+clojure -T:build spine :version '"0.2.0"'
+(cd grog_mcp && clojure -T:build uber :version '"0.2.0"')
 ```
 
 Both locations matter: the app looks for the spine jar in `target/`, and the
@@ -120,12 +130,12 @@ Open the run log and check, in order. The client writes one file per instance �
 | Thing | Path |
 |---|---|
 | settings | `~/.config/grog/grog.edn` |
-| first run | If `grog.edn` is missing the client **offers** to create it there (a native dialog naming the path), then opens the folder. Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are written alongside as `*.example`. |
+| first run | If `grog.edn` is missing the client **writes one** from the bundled example (and logs the exact path). Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are left beside it as `*.example`. |
 | other config | `~/.config/grog/{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
 | secrets | the OS secret store (Secret Service); `secrets.edn` is the fallback |
 | projects | `~/grog-projects/<project>/{notes,dialog,state}` |
 | run log | the client's `~/grog.<pid>.log` (newest; `$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts/grog-client` also saves a stream copy to `$XDG_STATE_HOME/grog/client.log` |
-| version | `VERSION` at the tree root; also inside the jars as `grog-version.edn` |
+| version | `VERSION` at the tree root; stamped into the jars as `grog-version.edn`, and shown on the client's startup screen |
 
 ## 7. Two things worth knowing
 

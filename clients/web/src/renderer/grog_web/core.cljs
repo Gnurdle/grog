@@ -38,6 +38,10 @@
       "toolCalled"      {:kind :tool     :text (str "⚙ " (or summary name "tool"))}
       "toolCallRun"     {:kind :tool     :text (str "⚙ " (or summary name "tool"))}
       "usage"           {:kind :usage    :text (usage-text content)}
+      ;; an assistant image (from an MCP tool's image content block or image
+      ;; generation) — ECA sends it inline as base64; render it, don't text it.
+      "image"           {:kind :image    :media_type (str (or (:mediaType content) "image/png"))
+                         :base64 (str (:base64 content))}
       ;; lifecycle / noise — deliberately not painted
       ("reasonStarted" "reasonFinished" "progress" "metadata"
        "toolCallPrepare" "toolCallRunning") nil
@@ -45,7 +49,10 @@
       (do (.log js/console "[grog-web] unhandled content type:" (pr-str type))
           nil))))
 
-(def ^:private project-name "grog")
+;; The project the client opens is decided by the SPINE (`startup`), never
+;; hard-coded here. It used to be a literal "grog" — the developer's own
+;; project, which exists on nobody else's machine. On a fresh install the spine
+;; seeds the getting-started project (`ouroboros`); see the :startup-ok event.
 
 (defn- opt-label
   "Render one option from a question, tolerating ECA sending strings or maps."
@@ -62,9 +69,22 @@
     {:sessions {} :order [] :active nil :focused? true :input ""
      :connected? false :socket-path "" :opened? false :font-size 16
      :dialog nil :dialog-input "" :q-input "" :projects []
+     ;; startup (from the spine's `startup` call): which project to open, and
+     ;; whether an LLM is even reachable — if not, the client shows the "Job 1"
+     ;; onboarding page instead of a transcript.
+     :home-project nil :bootstrap-needed? false :bootstrap-configured? false
+     :bootstrap-dismissed? false :docs-dir nil :first-run? false
      ;; model picker (settings dialog): catalogue from the server, which source
-     ;; is being browsed, and the search string
-     :catalogue nil :model-source "eca" :model-query ""
+     ;; is being browsed, and the search string. `:model-sources` also comes from
+     ;; the server — Local and Remote only, never a hard-coded provider.
+     :catalogue nil :model-source nil :model-query ""
+     :model-sources [["local" "Local"]]
+     ;; provider picker (settings dialog): the shipped catalogue (resources/
+     ;; providers.edn via the server's `providers` method) + what :llm points at.
+     :providers nil :provider-current nil
+     ;; composer attachments: pasted images ({:kind :image :media_type :base64})
+     ;; and picked/dropped files ({:kind :file :path}). Sent as ECA contexts.
+     :attachments []
      :voice nil :recording? false :transcribing? false}))
 
 (rf/reg-sub :db (fn [db _] db))
@@ -93,9 +113,35 @@
 
                      :else (conj t seg)))))))
 
+(rf/reg-event-fx :startup-ok
+  "The spine told us which project to open, and whether grog can talk at all.
+  Store it, then open that project — on a first run the spine has already seeded
+  the getting-started project, so this is the onboarding landing."
+  (fn [{:keys [db]} [_ s]]
+    {:db (-> db
+             (assoc :home-project (:project s)
+                    :first-run? (boolean (:first-run? s))
+                    :bootstrap-needed? (and (not (:bootstrap-dismissed? db))
+                                            (boolean (get-in s [:bootstrap :needed?])))
+                    :bootstrap-configured? (boolean (get-in s [:bootstrap :configured?]))
+                    :docs-dir (get-in s [:bootstrap :docs-dir])))
+     :dispatch [:open (:project s)]}))
+
 (rf/reg-event-db :open-ok
   (fn [db [_ snap]]
-    (let [id (:id snap)]
+    (let [id (:id snap)
+          ;; the picker's sources ride along on every open (config-derived), so
+          ;; keep the last good list if this snapshot somehow lacks one; same for
+          ;; the bootstrap/doc-dir hints.
+          db (-> db
+                 (assoc :model-sources (or (seq (:model-sources snap))
+                                           (:model-sources db)))
+                 (assoc :bootstrap-needed? (if (:bootstrap-dismissed? db)
+                                             false
+                                             (boolean (get-in snap [:bootstrap :needed?])))
+                        :bootstrap-configured? (boolean (get-in snap [:bootstrap :configured?]))
+                        :docs-dir (or (get-in snap [:bootstrap :docs-dir])
+                                      (:docs-dir db))))]
       (if (contains? (:sessions db) id)
         ;; already-open project: the server returns the existing session id.
         ;; Focus it; do NOT clobber its transcript.
@@ -104,6 +150,7 @@
             (assoc-in [:sessions id]
                       {:id id :project (:project snap)
                        :model (:model snap) :status (or (:status snap) "idle")
+                       :version (:version snap)
                        :trust (boolean (:trust snap))
                        :running? (boolean (:running? snap))
                        :transcript (if (:banner snap)
@@ -112,9 +159,83 @@
             (update :order (fnil conj []) id)
             (assoc :active id :opened? true))))))
 
+(rf/reg-event-db :dismiss-bootstrap
+  "Leave the getting-started landing for the transcript. Sticky for the session,
+  and it also stops `:open-ok` (another tab's snapshot) from bringing the page
+  back."
+  (fn [db _] (assoc db :bootstrap-needed? false :bootstrap-dismissed? true)))
+
 (rf/reg-event-db :select-tab (fn [db [_ id]] (assoc db :active id)))
 (rf/reg-event-db :focus     (fn [db [_ f]] (assoc db :focused? f)))
 (rf/reg-event-db :input     (fn [db [_ s]] (assoc db :input s)))
+
+;; --- attachments (images pasted, files picked/dropped) ---------------------
+;;
+;; Attachments ride to ECA as `contexts` on the prompt: a pasted image becomes
+;; an ImageContext (inline base64 — no path needed), a picked/dropped file a
+;; FileContext (a path the ECA server reads; a .png path counts as an image).
+;; Nothing is uploaded anywhere — the bytes go only to the local ECA.
+
+(defn- bytes->base64
+  "Uint8Array → base64 in 32 KiB chunks. `String.fromCharCode.apply` over a
+  whole multi-MB image would overflow the call stack."
+  [^js u8]
+  (let [n (.-length u8) chunk 0x8000]
+    (loop [i 0 parts (js/Array.)]
+      (if (< i n)
+        (do (.push parts (js/String.fromCharCode.apply nil (.subarray u8 i (min n (+ i chunk)))))
+            (recur (+ i chunk) parts))
+        (js/btoa (.join parts ""))))))
+
+(defn- attach-image-bytes!
+  "Read a Blob's bytes and dispatch them as an image attachment (async)."
+  [blob]
+  (-> (.arrayBuffer blob)
+      (.then (fn [buf]
+               (rf/dispatch [:attach-image (str (.-type blob))
+                             (bytes->base64 (js/Uint8Array. buf))])))
+      (.catch (fn [_] nil))))
+
+(rf/reg-event-db :attach-image
+  (fn [db [_ media-type base64]]
+    (update db :attachments (fnil conj [])
+            {:kind :image :media_type (or media-type "image/png") :base64 base64})))
+
+(rf/reg-event-db :attach-files
+  (fn [db [_ paths]]
+    (update db :attachments (fnil into [])
+            (map (fn [p] {:kind :file :path (str p)})) paths)))
+
+(rf/reg-event-db :attach-remove
+  (fn [db [_ i]]
+    (update db :attachments
+            (fn [xs] (vec (keep-indexed (fn [j x] (when (not= j i) x)) (or xs [])))))))
+
+(rf/reg-event-db :attach-clear
+  (fn [db _] (assoc db :attachments [])))
+
+(rf/reg-event-fx :attach-pick
+  (fn [_ _]
+    (-> (.pickFiles js/window.grogAPI)
+        (.then (fn [paths] (when (seq paths) (rf/dispatch [:attach-files (js->clj paths)]))))
+        (.catch (fn [_] nil)))
+    {}))
+
+;; An assistant image: open it FULL SIZE externally (OS viewer / browser — the
+;; in-app <img> is capped so it can't swallow the transcript) or save it to the
+;; Downloads folder. Both take the image's own bytes from the event.
+(rf/reg-event-fx :open-image
+  (fn [_ [_ media-type base64]]
+    (-> (.openImage js/window.grogAPI (or media-type "image/png") base64)
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] open image failed: " (.-message e))]))))
+    {}))
+
+(rf/reg-event-fx :save-image
+  (fn [_ [_ media-type base64]]
+    (-> (.saveImage js/window.grogAPI (or media-type "image/png") base64)
+        (.then (fn [p] (rf/dispatch [:status-line nil (str "[grog] saved image to " p)])))
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] save image failed: " (.-message e))]))))
+    {}))
 (rf/reg-event-db :q-input   (fn [db [_ s]] (assoc db :q-input s)))
 (rf/reg-event-db :connected (fn [db [_ on? path]]
                               (assoc db :connected? on? :socket-path (or path (:socket-path db)))))
@@ -231,8 +352,9 @@
     (cond-> {:db (assoc db :dialog kind :dialog-input (or initial ""))}
       ;; the project picker needs the live list from the server
       (= kind :projects) (assoc :dispatch [:fetch-projects])
-      ;; the settings dialog opens onto the model picker's current source
-      (= kind :settings) (assoc :dispatch [:models-fetch nil]))))
+      ;; the settings dialog opens onto the model picker's current source, and
+      ;; loads the provider catalogue alongside it
+      (= kind :settings) (assoc :dispatch-n [[:models-fetch nil] [:providers-load]]))))
 
 ;; --- project list (server `projects` method) -------------------------------
 
@@ -256,8 +378,26 @@
 ;; `models` broadcast, so a first click on Ollama/OpenRouter shows "loading…"
 ;; and then fills in, rather than freezing the dialog.
 
-(rf/reg-event-db :models-source
-  (fn [db [_ source]] (assoc db :model-source source :model-query "")))
+(rf/reg-event-fx :models-source
+  "Switch the browsed source AND ask for its models. Switching without asking
+  left every tab except the one the dialog opened on empty, with nothing to do
+  but press ↻ — which is why the local tab looked broken."
+  (fn [{:keys [db]} [_ source]]
+    {:db (assoc db :model-source source :model-query "")
+     ;; the server answers from its cache instantly and refreshes in the
+     ;; background, so this is cheap on a source we already have
+     :dispatch [:models-fetch nil]}))
+
+(defn- effective-source
+  "Which picker source is being browsed.
+
+  A source the user actually picked always wins. Until they pick one: `remote`
+  when a remote provider is configured (that is where a model usually comes
+  from), else `local`."
+  [db]
+  (or (:model-source db)
+      (when (some #(= "remote" (first %)) (:model-sources db)) "remote")
+      "local"))
 
 (rf/reg-event-db :model-query
   (fn [db [_ q]] (assoc db :model-query q)))
@@ -273,12 +413,47 @@
   "Ask for `source`'s models (default: whichever source is being browsed).
   `force` re-fetches a source we already have cached."
   (fn [{:keys [db]} [_ force]]
-    (-> (.call js/window.grogAPI
-               "models"
-               (clj->js (cond-> {:source (or (:model-source db) "eca")}
-                          force (assoc :force true))))
+         (-> (.call js/window.grogAPI
+                    "models"
+                    (clj->js (cond-> {:source (effective-source db)}
+                               force (assoc :force true))))
         (.then (fn [cat] (rf/dispatch [:catalogue cat])))
         (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] models failed: " (.-message e))]))))
+    {}))
+
+;; --- provider picker -------------------------------------------------------
+;;
+;; The catalogue is DATA shipped with the app (resources/providers.edn), served
+;; by the spine's `providers` method so the renderer never hard-codes a host.
+;; Picking one writes :llm :url (:model) into grog.edn — a GLOBAL change that
+;; lands on the next start (config is snapshotted per session), so the status
+;; line says "restart" instead of pretending it took effect.
+
+(rf/reg-event-db :providers-loaded
+  (fn [db [_ m]]
+    (let [m (js->clj m :keywordize-keys true)]
+      (assoc db :providers (vec (:providers m)) :provider-current (:current m)))))
+
+(rf/reg-event-db :provider-current
+  (fn [db [_ cur]] (assoc db :provider-current cur)))
+
+(rf/reg-event-fx :providers-load
+  (fn [_ _]
+    (-> (.call js/window.grogAPI "providers" (clj->js {}))
+        (.then (fn [m] (rf/dispatch [:providers-loaded m])))
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] providers failed: " (.-message e))]))))
+    {}))
+
+(rf/reg-event-fx :set-provider
+  (fn [_ [_ id]]
+    (-> (.call js/window.grogAPI "set-provider" (clj->js {:id id}))
+        (.then (fn [m]
+                 (let [m (js->clj m :keywordize-keys true)]
+                   (rf/dispatch [:provider-current {:url (:url m) :model (:model m)
+                                                    :provider (:provider m)}])
+                   (rf/dispatch [:status-line nil
+                                 (str "[grog] provider -> " (:url m) " · restart grog to apply")]))))
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] set-provider failed: " (.-message e))]))))
     {}))
 
 (rf/reg-event-db :status-line
@@ -292,7 +467,7 @@
   "ECA content types that mean the MODEL has started producing output — the
   moment a turn stops being 'waiting on the model' and becomes 'streaming'.
   `usage`/`progress`/`metadata`/lifecycle chatter do not count."
-  #{"text" "thinking" "reasonText" "toolCalled" "toolCallRun"})
+  #{"text" "thinking" "reasonText" "toolCalled" "toolCallRun" "image"})
 
 (defn- set-running
   "Set a session's busy flag, keeping `:waiting?` consistent with it: a NEW turn
@@ -329,6 +504,7 @@
         (= :running kind)  (set-running db sid (boolean (:value ev)))
         (= :trust kind)    (assoc-in db [:sessions sid :trust] (boolean (:value ev)))
         (= :model kind)    (assoc-in db [:sessions sid :model] (:value ev))
+        (= :vision kind)   (assoc-in db [:sessions sid :vision?] (:value ev))
         (= :clear kind)    (assoc-in db [:sessions sid :transcript] [])
         (= :approval kind) (assoc-in db [:sessions sid :pending-approval] (dissoc ev :answer))
         (= :question kind) (-> db
@@ -431,15 +607,23 @@
 
 (rf/reg-event-fx :send
   (fn [{:keys [db]} _]
-    (let [id (:active db) txt (:input db)]
-      (if (and id (seq (str/trim txt)))
+    (let [id (:active db) txt (:input db) atts (or (:attachments db) [])
+          ;; ECA ChatContext: {type image mediaType base64} | {type file path}
+          contexts (mapv (fn [{:keys [kind media_type base64 path]}]
+                           (if (= kind :file)
+                             {:type "file" :path path}
+                             {:type "image" :mediaType media_type :base64 base64}))
+                         atts)]
+      (if (and id (or (seq (str/trim txt)) (seq atts)))
         (do
           (rf/dispatch [:running id true])
-          (-> (.call js/window.grogAPI "prompt" (clj->js {:id id :text txt}))
+          (-> (.call js/window.grogAPI "prompt"
+                     (clj->js (cond-> {:id id :text txt}
+                                (seq contexts) (assoc :contexts contexts))))
               (.catch (fn [e]
                         (rf/dispatch [:running id false])
                         (rf/dispatch [:status-line id (str "[grog] prompt failed: " (.-message e))]))))
-          {:db (assoc db :input "")})
+          {:db (-> db (assoc :input "") (assoc :attachments []))})
         {}))))
 
 (rf/reg-event-fx :stop
@@ -462,9 +646,9 @@
     (let [m (str/trim (str model))]
       (if (seq m)
         (do
-          ;; `source` (from the picker) lets the server qualify the id exactly:
-          ;; an OpenRouter catalog id must not be mistaken for a native
-          ;; provider just because its org slug matches one.
+          ;; `source` is the picker's PLACE ("local"/"remote"). The server turns
+          ;; that into a provider before qualifying — it knows the config; this
+          ;; side only knows the tab.
           (-> (.call js/window.grogAPI "set-model"
                      (clj->js (cond-> {:id id :model m}
                                 source (assoc :source (str source)))))
@@ -505,9 +689,33 @@
         {:dispatch [:write-clipboard txt "[grog] transcript copied to clipboard"]}
         {}))))
 
+(rf/reg-event-fx :open-doc
+  "Open a shipped documentation file (docs-relative) in the OS handler — or the
+  docs folder itself when `rel` is blank. Confined to the docs dir in main."
+  (fn [_ [_ rel]]
+    (-> (.openDoc js/window.grogAPI rel)
+        (.then (fn [err]
+                 (when (and err (string? err) (seq err))
+                   (rf/dispatch [:status-line nil (str "[grog] could not open docs: " err)]))))
+        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] open doc failed: " (.-message e))]))))
+    {}))
+
+(rf/reg-event-fx :request-startup
+  "Ask the spine which project to open, and whether an LLM is reachable. Retried
+  on every (re)attach until it lands, so it is safe before the server is up."
+  (fn [_ _]
+    (-> (.call js/window.grogAPI "startup" (clj->js {}))
+        (.then (fn [s] (rf/dispatch [:startup-ok (js->clj s :keywordize-keys true)])))
+        (.catch (fn [e] (.log js/console "[grog-web] startup call failed (will retry):" (.-message e)))))
+    {}))
+
 (rf/reg-event-fx :retry-open
   (fn [{:keys [db]} [_ project]]
-    (when-not (:opened? db) (rf/dispatch [:open (or project project-name)]))
+    (when-not (:opened? db)
+      (if-let [p (or project (:home-project db))]
+        (rf/dispatch [:open p])
+        ;; we never got a startup answer (server was down at launch) — ask again
+        (rf/dispatch [:request-startup])))
     {}))
 
 ;; --- subs ------------------------------------------------------------------
@@ -516,6 +724,7 @@
 (rf/reg-sub :active  (fn [db _] (:active db)))
 (rf/reg-sub :focused (fn [db _] (:focused? db)))
 (rf/reg-sub :input   (fn [db _] (:input db)))
+(rf/reg-sub :attachments (fn [db _] (:attachments db)))
 (rf/reg-sub :q-input (fn [db _] (:q-input db)))
 (rf/reg-sub :connected? (fn [db _] (:connected? db)))
 (rf/reg-sub :voice (fn [db _] (:voice db)))
@@ -524,14 +733,21 @@
 (rf/reg-sub :font-size (fn [db _] (or (:font-size db) 16)))
 (rf/reg-sub :socket-path (fn [db _] (:socket-path db)))
 (rf/reg-sub :retry (fn [db _] (:retry db)))
+(rf/reg-sub :bootstrap-needed? (fn [db _] (:bootstrap-needed? db)))
+(rf/reg-sub :bootstrap-configured? (fn [db _] (:bootstrap-configured? db)))
+(rf/reg-sub :docs-dir (fn [db _] (:docs-dir db)))
 (rf/reg-sub :sessions (fn [db _] (:sessions db)))
 (rf/reg-sub :sess (fn [db [_ id]] (get-in db [:sessions id])))
 (rf/reg-sub :ui-dialog (fn [db _] (:dialog db)))
 (rf/reg-sub :dialog-input (fn [db _] (:dialog-input db)))
 (rf/reg-sub :projects (fn [db _] (:projects db)))
 (rf/reg-sub :catalogue (fn [db _] (:catalogue db)))
-(rf/reg-sub :model-source (fn [db _] (:model-source db)))
+;; [[id label] …] from the server's `open` snapshot — Local and Remote.
+(rf/reg-sub :model-sources (fn [db _] (:model-sources db)))
 (rf/reg-sub :model-query (fn [db _] (:model-query db)))
+;; provider picker: the shipped catalogue + what :llm currently points at.
+(rf/reg-sub :providers (fn [db _] (:providers db)))
+(rf/reg-sub :provider-current (fn [db _] (:provider-current db)))
 (rf/reg-sub :pending-questions
   (fn [db _] (->> (:sessions db) (keep (fn [[id s]] (when (:pending-question s) id))) set)))
 
@@ -541,7 +757,7 @@
   (case kind :answer "answer" :thinking "think" :tool "tool"
         :user "user" :usage "usage" "·"))
 
-(defn- segment-view [{:keys [kind text]}]
+(defn- segment-view [{:keys [kind text media_type base64]}]
   (cond
     (= :snark kind)
     [:div {:class "text-center seg-snark italic text-sm py-1"} text]
@@ -557,6 +773,22 @@
      (into [:div {:class (str "flex-1 min-w-0 md "
                               (if (= :thinking kind) "seg-think" "seg-answer"))}]
            (md/->hiccup text))]
+
+    ;; an inline image from the assistant (data: URL — no filesystem access).
+    ;; Inline is capped (~70vh) so it can't swallow the transcript; click to
+    ;; open it FULL SIZE in the OS viewer/browser (real pan + zoom), or save it.
+    (= :image kind)
+    [:div {:class "py-1 space-y-1"}
+     [:img {:src (str "data:" (or media_type "image/png") ";base64," base64)
+            :alt "image"
+            :title "click to open full size (pan/zoom)"
+            :on-click #(rf/dispatch [:open-image media_type base64])
+            :class "max-w-full max-h-[70vh] rounded-md border border-slate-700 bg-[#121212] cursor-zoom-in"}]
+     [:div {:class "flex items-center gap-3 text-[0.7rem]"}
+      [:button {:class "text-sky-300 hover:underline"
+                :on-click #(rf/dispatch [:open-image media_type base64])} "↗ open full size"]
+      [:button {:class "text-slate-400 hover:underline"
+                :on-click #(rf/dispatch [:save-image media_type base64])} "↓ save to Downloads"]]]
 
     :else
     [:div {:class (str "text-sm " (if (= :user kind) "text-right" ""))}
@@ -577,7 +809,7 @@
   "True once a real turn has happened (the splash logo retires then, like
   client 1's :splash?)."
   [segs]
-  (boolean (some #(contains? #{:user :answer :thinking :tool} (:kind %)) segs)))
+  (boolean (some #(contains? #{:user :answer :thinking :tool :image} (:kind %)) segs)))
 
 ;; --- matrix rain (splash background) ---------------------------------------
 ;;
@@ -589,10 +821,17 @@
 (defonce ^:private !matrix (atom {:raf nil :resize nil}))
 (defonce ^:private !splash-canvas (atom nil))
 
-;; Milliseconds between rain steps. The RAF loop runs every frame (~60fps) but
-;; only paints once this much time has elapsed, so the glyphs fall at a calm,
-;; readable pace instead of a frantic blur. Bump this to slow it further.
+;; Milliseconds between rain steps during the intro sweep. The RAF loop runs
+;; every frame (~60fps) but only paints once this much time has elapsed, so
+;; the glyphs fall at a calm, readable pace instead of a frantic blur.
 (def ^:private matrix-frame-ms 55)
+
+;; After the first sweep — the leading glyphs have fallen off the bottom of
+;; the canvas — the rain settles: it steps ~3x slower and only a fraction of
+;; the columns keep falling, so the splash calms down behind the logo instead
+;; of holding the full opening downpour. Bump the density to keep more columns.
+(def ^:private matrix-frame-ms-settled (* 3 matrix-frame-ms))
+(def ^:private matrix-settled-density 0.33)
 
 ;; The rain's alphabet. Classic Matrix uses half-width katakana, but this box
 ;; has NO CJK font installed (katakana render blank), so we stand in with
@@ -612,13 +851,23 @@
     (when resize (.removeEventListener js/window "resize" resize))
     (reset! !matrix {:raf nil :resize nil})))
 
+(defn- matrix-active-cols
+  "Boolean array marking which columns keep raining once the splash has
+  settled; guarantees at least one active column."
+  [cols]
+  (let [a (into-array (map (fn [_] (< (js/Math.random) matrix-settled-density))
+                           (range cols)))]
+    (if (some true? a)
+      a
+      (doto a (aset 0 true)))))
+
 (defn- start-matrix! [canvas]
   (stop-matrix!)
   (let [ctx    (.getContext canvas "2d")
         chars  matrix-glyphs
         nchars (count chars)
         font   16
-        st     (atom {:cols 1 :drops (array) :w 0 :h 0})
+        st     (atom {:cols 1 :drops (array) :w 0 :h 0 :swept? false :active nil})
         !last  (atom 0)]
     (letfn [(fit []
               (let [w    (.-clientWidth canvas)
@@ -626,27 +875,40 @@
                     cols (int (max 1 (js/Math.floor (/ w font))))]
                 (set! (.-width canvas) w)
                 (set! (.-height canvas) h)
-                (swap! st assoc :cols cols :w w :h h
-                       :drops (into-array (repeat cols 1)))))
+                (swap! st (fn [s]
+                            (cond-> (assoc s :cols cols :w w :h h
+                                           :drops (into-array (repeat cols 1)))
+                              ;; keep the settled thinning across resizes
+                              (:swept? s) (assoc :active (matrix-active-cols cols)))))))
             (draw [now]
-              ;; time-gated: skip frames until matrix-frame-ms has passed
-              (when (>= (- now (or @!last 0)) matrix-frame-ms)
-                (reset! !last now)
-                (let [{:keys [cols drops w h]} @st]
-                  ;; fade the previous frame toward the page bg, then paint glyphs
-                  (set! (.-fillStyle ctx) "rgba(13,14,17,0.10)")
-                  (.fillRect ctx 0 0 w h)
-                  ;; teal — matches the splash logo palette
-                  (set! (.-fillStyle ctx) "#2ec7cd")
-                  (set! (.-font ctx) matrix-font)
-                  (dotimes [i cols]
-                    (let [i  (int i)
-                          ch (.charAt chars (js/Math.floor (* (js/Math.random) nchars)))
-                          y  (* (aget drops i) font)]
-                      (.fillText ctx ch (* i font) y)
-                      (when (and (> y h) (> (js/Math.random) 0.975))
-                        (aset drops i 0))
-                      (aset drops i (inc (aget drops i)))))))
+              ;; time-gated: skip frames until this phase's interval has passed
+              ;; (intro sweep at full pace; the settled rain steps ~3x slower)
+              (let [gate (if (:swept? @st) matrix-frame-ms-settled matrix-frame-ms)]
+                (when (>= (- now (or @!last 0)) gate)
+                  (reset! !last now)
+                  ;; first sweep is done once the leading glyphs fall off the
+                  ;; bottom — thin the rain to a subset of columns from here on
+                  (let [{:keys [drops h]} @st]
+                    (when (and (not (:swept? @st))
+                               (some #(> (* % font) h) drops))
+                      (swap! st assoc :swept? true
+                                      :active (matrix-active-cols (:cols @st)))))
+                  (let [{:keys [cols drops w h swept? active]} @st]
+                    ;; fade the previous frame toward the page bg, then paint glyphs
+                    (set! (.-fillStyle ctx) "rgba(13,14,17,0.10)")
+                    (.fillRect ctx 0 0 w h)
+                    ;; teal — matches the splash logo palette
+                    (set! (.-fillStyle ctx) "#2ec7cd")
+                    (set! (.-font ctx) matrix-font)
+                    (dotimes [i cols]
+                      (let [i (int i)]
+                        (when (or (not swept?) (aget active i))
+                          (let [ch (.charAt chars (js/Math.floor (* (js/Math.random) nchars)))
+                                y  (* (aget drops i) font)]
+                            (.fillText ctx ch (* i font) y)
+                            (when (and (> y h) (> (js/Math.random) 0.975))
+                              (aset drops i 0))
+                            (aset drops i (inc (aget drops i))))))))))
               (swap! !matrix assoc :raf (js/requestAnimationFrame draw)))]
       (fit)
       (let [on-resize (fn [_] (fit))]
@@ -654,7 +916,7 @@
         (swap! !matrix assoc :resize on-resize))
       (draw (js/performance.now)))))
 
-(defn- splash [segs]
+(defn- splash [segs version]
   (r/create-class
    {:component-did-mount
     (fn [_]
@@ -662,7 +924,7 @@
         (start-matrix! c)))
     :component-will-unmount (fn [_] (stop-matrix!))
     :reagent-render
-    (fn [segs]
+    (fn [segs version]
       (let [notes (filter #(contains? #{:snark :line} (:kind %)) segs)]
         [:div {:class "absolute inset-0 flex flex-col items-center justify-center gap-3 overflow-hidden p-6"}
          [:canvas {:ref (fn [el] (reset! !splash-canvas el))
@@ -673,6 +935,10 @@
           [:img {:src "logo.jpg" :alt "grog"
                  :class "w-auto max-w-[70vw] min-h-0 shrink object-contain rounded-xl shadow-2xl opacity-50"
                  :style {:max-height "50vh"}}]
+          ;; which build this is — the spine stamps it into the jar; nil when an
+          ;; unstamped source tree is running, in which case show nothing.
+          (when version
+            [:div {:class "text-xs font-mono tracking-wide seg-snark opacity-70"} version])
           (when (seq notes)
             [:div {:class "flex flex-col items-center gap-1 max-w-3xl max-h-[22vh] overflow-y-auto min-h-0"}
              (for [[i s] (map-indexed vector notes)]
@@ -684,10 +950,10 @@
     (r/after-render scroll-end!)
     [:div {:ref (fn [el] (reset! !scroll-el el))
            :class "relative flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-3"}
-     (if (has-messages? segs)
-       (for [[i seg] (map-indexed vector segs)]
-         ^{:key i} [segment-view seg])
-       [splash segs])]))
+           (if (has-messages? segs)
+             (for [[i seg] (map-indexed vector segs)]
+               ^{:key i} [segment-view seg])
+             [splash segs (:version s)])]))
 
 (defn- tab-strip []
   (let [order @(rf/subscribe [:order]) active @(rf/subscribe [:active])
@@ -760,6 +1026,11 @@
                                "bg-slate-800 border-slate-700 text-slate-300 disabled:opacity-40"))
                :on-click #(rf/dispatch [:toggle-trust active])}
       (if trust? "YOLO ON" "YOLO")]
+     [:button {:disabled (not active)
+               :title "Attach files — or paste / drop an image"
+               :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
+               :on-click #(rf/dispatch [:attach-pick])}
+      "📎"]
      [:button {:disabled (not active) :title "Settings"
                :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
                :on-click #(rf/dispatch [:dialog-open :settings (get-in @(rf/subscribe [:sessions]) [active :model])])}
@@ -769,16 +1040,61 @@
                :on-click #(rf/dispatch [:copy-transcript])} "⧉"]]))
 
 (defn- composer []
-  (let [txt @(rf/subscribe [:input]) active @(rf/subscribe [:active])]
-    [:div {:class "border-t border-slate-700 bg-slate-900/50 p-3 space-y-2"}
+  (let [txt @(rf/subscribe [:input]) active @(rf/subscribe [:active])
+        atts (or @(rf/subscribe [:attachments]) [])]
+    [:div {:class "border-t border-slate-700 bg-slate-900/50 p-3 space-y-2"
+           ;; drop files/images anywhere on the composer: a file → its absolute
+           ;; path (ECA reads it), an image with no path → inline bytes
+           :on-drag-over (fn [e] (.preventDefault e))
+           :on-drop
+           (fn [e]
+             (.preventDefault e)
+             (doseq [f (array-seq (.. e -dataTransfer -files))]
+               (let [p (js/window.grogAPI.pathForFile f)]
+                 (if (seq (str p))
+                   (rf/dispatch [:attach-files [p]])
+                   (when (str/starts-with? (str (.-type f)) "image/")
+                     (attach-image-bytes! f))))))}
      [toolbar]
-     [:textarea {:id "grog-composer" :rows 3 :value txt :placeholder "Ctrl+Enter sends · Enter newline"
+     (when (seq atts)
+       (into [:div {:class "flex flex-wrap gap-2"}]
+             (for [[i a] (map-indexed vector atts)]
+               ^{:key i}
+               [:div {:class "flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-[0.7rem] text-slate-300"}
+                (if (= :image (:kind a))
+                  [:img {:src (str "data:" (:media_type a) ";base64," (:base64 a))
+                         :alt "attachment" :class "h-8 w-8 object-cover rounded"}]
+                  [:span {:class "font-mono max-w-[16rem] truncate"}
+                   (str "📄 " (last (str/split (str (:path a)) #"[/\\]")) )])
+                [:button {:title "remove" :class "ml-1 text-slate-400 hover:text-rose-300"
+                          :on-click #(rf/dispatch [:attach-remove i])} "✕"]])))
+     ;; warn when an image is attached to a model ECA will silently drop it on
+     (when (some #(= :image (:kind %)) atts)
+       (let [v (get-in @(rf/subscribe [:sessions]) [active :vision?])]
+         (cond
+           (false? v)
+           [:div {:class "text-[0.7rem] text-rose-300"}
+            "⚠ this model has no image input — the image will be ignored (pick a vision model)"]
+           (true? v) nil
+           :else
+           [:div {:class "text-[0.7rem] text-slate-500"}
+            "images only reach models with image input (vision)"])))
+     [:textarea {:id "grog-composer" :rows 3 :value txt
+                 :placeholder "Ctrl+Enter sends · Enter newline · paste or drop an image"
                  :disabled (not active)
                  :on-change #(rf/dispatch [:input (.. % -target -value)])
                  :on-key-down #(when (and (= "Enter" (.-key %)) (.-ctrlKey %))
                                  (.preventDefault %) (rf/dispatch [:send]))
+                 ;; paste an image straight from the clipboard
+                 :on-paste
+                 (fn [e]
+                   (let [imgs (->> (array-seq (.. e -clipboardData -items))
+                                   (filter #(str/starts-with? (str (.-type %)) "image/")))]
+                     (when (seq imgs)
+                       (.preventDefault e)
+                       (doseq [it imgs] (attach-image-bytes! (.getAsFile it))))))
                  :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-     [:div {:class "text-[0.7rem] text-slate-500"} "Ctrl+Enter send · Ctrl+Shift+Space voice · /clear · /yolo"]]))
+     [:div {:class "text-[0.7rem] text-slate-500"} "Ctrl+Enter send · Ctrl+Shift+Space voice · 📎 attach · paste an image · /clear · /yolo"]]))
 
 (defn- status-bar []
   (let [pending @(rf/subscribe [:pending-questions])
@@ -918,15 +1234,11 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Cancel"]]]]))
 
-(def ^:private picker-sources
-  "Model sources the picker offers, in order. `eca` is ECA's own catalogue
-  (offline, arrives on connect); the other two are fetched."
-  [["eca" "ECA"] ["openrouter" "OpenRouter"] ["ollama" "Ollama"]])
-
 (defn- settings-dialog []
   (let [in @(rf/subscribe [:dialog-input]) active @(rf/subscribe [:active])
         sess (get-in @(rf/subscribe [:sessions]) [active])
-        src @(rf/subscribe [:model-source])
+        src (effective-source @(rf/subscribe [:db]))
+        pickers (or (seq @(rf/subscribe [:model-sources])) [["local" "Local"]])
         q @(rf/subscribe [:model-query])
         cat @(rf/subscribe [:catalogue])
         all (get cat (keyword src))
@@ -934,7 +1246,8 @@
         shown (if (str/blank? q)
                 all
                 (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
-        loading-src? (some #(= src %) (:loading cat))]
+        ;; `:loading` holds keywords; `src` is the string from the source list
+        loading-src? (some #(= (keyword src) %) (:loading cat))]
     [overlay
      [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[520px] max-h-[85vh] overflow-y-auto"}
       [:div {:class "text-slate-200 text-sm font-medium"} "Settings"]
@@ -944,14 +1257,42 @@
                :on-change #(rf/dispatch [:dialog-input (.. % -target -value)])
                :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:set-model active in]))
                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-      [:div {:class "text-[0.7rem] text-slate-500"} "persists via /eca-model on the server"]
+      [:div {:class "text-[0.7rem] text-slate-500"} "applies to this tab's session only — the default comes from grog.edn"]
+
+      ;; provider picker — the shipped catalogue (resources/providers.edn, over
+      ;; the server's `providers` method). Picking one writes :llm :url to
+      ;; grog.edn: the "get the ball rolling" step — choose where models come
+      ;; from, then /secret set the key. Global change; applies on restart.
+      (let [ps @(rf/subscribe [:providers])
+            cur @(rf/subscribe [:provider-current])
+            cur-id (:provider cur)]
+        [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
+         [:label {:class "text-xs text-slate-400"} "provider"]
+         (if (seq ps)
+           (into [:div {:class "flex flex-wrap gap-1"}]
+                 (for [{:keys [id label url]} ps]
+                   ^{:key id}
+                   [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
+                                         (if (= id cur-id)
+                                           "bg-emerald-600/30 border-emerald-500 text-emerald-100"
+                                           "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"))
+                             :title url
+                             :on-click #(rf/dispatch [:set-provider id])}
+                    label]))
+           [:div {:class "text-xs text-slate-500"} "loading…"])
+         [:div {:class "text-[0.7rem] text-slate-500"}
+          (if cur
+            (str "current: " (:url cur) (when (:model cur) (str " · " (:model cur))))
+            "current: from grog.edn")]
+         [:div {:class "text-[0.7rem] text-slate-500"}
+          "writes :llm :url to grog.edn · restart to apply · keys via /secret"]])
 
       ;; browse + search + pick. The list comes from the server; a source that
       ;; has never been fetched shows "loading…" and fills in via broadcast.
       [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
        [:div {:class "flex items-center gap-1"}
-        (into [:span {:class "flex items-center gap-1"}]
-              (for [[id label] picker-sources]
+                 (into [:span {:class "flex items-center gap-1"}]
+                       (for [[id label] pickers]
                 ^{:key id}
                 [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
                                       (if (= id src)
@@ -973,9 +1314,11 @@
 
                (empty? shown)
                [[:div {:class "p-2 text-xs text-slate-500"}
-                 (str "no models — " (if (= "eca" src)
-                                       "connect a session, or pick another source"
-                                       "press ↻ to fetch"))]]
+                 (if (nil? (get cat (keyword src)))
+                   "press ↻ to fetch"
+                   (if (= "local" src)
+                     "no local models — is ollama running?"
+                     "the provider listed no models"))]]
 
                :else
                (for [m shown]
@@ -1013,14 +1356,66 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
                  :on-click #(rf/dispatch [:set-model active in])} "Save"]]]]))
 
+(defn- bootstrap-panel
+  "The getting-started landing: shown instead of the transcript when grog has no
+  usable LLM ('Job 1'), or when a factory reset asked for the onboarding. Renders
+  fully OFFLINE — no model, no network. The composer stays live underneath,
+  because `/secret` is handled locally and needs no brain.
+
+  A reset does not touch ECA's own config, so an LLM can already be reachable when
+  this page appears; it then says so plainly and offers a way through to the
+  transcript, rather than claiming there is no brain."
+  []
+  (let [docs @(rf/subscribe [:docs-dir])
+        configured? @(rf/subscribe [:bootstrap-configured?])]
+    [:div {:class "flex-1 min-h-0 overflow-y-auto px-6 py-10 flex justify-center"}
+     [:div {:class "max-w-2xl w-full space-y-5"}
+      (if configured?
+        [:div {:class "space-y-2"}
+         [:div {:class "text-[0.7rem] uppercase tracking-widest seg-snark"} "getting started"]
+         [:div {:class "text-2xl font-semibold text-slate-100"} "Fresh start"]
+         [:div {:class "text-sm text-slate-300"}
+          "You reset grog, so this is the getting-started project again. A model is already "
+          "reachable — ECA's own config outlived the reset — so there is nothing to fix before "
+          "you talk to me. Ask me anything, or point me at the docs."]]
+        [:div {:class "space-y-2"}
+         [:div {:class "text-[0.7rem] uppercase tracking-widest seg-snark"} "bootstrap"]
+         [:div {:class "text-2xl font-semibold text-slate-100"} "Job 1 — get your LLM online"]
+         [:div {:class "text-sm text-slate-300"}
+          "I can't think yet: no provider, no model, no key — so there's no brain to talk to. "
+          "Sort that out and I'll grow one, then walk you through the rest of the setup."]])
+      (when-not configured?
+        [:div {:class "card rounded-xl p-4 space-y-3"}
+         [:div {:class "text-slate-200 text-sm font-medium"} "Three steps"]
+         [:ol {:class "list-decimal ml-5 space-y-2 text-sm text-slate-300"}
+          [:li "Point grog at a provider and a model — set " [:code ":llm :url"] " and "
+           [:code ":llm :model"] " in " [:code "grog.edn"] " (or use ⚙ Settings)."]
+          [:li "Put the key in the secret store: type "
+           [:code "/secret set LLM_API_KEY <value>"]
+           " below. It goes to your OS keyring, never to a file."]
+          [:li "Restart grog. This page retires the moment a model is reachable."]]])
+      [:div {:class "flex flex-wrap gap-2"}
+       (when configured?
+         [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium text-sm"
+                   :on-click #(rf/dispatch [:dismiss-bootstrap])} "Start chatting"])
+       [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium text-sm"
+                 :on-click #(rf/dispatch [:open-doc ""])} "Open the docs folder"]
+       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm"
+                 :on-click #(rf/dispatch [:open-doc "USERS-GUIDE.md"])} "Users guide"]]
+      (when docs
+        [:div {:class "text-[0.7rem] text-slate-500 font-mono"} (str "docs: " docs)])]]))
+
 (defn- shell []
-  (let [active @(rf/subscribe [:active]) dialog @(rf/subscribe [:ui-dialog])]
+  (let [active @(rf/subscribe [:active]) dialog @(rf/subscribe [:ui-dialog])
+        boot? @(rf/subscribe [:bootstrap-needed?])]
     [:div {:class "app h-screen w-screen flex flex-col overflow-hidden"}
      [banner]
      [:div {:class "flex-1 min-h-0 flex flex-col overflow-hidden"}
       [tab-strip]
-      (if active [transcript active]
-          [:div {:class "flex-1 grid place-items-center text-slate-500"} "connecting…"])
+      (cond
+        boot?  [bootstrap-panel]
+        active [transcript active]
+        :else  [:div {:class "flex-1 grid place-items-center text-slate-500"} "connecting…"])
       [composer]
       [status-bar]]
      [approval-dialog]
@@ -1066,11 +1461,8 @@
   (-> (.voiceStatus js/window.grogAPI)
       (.then (fn [s] (rf/dispatch [:voice-status (js->clj s :keywordize-keys true)])))
       (.catch (fn [_] nil)))
-  ;; if the daemon is already attached, open now; else :retry-open fires on attach.
-  (-> (.call js/window.grogAPI "open" (clj->js {:project project-name}))
-      (.then (fn [snap]
-               (let [snap (js->clj snap :keywordize-keys true)]
-                 (rf/dispatch [:open-ok snap])
-                 (rf/dispatch [:connect (:id snap)]))))
-      (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] open failed: " (.-message e))]))))
+  ;; ASK THE SPINE which project to open (it decides — and on a fresh install it
+  ;; seeds the getting-started project first), then open it. `:retry-open` asks
+  ;; again on (re)attach if the server was not up yet.
+  (rf/dispatch [:request-startup])
   (rdom/render [shell] (.getElementById js/document "app")))

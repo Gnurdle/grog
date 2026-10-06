@@ -1,18 +1,19 @@
-// config-seed.js — the FIRST-RUN CONFIG OFFER.
+// config-seed.js — the FIRST-RUN CONFIG SEED.
 //
 // grog needs a config file. Without one it runs on built-in defaults, which is
 // rarely what anyone wants: no model, no provider, no API key. The examples
 // that make this easy ship INSIDE the app package (resources/config.examples/),
-// which for an AppImage is a read-only squashfs mount a human cannot browse.
+// which for an AppImage is a read-only squashfs mount a human cannot browse —
+// and in a source tree they live in the repo's resources/config.examples.
 //
-// So the client OFFERS to write them at startup, names the exact path, and
-// reveals the folder. Deliberately NOT a silent copy: a config grog created
-// behind your back still doesn't work (the model/provider/key are unset), so
-// the user must know it exists, where it is, and that it needs editing before
-// it will do anything.
+// So the client SEEDS the config home at startup: grog.edn (renamed from the
+// example) plus the optional files as `*.example`. Nothing is overwritten, and
+// the caller logs the exact path, so the user always knows the starter exists
+// and where it went. That starter still has no model/provider/key, so it cannot
+// reach a model until it is edited — the caller says so plainly.
 //
-// This module only plans and writes. Asking the user is the caller's job
-// (main.js shows a native dialog).
+// This module only plans and writes; resolving the example directory (packaged
+// vs source tree) and reporting the paths is the caller's job (main.js).
 "use strict";
 const fs = require("fs");
 const os = require("os");
@@ -62,13 +63,13 @@ function availableExamples(resourcesPath) {
 }
 
 /**
- * What the first-run offer WOULD do. Reads the filesystem, writes nothing.
+ * What the first-run seed WOULD do. Reads the filesystem, writes nothing.
  *
- *   home        the config home (created only if the user accepts)
+ *   home        the config home (created when the seed is written)
  *   grogEdn     <home>/grog.edn — the file the user must actually edit
  *   mainExample the shipped grog.edn.example, or nil
  *   needsMain   TRUE when grog.edn is absent and its example is available —
- *               this is the trigger for asking
+ *               this is the trigger for seeding
  *   optional    the remaining examples (odoo/imap/gitlab/…), offered as
  *               `*.example` so an AppImage user can reach them at all
  */

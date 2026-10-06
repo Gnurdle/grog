@@ -79,8 +79,8 @@
 
 ;; Optional file-based config: ~/.config/grog/search.edn
 ;;   {:timeout-ms 20000}
-;; (env vars are intentionally NOT read — file-config normalization, like
-;; grog-big.) The Brave API key stays in the OS keyring (service "grog",
+;; (env vars are intentionally NOT read — file-config normalization, like the
+;; other grog MCP servers.) The Brave API key stays in the OS keyring (service "grog",
 ;; account "BRAVE_SEARCH_API"); search.edn is optional and currently only tunes
 ;; the HTTP timeout. If you don't need it, don't create the file — the loader
 ;; returns {} and the defaults below apply.

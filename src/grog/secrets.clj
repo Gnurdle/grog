@@ -145,6 +145,50 @@
   ^java.io.File []
   (io/file (platform/config-home-dir) "secrets.edn"))
 
+(defn secret-ledger-file
+  "The ledger of secret ACCOUNT NAMES grog itself has written — names only,
+  never values.
+
+  The OS keyring has no 'list my accounts' API, so this is the only way the
+  factory reset (`grog.reset`) can know which credentials grog created and
+  should therefore remove — without touching keys the user stored by other means."
+  ^java.io.File []
+  (io/file (platform/config-home-dir) "secret-ledger.edn"))
+
+(defn- read-ledger
+  "The ledger as a set of account names (strings), or nil if absent/unreadable."
+  []
+  (try
+    (let [f (secret-ledger-file)]
+      (when (.exists f)
+        (let [v (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))]
+          (set (filter string? v)))))
+    (catch Throwable _ nil)))
+
+(defn ledger-accounts
+  "Account names grog has written to the secret store (a set of strings)."
+  []
+  (or (read-ledger) #{}))
+
+(defn- note-in-ledger!
+  "Record `account` in the ledger (best effort — the ledger must never break a
+  secret write). The ledger holds NAMES only, never values, so it needs no
+  special permissions."
+  [^String account]
+  (try
+    (let [f (secret-ledger-file)
+          accounts (conj (ledger-accounts) (str account))]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (pr-str (into (sorted-set) accounts)) :encoding "UTF-8"))
+    (catch Throwable _ nil)))
+
+(defn clear-ledger!
+  "Remove the ledger file (the factory reset calls this after removing the
+  accounts it names)."
+  []
+  (try (let [f (secret-ledger-file)] (when (.exists f) (.delete f)))
+       (catch Throwable _ nil)))
+
 (defn- harden-file! [^java.io.File f]
   ;; Best effort: owner-only read/write, no other users, on platforms that
   ;; support POSIX-style permissions (Windows ignores most of these).
@@ -264,6 +308,7 @@
   (when (str/blank? password)
     (throw (ex-info "value must be non-empty" {})))
   (note-unknown-account! account)
+  (note-in-ledger! account)
   (try
     (with-open [^Keyring kr (Keyring/create)]
       (.setPassword kr service-id account password))

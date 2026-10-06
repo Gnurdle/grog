@@ -102,6 +102,7 @@
                              :properties {:path {:type :string}
                                           :png_base64 {:type :string}}
                              :required [:path "png_base64"]})
+    :image-out? true   ; hand the written PNG back as an MCP image block (see grog_mcp.main)
     :fn (fn [a] (tools/run-write-workspace-png! a))}
 
    {:name "crop_workspace_image"
@@ -117,6 +118,7 @@
                                           :dpi {:type :integer}
                                           :pad_px {:type :integer}}
                              :required [:source_path :out_path]})
+    :image-out? true   ; hand the crop PNG back as an MCP image block
     :fn (fn [a] (tools/run-crop-workspace-image! a))}
 
    {:name "read_png_image"
@@ -161,6 +163,7 @@
                                           :out_path {:type :string}
                                           :overlays {:type :object}}
                              :required [:source_path :out_path]})
+    :image-out? true   ; hand the overlay PNG back as an MCP image block
     :fn (fn [a] (tools/run-draw-overlay-png! a))}])
 
 ;; --- server ----------------------------------------------------------------

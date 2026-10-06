@@ -53,13 +53,6 @@
   (`config/cmstools/cdh-wip/gui/modal-utils.edn`, 2026-09-29), and that file is included by
   many, many configurations.
 
-- **When a task is too hard, escalate to the big model** via the `big_model_ask` tool (the
-  `grog-big` MCP server). You are a small local model; for deep reasoning, tricky analysis,
-  unfamiliar code, or anything where a better model would clearly do better, call `big_model_ask`
-  with a **complete, self-contained prompt** (it does NOT see this conversation — include all
-  needed context) and then continue from its answer. Don't guess or refuse when escalation is
-  obviously the higher-quality move.
-
 - **Never commit anything** — secrets, API keys, tokens, credentials, personal/private data, or
   generated scratch/artifacts. Do not add, stage, or commit such files. If you are about to write
   a file to disk for real use, make sure it is not in a place that would be committed, and never

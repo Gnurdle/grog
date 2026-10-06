@@ -14,7 +14,7 @@
   grog.eca-config)."
   (:require [clojure.tools.build.api :as b]))
 
-(def default-version "0.1.0")
+(def default-version "0.2.0")
 (def class-dir "target/classes")
 ;; Just the bundle's own sources: the 12 servers arrive on the classpath as
 ;; `:local/root` deps (see deps.edn), NOT as a vendored copy.
@@ -27,7 +27,7 @@
 
 (defn uber
   "Copy the bundle's own sources into the class dir, then merge the whole
-  classpath into one jar (the 12 servers come in via `:local/root`).
+  classpath into one jar (the 11 servers come in via `:local/root`).
 
   `:version` overrides the jar name's version (build_dist stamps the collective
   version here): clojure -T:build uber :version '\"1.2.3\"'. eca_config finds the

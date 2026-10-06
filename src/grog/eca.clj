@@ -470,7 +470,7 @@
     (try
       (let [init (send-request! id "initialize"
                                 {:processId (long (try (.pid (ProcessHandle/current)) (catch Exception _ 0)))
-                                 :clientInfo {:name "grog" :version "0.1.0"}
+                                 :clientInfo {:name "grog" :version "0.2.0"}
                                  :capabilities {:codeAssistant {:chat true :rewrite false}}
                                  :workspaceFolders (vec workspace-folders)})]
         (if (:error init)

@@ -343,6 +343,13 @@
         (when-let [ms (get-in params [:chat :models])]
           (models/register-eca-catalog! ms))
 
+        ;; A provider's status changed (login/logout/sync) — it carries per-model
+        ;; image-input capability, so refresh what the client can warn about.
+        "providers/updated"
+        (do (models/register-provider-vision! {:providers [params]})
+            (publish! state {:type :vision
+                             :value (models/vision-for @(:model state))}))
+
         nil))))
 
 (defn parse-cost
@@ -447,7 +454,7 @@
   pixels is either PUBLISHED (`:user` echo, `:clear` transcript wipe) or
   DELEGATED through `hooks`:
 
-    :send       (fn [history text] -> history)  hand an LLM turn over
+    :send       (fn [history text contexts] -> history)  hand an LLM turn over
     :set-model! (fn [name])  /eca-model — qualify, push to ECA, footer, status
     :set-yolo!  (fn [on?])   /yolo (nil toggles)
     :console    (fn [] -> Writer)  called once per turn; `*out*`/`*err*` bind
@@ -460,7 +467,7 @@
   The console binding wraps the whole route (the `:user` echo publishes
   before it, as before), because `route-slash-command!` prints its handlers'
   output to `*out*`."
-  [state {:keys [send set-model! set-yolo! console quit!]} text]
+  [state {:keys [send set-model! set-yolo! console quit!]} text contexts]
   (cancel/clear!)
   ;; echo the user's input (prompt or command) as a bubble. `/secret KEY VALUE`
   ;; carries a credential: publish a MASKED form so the value never reaches the
@@ -500,7 +507,7 @@
                     @(:history state)
 
                     :grog.core/llm
-                    (send @(:history state) text))))]
+                    (send @(:history state) text contexts))))]
     (if-let [w (when console (console))]
       (binding [*out* w *err* w] (route))
       (route))))
@@ -519,17 +526,19 @@
   (Thread.
    (fn []
      (loop []
-       (when-let [text (.take queue)]
-         (binding [*out* *err*]
-           ;; never log a credential: mask `/secret KEY VALUE` before printing
-           (println "worker take:" (pr-str (secrets/redact-secret-command (str text)))))
-         (try
-           (reset! (:history state) (handle-turn! state hooks text))
-           (catch Throwable e
-             (binding [*out* *err*]
-               (println "worker turn error:" (.getMessage e))
-               (println (with-out-str (.printStackTrace e))))
-             (publish! state {:type :line
-                              :text (str "[grog] internal error handling that message: "
-                                         (.getMessage e))})))
-         (recur))))))
+       (when-let [item (.take queue)]
+         ;; a queue item is {:text … :contexts …}; tolerate a bare string
+         (let [{:keys [text contexts]} (if (map? item) item {:text item})]
+           (binding [*out* *err*]
+             ;; never log a credential: mask `/secret KEY VALUE` before printing
+             (println "worker take:" (pr-str (secrets/redact-secret-command (str text)))))
+           (try
+             (reset! (:history state) (handle-turn! state hooks text contexts))
+             (catch Throwable e
+               (binding [*out* *err*]
+                 (println "worker turn error:" (.getMessage e))
+                 (println (with-out-str (.printStackTrace e))))
+               (publish! state {:type :line
+                                :text (str "[grog] internal error handling that message: "
+                                           (.getMessage e))})))
+           (recur)))))))

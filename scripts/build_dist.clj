@@ -49,9 +49,9 @@
 (defn resolve-version [args]
   (or (arg-value args "--version")
       (when (fs/exists? version-file) (str/trim (slurp version-file)))
-      (do (spit version-file "0.1.0\n")
-          (say "created VERSION (0.1.0) — edit it to release")
-          "0.1.0")))
+      (do (spit version-file "0.2.0\n")
+          (say "created VERSION (0.2.0) — edit it to release")
+          "0.2.0")))
 
 (def ^:private windows?
   (str/includes? (str/lower-case (str (System/getProperty "os.name"))) "win"))
@@ -121,7 +121,7 @@
         args (mapv str args)
         ;; resolve the program, not the rest of argv: babashka passes arguments
         ;; through untouched, and going via `cmd /c` would let cmd re-parse them
-        ;; (it would strip the quotes from e.g. :version "0.1.0").
+        ;; (it would strip the quotes from e.g. :version "0.2.0").
         prog (find-on-path (first args))]
     (when-not prog
       ;; Windows gotcha: scoop's `clojure` package installs only a PowerShell

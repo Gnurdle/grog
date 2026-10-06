@@ -52,9 +52,13 @@ example can confuse the runtime — delete them from `~/.config/grog` instead:
 
 ## grog.edn — the rest of the knobs
 
-`grog.edn.example` is kept deliberately short: it mirrors a *working* config, so
-you can read it in one go. Everything below is optional and lives in the same
-file — add a key when you need it.
+`grog.edn.example` mirrors a *working* config so you can read it in one go. The
+one deliberately long part is `:llm :profiles`, which lists well-known
+OpenAI-compatible endpoints — generated from the shipped catalogue
+`resources/providers.edn` (the machine-readable source of truth; the settings
+provider picker reads the same file). The two are kept in step by
+`bb scripts/providers-test.clj`. Everything else is optional and lives in the
+same file — add a key when you need it.
 
 ```clojure
 ;; --- the LLM block ---

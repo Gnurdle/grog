@@ -47,7 +47,7 @@
   (session [this id]) ; -> snapshot map or nil
   (connect! [this id])     ; eager ECA connect (the tab-open path does this)
   (disconnect! [this id])  ; alias of close, kept for the UI's :disconnect! slot
-  (prompt! [this id text]) ; queue a normal prompt
+  (prompt! [this id text] [this id text contexts]) ; queue a prompt (optional ECA contexts: images/files/…)
   (steer! [this id text])  ; steer a running turn
   (stop! [this id])
   (answer! [this id ans])  ; ans = {:approval-id .. :decision ..}
@@ -87,7 +87,9 @@
 (defn session [id] (session (need) id))
 (defn connect! [id] (connect! (need) id))
 (defn disconnect! [id] (disconnect! (need) id))
-(defn prompt! [id text] (prompt! (need) id text))
+(defn prompt!
+  ([id text] (prompt! (need) id text))
+  ([id text contexts] (prompt! (need) id text contexts)))
 (defn steer! [id text] (steer! (need) id text))
 (defn stop! [id] (stop! (need) id))
 (defn answer! [id ans] (answer! (need) id ans))
