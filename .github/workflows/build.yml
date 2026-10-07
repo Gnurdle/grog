@@ -1,0 +1,190 @@
+# grog CI — build + test + package.
+#
+# Two jobs:
+#   test  — the fast gate: offline unit tests, a compile check of the spine,
+#           the MCP wire test, and a renderer compile. Runs on every push and PR.
+#   dist  — the slow one: builds BOTH jars + the renderer, then the Windows NSIS
+#           installer and the Linux AppImage, and (on a v* tag) attaches them to
+#           a GitHub Release. Runs on branch pushes, tags, and manual dispatch —
+#           NOT on pull requests (a public repo would otherwise let anyone burn
+#           ~15 min of packaging per PR).
+#
+# Why Wine: `bb dist --target windows` on Linux needs Wine, and NOT for signing.
+# electron-builder builds NSIS in two passes — `makensis` emits an intermediate
+# installer, then it RUNS that installer under Wine to capture the uninstaller it
+# writes at runtime; Wine is also used for rcedit (grog icon + version stamping).
+# See the comment in scripts/build_dist.clj.
+#
+# This repo is PUBLIC, so standard GitHub-hosted runners and Actions storage are
+# free — no secrets are required to build or to run any of these checks. Smoke
+# tests (scripts/electron-smoke.js, scripts/smoke-server.js) are deliberately
+# NOT wired in here.
+
+name: build
+
+on:
+  push:
+    branches: [master, v2, winloop]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# One run per ref; supersede in-flight runs EXCEPT on tags — never cancel a
+# release build that is mid-package.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unit + compile gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Clojure CLI
+        run: |
+          curl -L -o /tmp/linux-install.sh \
+            https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+          chmod +x /tmp/linux-install.sh
+          sudo /tmp/linux-install.sh
+
+      - name: Install babashka
+        run: |
+          curl -sLO https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x install
+          sudo ./install
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: clients/web/package-lock.json
+
+      - name: Cache Clojure deps (Maven + gitlibs)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: clj-${{ runner.os }}-${{ hashFiles('**/deps.edn') }}
+          restore-keys: clj-${{ runner.os }}-
+
+      - name: Offline JS tests
+        run: |
+          node scripts/log-test.js
+          node scripts/config-seed-test.js
+          node scripts/desktop-install-test.js
+
+      - name: Provider catalogue test
+        run: bb scripts/providers-test.clj
+
+      - name: Spine compiles
+        run: clojure -J--add-opens=java.base/java.lang=ALL-UNNAMED -M -e "(require 'grog.server 'grog.config 'grog.models 'grog.chat 'grog.client.local 'grog.eca-config 'grog.doctor) (println :SPINE-OK)"
+
+      - name: Build the MCP bundle jar
+        working-directory: grog_mcp
+        run: clojure -T:build uber
+
+      - name: MCP wire test (inputSchema must be a JSON object)
+        working-directory: grog_mcp
+        run: clojure -M:test
+
+      - name: Renderer compiles (0 warnings)
+        working-directory: clients/web
+        env:
+          # the compile check needs shadow-cljs, not the Electron binary
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: |
+          npm ci
+          npx shadow-cljs compile app
+
+  dist:
+    name: installers
+    runs-on: ubuntu-24.04
+    needs: test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write   # required to attach installers to a Release on tags
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Clojure CLI
+        run: |
+          curl -L -o /tmp/linux-install.sh \
+            https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+          chmod +x /tmp/linux-install.sh
+          sudo /tmp/linux-install.sh
+
+      - name: Install babashka
+        run: |
+          curl -sLO https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x install
+          sudo ./install
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: clients/web/package-lock.json
+
+      - name: Install Wine + FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wine
+          # libfuse2 is needed for the AppImage step; on 24.04 it is libfuse2t64
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
+
+      - name: Cache Clojure + electron-builder caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: dist-${{ runner.os }}-${{ hashFiles('**/deps.edn', 'clients/web/package-lock.json') }}
+          restore-keys: dist-${{ runner.os }}-
+
+      - name: Web deps (incl. the Electron binary)
+        working-directory: clients/web
+        run: npm ci
+
+      - name: Build both jars + renderer + Windows NSIS + Linux AppImage
+        run: bb dist --target all
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: grog-installers
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/*.exe
+            dist/*.AppImage
+
+      - name: Attach installers to the Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.AppImage

@@ -1,6 +1,12 @@
 grog.edn
 target/
 .*
+# ...but the CI workflow MUST be tracked — the `.*` rule above would otherwise
+# silently ignore .github/ (git status shows nothing, nothing gets pushed).
+# A directory cannot be re-included unless it is itself un-ignored first, hence
+# both lines.
+!.github/
+!.github/**
 workspace/
 grog-memory/err.log
 grog-ui.log
