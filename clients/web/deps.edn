@@ -1,0 +1,7 @@
+{:paths ["src/renderer"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        reagent/reagent {:mvn/version "1.2.0"}
+        re-frame/re-frame {:mvn/version "1.4.3"}
+        ;; on the main classpath (not an alias) so the npm `shadow-cljs` wrapper
+        ;; finds it regardless of how it invokes clojure
+        thheller/shadow-cljs {:mvn/version "2.28.19"}}}

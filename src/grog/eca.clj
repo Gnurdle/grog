@@ -13,12 +13,13 @@
     - a message with neither                -> notification (event handler)
 
   Notifications (especially `chat/contentReceived`) are routed to a pluggable
-  event handler so the Swing UI can render them. Requests are routed to a
+  event handler so the UI can render them. Requests are routed to a
   pluggable request handler so it can answer `chat/askQuestion` / `editor/getDiagnostics`
   (responds with safe defaults if unset)."
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.platform :as platform])
   (:import [java.io ByteArrayOutputStream InputStream OutputStreamWriter]
            [java.lang ProcessBuilder Process ProcessHandle]
            [java.nio.charset StandardCharsets]
@@ -136,7 +137,7 @@
 ;;   2. the bare name via the OS PATH lookup,
 ;;   3. well-known install locations (VS Code extension dirs, scoop shims, npm
 ;;      global, ~/.local, /usr/local)
-;; so `clojure -M:gui` / grog-ui works on Windows too.
+;; so it works on Windows too.
 
 (defn- windows?
   "True when running on a Microsoft Windows OS."
@@ -166,21 +167,26 @@
        (remove str/blank?)
        (map msys-path->windows)))
 
-(defn- path-executable?
-  "True if `name` (optionally with a platform executable extension) resolves to
-  an executable file on the OS PATH."
-  [name]
+(defn- path-executable-file
+  "The executable File for `name` (trying the platform executable extensions) on
+  the OS PATH, or nil. Returning the FILE rather than a boolean is what lets the
+  startup log name the exact ECA in use instead of a bare `eca`."
+  ^java.io.File [name]
   (try
     (let [win? (windows?)
           exts (if win? ["exe" "cmd" "bat" ""] [""])]
-      (boolean
-        (some (fn [d]
-                (some (fn [ext]
-                        (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
-                          (and (.isFile f) (.canExecute f))))
-                      exts))
-              (path-dirs))))
-    (catch Throwable _ false)))
+      (some (fn [d]
+              (some (fn [ext]
+                      (let [f (java.io.File. d (str name (when (seq ext) (str "." ext))))]
+                        (when (and (.isFile f) (.canExecute f)) f)))
+                    exts))
+            (path-dirs)))
+    (catch Throwable _ nil)))
+
+(defn- path-executable?
+  "True if `name` resolves to an executable file on the OS PATH."
+  [name]
+  (boolean (path-executable-file name)))
 
 (defn- extension-eca-dirs
   "Candidate ECA directories found in a VS Code `extensions` folder: every
@@ -196,12 +202,20 @@
     (catch Throwable _ nil)))
 
 (defn- candidate-dirs
-  "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary."
+  "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary.
+
+  ORDER MATTERS. grog's OWN install (`%LOCALAPPDATA%\\eca`) comes FIRST, so a box
+  that also has the VS Code extension does not silently drive VS CODE's ECA
+  instead of the one grog shipped. The VS Code extension dirs are a FALLBACK —
+  useful only when grog has no copy of its own."
   []
   (let [home (System/getProperty "user.home")
         userprofile (System/getenv "USERPROFILE")
         appdata (System/getenv "APPDATA")]
     (concat
+      ;; grog's own installed ECA — the one we expect to drive.
+      (when-let [localappdata (System/getenv "LOCALAPPDATA")]
+        [(java.io.File. localappdata "eca")])
       ;; VS Code user extensions (Windows + POSIX): ~/.vscode/extensions
       (extension-eca-dirs (io/file home ".vscode" "extensions"))
       ;; VS Code scoop installs: %USERPROFILE%\scoop\apps\vscode\{version,current}
@@ -243,8 +257,12 @@
     (cond
       explicit (.getAbsolutePath explicit)
 
+      ;; PATH: the user's own install wins (this is also where our fallback dir
+      ;; lands on installs made by an older prereqs.ps1). Return the ABSOLUTE
+      ;; path so the startup log names the binary, not the word "eca".
       (or (nil? (seq eca-binary)) (path-executable? eca-binary))
-      (if (seq eca-binary) (msys-path->windows eca-binary) "eca")
+      (or (when (seq eca-binary) (some-> (path-executable-file eca-binary) .getAbsolutePath))
+          (if (seq eca-binary) (msys-path->windows eca-binary) "eca"))
 
       :else
       (or (when-let [f (some (fn [^java.io.File f] (and (.isFile f) (.getAbsolutePath f)))
@@ -454,7 +472,7 @@
     (try
       (let [init (send-request! id "initialize"
                                 {:processId (long (try (.pid (ProcessHandle/current)) (catch Exception _ 0)))
-                                 :clientInfo {:name "grog" :version "0.1.0"}
+                                 :clientInfo {:name "grog" :version "0.2.0"}
                                  :capabilities {:codeAssistant {:chat true :rewrite false}}
                                  :workspaceFolders (vec workspace-folders)})]
         (if (:error init)
@@ -466,16 +484,29 @@
         (disconnect! id)
         (throw e)))))
 
+(defn- kill-tree!
+  "Kill a child process AND everything beneath it.
+
+  Delegates to `grog.platform/kill-tree!` — ONE implementation, because the bug
+  recurred precisely when the MCP launchers kept their own leaky `.destroy`.
+  History (why this matters): `.destroy` terminates only the one process; ECA's
+  children are `bash -lc \"java … --server …\"` wrappers, so on Windows the JVMs
+  were orphaned and stayed resident — measured: 121 leaked JVMs plus 77 bash
+  wrappers, enough to thrash the box into 'java out of memory'."
+  [^Process p]
+  (platform/kill-tree! p))
+
 (defn disconnect!
-  "Politely shut down session `id`'s ECA child (shutdown -> exit) and kill it."
+  "Politely shut down session `id`'s ECA child (shutdown -> exit), then kill it
+  AND its descendants (see `kill-tree!` — plain `.destroy` leaked the MCP
+  servers)."
   [id]
   (when-let [conn (get @!conns id)]
     (try (send-request! id "shutdown" nil)
          (catch Exception _))
     (try (send-notify! id "exit" {})
          (catch Exception _))
-    (try (.destroy ^Process (:process conn))
-         (catch Exception _))
+    (kill-tree! (:process conn))
     (swap! !conns dissoc id))
   nil)
 

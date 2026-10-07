@@ -25,10 +25,30 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [grog.config :as cfg]
+            [grog.docs :as docs]
             [grog.platform :as platform])
   (:import (java.io File)))
 
 ;; ---------------------------------------------------------------------------
+;; The getting-started project
+;; ---------------------------------------------------------------------------
+
+(def bootstrap-project-name
+  "The name of the FIRST-RUN getting-started project (`grog.bootstrap`).
+
+  Deliberately NOT `grog`: that name belongs to the developer's own checkout
+  (`~/grog-projects/grog` is where grog is developed), so the onboarding project
+  must not collide with it. `ouroboros` — the snake that eats its tail — is the
+  self-referential joke made real: the app bootstraps itself by talking to
+  itself about its own documentation. That's what grog is — a deliberate vicious
+  cycle."
+  "ouroboros")
+
+(defn bootstrap-project?
+  "True when `proj` names the getting-started project."
+  [proj]
+  (= (str/trim (str proj)) bootstrap-project-name))
+
 ;; Projects home
 ;; ---------------------------------------------------------------------------
 
@@ -179,18 +199,64 @@
   (let [p (resolve-active-project)]
     (when p (project-root p))))
 
+(defn extension-for-media-type
+  "File extension for an image media type (no dot). Unknown types fall back to
+  `png` — a wrong extension is better than losing the image."
+  ^String [media-type]
+  (case (str/lower-case (str media-type))
+    "image/jpeg" "jpg"
+    "image/jpg"  "jpg"
+    "image/webp" "webp"
+    "image/gif"  "gif"
+    "image/svg+xml" "svg"
+    "image/bmp"  "bmp"
+    "image/tiff" "tiff"
+    "png"))
+
+(defn save-image!
+  "Write base64 image bytes into `project`'s `images/` dir — a DURABLE artifact
+  beside notes/ and state/, not a temp file, so it travels with the project and
+  can be handed to somebody (or read back by another grog).
+
+  Returns `{:path <absolute> :rel <project-relative> :bytes n}`, or nil when the
+  project cannot be resolved or the bytes are missing."
+  [project media-type base64]
+  (when-let [root (project-root (or project (project-name)))]
+    (let [^String b64 (some-> base64 str not-empty)]
+      (when b64
+        (let [dir (io/file root "images")
+              _ (.mkdirs dir)
+              f (io/file dir (str "grog-image-" (System/currentTimeMillis) "."
+                                  (extension-for-media-type media-type)))
+              bytes (.decode (java.util.Base64/getDecoder) b64)]
+          (with-open [os (io/output-stream f)]
+            (.write os ^bytes bytes))
+          {:path (.getPath f)
+           :rel (str "images/" (.getName f))
+           :bytes (alength ^bytes bytes)})))))
+
 (defn workspace-folders
   "ECA `workspaceFolders` for the active project: a one-element vector of
   {:uri <file://…> :name <project>} rooted at the active project's primary
   directory (`project-root`). This abandons the repo-root workspace — the agent
   operates purely on the active project. Falls back to the projects home if the
-  project dir cannot be resolved. Always returns a non-empty seq."
-  []
-  (let [proj (or (resolve-active-project) (project-name) "default")
+  project dir cannot be resolved. Always returns a non-empty seq.
+
+  The getting-started project (`ouroboros`) gets a SECOND folder: grog's own
+  documentation, resolved at runtime by `grog.docs` (it lives in the app bundle,
+  so a packaged client cannot find it by searching). REFERENCED, never copied —
+  the shipped docs stay the single source of truth, so a rebuild flows straight
+  into the project and the project can never drift."
+  [proj]
+  (let [proj (or proj (project-name) "default")
         root (or (project-root proj)
-                 (ensure-project-dir! proj))]
-    [{:uri (str (.toURI (platform/canonical-file root)))
-      :name proj}]))
+                 (ensure-project-dir! proj))
+        base [{:uri (str (.toURI (platform/canonical-file root)))
+               :name proj}]
+        docs (when (bootstrap-project? proj) (docs/docs-dir))]
+    (cond-> base
+      docs (conj {:uri (str (.toURI (platform/canonical-file docs)))
+                  :name "grog-docs"}))))
 
 (defn manifest-for
   "The manifest for a project by name (or {} if no project)."
@@ -345,10 +411,10 @@
   "Load a project's relevant context as a markdown string: a short header with the
   project path, manifest description (if any), and top-level layout, then the
   contents of its `notes/` text files (best effort; the `dialog/thread.edn` chat
-  log is deliberately excluded). Returns nil when no active project / no dir."
-  ^String []
-  (when-let [proj-dir (project-dir-for-active)]
-    (let [proj (project-name)]
+  log is deliberately excluded). Returns nil when no project / no dir."
+  ^String [proj]
+  (when-let [proj-dir (project-dir (or proj (project-name)))]
+    (let [proj (or proj (project-name))]
       (if-not (and proj (.isDirectory proj-dir))
         (str "Active project: **" proj "** (no directory yet at "
              (.getPath proj-dir) " — create it to hold project context).")
@@ -371,7 +437,7 @@
                (str/join "\n")))))))
 
 ;; ---------------------------------------------------------------------------
-;; Project-owned state (collapse of the old edn-store "Projects/<proj>" split)
+;; Project-owned state, kept under each project's own home
 ;; Every project owns its runtime state under its own project home:
 ;;   ~/grog-projects/<proj>/state/mem.db        (SQLite assoc memory store)
 ;;   ~/grog-projects/<proj>/state/              (other working data)

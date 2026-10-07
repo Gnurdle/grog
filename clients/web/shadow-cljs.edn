@@ -1,0 +1,9 @@
+{:deps true   ; classpath (paths + deps) comes from deps.edn — required, else
+              ; src/renderer never lands on the classpath and builds fail with
+              ; "namespace grog-web.core is not available"
+ :builds
+ {:app {:target :browser
+        :output-dir "resources/public/js"
+        :asset-path "/js"
+        :modules {:main {:init-fn grog-web.core/init}}
+        :devtools {:http-port 9633 :http-root "resources/public"}}}}

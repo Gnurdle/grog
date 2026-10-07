@@ -409,7 +409,7 @@
 
 ;; Config is file-based: ~/.config/grog/office.edn
 ;;   {:bin "soffice" :pdftoppm "pdftoppm"}
-;; (env vars are intentionally NOT read — file-config normalization, like grog-big.)
+;; (env vars are intentionally NOT read — file-config normalization, like the other grog MCP servers.)
 (defn- config-file []
   (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
            ".config/grog/office.edn"))

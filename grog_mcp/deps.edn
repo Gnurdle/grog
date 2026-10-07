@@ -1,5 +1,27 @@
-{:paths ["src" "vendor-src"]
+{:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+
+        ;; --- the 11 MCP servers, referenced as sibling PROJECTS --------------
+        ;; `:local/root` puts each project's own `src` on the classpath, so the
+        ;; bundle needs NO vendored copy and `bb sync-vendor` is unnecessary.
+        ;; A copy existed only because the Clojure CLI deprecates `:paths`
+        ;; outside the project ("Use of :paths external to the project has been
+        ;; deprecated" — one warning per path, per launch, onto the MCP child's
+        ;; stderr). Symlinks are NOT an alternative: git stores them as
+        ;; symlinks, Windows checks them out as plain text files, and
+        ;; tools.build's copy-dir silently skips them.
+        grog/grog-alpaca         {:local/root "../grog-alpaca"}
+        grog/grog-babashka       {:local/root "../grog-babashka"}
+        grog/grog-fetch          {:local/root "../grog-fetch"}
+        grog/grog-gitlab         {:local/root "../grog-gitlab"}
+        grog/grog-imaging        {:local/root "../grog-imaging"}
+        grog/grog-imap           {:local/root "../grog-imap"}
+        grog/grog-odoo           {:local/root "../grog-odoo"}
+        grog/grog-office         {:local/root "../grog-office"}
+        grog/grog-project-search {:local/root "../grog-project-search"}
+        grog/grog-rss            {:local/root "../grog-rss"}
+        grog/grog-search         {:local/root "../grog-search"}
+
         org.clojure/data.json {:mvn/version "2.5.1"}
         cheshire/cheshire {:mvn/version "5.13.0"}
         clj-http/clj-http {:mvn/version "3.13.0"}
@@ -7,7 +29,9 @@
         org.apache.poi/poi-ooxml {:mvn/version "5.3.0" :exclusions [org.apache.poi/poi-ooxml-lite]}
         org.apache.poi/poi-ooxml-full {:mvn/version "5.3.0"}
         org.apache.pdfbox/pdfbox {:mvn/version "3.0.4"}
-        net.sourceforge.tess4j/tess4j {:mvn/version "5.14.0"}
+        ;; OCR shells out to the `tesseract` CLI (see grog_imaging.image) — no
+        ;; tess4j/JNA/lept4j native chain in the jar. Tesseract itself is a probed
+        ;; prerequisite (%PATH%, or `:tesseract-bin` in imaging.edn).
         org.boofcv/boofcv-io {:mvn/version "1.2.2"}
         org.boofcv/boofcv-feature {:mvn/version "1.2.2"}
         org.postgresql/postgresql {:mvn/version "42.7.4"}
@@ -15,11 +39,25 @@
         com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
         ;; assoc-memory store (Clojure repl of grog-memory) — SQLite via JDBC
         org.xerial/sqlite-jdbc {:mvn/version "3.45.1.0"}
-        org.slf4j/slf4j-nop {:mvn/version "2.0.3"}}
+        org.slf4j/slf4j-nop {:mvn/version "2.0.3"}
+        ;; Streamable-HTTP MCP server transport (the SAME library ECA uses as an
+        ;; MCP *client* — see grog-mcp.http); brings plumcp.core transitively.
+        io.github.plumce/plumcp.core-json-cheshire {:mvn/version "0.2.0-beta6"}}
  :aliases
- {:mcp {:main-opts ["-m" "grog_mcp.main"]
+ {;; NOTE: the servers arrive as `:local/root` deps (above), NOT via a ":dev"
+  ;; alias with `:paths` pointing at ../grog-<x>/src. That was tried and is a
+  ;; dead end: the Clojure CLI deprecates `:paths` external to the project
+  ;; ("Use of :paths external to the project has been deprecated") and prints
+  ;; one warning per path on every launch — straight onto the MCP child's
+  ;; stderr. `:local/root` is the supported way, and needs no vendored copy.
+  :mcp {:main-opts ["-m" "grog_mcp.main"]
         :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                    "--enable-native-access=ALL-UNNAMED"]}
+  ;; Streamable-HTTP MCP endpoint (localhost only): one JVM, all tools, ECA
+  ;; dials it by :url instead of spawning 13 stdio children. See grog-mcp.http.
+  :http {:main-opts ["-m" "grog_mcp.http"]
+         :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                    "--enable-native-access=ALL-UNNAMED"]}
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.8"}}
           :ns-default build}
   :test {:extra-paths ["test"]

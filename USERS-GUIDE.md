@@ -18,7 +18,10 @@ grog merges several sources. **Later sources win.**
 |---|---|---|
 | 1 | bundled defaults (`resources/config.examples/grog.edn.example`) | built-in defaults / template |
 | 2 | **user `grog.edn`** (see table below) | your personal setup |
-| 3 | `./grog.edn` in the run directory | project/override config |
+
+There is deliberately no `./grog.edn` (working-directory) layer: it used to
+override the user config, which made saved settings (model, appearance) revert
+on reload.
 
 ### Where is the user `grog.edn`?
 
@@ -30,16 +33,13 @@ The location is **platform-aware** and can be overridden with **`GROG_CONFIG_HOM
 | Any (override) | `$GROG_CONFIG_HOME/grog.edn` |
 
 > **Windows:** grog uses `~/.config/grog` (same as ECA's own `~/.config/eca`).
-> The old `%APPDATA%\grog` location is no longer supported; if you have files
-> there, move them (e.g. `grog.edn`, `secrets.edn`, `odoo-instances.edn`) to
-> `C:\Users\you\.config\grog\` yourself.
 
 Secrets and generated files (ECA config, IMAP/Odoo metadata, approved-tools,
 `secrets.edn`) live **in the same config home directory**, so moving to a new
 machine is "copy one folder + set one env var".
 
-> Legacy Linux users: `~/.config/grog/grog.edn` is still honored even when
-> `$GROG_CONFIG_HOME` points elsewhere.
+> `~/.config/grog/grog.edn` is honored even when `$GROG_CONFIG_HOME` points
+> elsewhere.
 
 ---
 
@@ -59,21 +59,69 @@ machine is "copy one folder + set one env var".
 
    ```bash
    cd <repo>
-   clojure -M:gui          # Swing GUI (or ./grog-ui)
+   scripts/grog-client --console   # desktop app (Linux; scripts\grog-client.bat on Windows)
    ```
 
 4. **Talk to it.** If your provider needs an API key, store it (section 4) before
    chatting.
 
+### First run — the getting-started project (`ouroboros`)
+
+A brand-new grog has no provider, model or key, so it cannot think yet. Two
+things happen on that first launch, both fully offline:
+
+1. **The bootstrap page.** Instead of a transcript you get *Job 1 — get your LLM
+   online*: it names the three steps (set `:llm :url` and `:llm :model`, store the
+   key with `/secret set LLM_API_KEY <value>`, restart). The composer stays usable,
+   because `/secret` is handled locally and needs no model.
+2. **`ouroboros`.** grog seeds ONE project, named after the snake that eats its
+   tail — the getting-started project. Its `SOUL.md` makes the agent your
+   onboarding guide, and grog's **own documentation is mounted into it** as a
+   workspace folder named `grog-docs/`. The agent therefore reads the *shipped*
+   docs (they travel inside the application) and walks you through setup,
+   `grog doctor`, and a first smoke test.
+
+The docs are **referenced, never copied** — the app bundle is the single source of
+truth, so upgrading grog upgrades the docs the agent reads. `ouroboros` is
+(re)created when you have **no projects at all**, or when grog's config home has
+just been seeded or reset — so deleting `~/.config/grog` and relaunching brings the
+welcome back. It never displaces your own work.
+
+The bootstrap page shows again on any fresh config home, and it reports *grog's*
+readiness only: the "three steps" retire once **grog** has its own key (or points
+at a local endpoint). A key that lives only in ECA's own config does **not** count —
+onboarding exists to set up *grog's* secret store, so a fresh grog still walks you
+through it even if an inherited ECA key could reach a model.
+
+> Guided setup is much easier with a capable model. On a small local model, expect
+> to lean on `grog doctor` and the docs rather than the model's reasoning. The
+> choice of model is yours.
+
 ---
 
 ## 3. Full annotated config
 
-Copy `resources/config.examples/grog.edn.example` to your user config path, then
-edit. Everything is optional except `:llm :url` and `:llm :model`. For a complete
-starter bundle (imaging tessdata, gitlab, odoo, imap, secrets prototypes), copy
-the whole `resources/config.examples/` directory into your config home — see its
-`README.md`.
+On first run — when there is no `grog.edn` — the client **writes one for you**
+from the bundled example, names the exact path in its log, and leaves the
+optional examples beside it:
+
+```text
+[grog-client] no grog.edn yet - seeded the config home from the example:
+  ~/.config/grog/grog.edn
+[grog-client] edit ~/.config/grog/grog.edn - at least :llm :url, :llm :model and
+  an API key - then restart grog; until then it cannot reach a model.
+```
+
+Nothing is overwritten, and the starter is still missing a model, a provider and
+an API key, so it cannot work until you edit it — edit the file, then restart
+grog. The optional examples (odoo, imap, gitlab, imaging, secrets) are left
+alongside it as `*.example`; copy the ones you need.
+
+Everything is optional except `:llm :url` and `:llm :model`.
+
+*(From a source tree the same files live at `resources/config.examples/` and the
+client seeds from there too, so a dev checkout gets a starter `grog.edn` just
+like a packaged install.)*
 
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
@@ -151,7 +199,7 @@ In **chat** (GUI or terminal):
 ```text
 /secret                       # list accounts + set/unset status (values never printed)
 /secret set LLM_API_KEY sk-...   # store a key (both backends)
-/secret BRAVE_SEARCH_API ...     # legacy form — same effect
+/secret BRAVE_SEARCH_API ...     # alternative form — same effect
 /secret rm LLM_API_KEY           # remove from keyring and file store
 /secret file                     # show the fallback file path
 /secret backend                  # show which backend is active
@@ -165,17 +213,30 @@ In **chat** (GUI or terminal):
 
 ### 4.4 Custom secret accounts
 
-You can teach grog about additional accounts (for the `with_api_key` tool) by
-adding them to `:secrets :accounts` in `grog.edn`:
+**The secret store is yours — any name you invent works.** `/secret set`,
+`/secret rm`, and any config field that names an account (e.g. an Odoo
+instance's `:password-secret "ODOO_PROD_PASSWORD"`) accept whatever name you
+type; nothing has to be declared first.
+
+```text
+/secret set ODOO_PROD_PASSWORD <value>     # works with no config change at all
+```
+
+Declaring an account under `:secrets :accounts` in `grog.edn` is **optional**
+and purely cosmetic — it only adds a description to the `/secret` listing:
 
 ```clojure
 {:secrets {:accounts [{:account "GITHUB_TOKEN"      :description "GitHub PAT"}
-                      {:account "PHANTOM_X"         :description "Another API token"}]}
- :with-api-key {:allowed-secrets ["GITHUB_TOKEN"]}}
+                      {:account "PHANTOM_X"         :description "Another API token"}]}}
 ```
 
-Then store them with `/secret set GITHUB_TOKEN <value>`. `with_api_key` will
-only accept account names listed in `:with-api-key :allowed-secrets`.
+`with_api_key` has its own explicit allowlist (`:with-api-key
+:allowed-secrets`) — *that* is the real gate for what the model may pass by
+name, and it too accepts names you never declared:
+
+```clojure
+{:with-api-key {:allowed-secrets ["ODOO_PROD_PASSWORD"]}}
+```
 
 ### 4.5 Configuring an API-keyed provider
 
@@ -191,19 +252,27 @@ That's all you need for any OpenAI-compatible cloud provider.
 ### Windows
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`,
-  or `$GROG_CONFIG_HOME`). The old `%APPDATA%\grog` location is no longer used.
-- **Log files**: each running grog writes its own log — `<base>.<pid>.log` — so
-  concurrent instances never share a file. `<base>` defaults to `~/grog-ui`
-  (`%USERPROFILE%\grog-ui` on Windows) and is set by `:log {:dir … :keep …}` in
-  `grog.edn` (`GROG_LOG` / `GROG_UI_LOG_KEEP` override for one-off runs). On
-  startup the oldest instance logs are pruned, keeping `:keep` (default 5).
-  Logging is in-process (`grog.log`), which tees stdout/stderr to both the console
-  and the file, so `tail -f ~/grog-ui.<pid>.log` shows live output.
-- **If the chat shows `ECA connect failed`**: grog looks for the `eca` binary on
-  PATH, then in scoop shims, npm global, and `~/.vscode/extensions` (the
-  `editor-code-assistant.eca-*` extension dir). If it's anywhere else, set
-  `:eca :binary` in your `grog.edn` to the full path (e.g.
-  `C:\Users\you\scoop\shims\eca.exe`).
+  or `$GROG_CONFIG_HOME`).
+- **Log files**: the client writes one log per running instance —
+  `<base>.<pid>.log` — so concurrent instances never share a file. `<base>` is
+  `$GROG_LOG` (a trailing `.log` is stripped) else `~/grog`
+  (`%USERPROFILE%\grog` on Windows). The client captures its own messages **and**
+  the backend's stdout/stderr into the file, so `tail -f ~/grog.<pid>.log` shows
+  live output. On startup the oldest instance logs are pruned, keeping
+  `$GROG_UI_LOG_KEEP` (default 5). Set `GROG_LOG_WIRE=1` to also record the raw
+  driver traffic (NDJSON — off by default; high volume).
+- **Profile & cache**: Chromium's private store (HTTP/GPU/Code caches, Local
+  Storage) is kept in `%LOCALAPPDATA%\grog` — **Local** AppData, not Roaming, so
+  it never bloats a roaming/domain profile. This is not grog's config; that
+  stays in `~/.config/grog`.
+- **If the chat shows `ECA connect failed`**: grog resolves the `eca` binary
+  **at every launch** — `:eca :binary` (if set), else PATH, else
+  `~/.vscode/extensions` (`editor-code-assistant.eca-*`, the VS Code extension),
+  else scoop shims, npm global, and last the installer's own copy in
+  `%LOCALAPPDATA%\eca`. An ECA you install later is therefore picked up on the
+  next launch, and the installer never downloads a second copy when one is
+  already present. If it's somewhere else, set `:eca :binary` to the full path
+  (e.g. `C:\Users\you\scoop\shims\eca.exe`).
 - **Secret backend**: Windows Credential Manager; falls back to
   `~/.config/grog/secrets.edn` automatically if needed.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
@@ -212,7 +281,9 @@ That's all you need for any OpenAI-compatible cloud provider.
 ### Linux
 
 - **Config home**: `~/.config/grog/grog.edn` (or `$XDG_CONFIG_HOME/grog/grog.edn`).
-- **Launch**: `./grog-ui` (or `clojure -M:gui`).
+- **Launch**: `scripts/grog-client` (add `--console` to stream the log here).
+- **Log files**: same rule as Windows — `<base>.<pid>.log`, where `<base>` is
+  `$GROG_LOG` else `~/grog`.
 - **Secret backend**: Secret Service if a desktop session with a keyring is
   running; otherwise falls back to `~/.config/grog/secrets.edn`.
 
@@ -249,6 +320,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | Config changes "not applied" | grog reads config at startup. After editing `grog.edn`, restart (or use `/soul reload` where applicable). |
 | Windows: no config found | Your user `grog.edn` should be under `C:\Users\you\.config\grog\` (not AppData). |
 | Where's my `secrets.edn`? | `/secret file` prints its absolute path. |
+| Where's my client log? | `<base>.<pid>.log` — base is `$GROG_LOG` else `~/grog` (`%USERPROFILE%\grog`). The newest file is the running instance; the client prints its path at startup (`[grog-client] log file: …`). |
 
 ---
 
@@ -256,9 +328,9 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 
 | Command | Effect |
 |---|---|
-| `/secret` | list known accounts + set/unset status (values never printed) |
+| `/secret` | list accounts + set/unset status (values never printed) |
 | `/secret set <KEY> <value>` | store a secret (keyring or file fallback) |
-| `/secret <KEY> <value>` | legacy alias for the above |
+| `/secret <KEY> <value>` | short alias for the above |
 | `/secret rm <KEY>` | delete a secret |
 | `/secret file` | show the fallback store path |
 | `/secret backend` | show active backend |
@@ -267,6 +339,7 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | `/model reset` | revert session override to config file values |
 | `/model <name>` / `/model <profile>` | switch provider/model/profile for the session |
 | `/project`, `/project <name>` | switch per-project context home |
+| `/reset` / `/reset --yes` | factory reset — plan first, then perform (see §10) |
 
 ---
 
@@ -278,12 +351,42 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 |---|---|
 | `grog.edn` | your config (user-level) |
 | `secrets.edn` | fallback secret store (owner-only perms) |
+| `secret-ledger.edn` | names of secrets **grog itself wrote** (never values) — lets `/reset` remove exactly those |
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
-| `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; legacy `.json` still read) |
+| `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
 | `approved-tools.edn` | permanently-allowed tool names |
+
+Per-instance **client logs** live outside the config home: `<base>.<pid>.log` in
+`~/grog` by default (`%USERPROFILE%\grog` on Windows), or wherever `$GROG_LOG`
+points — see §5.
+
+---
+
+## 10. Factory reset (the airbag)
+
+If the state gets too wonky, reset grog to a fresh install:
+
+- in chat: `/reset` prints a **plan** and changes nothing; `/reset --yes` performs it;
+- from a shell: `clojure -M -m grog.reset [--yes]`.
+
+It removes **only what grog made**:
+
+| Removed | Note |
+|---|---|
+| the getting-started project (`ouroboros`) | copied into the backup dir first |
+| the config home (`~/.config/grog`) | MOVED into the backup — `grog.edn` and `secrets.edn` survive there |
+| saved session configs | they live under the config home |
+| credentials **grog created** | read from `secret-ledger.edn` (§9) and deleted from the keyring |
+
+Nothing is destroyed outright: everything is moved into
+`~/.config/grog.reset-<timestamp>/`. **Secret values are never exported** — the
+keyring entries grog wrote are deleted, so re-enter them with `/secret`. Your other
+projects (including a developer's own `grog` project) are never touched.
+**Restart grog afterwards** — it comes up on defaults, re-seeds `ouroboros`, and
+the client writes a fresh starter `grog.edn` into the (new) config home.
 
 ---
 
 *See also:* the `README.md` (full feature listing, quick start, MCP) and
-`resources/config.examples/grog.edn.example` (annotated template with every
-option).
+`grog.edn.example` (annotated template with every option) — placed in your
+config home on first run, and at `resources/config.examples/` in a source tree.

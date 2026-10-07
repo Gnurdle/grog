@@ -14,6 +14,8 @@ grog-memory.db
 grog-memory/*.db
 grog-memory/gmail-cleanup
 
+clients/web/resources/public/js/
+clients/web/resources/public/css/output.css
 # Stray assoc stores the BUNDLE's memory server drops in its cwd. It resolves
 # `path` as a literal cwd-relative filename with NO .db suffix and no reserved
 # -name handling, so a caller passing "global" (or a nil stringified to "null")
@@ -26,3 +28,15 @@ grog_mcp/*.db
 .clj-kondo/
 .lsp/
 .cpcache/
+
+# Client build output and downloaded packages — never commit these.
+node_modules/
+dist/
+*.tar.gz
+
+# Speech models: large, platform-neutral INPUTS that ARE shipped (packaged via
+# extraResources) but must never be committed.
+resources/models/*.bin
+
+# Per-instance run logs
+*.pid.log

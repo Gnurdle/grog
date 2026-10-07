@@ -4,6 +4,11 @@
         clj-http/clj-http {:mvn/version "3.13.0"}
         io.modelcontextprotocol.sdk/mcp {:mvn/version "0.8.0"}
         org.postgresql/postgresql {:mvn/version "42.7.4"}
+        ;; OS keyring: macOS Keychain / Windows Credential Manager / Linux Secret
+        ;; Service — per-instance credentials come from grog's secret store, not
+        ;; from the instances file. The bundle already carries this (grog-search),
+        ;; so the shipped jar needs no change; this is for standalone runs.
+        com.github.javakeyring/java-keyring {:mvn/version "1.0.4"}
         org.slf4j/slf4j-nop {:mvn/version "2.0.3"}}
  :aliases
  {:mcp {:main-opts ["-m" "grog-odoo.main"]}

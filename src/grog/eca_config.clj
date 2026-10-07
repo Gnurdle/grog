@@ -16,6 +16,7 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [grog.config :as config]
+            [grog.mcp-http :as mcp-http]
             [grog.models :as models]
             [grog.projects :as projects]
             [grog.secrets :as secrets]
@@ -52,40 +53,49 @@
   (some-> v str env-interp str/trim not-empty))
 
 (defn- clean-inst
-  "Interpolate + drop blank scalar fields of an instance map."
+  "Interpolate + drop blank scalar fields of an instance map.
+
+  `:password-secret` is a store ACCOUNT NAME, not a value, so it is copied
+  through verbatim and never `${ENV}`-interpolated — a credential must not be
+  reachable through the environment by way of its name."
   [m]
   (into {}
-        (keep (fn [[k v]] (when-let [v (interp-inst v)] [(keyword (name k)) v])))
+        (keep (fn [[k v]]
+                (let [k (keyword (name k))]
+                  (if (= :password-secret k)
+                    (let [v (some-> v str str/trim not-empty)]
+                      (when v [k v]))
+                    (when-let [v (interp-inst v)] [k v])))))
         m))
 
-(defn- clean-sql
-  "Interpolate env refs in the (optional) `:sql` block of an instance map,
-  preserving non-string values (e.g. `:port`)."
-  [sql]
-  (when sql
-    (into {}
-          (keep (fn [[k v]]
-                  (when (some? v)
-                    [k (if (string? v) (interp-inst v) v)])))
-          sql)))
-
 (defn- odoo-instances-data
-  "Legacy instances list from grog.edn's `:odoo` (used only as a one-time
-  migration fallback — Odoo config now lives in `odoo-instances.edn`).
+  "Instances list from grog.edn's `:odoo`, used as a one-time migration fallback
+  — Odoo config otherwise lives in `odoo-instances.edn`.
 
-  New shape: `:instances [{:name ... :url ... :db ... :user ... :password ...
-                           :sql {...}} ...]`.
-  Legacy shape (`:url`/`:db`/`:user`/`:password` at the top level) is treated
+  Shape: `:instances [{:name ... :url ... :db ... :user ... :password-secret ...
+                       :allow-write false} ...]`.
+  `:password-secret` is a store ACCOUNT NAME, never a credential, so nothing this
+  writer produces ever contains a password.
+  A flat shape (`:url`/`:db`/`:user`/`:password-secret` at the top level) is treated
   as a single instance named \"default\".
+
+  There is deliberately no `:sql` block any more: SQL goes through the
+  instance's own Odoo API (the Select-O-Matic addon), never a database
+  connection, so no database host/port/credentials belong here.
+
   Returns nil when nothing usable is configured."
   []
-  (let [o (get-in (config/grog) [:odoo] {})]
+  (let [o (get-in (config/grog) [:odoo] {})
+        ;; :allow-write is a BOOLEAN — keep it out of clean-inst (which
+        ;; stringifies), or `false` would come back as the truthy "false".
+        with-write (fn [m src]
+                     (cond-> m
+                       (contains? src :allow-write)
+                       (assoc :allow-write (boolean (:allow-write src)))))]
     (if (seq (:instances o))
-      (mapv (fn [i]
-              (cond-> (clean-inst (select-keys i [:name :url :db :user :password]))
-                (:sql i) (assoc :sql (clean-sql (:sql i)))))
+      (mapv (fn [i] (with-write (clean-inst (select-keys i [:name :url :db :user :password-secret])) i))
             (:instances o))
-      (let [inst (clean-inst (select-keys o [:name :url :db :user :password]))]
+      (let [inst (with-write (clean-inst (select-keys o [:name :url :db :user :password-secret])) o)]
         (when (and (:url inst) (:db inst) (:user inst))
           [(merge {:name "default"} inst)])))))
 
@@ -102,7 +112,7 @@
 
 (defn odoo-configured?
   "True when Odoo is configured anywhere: the user-maintained
-  `odoo-instances.edn`, a legacy `grog.edn :odoo` block, or legacy
+  `odoo-instances.edn`, a `grog.edn :odoo` block, or
   `GROG_ODOO_*` env vars."
   []
   (boolean
@@ -115,21 +125,24 @@
 
   Source of truth: the **user-maintained** `~/.config/grog/odoo-instances.edn`.
   Edit that file directly (credentials stay in config home, never in grog.edn).
-  If it's absent and grog.edn still carries a legacy `:odoo` block, grog writes
-  the file once (migration) so the model still sees the same instances.
+  If it's absent and grog.edn carries a `:odoo` block, grog writes the file
+  once (migration) so the model still sees the same instances.
 
-  Final fallback is legacy single-instance env vars (`GROG_ODOO_URL` /
-  `GROG_ODOO_DB` / `GROG_ODOO_USER` / `GROG_ODOO_PASSWORD`)."
+  Final fallback is single-instance env vars (`GROG_ODOO_URL` /
+  `GROG_ODOO_DB` / `GROG_ODOO_USER`) — NO password.
+
+  NOTE: like grog-gitlab, this server gets NO secret injection. It used to pass
+  `GROG_ODOO_PASSWORD`, and everything in this env map is written VERBATIM into
+  the generated config (`~/.config/grog/sessions/<project>.json`), so the Odoo
+  password sat on disk in cleartext. grog-odoo now reads the OS keyring itself,
+  per instance (`:password-secret` in odoo-instances.edn). Nothing secret may
+  enter this env map."
   []
   (let [path (odoo-instances-path)
         f (io/file path)]
     (cond
       (.exists f)
-      (cond-> {"GROG_ODOO_CONFIG" path}
-        ;; Password comes from the OS keyring (/secret set ODOO_PASSWORD <value>),
-        ;; injected as a per-process env var — never a literal in the config file.
-        (some? (secrets/get-secret "ODOO_PASSWORD"))
-        (assoc "GROG_ODOO_PASSWORD" (secrets/get-secret "ODOO_PASSWORD")))
+      {"GROG_ODOO_CONFIG" path}
 
       (seq (odoo-instances-data))
       (do (spit f (with-out-str (pprint/pprint {:instances (odoo-instances-data)})))
@@ -148,8 +161,7 @@
                             (when-let [v (one cfg-k)] [env-k v])))
                     [["GROG_ODOO_URL" :url]
                      ["GROG_ODOO_DB" :db]
-                     ["GROG_ODOO_USER" :user]
-                     ["GROG_ODOO_PASSWORD" :password]])]
+                     ["GROG_ODOO_USER" :user]])]
         (when (seq m) m)))))
 
 (defn gitlab-config-path
@@ -183,15 +195,14 @@
      (or (and cfg (or (:url cfg) (:token cfg) (:token-file cfg)))
          (.exists inst-file)))))
 
-(defn- gitlab-env
-  "Env map for the grog-gitlab MCP server.
-
-  The token comes from the OS keyring (`/secret set GITLAB_TOKEN <value>`),
-  injected as a per-process env var — never a literal in the config file. The
-  server interpolates `${GROG_GITLAB_TOKEN}` in its `:token` field."
-  []
-  (let [tok (some-> (secrets/get-secret "GITLAB_TOKEN") str str/trim not-empty)]
-    (when tok {"GROG_GITLAB_TOKEN" tok})))
+;; NOTE: there is deliberately no `gitlab-env` any more.
+;;
+;; It used to inject the token as `GROG_GITLAB_TOKEN` — and everything in this
+;; env map is written VERBATIM into the generated config
+;; (`~/.config/grog/sessions/<project>.json`), so the GitLab token sat on disk in
+;; plaintext. The token is now read from the OS keyring by grog-gitlab itself
+;; (`/secret set GITLAB_TOKEN <value>`), which is also how grog-search reads the
+;; Brave key. Nothing secret should ever enter this env map.
 
 (defn- grog-root
   "The grog project root (where deps.edn and the grog-* sibling dirs live)."
@@ -199,55 +210,56 @@
   (abs-path (System/getProperty "user.dir" ".")))
 
 (defn memory-db-path
-  "The grog-memory SQLite store for the ACTIVE project:
-  `~/grog-projects/<proj>/state/mem.db`. grog is always in a project
-  (`resolve-active-project` guarantees one), so there is no repo-root fallback."
-  ^String []
-  (or (projects/active-memory-db-path)
-      (throw (ex-info "no active project for memory store" {}))))
+  "The grog-memory SQLite store for `project`:
+  `~/grog-projects/<proj>/state/mem.db`. grog is always in a project,
+  so there is no repo-root fallback."
+  ^String [project]
+  (when-not (and project (not (str/blank? (str project))))
+    (throw (ex-info "no active project for memory store" {})))
+  (projects/memory-db-path project))
 
 (defn memory-config-path
   "Per-project grog-memory server config: `<project>/state/memory.edn`. Never a
   global file — two sessions on different projects can't clobber each other."
-  ^String []
-  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/memory.edn"))
+  ^String [project]
+  (str (.getPath (projects/state-dir project)) "/memory.edn"))
 
 (defn- write-memory-config!
-  "Write this project's grog-memory config (`{:db … :max-open …}`) and return its
+  "Write `project`'s grog-memory config (`{:db … :max-open …}`) and return its
   path (handed to the server via `GROG_MEMORY_CONFIG`). Preserves a user-set
   `:max-open`."
-  ^String []
-  (let [p   (memory-config-path)
+  ^String [project]
+  (let [p   (memory-config-path project)
         cur (try (edn/read-string (slurp (io/file p))) (catch Exception _ nil))
         m   (merge {:max-open 8} (when (map? cur) cur)
-                   {:db (memory-db-path)})]
+                   {:db (memory-db-path project)})]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
 
 (defn- memory-env
-  "Env for the grog-memory server: point it at this project's config file."
-  []
-  {"GROG_MEMORY_CONFIG" (write-memory-config!)})
+  "Env for the grog-memory server: point it at THIS project's config file."
+  [project]
+  {"GROG_MEMORY_CONFIG" (write-memory-config! project)})
 
 (defn project-search-config-path
   "Per-project grog-project-search config: `<project>/state/project-search.edn`."
-  ^String []
-  (str (.getPath (projects/state-dir (projects/resolve-active-project))) "/project-search.edn"))
+  ^String [project]
+  (str (.getPath (projects/state-dir project)) "/project-search.edn"))
 
 (defn- write-project-search-config!
-  "Write this project's grog-project-search config (projects home + active project)
+  "Write `project`'s grog-project-search config (projects home + project name)
   and return its path (handed to the server via `GROG_PROJECT_SEARCH_CONFIG`)."
-  ^String []
-  (let [p (project-search-config-path)
+  ^String [project]
+  (let [p (project-search-config-path project)
         m {:projects-dir (.getPath (config/projects-dir))
-           :project (projects/project-name)}]
+           :project project}]
     (spit (io/file p) (with-out-str (pprint/pprint m)))
     p))
 
 (defn- project-search-env
-  "Env for the grog-project-search server: point it at this project's config file."
-  []
-  {"GROG_PROJECT_SEARCH_CONFIG" (write-project-search-config!)})
+  "Env for the grog-project-search server: point it at THIS project's config file."
+  [project]
+  {"GROG_PROJECT_SEARCH_CONFIG" (write-project-search-config! project)})
 
 (defn default-eca-config-path
   "The standard ECA config file this generator starts from."
@@ -276,19 +288,40 @@
 
 (defn- shell-wrapped
   "An MCP stdio server spec that first `cd`s into `dir`, so `clojure -M:...`
-  resolves that project's deps.edn regardless of ECA's working directory."
+  resolves that project's deps.edn regardless of ECA's working directory.
+
+  When `dir` does not exist the `cd` is dropped: a packaged install has no
+  source tree, and runs the server from an absolute jar path instead."
   [dir cmdline env]
-  (cond-> {"command" "bash"
-           "args" ["-lc" (str "cd '" dir "' && " cmdline)]}
-    env (assoc "env" env)))
+  (let [prefix (if (and dir (.isDirectory (io/file dir)))
+                 (str "cd '" dir "' && ")
+                 "")]
+    (cond-> {"command" "bash"
+             "args" ["-lc" (str prefix cmdline)]}
+      env (assoc "env" env))))
+
+(defn- explicit-bundle-jar
+  "The tool-bundle jar named by `GROG_MCP_JAR`, when the app ships one outside
+  any source tree (a packaged install). Returns a File, or nil."
+  ^java.io.File []
+  (when-let [p (some-> (System/getenv "GROG_MCP_JAR") str str/trim not-empty)]
+    (let [f (io/file p)]
+      (when (.exists f) f))))
 
 (defn- clean-imap-account
-  "Interpolate env refs in string fields; preserve numbers/booleans as-is."
+  "Interpolate env refs in string fields; preserve numbers/booleans as-is.
+
+  `:password-secret` / `:refresh-secret` are STORE ACCOUNT NAMES, not values, so
+  they are copied through verbatim and never `${ENV}`-interpolated — a credential
+  must not be reachable through the environment by way of its name."
   [m]
   (into {}
         (keep (fn [[k v]]
                 (when (some? v)
-                  [k (if (string? v) (interp-inst v) v)])))
+                  [k (if (and (string? v)
+                              (not (contains? #{:password-secret :refresh-secret} k)))
+                       (interp-inst v)
+                       v)])))
         m))
 
 (defn imap-instances-path
@@ -296,6 +329,42 @@
   ^String []
   (let [d (config/ensure-config-dir!)]
     (str d "/imap-accounts.edn")))
+
+(defn startup-config-files
+  "The files the ECA child — and the MCP servers IT spawns — read **at startup**.
+
+  None of these are re-read. An MCP server bakes its configuration in when it is
+  launched, so editing `odoo-instances.edn` (or any of these) cannot reach a
+  running ECA or its children; the old contents keep being served, tool schemas
+  included. Picking a change up therefore means STOPPING the ECA instance and
+  letting it respawn — which is what `config-stamp` detects.
+
+  `grog.edn` is deliberately NOT watched: grog rewrites it for unrelated things
+  (a model pick, an appearance tweak) and restarting ECA on each of those would
+  be worse than the problem."
+  []
+  (let [pf (fn [f] (try (some-> (f) io/file) (catch Throwable _ nil)))]
+    (remove nil?
+            (concat
+             [(io/file (default-eca-config-path))]
+             (map pf [odoo-instances-path
+                      gitlab-config-path
+                      memory-config-path
+                      project-search-config-path
+                      imap-instances-path])))))
+
+(defn config-stamp
+  "Newest last-modified time (epoch ms) across `startup-config-files`, else 0.
+
+  Cheap enough to evaluate before every prompt. If it has moved since the
+  running ECA was started, that ECA and everything under it is serving stale
+  config and must be restarted."
+  ^long []
+  (reduce (fn [acc ^java.io.File f]
+            (try (if (.exists f) (long (max acc (.lastModified f))) acc)
+                 (catch Throwable _ acc)))
+          0
+          (startup-config-files)))
 
 (defn imap-project-config-file
   "Path to the email project's IMAP account metadata (project data, outside the
@@ -307,7 +376,7 @@
 
 (defn imap-configured?
   "True when IMAP account metadata is available — from the email project file, or
-  (backward compat) grog.edn's `:imap :accounts`."
+  grog.edn's `:imap :accounts`."
   []
   (boolean
    (or (.exists (io/file (imap-project-config-file)))
@@ -315,8 +384,8 @@
        (seq (get-in (config/grog) [:imap :accounts])))))
 
 (defn- read-imap-accts
-  "Read the email project's account metadata file as EDN, falling back to legacy
-  JSON (the old `imap-accounts.json`). Returns a seq (possibly nil)."
+  "Read the email project's account metadata file as EDN, falling back to a
+  legacy JSON file (`imap-accounts.json`). Returns a seq (possibly nil)."
   []
   (let [edn-file (java.io.File. (imap-project-config-file))
         json-file (java.io.File. (str/replace (imap-project-config-file) #"\.edn$" ".json"))]
@@ -330,103 +399,127 @@
       :else nil)))
 
 (defn- imap-accounts-data
-  "Account *metadata* (never secrets). Source of truth is the email project file
-  at `~/grog-projects/email/state/imap-accounts.edn` (legacy `.json` accepted);
-  falls back to grog.edn's `:imap :accounts` for backward compatibility."
+  "Account *metadata* (never secrets) for the grog-imap MCP server. Source of
+  truth is the email project file at
+  `~/grog-projects/email/state/imap-accounts.edn` (a `.json` file is also
+  accepted); falls back to grog.edn's `:imap :accounts`.
+
+  `:password-secret` / `:refresh-secret` are carried through — they are the
+  NAMES of store accounts, not credentials (see grog-imap.main)."
   []
   (let [accts (or (read-imap-accts)
                   (get-in (config/grog) [:imap :accounts]))]
     (when (seq accts)
       {:accounts (mapv #(clean-imap-account
                          (select-keys % [:name :host :port :tls :user :sasl
-                                         :oauth :read-only]))
+                                         :oauth :read-only
+                                         :password-secret :refresh-secret]))
                        accts)})))
 
 (defn- imap-env
   "Env map for the grog-imap MCP server: write account *metadata* to the grog
   config home (`imap-accounts.edn`, EDN) and hand it via GROG_IMAP_CONFIG. The
-  server resolves the secret itself from its per-account file — never here."
+  metadata carries only the NAME of the store account holding each credential
+  (`:password-secret` / `:refresh-secret`); the server resolves the value itself
+  from grog's secret store — never here, since everything in this env map is
+  written verbatim into the generated ECA config."
   []
   (let [data (imap-accounts-data)
         path (imap-instances-path)]
     (spit (io/file path) (with-out-str (pprint/pprint data)))
     {"GROG_IMAP_CONFIG" path}))
 
+(defn- jar-version
+  "Numeric version parsed from a `grog-mcp-<version>.jar` filename → a vector of
+  longs (for ordering), or [0] when the name carries no plain numeric version."
+  [^java.io.File f]
+  (if-let [m (re-matches #"grog-mcp-(.+)\.jar" (.getName f))]
+    (let [ps (mapv (fn [s] (try (parse-long s) (catch Throwable _ nil)))
+                   (str/split (nth m 1) #"[._\-+]"))]
+      (if (and (seq ps) (every? some? ps)) ps [0]))
+    [0]))
+
+(defn- bundled-jar
+  "The built grog-mcp uberjar to run: the HIGHEST VERSION in `bundle/target`.
+
+  The version is parsed from the FILENAME, NOT the file mtime. Selecting the
+  newest mtime is a bug magnet: rebuilding an older version — or a reinstall /
+  unzip that restores an older jar with a fresh timestamp — would make the OLD
+  jar 'win' even though a newer one exists. mtime is only a tie-breaker among
+  equal versions."
+  [bundle]
+  (let [dir (java.io.File. (str bundle "/target"))
+        jars (when (.isDirectory dir)
+               (->> (.listFiles dir)
+                    (filter (fn [^java.io.File f]
+                              (and (re-matches #"grog-mcp-.*\.jar" (.getName f))
+                                   (not (str/includes? (.getName f) "-sources")))))))]
+    (->> jars
+         (sort-by (fn [^java.io.File f] [(jar-version f) (.lastModified f)]))
+         last)))
+
 (defn grog-mcp-servers
-  "The grog MCP server specs, keyed by server id."
-  []
-  (let [root (grog-root)
-        servers
-        {"grog-imaging"
-     (shell-wrapped (str root "/grog-imaging")
-                    "clojure -M:mcp"
-                    nil)
+  "The grog MCP server specs for `project` — ONE entry, ONE process.
 
-     ;; JVM memory (Clojure/SQLite), served by the grog-mcp bundle restricted to
-     ;; its memory tools — no Python/venv. Reads the same `memory.edn` and uses a
-     ;; byte-compatible schema, so existing mem.db files work as-is. The server
-     ;; KEY stays "grog-memory" so ECA tool names (grog-memory__assoc_*) don't
-     ;; change and existing allowlists keep working.
-     "grog-memory"
-     (shell-wrapped (str root "/grog_mcp")
-                    "clojure -M:mcp --server grog-memory"
-                    (memory-env))
+  `grog_mcp.main` registers every server's tools in a single McpServer, so the
+  whole toolbelt is one JVM per session instead of one per server id (12 of
+  them). The entry is keyed `grog-mcp`, which is the prefix ECA puts on every
+  tool (`grog-mcp__odoo_search_read`).
 
-     "grog-office"
-     (shell-wrapped (str root "/grog-office")
-                    "clojure -M:mcp"
-                    nil)
+  That key was long kept per-server id — `grog-odoo`, `grog-rss`, … — on the
+  theory that it preserved existing allowlists. It does not: the permanent
+  approval store (`approved-tools.edn`) holds BARE tool names (`odoo_search_read`,
+  `read_pdf_document`), so collapsing the keys changes only the display prefix.
 
-     "grog-search"
-     (shell-wrapped (str root "/grog-search")
-                    "clojure -M:mcp"
-                    nil)
+  Every per-server config env is merged into that one child's environment. A
+  server therefore contributes tools only when its config actually loads — an
+  unconfigured server's `build-tools` throws, `collect-tools` swallows it, and
+  its tools are simply absent.
 
-     "grog-big"
-     (shell-wrapped (str root "/grog-big")
-                    "clojure -M:mcp"
-                    nil)
+  The bundle wrapper also carries the schema fix: it builds a real JsonSchema
+  object, where the SDK's String constructor would ship `function.parameters` as
+  a JSON *string* and strict providers would 400 the entire request. `spec` is
+  the single place the command is built, so the jar↔source choice lives there.
 
-     "grog-babashka"
-     (shell-wrapped (str root "/grog-babashka")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-fetch"
-     (shell-wrapped (str root "/grog-fetch")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-rss"
-     (shell-wrapped (str root "/grog-rss")
-                    "clojure -M:mcp"
-                    nil)
-
-     "grog-project-search"
-     (shell-wrapped (str root "/grog-project-search")
-                    "clojure -M:mcp"
-                    (project-search-env))
-
-     "grog-alpaca"
-     (shell-wrapped (str root "/grog-alpaca")
-                    "clojure -M:mcp"
-                    nil)}]
-    (cond-> servers
-      (imap-configured?)
-      (assoc "grog-imap"
-             (shell-wrapped (str root "/grog-imap")
-                            "clojure -M:mcp"
-                            (imap-env)))
-      (odoo-configured?)
-      (assoc "grog-odoo"
-             (shell-wrapped (str root "/grog-odoo")
-                            "clojure -M:mcp"
-                            (odoo-env)))
-      (gitlab-configured?)
-      (assoc "grog-gitlab"
-             (shell-wrapped (str root "/grog-gitlab")
-                            "clojure -M:mcp"
-                            (gitlab-env))))))
+  The Streamable-HTTP branch (`grog.mcp-http`) is inert unless a daemon is
+  running: with no daemon, `urls` is nil and the stdio spec is returned."
+  [project]
+  (if-let [us (mcp-http/urls)]
+    (into {} (map (fn [[k u]] [k {:url u}])) us)
+    (let [root (grog-root)
+          bundle (str root "/grog_mcp")
+                     ;; Prefer the built uberjar (no Clojure CLI needed, one artifact), but
+                     ;; fall back to the source tree when it hasn't been built — dev boxes
+                     ;; and a fresh checkout keep working either way. `build.clj` writes
+                     ;; target/grog-mcp-<version>.jar; pick the HIGHEST VERSION (parsed from
+                     ;; the name), NOT the newest mtime — see `bundled-jar`.
+                     jar (or (explicit-bundle-jar) (bundled-jar bundle))
+          ;; GROG_MCP_SOURCE=1 (set by `bb dev`) runs from .clj source at launch
+          ;; instead of the built jar — plain `clojure -M:mcp` in the bundle, the
+          ;; same on-the-fly compile, just without the jar. The bundle's
+          ;; `:local/root` deps point straight at the live sibling projects, so
+          ;; there is no copy to refresh first. Also the
+          ;; automatic behaviour when no jar has been built.
+          source? (or (some-> (System/getenv "GROG_MCP_SOURCE") str str/trim not-empty)
+                      (nil? jar))
+          ;; One child, so all per-server config rides in ITS environment.
+          ;; All of it is written verbatim into the generated config file, so
+          ;; these values must be PATHS and switches only — never secrets. The
+          ;; GitLab token is absent for exactly that reason: the server reads it
+          ;; from the OS keyring (see the note above `grog-root`).
+          env (merge (memory-env project)
+                     (project-search-env project)
+                     (when (imap-configured?) (imap-env))
+                     (when (odoo-configured?) (odoo-env)))
+          spec (if source?
+                 (shell-wrapped bundle "clojure -M:mcp" env)
+                 (shell-wrapped bundle
+                                (str "java --add-opens=java.base/java.lang=ALL-UNNAMED"
+                                     " --enable-native-access=ALL-UNNAMED"
+                                     " -cp '" (.getAbsolutePath ^java.io.File jar) "'"
+                                     " clojure.main -m grog_mcp.main")
+                                env))]
+      {"grog-mcp" spec})))
 
 (defn debug-dump-config!
   "Log that the ECA config was (re)written to the grog debug log, **without**
@@ -434,9 +527,10 @@
   be written to a log).
 
   Prints to `System/err` explicitly (NOT the bound `*err*`) so the line always
-  lands in the real debug log (`grog-ui.<pid>.log`, via grog.log's in-process
-  tee), even when called from a worker thread whose `*err*` is bound to the
-  transcript pane.
+  reaches the real stderr — the desktop client redirects the backend's stderr
+  into its per-instance log (`<base>.<pid>.log`; see
+  clients/web/src/main/log.js) — even when called from a worker thread whose
+  `*err*` is bound to the transcript pane.
   Called whenever the config is (re)written or ECA is (re)started."
   [^String path merged]
   (.println System/err (str "==== grog: ECA config (re)written -> " path))
@@ -503,21 +597,21 @@
 ;; --- Per-project rules (global SOUL + project SOUL overlay + context) ------
 
 (defn project-rules-file
-  "The absolute path of the generated ECA rules markdown for the active project.
+  "The absolute path of the generated ECA rules markdown for `project`.
   The file is the composed per-project standing context:
     * global SOUL.md (base personality),
     * the project's own SOUL.md (if present) — overrides global on conflicts,
     * the project's loaded context (banner + notes + dialog snapshot).
 
   Written under the project's `state/` dir so it stays out of the source tree.
-  Returns nil if no active project can be resolved."
-  ^String []
-  (when-let [proj (projects/resolve-active-project)]
+  Returns nil if `project` is nil."
+  ^String [project]
+  (when-let [proj project]
     (let [^java.io.File dir (projects/state-dir proj)
           f (io/file dir "eca-rules.md")
           global (soul/read-text)
           project-soul (soul/read-project-text proj)
-          ctx (projects/load-context)
+          ctx (projects/load-context proj)
           parts (cond-> []
                   (seq global)
                   (conj "## Persistent instructions (global SOUL)\n\n" global)
@@ -534,25 +628,145 @@
       (.getPath f))))
 
 (defn- add-rules!
-  "Add a `rules` entry pointing at the active project's generated rules file (if
-  any). ECA loads rule files/dirs as standing context on every prompt."
-  [cfg]
-  (if-let [rules-file (project-rules-file)]
+  "Add a `rules` entry pointing at `project`'s generated rules file (if any).
+  ECA loads rule files/dirs as standing context on every prompt."
+  [cfg project]
+  (if-let [rules-file (project-rules-file project)]
     (update cfg :rules conj {:path rules-file})
     cfg))
 
+(defn- odoo-rules-file
+  "Write (and return) the grog-odoo standing-context rule file, or nil when Odoo
+  is not configured.
+
+  The instance rule is stated here, not only in the tool schemas, because
+  getting it wrong is expensive: with more than one instance configured, every
+  `odoo_*` call has to name one, and a bare call is REFUSED by the server — the
+  model should know that before it tries."
+  ^String []
+  (when (odoo-configured?)
+    (let [insts (or (seq (read-odoo-instances-file)) (seq (odoo-instances-data)))
+          names (mapv (fn [i] (str (or (:name i) "default"))) insts)
+          multi? (> (count names) 1)
+          f (io/file (config/ensure-config-dir!) "odoo-rules.md")]
+      (spit f
+            (str/join
+             "\n"
+             (concat
+              ["# Odoo (grog-odoo)"
+               ""
+               (str "- Configured instances: " (str/join ", " names))]
+              (when multi?
+                ["- **Every `odoo_*` call MUST pass `instance`** — the ONE exception is `odoo_list_instances`, which exists to discover them and takes no instance. More than one instance is configured, so there is NO default: any other call that does not name one is refused. Name it explicitly; never guess."
+                 "- An invocation like `odoo stage …` does nothing until `instance` is stated — say which instance you mean."])
+              ["- SQL goes through the Select-O-Matic addon over the Odoo API. There is no direct database access, and no database credentials are involved."
+               "- Writes are per instance: an instance configured `:allow-write false` (the default) refuses any statement that could modify data."]))
+            :encoding "UTF-8")
+      (.getPath f))))
+
+(defn- add-odoo-rules!
+  "Add the grog-odoo standing-context rule file when Odoo is configured."
+  [cfg]
+  (if-let [rules-file (odoo-rules-file)]
+    (update cfg :rules conj {:path rules-file})
+    cfg))
+
+(defn core-rules-file
+  "Write (and return) grog's own standing operating rules — the rules that apply
+  to every project, on every client, regardless of what grog.edn says.
+
+  Written to the grog config home (not the project state dir) because they are
+  grog's rules, not the project's."
+  ^String []
+  (let [f (io/file (config/ensure-config-dir!) "grog-rules.md")]
+    (spit f
+          (str/join
+           "\n"
+           ["# grog — operating rules"
+            ""
+            "These apply to every project and every client."
+            ""
+            "- **When an MCP tool breaks, debug the tool. Do not wire around it.**"
+            "  If a tool errors, returns an empty or partial result, times out, or"
+            "  behaves unexpectedly, the task stops there until that tool is"
+            "  understood and fixed."
+            "- Do NOT bypass the MCP tools — no shell command, `curl`, direct"
+            "  database connection, or one-off script — to reach data or an effect"
+            "  the tools are meant to provide, and do not present a result obtained"
+            "  that way as if a tool had produced it. Using ANOTHER MCP tool that"
+            "  genuinely serves the request is fine; bypassing the tools is not."
+            "- Report the failure plainly (tool, arguments, exact error, evidence),"
+            "  then debug it: the MCP tools ARE the product, and a workaround hides"
+            "  the bug instead of fixing it."
+            "- If a tool is genuinely unusable, say so explicitly and get agreement"
+            "  before using any alternative — never substitute silently."
+            "- The same goes for a tool that 'works' but lies: empty or partial"
+            "  results are a break, not a green light."])
+          :encoding "UTF-8")
+    (.getPath f)))
+
+(defn- add-core-rules!
+  "Add grog's own standing operating rules to the generated ECA config."
+  [cfg]
+  (update cfg :rules conj {:path (core-rules-file)}))
+
 (defn- eca-config-debug! [& xs]
-  "One-line ECA-config trace written to the **real** stderr so it lands in the
-  grog debug log (`grog-ui.<pid>.log` / `$GROG_LOG`) regardless of `*out*`/`*err*`
-  rebinding."
+  "One-line ECA-config trace written to the **real** stderr so it survives
+  regardless of `*out*`/`*err*` rebinding; the desktop client redirects the
+  backend's stderr into its per-instance log (`<base>.<pid>.log`)."
   (.println System/err (str "[grog-eca-config] " (apply str (interpose " " (map str xs))))))
 
+(def ^:private eca-built-in-providers
+  "Providers ECA ships a built-in default URL for. Adding our own entry for one
+  of these would CLOBBER that default, so we never do."
+  #{"openai" "anthropic" "github-copilot" "google" "ollama"})
+
+(defn- model-provider
+  "The provider half of a `provider/model` id, or nil."
+  [model]
+  (when-let [m (re-matches #"([^/]+)/.+" (str model))]
+    (second m)))
+
+(defn- ensure-provider
+  "Make sure `cfg` carries a provider entry for `model`'s provider half.
+
+  This is what makes the base case work with ONE secret and no eca/config.json:
+  ECA ships defaults for openai/anthropic/google/github-copilot/ollama but NOT,
+  say, openrouter — so an `openrouter/…` model has no URL to resolve, and the
+  user was left hand-writing a provider block.
+
+  Precedence: a provider already in the user's ECA config wins (their config,
+  their call) -> an explicit `:eca :providers` entry -> derived from grog's own
+  `:llm :url`. The derived `:key` is an env REFERENCE; grog injects the value
+  into the ECA child (see `chat/provider-env`), so no secret lands in a file."
+  [cfg model]
+  (let [p (model-provider model)
+        providers (:providers cfg)]
+    (cond
+      (nil? p)                            cfg
+      ;; Compare by NAME, not by key identity: the base config comes from
+      ;; cheshire with KEYWORD keys (`:openrouter`) while we add a String key,
+      ;; and `contains?` would miss the user's own provider — then we would add
+      ;; a duplicate `"openrouter"` that clobbers it in the JSON.
+      (some #(= (name %) p) (keys providers)) cfg
+      (contains? eca-built-in-providers p) cfg
+      :else
+      (let [explicit (get (config/eca-provider-overrides) p)
+            derived  {:api "openai-chat"
+                      :url (try (config/llm-url) (catch Exception _ nil))
+                      :key "${env:GROG_LLM_API_KEY}"}]
+        (assoc-in cfg [:providers p] (or explicit derived))))))
+
 (defn generate-config!
-  "Produce the merged ECA config map and write it to
-  `(generated-config-path)`, dumping it to the debug log. Returns the written path."
+  "Produce the merged ECA config map and write it to `out-path`
+  (default `(generated-config-path)`), dumping it to the debug log. The
+  project-scoped bits (memory, project-search, rules) are resolved for
+  `project` — NOT the process-global active project — so concurrent sessions
+  in one grog process can't stamp each other's stores. Returns the written path."
   ([] (generate-config! (default-eca-config-path)))
   ([base-path] (generate-config! base-path (generated-config-path)))
-  ([base-path out-path]
+  ([base-path out-path] (generate-config! base-path out-path (projects/resolve-active-project)))
+  ([base-path out-path project]
    (let [base-file (io/file base-path)
          base-exists? (.exists base-file)
          base-parsed (when base-exists?
@@ -577,17 +791,32 @@
          ;; provider-qualified (`ollama/…`, `openrouter/…`). A bare local id such
          ;; as `qwen3.5:4b-tweaked` would make ECA fail with
          ;; "API url not found … provider 'qwen3.5:4b-tweaked'".
-         model (models/qualify-eca-model raw-model
-                                         nil
-                                         (try (config/llm-url) (catch Exception _ nil)))
+         llm-url (try (config/llm-url) (catch Exception _ nil))
+         ;; A model taken from the :llm block (the single-model case) is a RAW
+         ;; catalog id, and its provider is whatever :llm :url points at — pass
+         ;; that explicitly, so an OpenRouter org that shares a native provider's
+         ;; name (`deepseek/deepseek-v4.1-flash`) is not read as a provider of
+         ;; that name. The catalog that would otherwise disambiguate it only
+         ;; arrives once ECA is already running.
+         src (when (= :llm (config/eca-model-source))
+               (models/provider-prefix-for-url llm-url))
+         model (models/qualify-eca-model raw-model src llm-url)
          _ (eca-config-debug! "raw model=" (pr-str raw-model)
                               " qualified=" (pr-str model)
-                              " source=" (if (config/eca-model) "grog.edn :eca :model" "base config defaultModel"))
+                              " source=" (name (or (config/eca-model-source) :base-config-default)))
          merged (-> base
-                    (assoc :mcpServers (grog-mcp-servers))
+                    (ensure-provider model)
+                    (assoc :mcpServers (grog-mcp-servers project))
                     (cond-> model (assoc :defaultModel model))
                     (add-approval!)
-                    (add-rules!))
+                    (add-core-rules!)
+                    (add-rules! project)
+                    (add-odoo-rules!))
+         ;; `sort-by name`: provider keys are a MIX of keywords (from the
+         ;; cheshire-parsed base config) and strings (ours), and a plain `sort`
+         ;; throws ClassCastException comparing Keyword to String.
+         _ (eca-config-debug! "providers in generated config:"
+                              (pr-str (sort (map name (keys (:providers merged {}))))))
          out (or out-path (generated-config-path))]
      (spit (io/file out) (json/generate-string merged {:pretty true}))
      (debug-dump-config! out merged)

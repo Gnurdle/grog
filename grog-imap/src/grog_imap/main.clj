@@ -9,20 +9,27 @@
   -------------
   Config is file-based: ~/.config/grog/imap.edn
     {:config \"~/.config/grog/imap-accounts.json\"}   → path to accounts file
-  `:config` is a file path or inline EDN/JSON of account *metadata*:
+  `:config` is a file path or inline EDN/JSON of account *metadata*. The secret
+  FIELDS are named here; the VALUES live in grog's secret store:
     { \"accounts\": [
         { \"name\": \"gmail\", \"host\": \"imap.gmail.com\", \"port\": 993,
-          \"tls\": true, \"user\": \"you@gmail.com\" },
+          \"tls\": true, \"user\": \"you@gmail.com\",
+          \"password-secret\": \"IMAP_GMAIL_PASSWORD\" },
         { \"name\": \"work\", \"host\": \"mail.example.com\", \"port\": 993,
           \"tls\": true, \"user\": \"you@example.com\", \"sasl\": \"xoauth2\",
           \"oauth\": { \"provider\": \"google\", \"client-id\": \"...\" },
+          \"refresh-secret\": \"IMAP_WORK_REFRESH\",
           \"read-only\": true }
       ] }
 
-  Credentials are NEVER in the config. The server resolves them at connect time
-  from per-account env vars (`GROG_IMAP_PASSWORD_<NAME>` for LOGIN/PLAIN,
-  `GROG_IMAP_REFRESH_<NAME>` for XOAUTH2) — secrets never transit tool
-  arguments or results.
+  Credentials are NEVER in the config: each account NAMES the store entry that
+  holds its value — `:password-secret` for LOGIN/PLAIN, `:refresh-secret` for
+  XOAUTH2 — and this server reads that entry from grog's secret store itself
+  (OS keyring, service \"grog\"; `<config-home>/secrets.edn` on headless boxes).
+  Set one with `/secret set <NAME> <value>`. There is deliberately no env-var
+  and no credential-file path: mail accounts can be configured without bound, so
+  the account name is carried in the config rather than derived from it.
+  Secrets never transit tool arguments or results.
 
   Safety
   ------
@@ -42,7 +49,8 @@
             McpSchema$ServerCapabilities McpSchema$Tool McpSchema$CallToolResult
             McpSchema$TextContent]
            [reactor.core.publisher Mono]
-           [com.fasterxml.jackson.databind ObjectMapper]))
+           [com.fasterxml.jackson.databind ObjectMapper]
+           [com.github.javakeyring Keyring]))
 
 (set! *warn-on-reflection* true)
 
@@ -69,11 +77,6 @@
       (try (edn/read-string (slurp f))
            (catch Exception e (binding [*out* *err*] (println "imap config load error:" (.getMessage e))) {}))
       {})))
-
-(defn- env! [k]
-  (or (not-empty (str/trim (or (System/getenv k) "")))
-      (throw (ex-info (str "Missing env " k
-                           " — set it before connecting to this account") {}))))
 
 (defn- load-config!
   "Load account metadata. Config is file-based: ~/.config/grog/imap.edn
@@ -107,35 +110,106 @@
       (throw (ex-info "No accounts configured — add :config to ~/.config/grog/imap.edn first" {})))
     (core/get-account config (or @current* (first (account-names config))))))
 
-(defn- secret-file-path
-  "Per-account secret file for LOGIN/PLAIN credentials: the
-  `GROG_IMAP_PASSWORD_FILE_<NAME>` env var if set, else `~/.grog-imap-<lower-name>`."
-  [name]
-  (let [upper (str/upper-case (str/replace name #"[^A-Za-z0-9_]" "_"))
-        lower (str/lower-case (str/replace name #"[^A-Za-z0-9_]" "_"))
-        explicit (not-empty (System/getenv (str "GROG_IMAP_PASSWORD_FILE_" upper)))]
-    (or explicit
-        (str (System/getProperty "user.home") "/.grog-imap-" lower))))
+;; --- secret store ----------------------------------------------------------
+;; A credential is NEVER carried in the config: the account metadata NAMES the
+;; store entry that holds it (`:password-secret` for LOGIN/PLAIN,
+;; `:refresh-secret` for XOAUTH2) and this server reads the value itself. There
+;; is deliberately no env-var and no `~/.grog-imap-<name>` credential file — a
+;; box can have any number of mail accounts, so the account name is carried in
+;; the config rather than derived from it. Same shape as grog-odoo's
+;; `:password-secret`.
+
+(def ^:private ^String keyring-service "grog")
+(def ^:private keyring-read-timeout-ms 4000)
+
+(defn- config-home-dir
+  "grog's config home: $GROG_CONFIG_HOME, else $XDG_CONFIG_HOME/grog, else
+  ~/.config/grog. Mirrors grog.platform/config-home-dir so the secrets file
+  fallback is found even on a relocated config home."
+  ^String []
+  (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
+      (if-let [xdg (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)]
+        (str xdg "/grog")
+        (str (or (some-> (System/getenv "HOME") str str/trim not-empty)
+                 (System/getProperty "user.home"))
+             "/.config/grog"))))
+
+(defn- secrets-file
+  "grog's headless fallback: `<config-home>/secrets.edn`, an {account password} map."
+  ^java.io.File []
+  (io/file (config-home-dir) "secrets.edn"))
+
+(defn- keyring-secret
+  "Read `account` from the OS keyring (service \"grog\"). Time-bounded: without a
+  working Secret Service / D-Bus (SSH, containers) `Keyring/create` can block
+  forever. nil when absent, unsupported, or timed out."
+  ^String [^String account]
+  (when-not (str/blank? (str account))
+    (let [f (future
+              (try
+                (with-open [^Keyring kr (Keyring/create)]
+                  (some-> (.getPassword kr keyring-service (str account))
+                          str str/trim not-empty))
+                (catch Throwable _ nil)))
+          v (deref f keyring-read-timeout-ms ::timeout)]
+      (when-not (= ::timeout v) v))))
+
+(defn- file-secret
+  ^String [^String account]
+  (try
+    (let [f (secrets-file)]
+      (when (.exists f)
+        (some-> (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
+                (get account) str str/trim not-empty)))
+    (catch Throwable _ nil)))
+
+(defn- lookup-secret
+  "OS keyring first, then grog's secrets file. nil when neither has it."
+  ^String [^String account]
+  (or (keyring-secret account) (file-secret account)))
+
+(defn- store-secret
+  "Resolve the store entry a mail account NAMES for its credential — or throw an
+  error that says exactly what to add or set.
+
+  `declared` is the config field's value (the store ACCOUNT NAME, not a secret);
+  `field` / `suggested` / `name` / `kind` shape the two failure messages."
+  ^String [{:keys [declared field suggested name kind]}]
+  (let [acct (some-> declared str str/trim not-empty)]
+    (if (nil? acct)
+      (throw (ex-info (str "Mail account '" name "' " kind ", but declares no " field ", so it "
+                           "has no credential. Add  " field " " (pr-str suggested) "  — the NAME of "
+                           "an account in grog's secret store, never the secret itself — then:  "
+                           "/secret set " suggested " <value>")
+                      {:mail-account name :field field}))
+      (or (lookup-secret acct)
+          (throw (ex-info (str "Mail account '" name "' " kind " using the store account '" acct
+                               "' (" field "), but nothing is stored under that name — checked the "
+                               "OS keyring (service '" keyring-service "') and "
+                               (.getPath (secrets-file)) ". Set it with:  /secret set " acct " <value>")
+                          {:account acct :field field :mail-account name}))))))
 
 (defn credential-provider
-  "Resolve a credential for `account`. Sources (never tool args / results):
-    XOAUTH2  -> GROG_IMAP_REFRESH_<NAME> env
-    LOGIN/PLAIN -> GROG_IMAP_PASSWORD_<NAME> env, else the per-account secret
-    file (GROG_IMAP_PASSWORD_FILE_<NAME> or ~/.grog-imap-<lower-name>).
-  The secret stays on disk; it is never logged or returned."
+  "Resolve a credential for `account` from grog's secret store — the OS keyring
+  (service grog), falling back to `<config-home>/secrets.edn` on headless boxes.
+  The account metadata only carries the field NAME; the secret is never read
+  from the environment, a credential file, a tool argument or a tool result.
+
+    LOGIN/PLAIN -> `:password-secret`
+    XOAUTH2     -> `:refresh-secret`"
   [account]
-  (let [name (str (:name account))
-        upper (str/upper-case (str/replace name #"[^A-Za-z0-9_]" "_"))]
+  (let [name (str (:name account))]
     (if (= :xoauth2 (:sasl account))
-      {:refresh-token (env! (str "GROG_IMAP_REFRESH_" upper))}
-      (let [pw (or (not-empty (System/getenv (str "GROG_IMAP_PASSWORD_" upper)))
-                   (try (str/trim (slurp (secret-file-path name)))
-                        (catch Throwable _ "")))]
-        (if pw
-          {:password pw}
-          (throw (ex-info (str "No credential for account '" name "': set "
-                               "GROG_IMAP_PASSWORD_" upper " or put the secret in "
-                               (secret-file-path name)) {})))))))
+      {:refresh-token (store-secret {:declared  (:refresh-secret account)
+                                     :field     ":refresh-secret"
+                                     :suggested (str "IMAP_" (str/upper-case name) "_REFRESH")
+                                     :name      name
+                                     :kind      "authenticates with XOAUTH2"})}
+      {:password (store-secret {:declared  (:password-secret account)
+                                :field     ":password-secret"
+                                :suggested (str "IMAP_" (str/upper-case name) "_PASSWORD")
+                                :name      name
+                                :kind      "authenticates with LOGIN/PLAIN"})})))
 
 (defn- active-conn!
   "Ensure the active account is authenticated (lazy) and return its live
@@ -199,8 +273,13 @@
 ;; --- tools -----------------------------------------------------------------
 
 (defn build-tools
-  "Build the tool list. Every tool is a thin adapter over grog-imap.core."
+  "Build the tool list. Every tool is a thin adapter over grog-imap.core.
+
+  Loads the config HERE if nothing has: the bundle (`grog_mcp.main`) calls this
+  fn directly and never runs this server's `-main`/`mcp-server`, its only other
+  `load-config!` caller — so under the bundle the accounts list would be empty."
   []
+  (when (nil? @config*) (load-config!))
   (let [config @config*
         names (account-names config)]
     [{:name "imap_list_accounts"

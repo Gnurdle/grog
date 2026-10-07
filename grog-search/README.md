@@ -3,16 +3,14 @@
 MCP server (over stdio) exposing **Brave Web Search** as `brave_web_search` so an
 ECA-driven agent loop can search the public web.
 
-This is the *"Keep → grog MCP"* path for grog's old `brave_web_search` tool (see
-`doc/gap-analysis-grog-vs-eca.md` §6.5). After the GUI was rewired onto ECA, the
-model loop only sees MCP servers — the old grog-own tool loop that dispatched
-`brave_web_search` was superseded, so the tool had to be re-exposed here.
+This exposes grog's `brave_web_search` tool on the ECA/MCP surface (see
+`doc/gap-analysis-grog-vs-eca.md` §6.5). ECA's model loop only sees MCP servers,
+so the tool is served here.
 
 ## API key
 
 The subscription token is read from the **OS keyring** (service `grog`, account
-`BRAVE_SEARCH_API`) — exactly like the original grog tool. Set it from a grog
-chat with:
+`BRAVE_SEARCH_API`). Set it from a grog chat with:
 
 ```
 /secret BRAVE_SEARCH_API <token>

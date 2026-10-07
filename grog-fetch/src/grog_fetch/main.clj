@@ -35,7 +35,7 @@
 
 ;; Config is file-based: ~/.config/grog/fetch.edn
 ;;   {:timeout-ms 20000 :max-chars 12000}
-;; (env vars are intentionally NOT read — file-config normalization, like grog-big.)
+;; (env vars are intentionally NOT read — file-config normalization, like the other grog MCP servers.)
 (defn- config-file []
   (io/file (or (some-> (System/getenv "HOME") str not-empty) "~")
            ".config/grog/fetch.edn"))
@@ -141,7 +141,7 @@
           (str "fetch_url failed: " (.getMessage e) " (URL " url ")"))))))
 
 ;; ---------------------------------------------------------------------------
-;; MCP wiring (same as grog-search / grog-big)
+;; MCP wiring (same as grog-search)
 ;; ---------------------------------------------------------------------------
 
 (defn- text-content [^String s] (McpSchema$TextContent. s))

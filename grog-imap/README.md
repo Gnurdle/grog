@@ -53,10 +53,10 @@ src/grog_imap/
 
 **From the MCP**: `clojure -M:mcp` (or `java -cp grog-imap.jar clojure.main -m
 grog-imap.main`) exposes `imap_list_accounts`, `imap_use_account`,
-`imap_authenticate`, `imap_list_mailboxes`, `imap_search`, `imap_fetch`, and —
-for writable accounts — `imap_set_flags`, `imap_delete`, `imap_move`,
-`imap_copy`, `imap_append`. Each tool calls the exact same `core.clj` function
-app code calls.
+`imap_authenticate`, `imap_list_mailboxes`, `imap_count`, `imap_search`,
+`imap_fetch`, and — for writable accounts — `imap_set_flags`, `imap_delete`,
+`imap_move`, `imap_move_sender`, `imap_copy`, `imap_append`. Each tool calls the
+exact same `core.clj` function app code calls.
 
 ## Configuration
 
@@ -66,10 +66,12 @@ app code calls.
 ```edn
 {:accounts [
   {:name "gmail" :host "imap.gmail.com" :port 993 :tls true
-   :user "you@gmail.com"}
+   :user "you@gmail.com"
+   :password-secret "IMAP_GMAIL_PASSWORD"}
   {:name "work"  :host "mail.example.com" :port 993 :tls true
    :user "you@example.com" :sasl "xoauth2"
    :oauth {:provider "google" :client-id "..."}
+   :refresh-secret "IMAP_WORK_REFRESH"
    :read-only true}
 ]}
 ```
@@ -85,7 +87,11 @@ The library never acquires or stores secrets. The caller injects them:
 | Path | How |
 |------|-----|
 | App code | pass a credential map (`{:password ...}` or `{:refresh-token ...}`) or a `[account] -> credential` fn to `connect-account!` |
-| MCP | the server resolves credentials at connect time from per-account env vars: `GROG_IMAP_PASSWORD_<NAME>` (LOGIN/PLAIN) or `GROG_IMAP_REFRESH_<NAME>` (XOAUTH2) |
+| MCP | each account **NAMES** the store account holding its credential — `:password-secret` (LOGIN/PLAIN), `:refresh-secret` (XOAUTH2) — and the server reads the value from **grog's secret store**: the OS keyring (service `grog`), with `<config-home>/secrets.edn` as the headless fallback. Set one with `/secret set <NAME> <value>` |
+
+There is no env-var credential and no `~/.grog-imap-<name>` file: several mail
+accounts can be configured, so each carries the *name* of its store entry rather
+than a value.
 
 Secrets **never** appear in tool arguments, tool results, or account-listing
 metadata. `imap_list_accounts` / `imap_use_account` return names only.
@@ -93,9 +99,11 @@ metadata. `imap_list_accounts` / `imap_use_account` return names only.
 ### OAuth2 (Gmail / Microsoft 365)
 
 - **Gmail**: a Google "Desktop app" OAuth client → run
-  `clojure -M scripts/oauth-authorize.clj <client-id>` once → store the refresh
-  token as `GROG_IMAP_REFRESH_GMAIL` (or inject via app code). An app password
-  (`GROG_IMAP_PASSWORD_<NAME>`) also works for Gmail.
+  `clojure -M -m grog-imap.oauth-authorize <client-id> IMAP_GMAIL_REFRESH` once →
+  the refresh token is written straight into the OS keyring under that account
+  name (never a file, never printed) → point the account at it with
+  `:refresh-secret "IMAP_GMAIL_REFRESH"`. An app password via `:password-secret`
+  also works for Gmail.
 - **Microsoft 365**: requires OAuth2 (basic auth is retired) → register an app
   with `IMAP.AccessAsUser.All`, `authorize!` once, store the refresh token.
 
@@ -105,12 +113,3 @@ See `docs/OAuth2.md` for the full setup.
 
 JVM Clojure — deps.edn; stdlib sockets/SSL + `java.net.http` only. Mirrors the
 self-contained-client approach of `grog-odoo`'s XML-RPC layer.
-
-## Status
-
-Phases 1–3 complete. Protocol layer builds clean and is unit-tested; `core`
-drives the whole inbox/manage surface with no MCP SDK; the MCP server is a thin
-adapter over it. 50 tests / 223 assertions green. Verified live against Gmail
-(TLS, LOGIN with app password, LIST/EXAMINE/SEARCH, non-destructive). Remaining
-(Phase 4): README refresh (this), real-account checks for other providers, and
-final `java -jar` packaging verification.

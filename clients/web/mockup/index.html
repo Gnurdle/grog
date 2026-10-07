@@ -1,0 +1,148 @@
+<!doctype html>
+<!-- grog web client — MOCKUP (static, no build). Open: file:///.../clients/web/mockup/index.html
+     Skin/stack per doc/clients/web-client-plan.md §2; role colours are grog.edn :appearance values
+     emitted as CSS vars (the intended eventual source of truth). -->
+<html lang="en"><head><meta charset="utf-8"/><title>grog — web client mockup</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root{ --grog-bg:#0d0e11; --grog-answer:#ff99af; --grog-thinking:#69b478; --grog-tool:#ffa05a;
+         --grog-user:#a58a19; --grog-snark:#828692; --grog-bubble:#2b2c36; --grog-border:#3c424e; }
+  body{background:#020617;color:#f1f5f9;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .app{background:var(--grog-bg)}
+  .role-answer{color:var(--grog-answer)} .role-think{color:var(--grog-thinking)}
+  .role-tool{color:var(--grog-tool)} .role-user{color:var(--grog-user)} .role-snark{color:var(--grog-snark)}
+  .card{background:var(--grog-bubble);border:1px solid var(--grog-border)}
+  ::-webkit-scrollbar{width:10px;height:10px} ::-webkit-scrollbar-thumb{background:#334155;border-radius:6px}
+  ::-webkit-scrollbar-thumb:hover{background:#64748b} ::-webkit-scrollbar-track{background:transparent}
+</style></head>
+<body>
+<div class="h-screen flex flex-col">
+  <div class="flex items-center gap-3 px-4 py-2 text-xs text-slate-400 bg-slate-900/70 border-b border-slate-700">
+    <span class="px-2 py-1 rounded-md bg-slate-800 border border-slate-700">MOCKUP — static markup, no transport</span>
+    <button onclick="dlg('approval')" class="px-2 py-1 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40">show approval dialog</button>
+    <button onclick="dlg('question')" class="px-2 py-1 rounded-md bg-sky-500/20 text-sky-300 border border-sky-500/40">show question dialog</button>
+    <span class="ml-auto">skin: cms-estimate (slate-950 / sky-500) · roles: grog.edn :appearance</span>
+  </div>
+
+  <div class="app flex-1 min-h-0 flex flex-col overflow-hidden">
+    <!-- tab strip -->
+    <div class="flex items-center gap-1 px-2 pt-2 bg-slate-900/70 border-b border-slate-700">
+      <div class="flex items-center gap-2 px-3 py-2 rounded-t-md bg-sky-500/15 border border-sky-500/40 border-b-0 text-sky-200 text-sm">
+        <span class="w-2 h-2 rounded-full bg-emerald-400"></span>grog<span class="text-slate-400 hover:text-rose-400 cursor-pointer">✕</span></div>
+      <div class="flex items-center gap-2 px-3 py-2 rounded-t-md bg-amber-500/10 border border-amber-500/40 border-b-0 text-amber-200 text-sm"
+           title="Question pending — the dialog appears when this tab is selected and the window is focused">
+        <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>neobox
+        <span class="px-1 rounded bg-amber-500/20 text-[10px] text-amber-300">?</span><span class="cursor-pointer">✕</span></div>
+      <div class="flex items-center gap-2 px-3 py-2 rounded-t-md text-slate-400 text-sm hover:bg-slate-800">
+        <span class="w-2 h-2 rounded-full bg-slate-600"></span>cms-estimate<span class="cursor-pointer">✕</span></div>
+      <div class="ml-2 px-2 py-1 text-slate-500 text-sm cursor-pointer hover:text-sky-300">+</div>
+      <div class="ml-auto text-[11px] text-slate-500 pr-2">Ctrl+Tab cycle · Ctrl+T new · Ctrl+W close · Ctrl+E export</div>
+    </div>
+
+    <!-- transcript -->
+    <div class="flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-3">
+      <div class="role-snark text-xs italic">No snark pool — someone edited the wrong file. Pity.</div>
+
+      <div class="flex justify-end"><div class="card rounded-lg px-3 py-2 max-w-[70%] text-sm">
+        <div class="role-user text-[11px] mb-1">you</div>where is my grog.edn live right now</div></div>
+
+      <div class="max-w-[85%] text-sm">
+        <div class="role-think text-[11px] mb-1">thinking</div>
+        <div class="role-think/90 text-xs leading-relaxed">home fragment merges first, cwd overlay last — cwd wins on conflicts…</div></div>
+
+      <div class="card rounded-lg px-3 py-2 max-w-[85%] text-sm">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="role-tool text-[11px]">tool</span>
+          <span class="text-[11px] text-slate-400">eca__shell_command</span>
+          <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">done 12ms</span></div>
+        <code class="text-[11px] text-slate-400 break-all">grep -n ":server" ~/.config/grog/grog.edn /d/gni/grog-2/grog.edn</code></div>
+
+      <div class="card rounded-lg px-3 py-2 max-w-[85%] text-sm">
+        <div class="role-answer text-[11px] mb-1">grog</div>
+        Two files, merged at runtime: <b>~/.config/grog/grog.edn</b> (11 keys) and the cwd overlay
+        <b>/d/gni/grog-2/grog.edn</b> (3 keys).
+        <div class="mt-2 border border-slate-700 rounded-md overflow-hidden">
+          <table class="w-full text-[12px]"><thead class="bg-slate-800/60 text-slate-300">
+            <tr><th class="text-left px-2 py-1">fragment</th><th class="text-left px-2 py-1">path</th><th class="text-left px-2 py-1">state</th></tr></thead>
+            <tbody class="text-slate-300"><tr class="border-t border-slate-700"><td class="px-2 py-1">home</td><td class="px-2 py-1">~/.config/grog/grog.edn</td><td class="px-2 py-1">1711 B, 11 keys</td></tr>
+            <tr class="border-t border-slate-700"><td class="px-2 py-1">cwd</td><td class="px-2 py-1">/d/gni/grog-2/grog.edn</td><td class="px-2 py-1">794 B, 3 keys</td></tr></tbody></table></div></div>
+
+      <div class="role-snark text-xs">[grog] thin-client mode — grog-server: ["clojure" "-M" "-m" "grog.server"]</div>
+      <div class="text-right text-[11px] text-slate-500">turn 4.2k tok · $0.0031 · session 71.8k tok · $0.041</div>
+    </div>
+
+    <!-- composer + toolbar -->
+    <div class="border-t border-slate-700 bg-slate-900/50 p-3 space-y-2">
+      <div class="flex gap-1 text-xs">
+        <button class="px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium">Send</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">Stop</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">🎤</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">Terminal</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">Settings</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">Export</button>
+        <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300">Clear</button>
+        <span class="ml-auto flex items-center gap-2 text-slate-400">project: <span class="px-2 py-1 rounded-md bg-slate-800 border border-slate-700 text-slate-200">grog  ▾</span></span>
+      </div>
+      <textarea rows="3" class="w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+        placeholder="Ask, or type /help — Ctrl+Enter sends, Enter adds a line">run the spike on per-session listeners</textarea>
+      <div class="text-[11px] text-slate-500">Ctrl+Enter send · Enter newline · /clear · /yolo · Alt+Space push-to-talk</div>
+    </div>
+
+    <!-- status bar -->
+    <div class="flex items-center gap-4 px-4 py-1.5 bg-slate-900 border-t border-slate-700 text-[11px] text-slate-400">
+      <span class="text-slate-200">openrouter/xiaomi/mimo-v2.6-flash</span>
+      <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-emerald-400"></span>idle</span>
+      <span class="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-300">YOLO off</span>
+      <span class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40"
+            title="Deferred: shows when the app is focused and the neobox tab is selected">⚠ question pending · neobox</span>
+      <span class="ml-auto">tokens 71.8k · cost $0.041</span>
+    </div>
+  </div>
+</div>
+
+<!-- dialogs -->
+<div id="backdrop-approval" class="hidden fixed inset-0 z-50 bg-black/60 items-center justify-center">
+  <div class="w-[620px] card rounded-xl shadow-2xl">
+    <div class="px-4 py-2 border-b border-slate-700 text-sm text-slate-200">grog — tool approval</div>
+    <div class="p-4 text-sm space-y-2">
+      <div class="text-slate-300">Approve tool call?</div>
+      <div class="role-tool text-xs">eca__shell_command</div>
+      <code class="block text-[11px] text-slate-400 break-all">{"command" "rm -rf ./target && clojure -M:http --base-port 9700"}</code>
+      <ul class="text-xs text-slate-400 space-y-0.5">
+        <li>• <span class="text-emerald-300">Approve</span> — just this once</li>
+        <li>• <span class="text-sky-300">Approve tool</span> — permanently allow</li>
+        <li>• <span class="text-rose-300">Reject</span> — don't run it</li>
+        <li>• <span class="text-amber-300">YOLO</span> — this call and everything after</li></ul>
+    </div>
+    <div class="grid grid-cols-4 gap-2 p-3 border-t border-slate-700">
+      <button class="px-3 py-1.5 rounded-md bg-emerald-500 text-slate-950 font-medium">Approve ⏎</button>
+      <button class="px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium">Approve tool</button>
+      <button class="px-3 py-1.5 rounded-md bg-rose-500 text-slate-950 font-medium">Reject</button>
+      <button class="px-3 py-1.5 rounded-md bg-amber-500 text-slate-950 font-medium">YOLO</button></div>
+    <div class="px-4 pb-3 text-[11px] text-slate-500">Esc / ✕ / focus loss = reject (safe default)</div>
+  </div></div>
+
+<div id="backdrop-question" class="hidden fixed inset-0 z-[60] bg-black/60 items-center justify-center">
+  <div class="w-[560px] card rounded-xl shadow-2xl">
+    <div class="px-4 py-2 border-b border-slate-700 text-sm text-slate-200">grog — question from the model</div>
+    <div class="p-4 text-sm space-y-3">
+      <div class="text-slate-200">Which port range should the per-session listeners use?</div>
+      <div class="space-y-1 text-xs">
+        <label class="flex items-center gap-2 px-2 py-1.5 rounded-md bg-slate-800/60 border border-slate-700"><input type="radio" name="q" checked/>9700–9728, 16 per session</label>
+        <label class="flex items-center gap-2 px-2 py-1.5 rounded-md bg-slate-800/60 border border-slate-700"><input type="radio" name="q"/>9800+, one listener per key per project</label>
+        <label class="flex items-center gap-2 px-2 py-1.5 rounded-md bg-slate-800/60 border border-slate-700"><input type="radio" name="q"/>pick dynamically, report back</label></div>
+      <input class="w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-xs" placeholder="Or type a custom answer:"/>
+    </div>
+    <div class="flex justify-end gap-2 p-3 border-t border-slate-700">
+      <button class="px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-sm">Cancel</button>
+      <button class="px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium text-sm">Answer</button></div>
+  </div></div>
+
+<script>
+function dlg(w){var b=document.getElementById('backdrop-'+w);b.classList.toggle('hidden');
+  b.classList.toggle('flex'); if(w==='approval'&&!b.classList.contains('hidden'))
+  document.getElementById('backdrop-question').classList.add('hidden');}
+document.querySelectorAll('[id^=backdrop-]').forEach(function(b){b.addEventListener('click',function(e){
+  if(e.target===b){b.classList.add('hidden');b.classList.remove('flex');}})});
+</script>
+</body></html>

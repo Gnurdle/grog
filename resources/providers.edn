@@ -1,0 +1,170 @@
+;; providers.edn — grog's catalogue of well-known OpenAI-compatible endpoints.
+;;
+;; This is DATA, not code. It is the single source of truth for "which
+;; providers does grog know about, what is each one's base URL, and what does
+;; a starter config look like for it". The settings provider picker reads it
+;; (`grog.providers`), `grog.models/provider-prefix-for-url` consults it to name
+;; a provider from its URL, and `resources/config.examples/grog.edn.example` is
+;; kept in step with it (see scripts/ ... provider tests).
+;;
+;; `:url` is the base grog appends "/models" and "/chat/completions" to, so it
+;; must be the EXACT documented base — several do NOT end in "/v1" (deepseek,
+;; z.ai, perplexity, github). A wrong URL is a 404 on the first prompt, so an
+;; entry that cannot be verified does not ship.
+;;
+;; `:sample` is ONE cheap, current model id to seed a starter config — model
+;; catalogues drift fast, so treat it as a hint, not a contract; the picker
+;; lists the live list from the provider's own /models.
+;;
+;; Secrets never live here. `:key-env` is the conventional env var / keyring
+;; account name — the user stores the value once with `/secret set <KEY> …`.
+
+{:version 1
+ :providers
+ [;; --- remote, OpenAI-compatible, one API key ------------------------------
+  {:id "openrouter" :label "OpenRouter" :kind :remote
+   :url "https://openrouter.ai/api/v1"
+   :key-env "OPENROUTER_API_KEY" :sample "moonshotai/kimi-k3"
+   :docs "https://openrouter.ai/docs"
+   :note "hundreds of models behind one key; org-prefixed ids (org/model)"}
+
+  {:id "fireworks" :label "Fireworks AI" :kind :remote
+   :url "https://api.fireworks.ai/inference/v1"
+   :key-env "FIREWORKS_API_KEY"
+   :sample "accounts/fireworks/models/llama-v3p3-70b-instruct"
+   :docs "https://docs.fireworks.ai"
+   :note "model ids look like accounts/fireworks/models/…"}
+
+  {:id "groq" :label "Groq" :kind :remote
+   :url "https://api.groq.com/openai/v1"
+   :key-env "GROQ_API_KEY" :sample "llama-3.3-70b-versatile"
+   :docs "https://console.groq.com/docs/openai"
+   :note "note the /openai/v1 path; very low latency"}
+
+  {:id "together" :label "Together AI" :kind :remote
+   :url "https://api.together.xyz/v1"
+   :key-env "TOGETHER_API_KEY"
+   :sample "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+   :docs "https://docs.together.ai"
+   :note "open-weight models; HuggingFace-style ids"}
+
+  {:id "deepseek" :label "DeepSeek" :kind :remote
+   :url "https://api.deepseek.com/v1"
+   :key-env "DEEPSEEK_API_KEY" :sample "deepseek-chat"
+   :docs "https://api-docs.deepseek.com"
+   :note "OpenAI- and Anthropic-shaped API; the /v1 suffix is optional but safe"}
+
+  {:id "mistral" :label "Mistral AI" :kind :remote
+   :url "https://api.mistral.ai/v1"
+   :key-env "MISTRAL_API_KEY" :sample "mistral-large-latest"
+   :docs "https://docs.mistral.ai"
+   :note "self-hosted models keep the same wire shape"}
+
+  {:id "cerebras" :label "Cerebras" :kind :remote
+   :url "https://api.cerebras.ai/v1"
+   :key-env "CEREBRAS_API_KEY" :sample "llama-3.3-70b"
+   :docs "https://inference-docs.cerebras.ai"
+   :note "wafer-scale speed; a useful free tier"}
+
+  {:id "xai" :label "xAI (Grok)" :kind :remote
+   :url "https://api.x.ai/v1"
+   :key-env "XAI_API_KEY" :sample "grok-2-latest"
+   :docs "https://docs.x.ai"
+   :note "Grok models over the OpenAI wire format"}
+
+  {:id "moonshot" :label "Moonshot (Kimi)" :kind :remote
+   :url "https://api.moonshot.ai/v1"
+   :key-env "MOONSHOT_API_KEY" :sample "kimi-k2-0905-preview"
+   :docs "https://platform.moonshot.ai/docs"
+   :note "use api.moonshot.cn for the China region"}
+
+  {:id "zai" :label "Z.AI (GLM)" :kind :remote
+   :url "https://api.z.ai/api/paas/v4"
+   :key-env "ZAI_API_KEY" :sample "glm-4.6"
+   :docs "https://docs.z.ai"
+   :note "NOT /v1 — the base ends in /paas/v4; the coding endpoint differs"}
+
+  {:id "deepinfra" :label "DeepInfra" :kind :remote
+   :url "https://api.deepinfra.com/v1/openai"
+   :key-env "DEEPINFRA_API_KEY" :sample "meta-llama/Meta-Llama-3.1-8B-Instruct"
+   :docs "https://deepinfra.com/docs"
+   :note "note the /v1/openai path"}
+
+  {:id "sambanova" :label "SambaNova" :kind :remote
+   :url "https://api.sambanova.ai/v1"
+   :key-env "SAMBANOVA_API_KEY" :sample "Meta-Llama-3.3-70B-Instruct"
+   :docs "https://docs.sambanova.ai"
+   :note "fast open-weight hosting"}
+
+  {:id "nvidia" :label "NVIDIA NIM" :kind :remote
+   :url "https://integrate.api.nvidia.com/v1"
+   :key-env "NVIDIA_API_KEY" :sample "meta/llama-3.3-70b-instruct"
+   :docs "https://build.nvidia.com"
+   :note "host is integrate.api.nvidia.com — do not trust the naive host split"}
+
+  {:id "google" :label "Google Gemini" :kind :remote
+   :url "https://generativelanguage.googleapis.com/v1beta/openai/"
+   :key-env "GEMINI_API_KEY" :sample "gemini-2.0-flash"
+   :docs "https://ai.google.dev/gemini-api/docs/openai"
+   :note "Google's OpenAI-compat bridge; keep the trailing slash"}
+
+  {:id "openai" :label "OpenAI" :kind :remote
+   :url "https://api.openai.com/v1"
+   :key-env "OPENAI_API_KEY" :sample "gpt-4o-mini"
+   :docs "https://platform.openai.com/docs"
+   :note "the reference endpoint everything else imitates"}
+
+  {:id "perplexity" :label "Perplexity" :kind :remote
+   :url "https://api.perplexity.ai"
+   :key-env "PERPLEXITY_API_KEY" :sample "sonar"
+   :docs "https://docs.perplexity.ai"
+   :note "NOT /v1 — base is the bare host; search-grounded models"}
+
+  {:id "github" :label "GitHub Models" :kind :remote
+   :url "https://models.inference.ai.azure.com"
+   :key-env "GITHUB_TOKEN" :sample "gpt-4o-mini"
+   :docs "https://docs.github.com/en/github-models"
+   :note "key is a GitHub PAT; NOT /v1"}
+
+  {:id "novita" :label "Novita AI" :kind :remote
+   :url "https://api.novita.ai/v3/openai"
+   :key-env "NOVITA_API_KEY" :sample "meta-llama/llama-3.3-70b-instruct"
+   :docs "https://novita.ai/docs"
+   :note "note the /v3/openai path"}
+
+  {:id "hyperbolic" :label "Hyperbolic" :kind :remote
+   :url "https://api.hyperbolic.xyz/v1"
+   :key-env "HYPERBOLIC_API_KEY" :sample "meta-llama/Llama-3.3-70B-Instruct"
+   :docs "https://docs.hyperbolic.xyz"
+   :note "open-weight hosting"}
+
+  ;; --- local / self-hosted (no key) ---------------------------------------
+  {:id "ollama" :label "Ollama" :kind :local
+   :url "http://localhost:11434/v1"
+   :key-env nil :sample "qwen3:8b"
+   :docs "https://ollama.com"
+   :note "the default local server; /api/tags lists installed models"}
+
+  {:id "lmstudio" :label "LM Studio" :kind :local
+   :url "http://localhost:1234/v1"
+   :key-env nil :sample "qwen2.5-7b-instruct"
+   :docs "https://lmstudio.ai/docs"
+   :note "start its local server from the LM Studio UI"}
+
+  {:id "llamacpp" :label "llama.cpp server" :kind :local
+   :url "http://localhost:8080/v1"
+   :key-env nil :sample "local-model"
+   :docs "https://github.com/ggml-org/llama.cpp"
+   :note "`llama-server` default port; -c and -ngl decide how much fits"}
+
+  {:id "vllm" :label "vLLM" :kind :local
+   :url "http://localhost:8000/v1"
+   :key-env nil :sample "local-model"
+   :docs "https://docs.vllm.ai"
+   :note "`vllm serve` default port; OpenAI-compatible out of the box"}
+
+  {:id "litellm" :label "LiteLLM relay" :kind :local
+   :url "http://localhost:4000/v1"
+   :key-env nil :sample "gpt-4o-mini"
+   :docs "https://docs.litellm.ai"
+   :note "a local proxy in front of many providers; one key, one URL"}]}

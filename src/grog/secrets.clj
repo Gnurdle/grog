@@ -14,9 +14,12 @@
        The file is created with owner-only permissions where the OS supports it
        and lives **outside** the repo (never committed).
 
-  Only **known** accounts may be set/read via `/secret`: the built-in set plus
-  any registered with `refresh-known-accounts!` (from `:secrets {:accounts …}`
-  in grog.edn)."
+  `/secret` accepts **any** account name. The built-in accounts plus anything
+  registered with `refresh-known-accounts!` (from `:secrets {:accounts …}` in
+  grog.edn) are *known* names, used only for the listing and as the default
+  `with_api_key` allowlist — they are an advisory, **not** a gate. A name you
+  invented in a config file (e.g. `:password-secret \"ODOO_PROD_PASSWORD\"`) is
+  settable, readable and removable without being declared anywhere first."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -57,7 +60,7 @@
   (into base-known-secret-defs @!extra-secret-defs))
 
 (defn known-secret-defs
-  "Backward-compatible accessor for the built-in account definitions."
+  "The built-in account definitions."
   []
   base-known-secret-defs)
 
@@ -94,6 +97,27 @@
   [^String account]
   (boolean (when account ((known-account-set) account))))
 
+(def ^:private secret-verbs
+  #{"set" "rm" "del" "delete" "file" "backend" "list"})
+
+(defn redact-secret-command
+  "Mask the secret VALUE in a `/secret …` command line so it can be echoed into
+  the transcript, logged, and persisted without leaking the credential.
+
+  Handles both explicit (`/secret set KEY VALUE`) and short (`/secret KEY
+  VALUE`) forms; a bare `/secret`, `/secret file`, `/secret backend`, `/secret
+  list`, and `/secret rm KEY` carry no secret and pass through unchanged. Any
+  non-`/secret` line is returned as-is, so this is safe to apply to every turn."
+  [s]
+  (let [t (some-> s str)]
+    (if (nil? t)
+      s
+      (if-let [[_ pre k] (re-matches #"(?is)^(\s*/secret\s+(?:set\s+)?)(\S+)\s+\S.*$" t)]
+        (if (contains? secret-verbs (str/lower-case k))
+          t
+          (str pre k " ***redacted***"))
+        t))))
+
 (defonce ^:private keyring-read-timeout-ms 4000)
 
 ;; Keyring/create can block forever without a working Secret Service / D-Bus (e.g. SSH session).
@@ -120,6 +144,50 @@
   "The fallback secrets file: `<config-home>/secrets.edn` (outside the repo)."
   ^java.io.File []
   (io/file (platform/config-home-dir) "secrets.edn"))
+
+(defn secret-ledger-file
+  "The ledger of secret ACCOUNT NAMES grog itself has written — names only,
+  never values.
+
+  The OS keyring has no 'list my accounts' API, so this is the only way the
+  factory reset (`grog.reset`) can know which credentials grog created and
+  should therefore remove — without touching keys the user stored by other means."
+  ^java.io.File []
+  (io/file (platform/config-home-dir) "secret-ledger.edn"))
+
+(defn- read-ledger
+  "The ledger as a set of account names (strings), or nil if absent/unreadable."
+  []
+  (try
+    (let [f (secret-ledger-file)]
+      (when (.exists f)
+        (let [v (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))]
+          (set (filter string? v)))))
+    (catch Throwable _ nil)))
+
+(defn ledger-accounts
+  "Account names grog has written to the secret store (a set of strings)."
+  []
+  (or (read-ledger) #{}))
+
+(defn- note-in-ledger!
+  "Record `account` in the ledger (best effort — the ledger must never break a
+  secret write). The ledger holds NAMES only, never values, so it needs no
+  special permissions."
+  [^String account]
+  (try
+    (let [f (secret-ledger-file)
+          accounts (conj (ledger-accounts) (str account))]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (pr-str (into (sorted-set) accounts)) :encoding "UTF-8"))
+    (catch Throwable _ nil)))
+
+(defn clear-ledger!
+  "Remove the ledger file (the factory reset calls this after removing the
+  accounts it names)."
+  []
+  (try (let [f (secret-ledger-file)] (when (.exists f) (.delete f)))
+       (catch Throwable _ nil)))
 
 (defn- harden-file! [^java.io.File f]
   ;; Best effort: owner-only read/write, no other users, on platforms that
@@ -154,6 +222,8 @@
                (some? value) (assoc account value)
                (nil? value)  (dissoc account))
         tmp (io/file (str (.getPath f) ".tmp"))]
+    (when-let [parent (.getParentFile f)]
+      (.mkdirs parent))
     (harden-file! tmp)
     (spit tmp (pr-str (into (sorted-map) next)) :encoding "UTF-8")
     (io/copy tmp f)
@@ -207,20 +277,38 @@
          (catch Exception _ nil)))
      (file-secret account))))
 
+(defn- note-unknown-account!
+  "One advisory line for an account grog has not heard of.
+
+  This used to be a HARD REJECT (`set-secret!` refused any account outside the
+  curated list), which was backwards: the store is YOURS, and a name you invented
+  in a config file — `:password-secret \"ODOO_PROD_PASSWORD\"`, an MCP server's
+  expected env var — has to be settable without first being declared somewhere.
+  The only thing the gate actually bought was catching a typo, so it is now an
+  advisory and nothing more."
+  [^String account]
+  (when-not (known-account? account)
+    (binding [*out* *err*]
+      (println (str "grog: note: '" account "' is not a declared account — proceeding anyway. "
+                    "(Declared: " (str/join ", " (sort (known-account-set))) ")")))))
+
 (defn set-secret!
-  "Persist `password` for `account` under service `grog`. `account` must be a
-  known secret name. Writes to the OS keyring, silently falling back to the
-  secrets file when no keyring backend is available. Returns
+  "Persist `password` for `account` under service `grog`.
+
+  ANY account name is accepted — see `note-unknown-account!`. (The model-facing
+  allowlist is a different thing and stays: `with_api_key` only ever uses
+  accounts listed in `:with-api-key :allowed-secrets`.)
+
+  Writes to the OS keyring, silently falling back to the secrets file when no
+  keyring backend is available. Returns
   `{:backend :keyring|:file :reason str|nil}`."
   [^String account ^String password]
   (when (str/blank? account)
     (throw (ex-info "account (key) is required" {})))
   (when (str/blank? password)
     (throw (ex-info "value must be non-empty" {})))
-  (when-not (known-account? account)
-    (let [known (sort (known-account-set))]
-      (throw (ex-info (str "unknown secret key " (pr-str account) "; known: " (str/join ", " known))
-                      {:account account :known known}))))
+  (note-unknown-account! account)
+  (note-in-ledger! account)
   (try
     (with-open [^Keyring kr (Keyring/create)]
       (.setPassword kr service-id account password))
@@ -242,16 +330,16 @@
 
 (defn delete-secret!
   "Remove `account` from the OS keyring (best effort) and the secrets file.
-  `account` must be a known secret name. Returns
+
+  ANY account name is accepted — see `note-unknown-account!`; an undeclared
+  name is a no-op advisory, never a rejection. Returns
   `{:keyring :deleted|:absent|:unavailable :file :removed|:absent}`."
   [^String account]
   (when (str/blank? account)
     (throw (ex-info "account (key) is required" {})))
-  (when-not (known-account? account)
-    (throw (ex-info (str "unknown secret key " (pr-str account))
-                    {:account account :known (sort (known-account-set))})))
+  (note-unknown-account! account)
   (let [had-file? (some? (file-secret account))
-        _ (write-secret-file! account nil)
+        _ (when had-file? (write-secret-file! account nil))
         kr (try
              (with-open [^Keyring kr (Keyring/create)]
                (.deletePassword kr service-id account)
@@ -269,11 +357,18 @@
   "Print known secret keys and whether each is set in the active store. Never
   prints values."
   []
-  (let [b (backend-status)]
+  (let [b (backend-status)
+        declared (set (map :account (all-known-secret-defs)))
+        extra (->> (or (read-secret-file) {}) keys (remove declared) sort)]
     (println (str "Defined secrets (service " service-id "):"))
     (doseq [{:keys [account description]} (all-known-secret-defs)]
       (println "  " account "— " description)
       (println "     store:" (if (keyring-set? account) "set" "unset")))
+    (when (seq extra)
+      (println)
+      (println "Other secrets in the file store (undeclared — still fully usable):")
+      (doseq [a extra]
+        (println "  " a "— store:" (if (keyring-set? a) "set" "unset"))))
     (println)
     (println "Backend:" (if (= :keyring (:backend b))
                           "OS keyring"

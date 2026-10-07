@@ -1,7 +1,7 @@
 (ns grog.md-render
   "CommonMark → ANSI for terminal display (matches grog.core answer / thinking palette).
   Markdown may be wrapped in <text/markdown>…</text/markdown> or <text/markdown>…<text/markdown/>
-  (MIME-style, RFC 7763). Legacy <text-markdown>…</text-markdown> is normalized to the same.
+  (MIME-style, RFC 7763). The short <text-markdown>…</text-markdown> form is normalized to the same.
   GFM pipe tables render as Unicode box tables."
   (:require [clojure.string :as str])
   (:import [java.util Arrays]
@@ -47,7 +47,7 @@
 
 (defn- strip-markdown-tags
   "Remove `<text/markdown>` / `</text/markdown>` / `<text/markdown/>` wrappers
-  (and the legacy `<text-markdown>` forms). Returns the bare content."
+  (and the short `<text-markdown>` forms). Returns the bare content."
   ^String [^String s]
   (str/replace s
                #"(?i)</?text[-/]markdown/?>|</text[-/]markdown>"
@@ -505,9 +505,9 @@
 
 (defn render-to-ansi
   "Render `markdown` as ANSI for the terminal. The whole string is parsed as
-  Markdown. The legacy `<text/markdown> … </text/markdown>` region markers are
-  still accepted (and stripped) for backward compatibility, but are no longer
-  needed — assistant output is Markdown end to end. On failure, returns the
+  Markdown. The `<text/markdown> … </text/markdown>` region markers are
+  accepted (and stripped), but are not needed — assistant output is Markdown
+  end to end. On failure, returns the
   original text in the default body color."
   ^String [^String markdown]
   (if (str/blank? markdown)

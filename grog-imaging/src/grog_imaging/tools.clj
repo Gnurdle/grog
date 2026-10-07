@@ -681,3 +681,54 @@
     (catch Exception e
       (json/generate-string {:error (or (.getMessage e) "overlay draw failed")
                              :detail (str e)}))))
+
+;; --- show_image -------------------------------------------------------------
+;;
+;; The missing primitive. Every other image-returning tool CREATES an image
+;; (write / crop / overlay); nothing could simply SHOW one that already exists —
+;; so "show me that picture" had no tool to call, and the agent could only
+;; describe it or OCR it. `:image-out? true` on the spec makes grog_mcp attach
+;; the file as an MCP image block, which ECA relays and the client paints inline.
+
+(defn run-show-image!
+  [arguments]
+  (try
+    (let [m (parse-args arguments)
+          path-str (fnum m)
+          max-w (gnum m :max_width "max_width" "maxWidth")]
+      (if (str/blank? path-str)
+        (json/generate-string {:error "path is required"})
+        (let [^File f (as-file path-str)]
+          (cond
+            (not (.isFile f))
+            (json/generate-string {:error "not a file" :path path-str})
+
+            ;; Nothing to resize: hand back the ORIGINAL path. No copy, no
+            ;; re-encode — the user sees their own file, byte for byte.
+            (nil? max-w)
+            (json/generate-string {:ok true :path (.getPath f)})
+
+            :else
+            (let [^BufferedImage src (img/load-raster-image! f)
+                  w (.getWidth src)
+                  target (long (min (long max-w) (long w)))
+                  ^BufferedImage out
+                  (if (>= target w)
+                    src
+                    (let [scale (double (/ target (double w)))
+                          h (max 1 (long (Math/round (* scale (double (.getHeight src))))))
+                          ^BufferedImage dst (BufferedImage. (int target) (int h)
+                                                             BufferedImage/TYPE_INT_ARGB)
+                          ^Graphics2D g (.createGraphics dst)]
+                      (.setRenderingHint g RenderingHints/KEY_INTERPOLATION
+                                         RenderingHints/VALUE_INTERPOLATION_BILINEAR)
+                      (.drawImage g src 0 0 (int target) (int h) nil)
+                      (.dispose g)
+                      dst))
+                  ^File tmp (File/createTempFile "grog-show-" ".png")
+                  out-path (img/save-png! out tmp)]
+              (json/generate-string {:ok true :path out-path :source path-str
+                                     :width (.getWidth out) :height (.getHeight out)}))))))
+    (catch Exception e
+      (json/generate-string {:error (or (.getMessage e) "show_image failed")
+                             :detail (str e)}))))

@@ -13,7 +13,8 @@
             [clojure.walk :as walk]
             [grog.edn-store :as store]
             [grog.config :as config]
-            [grog.mcp-store :as mcp-store])
+            [grog.mcp-store :as mcp-store]
+            [grog.platform :as platform])
   (:import [java.io ByteArrayOutputStream InputStream OutputStreamWriter]
            [java.lang ProcessBuilder]
            [java.nio.charset StandardCharsets]
@@ -289,7 +290,7 @@
   (let [init (rpc! srv "initialize"
                     {:protocolVersion "2024-11-05"
                      :capabilities {:roots {:listChanged false}}
-                     :clientInfo {:name "grog" :version "0.1.0"}})]
+                     :clientInfo {:name "grog" :version "0.2.0"}})]
     (if (:error init)
       init
       (do (notify! srv "notifications/initialized" {})
@@ -323,7 +324,10 @@
 
 (defn- stop-server! [srv]
   (when srv
-    (try (.destroy (:process srv)) (catch Exception _))
+    ;; tree-kill: an MCP server is launched via a wrapper (`bash -lc "java …"`)
+    ;; whose real work is a `java` child, so a plain `.destroy` orphaned the JVM
+    ;; on Windows — see grog.platform/kill-tree!.
+    (platform/kill-tree! (:process srv))
     (try (.interrupt ^Thread (:reader-thread srv)) (catch Exception _))))
 
 (defn stop-all!
@@ -431,7 +435,8 @@
     (normalized-declared-cfgs))))
 
 (defn tool-specs-dynamic
-  "Deprecated name: specs come from cache, not running processes."
+  "Alias for `tool-specs-from-cache`: specs come from cache, not running
+  processes."
   []
   (tool-specs-from-cache))
 
