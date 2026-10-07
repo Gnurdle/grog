@@ -29,7 +29,8 @@
   Usage:  clojure -M:http [--base-port 9700]
   Beacon: one line per server on stderr —
     grog-mcp http READY <server-id> 127.0.0.1:<port>/mcp
-  then blocks forever."
+  then blocks forever (until the launching grog-server dies — see
+  `watch-parent!`)."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [grog_mcp.main :as bundle]
@@ -148,6 +149,31 @@
                       :ring-server localhost-ring-server
                       :print-banner? false})))
 
+(defn- watch-loop!
+  "Poll `pid` every 5s; exit the JVM when it disappears (leak-avoidance)."
+  [pid]
+  (loop []
+    (Thread/sleep 5000)
+    (when-not (.isPresent (java.lang.ProcessHandle/of (long pid)))
+      (binding [*out* *err*]
+        (println (str "[grog-mcp] parent grog-server " pid " is gone — exiting to avoid a leak")))
+      (System/exit 0))
+    (recur)))
+
+(defn- watch-parent!
+  "Exit when the grog-server that launched us (GROG_SERVER_PID) is gone.
+
+  A HARD kill of the server (Task Manager, `kill -9`, a Windows service stop
+  that force-terminates, an OOM kill) never runs the server's shutdown hook, so
+  the server can't stop us — we would outlive it and leak (a 'stale java
+  processes' source). When launched by a server, poll that pid and exit the
+  moment it disappears. No-op when GROG_SERVER_PID is unset (manual run)."
+  []
+  (when-let [pid (some-> (System/getenv "GROG_SERVER_PID") str str/trim not-empty parse-long)]
+    (doto (Thread. ^Runnable #(watch-loop! pid) "grog-mcp-parent-watch")
+      (.setDaemon true)
+      (.start))))
+
 (defn -main [& args]
   (let [base (or (some (fn [a]
                          (when-let [m (re-matches #"^--base-port[= ]?(.+)$" (str a))]
@@ -160,5 +186,7 @@
           (binding [*out* *err*]
             (println (str "grog-mcp http READY 127.0.0.1:" base "/mcp"))))
       (start-all! {:base-port base}))
-    ;; block the main thread forever — the servers run on their own executor
+    ;; exit when our grog-server dies (a hard kill included), then block forever
+    ;; — the servers run on their own executor
+    (watch-parent!)
     @(promise)))

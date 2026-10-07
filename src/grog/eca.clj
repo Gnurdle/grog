@@ -18,7 +18,8 @@
   (responds with safe defaults if unset)."
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.platform :as platform])
   (:import [java.io ByteArrayOutputStream InputStream OutputStreamWriter]
            [java.lang ProcessBuilder Process ProcessHandle]
            [java.nio.charset StandardCharsets]
@@ -201,12 +202,20 @@
     (catch Throwable _ nil)))
 
 (defn- candidate-dirs
-  "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary."
+  "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary.
+
+  ORDER MATTERS. grog's OWN install (`%LOCALAPPDATA%\\eca`) comes FIRST, so a box
+  that also has the VS Code extension does not silently drive VS CODE's ECA
+  instead of the one grog shipped. The VS Code extension dirs are a FALLBACK —
+  useful only when grog has no copy of its own."
   []
   (let [home (System/getProperty "user.home")
         userprofile (System/getenv "USERPROFILE")
         appdata (System/getenv "APPDATA")]
     (concat
+      ;; grog's own installed ECA — the one we expect to drive.
+      (when-let [localappdata (System/getenv "LOCALAPPDATA")]
+        [(java.io.File. localappdata "eca")])
       ;; VS Code user extensions (Windows + POSIX): ~/.vscode/extensions
       (extension-eca-dirs (io/file home ".vscode" "extensions"))
       ;; VS Code scoop installs: %USERPROFILE%\scoop\apps\vscode\{version,current}
@@ -222,14 +231,7 @@
       [(java.io.File. home ".local/bin")
        (java.io.File. home "bin")
        (java.io.File. "/usr/local/bin")
-       (java.io.File. "/usr/bin")]
-      ;; The installer's own copy (%LOCALAPPDATA%\eca). It is normally on PATH,
-      ;; but probe it here too so resolution survives a stale PATH. LOWEST
-      ;; priority: an ECA the user installed (PATH, or the VS Code extension
-      ;; above) is always preferred - this copy only exists because nothing else
-      ;; did at install time.
-      (when-let [localappdata (System/getenv "LOCALAPPDATA")]
-        [(java.io.File. localappdata "eca")]))))
+       (java.io.File. "/usr/bin")])))
 
 (defn- known-eca-candidates
   "Absolute File objects for likely ECA binaries across OSes."
@@ -485,34 +487,14 @@
 (defn- kill-tree!
   "Kill a child process AND everything beneath it.
 
-  `.destroy` terminates only that one process. ECA's own children are the MCP
-  servers (`bash -lc \"java … --server …\"`), so on Windows they were orphaned
-  and stayed resident — measured: 121 leaked JVMs, roughly nine dead clients'
-  worth, plus 77 bash wrappers, enough to thrash the box into 'java out of
-  memory'. Windows therefore gets `taskkill /T`, which walks the whole tree (the
-  same trick `main.js` uses for the spine). POSIX destroys the descendants via
-  ProcessHandle, then the process.
-
-  Best effort — teardown must never throw."
+  Delegates to `grog.platform/kill-tree!` — ONE implementation, because the bug
+  recurred precisely when the MCP launchers kept their own leaky `.destroy`.
+  History (why this matters): `.destroy` terminates only the one process; ECA's
+  children are `bash -lc \"java … --server …\"` wrappers, so on Windows the JVMs
+  were orphaned and stayed resident — measured: 121 leaked JVMs plus 77 bash
+  wrappers, enough to thrash the box into 'java out of memory'."
   [^Process p]
-  (when p
-    (try
-      (if (windows?)
-        (let [pid (.pid p)]
-          (try
-            (doto (ProcessBuilder. (into-array String ["taskkill" "/PID" (str pid) "/T" "/F"]))
-              (.redirectErrorStream true)
-              (.start)
-              (.waitFor))
-            (catch Throwable _ (try (.destroy p) (catch Throwable _)))))
-        (do
-          (try
-            (with-open [ds (.descendants (.toHandle p))]
-              (doseq [^java.lang.ProcessHandle h (iterator-seq (.iterator ds))]
-                (try (.destroyForcibly h) (catch Throwable _))))
-            (catch Throwable _))
-          (.destroy p)))
-      (catch Throwable _))))
+  (platform/kill-tree! p))
 
 (defn disconnect!
   "Politely shut down session `id`'s ECA child (shutdown -> exit), then kill it

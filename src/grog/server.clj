@@ -99,6 +99,7 @@
             [grog.models :as models]
             [grog.projects :as projects]
             [grog.providers :as providers]
+            [grog.reap :as reap]
             [grog.soul :as soul]
             [grog.version :as version])
   (:import (java.io BufferedReader BufferedWriter File InputStreamReader
@@ -583,6 +584,14 @@
   ;; to stderr so stray printlns (Java or Clojure) can't corrupt frames.
   (alter-var-root #'*out* (constantly *err*))
   (client/set-impl! (local/->LocalClient))
+  ;; Reap stray grog-mcp JVMs orphaned by earlier hard deaths (force-kill, Task
+  ;; Manager, a service stop that skipped shutdown hooks) — BEFORE we start our
+  ;; own endpoint, so we never reap the one we are about to spawn.
+  (try
+    (let [{:keys [found killed]} (reap/kill-strays!)]
+      (when (pos? found)
+        (log! "[grog-server] stray sweep: found" found "grog-mcp process(es), killed" killed)))
+    (catch Throwable e (log! "[grog-server] stray sweep failed:" (.getMessage e))))
   (try (start-mcp-http!)
        (catch Throwable e (log! "[grog-server] mcp-http start failed:" (.getMessage e))))
   (let [hub (make-hub)

@@ -429,6 +429,35 @@
     (spit (io/file path) (with-out-str (pprint/pprint data)))
     {"GROG_IMAP_CONFIG" path}))
 
+(defn- jar-version
+  "Numeric version parsed from a `grog-mcp-<version>.jar` filename → a vector of
+  longs (for ordering), or [0] when the name carries no plain numeric version."
+  [^java.io.File f]
+  (if-let [m (re-matches #"grog-mcp-(.+)\.jar" (.getName f))]
+    (let [ps (mapv (fn [s] (try (parse-long s) (catch Throwable _ nil)))
+                   (str/split (nth m 1) #"[._\-+]"))]
+      (if (and (seq ps) (every? some? ps)) ps [0]))
+    [0]))
+
+(defn- bundled-jar
+  "The built grog-mcp uberjar to run: the HIGHEST VERSION in `bundle/target`.
+
+  The version is parsed from the FILENAME, NOT the file mtime. Selecting the
+  newest mtime is a bug magnet: rebuilding an older version — or a reinstall /
+  unzip that restores an older jar with a fresh timestamp — would make the OLD
+  jar 'win' even though a newer one exists. mtime is only a tie-breaker among
+  equal versions."
+  [bundle]
+  (let [dir (java.io.File. (str bundle "/target"))
+        jars (when (.isDirectory dir)
+               (->> (.listFiles dir)
+                    (filter (fn [^java.io.File f]
+                              (and (re-matches #"grog-mcp-.*\.jar" (.getName f))
+                                   (not (str/includes? (.getName f) "-sources")))))))]
+    (->> jars
+         (sort-by (fn [^java.io.File f] [(jar-version f) (.lastModified f)]))
+         last)))
+
 (defn grog-mcp-servers
   "The grog MCP server specs for `project` — ONE entry, ONE process.
 
@@ -459,16 +488,12 @@
     (into {} (map (fn [[k u]] [k {:url u}])) us)
     (let [root (grog-root)
           bundle (str root "/grog_mcp")
-          ;; Prefer the built uberjar (no Clojure CLI needed, one artifact), but
-          ;; fall back to the source tree when it hasn't been built — dev boxes
-          ;; and a fresh checkout keep working either way. `build.clj` writes
-          ;; target/grog-mcp-<version>.jar; pick the newest if several exist.
-          jar (or (explicit-bundle-jar)
-                  (->> (seq (.listFiles (java.io.File. (str bundle "/target"))))
-                       (filter (fn [^java.io.File f]
-                                 (re-matches #"grog-mcp-.*\.jar" (.getName f))))
-                       (sort-by (fn [^java.io.File f] (.lastModified f)))
-                       last))
+                     ;; Prefer the built uberjar (no Clojure CLI needed, one artifact), but
+                     ;; fall back to the source tree when it hasn't been built — dev boxes
+                     ;; and a fresh checkout keep working either way. `build.clj` writes
+                     ;; target/grog-mcp-<version>.jar; pick the HIGHEST VERSION (parsed from
+                     ;; the name), NOT the newest mtime — see `bundled-jar`.
+                     jar (or (explicit-bundle-jar) (bundled-jar bundle))
           ;; GROG_MCP_SOURCE=1 (set by `bb dev`) runs from .clj source at launch
           ;; instead of the built jar — plain `clojure -M:mcp` in the bundle, the
           ;; same on-the-fly compile, just without the jar. The bundle's

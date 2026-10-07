@@ -15,6 +15,10 @@
 
 ;; --- helpers ---------------------------------------------------------------
 
+;; Forward declaration: `!follow?` is defined with the transcript further down,
+;; but the `:send` handler above uses it (sending re-pins to the bottom).
+(declare !follow?)
+
 (defn- usage-text
   "Compact one-line summary of an ECA `usage` content."
   [c]
@@ -713,11 +717,15 @@
         ;; `/help` is answered LOCALLY — the same table as the onboarding panel,
         ;; UI triggers and all — instead of the spine's long text dump.
         (and id (empty? atts) (= "/help" (str/lower-case (str/trim txt))))
-        (do (rf/dispatch [:help id])
+        (do (reset! !follow? true)
+            (rf/dispatch [:help id])
             {:db (assoc-in db [:sessions id :input] "")})
 
         (and id (or (seq (str/trim txt)) (seq atts)))
         (do
+          ;; sending is an explicit "take me to the latest" — re-pin even if the
+          ;; reader had scrolled up
+          (reset! !follow? true)
           (rf/dispatch [:running id true])
           (-> (.call js/window.grogAPI "prompt"
                      (clj->js (cond-> {:id id :text txt}
@@ -949,9 +957,36 @@
 
 (defonce ^:private !scroll-el (atom nil))
 
+;; FOLLOWING? — is the view pinned to the bottom? A reagent atom (not a plain
+;; one) so the "jump to latest" chip re-renders the instant the user scrolls
+;; away or returns. TRUE = keep pinning to new output; FALSE = the user scrolled
+;; up to read, so we must NOT yank them down when more arrives.
+(defonce ^:private !follow? (r/atom true))
+
+;; How close to the bottom still counts as "at the bottom" (px) — a little slack
+;; so sub-pixel / rounding gaps never flip following off spuriously.
+(def ^:private scroll-slack-px 48)
+
+(defn- at-bottom?
+  "True when `n` is scrolled to (or within `scroll-slack-px` of) the bottom."
+  [^js n]
+  (boolean
+   (and n
+        (<= (- (.-scrollHeight n) (.-scrollTop n) (.-clientHeight n))
+            scroll-slack-px))))
+
 (defn- scroll-end! []
-  (when-let [n @!scroll-el]
-    (set! (.-scrollTop n) (.-scrollHeight n))))
+  ;; Pin to the bottom ONLY while following. This is the whole fix: a render
+  ;; no longer drags the reader back down if they have scrolled up.
+  (when (and @!follow? (some? @!scroll-el))
+    (let [n @!scroll-el]
+      (set! (.-scrollTop n) (.-scrollHeight n)))))
+
+(defn- on-scroll! [e]
+  ;; Called on every scroll, including our own programmatic ones — setting the
+  ;; position to the bottom keeps `following?` true, so there is no feedback
+  ;; fight; any upward scroll flips it off.
+  (reset! !follow? (at-bottom? (.-currentTarget e))))
 
 (defn- has-messages?
   "True once a real turn has happened (the splash logo retires then, like
@@ -1093,15 +1128,32 @@
                ^{:key i} [:div {:class "text-center text-sm italic seg-snark"} (:text s)])])]]))}))
 
 (defn- transcript [sid]
-  (let [s @(rf/subscribe [:sess sid])
-        segs (:transcript s)]
-    (r/after-render scroll-end!)
-    [:div {:ref (fn [el] (reset! !scroll-el el))
-           :class "relative flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-3"}
-           (if (has-messages? segs)
-             (for [[i seg] (map-indexed vector segs)]
-               ^{:key i} [segment-view sid seg])
-             [splash segs (:version s)])]))
+  (r/create-class
+   {:component-did-mount
+    ;; A freshly-mounted transcript (a new tab, or a switch to another project)
+    ;; starts pinned to the bottom — a session you just opened should show the
+    ;; latest output, not wherever the previous tab happened to be scrolled.
+    (fn [_] (reset! !follow? true))
+    :reagent-render
+    (fn [sid]
+      (r/after-render scroll-end!)
+      (let [s @(rf/subscribe [:sess sid])
+            segs (:transcript s)]
+        [:div {:class "relative flex-1 min-h-0"}
+         [:div {:ref (fn [el] (reset! !scroll-el el))
+                :on-scroll on-scroll!
+                :class "absolute inset-0 overflow-y-auto px-6 py-4 space-y-3"}
+          (if (has-messages? segs)
+            (for [[i seg] (map-indexed vector segs)]
+              ^{:key i} [segment-view sid seg])
+            [splash segs (:version s)])]
+         ;; Only while the reader is scrolled away from the bottom: a one-click
+         ;; way back, and a signal that new output has landed below.
+         (when-not @!follow?
+           [:button {:on-click (fn [_] (reset! !follow? true) (scroll-end!))
+                     :title "Jump to the newest output"
+                     :class "absolute bottom-4 right-4 z-10 px-3 py-1.5 rounded-full bg-sky-500 text-slate-950 text-xs font-medium shadow-lg"}
+            "↓ Jump to latest"])]))}))
 
 (defn- tab-strip []
   (let [order @(rf/subscribe [:order]) active @(rf/subscribe [:active])
@@ -1662,7 +1714,9 @@
       [tab-strip]
       (cond
         boot?  [bootstrap-panel]
-        active [transcript active]
+        ;; keyed by session so switching tabs REMOUNTS the transcript — a tab
+        ;; you switch to opens at the bottom, not at the previous tab's scroll.
+        active ^{:key active} [transcript active]
         :else  [:div {:class "flex-1 grid place-items-center text-slate-500"} "connecting…"])
       [composer]
       [status-bar]]

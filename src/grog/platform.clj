@@ -4,7 +4,8 @@
   requires `grog.secrets`) and `grog.secrets` can use it without a require cycle."
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import (java.io File)))
+  (:import (java.io File)
+           (java.lang Process ProcessBuilder ProcessHandle)))
 
 (defn windows?
   "True when running on a Microsoft Windows OS."
@@ -123,3 +124,41 @@
   (let [d (config-home-dir)]
     (.mkdirs d)
     d))
+
+(defn kill-handle-tree!
+  "Tree-kill a process identified by a `ProcessHandle` (works for processes we
+  did NOT spawn — see grog.reap). Windows: `taskkill /T /F` by pid, which walks
+  the whole tree (`.destroyForcibly` on Windows cannot kill a wrapper's child).
+  POSIX: destroy descendants, then the process. Best effort — never throws."
+  [^ProcessHandle h]
+  (when h
+    (try
+      (if (windows?)
+        (let [pid (.pid h)]
+          (try
+            (doto (ProcessBuilder. (into-array String ["taskkill" "/PID" (str pid) "/T" "/F"]))
+              (.redirectErrorStream true)
+              (.start)
+              (.waitFor))
+            (catch Throwable _ (try (.destroyForcibly h) (catch Throwable _)))))
+        (do
+          (try
+            (with-open [ds (.descendants h)]
+              (doseq [c (iterator-seq (.iterator ds))]
+                (try (.destroyForcibly c) (catch Throwable _))))
+            (catch Throwable _))
+          (.destroyForcibly h)))
+      (catch Throwable _))))
+
+(defn kill-tree!
+  "Kill `p` AND everything it spawned (best effort — never throws).
+
+  `.destroy` terminates only the ONE process. The processes grog launches are
+  usually WRAPPERS — `clojure -M:http` (a .bat/.ps1/CLI shim) or
+  `bash -lc \"java …\"` — whose real work is a `java` child. On Windows
+  `.destroy` kills the wrapper and ORPHANS the JVM (grog.eca measured 121 leaked
+  JVMs + 77 bash wrappers this way), so use `taskkill /T /F`, which walks the
+  whole tree. POSIX destroys descendants via ProcessHandle, then the process."
+  [p]
+  (when p
+    (kill-handle-tree! (.toHandle ^Process p))))

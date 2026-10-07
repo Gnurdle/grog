@@ -18,8 +18,10 @@
 
   Failure is soft: if the endpoint never comes up, `urls` stays empty and
   eca-config falls back to spawning stdio MCPs."
-  (:require [clojure.string :as str])
-  (:import (java.io BufferedReader File InputStreamReader)))
+  (:require [clojure.string :as str]
+            [grog.platform :as platform])
+  (:import (java.io BufferedReader File InputStreamReader)
+           (java.lang ProcessHandle)))
 
 (defonce ^:private !ep
   ;; {:process Process :urls {id url}} while running
@@ -70,6 +72,12 @@
       (try
         (let [pb (doto (ProcessBuilder. ^java.util.List (vec cmd))
                    (.directory (File. (str dir))))
+              ;; Tell the endpoint which grog-server owns it, so it can exit when
+              ;; we die (even a hard kill that skips OUR shutdown hook) — see the
+              ;; watchdog in grog_mcp.http.
+              _ (try (.put (.environment pb) "GROG_SERVER_PID"
+                           (str (.pid (ProcessHandle/current))))
+                     (catch Throwable _ nil))
               p (.start pb)]
           (drain! (BufferedReader. (InputStreamReader. (.getErrorStream p) "UTF-8")) urls)
           (loop [last-count 0 last-change (System/currentTimeMillis)]
@@ -96,9 +104,11 @@
           {})))))
 
 (defn stop!
-  "Stop the endpoint process (if running)."
+  "Stop the endpoint process (if running) AND its children. The endpoint is a
+  `clojure -M:http` WRAPPER whose real work is a `java` child, so a plain
+  `.destroy` orphaned the JVM on Windows — see grog.platform/kill-tree!."
   []
   (when-let [{:keys [^Process process]} @!ep]
-    (try (.destroy process) (catch Throwable _ nil)))
+    (platform/kill-tree! process))
   (reset! !ep nil)
   nil)

@@ -24,7 +24,8 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.config :as config]
-            [grog.platform :as platform])
+            [grog.platform :as platform]
+            [grog.reap :as reap])
   (:import (java.io File)))
 
 (def ^:private windows?
@@ -240,19 +241,22 @@
 
 (defn report []
   (let [deps (probe-deps)
-        cfg (config-report)]
+        cfg (config-report)
+        strays (reap/strays)]
     {:platform {:os (System/getProperty "os.name") :windows? windows?
                 :config-home (str (platform/config-home-dir))
                 :user-home (System/getProperty "user.home")}
      :deps deps
      :config cfg
+     :strays strays
      :summary {:deps-ok (count (filter #(= "ok" (:status %)) deps))
                :deps-missing (vec (map :id (filter #(= "missing" (:status %)) deps)))
                :deps-missing-required (vec (map :id (filter #(and (= "missing" (:status %))
                                                                   (:required? %)) deps)))
                :config-files (count (:fragments cfg))
                :config-broken (count (:broken cfg))
-               :config-problems (count (:problems cfg))}}))
+               :config-problems (count (:problems cfg))
+               :stray-mcp (count strays)}}))
 
 (defn print-human! []
   (let [r (report)
@@ -283,6 +287,14 @@
         (println (format "  %-24s %s" (pr-str path) problem))
         (when file (println (str "             from " file)))))
     (println)
+    (println "Stray grog-mcp processes:")
+    (if (seq (:strays r))
+      (do
+        (doseq [{:keys [pid cmdline]} (:strays r)]
+          (println (format "  pid %-8s %s" pid (subs cmdline 0 (min 100 (count cmdline))))))
+        (println "  → run `grog doctor --reap` to tree-kill them"))
+      (println "  none"))
+    (println)
     (println (str "Summary: " (:deps-ok summary) "/" (count deps) " dependencies present"
                   (when (seq (:deps-missing summary)) (str "; missing: " (str/join ", " (:deps-missing summary))))
                   (when (seq (:deps-missing-required summary)) (str "; REQUIRED missing: " (str/join ", " (:deps-missing-required summary))))
@@ -293,6 +305,13 @@
     (println "Tip: grog never sets `:llm :max-tokens` for ECA-driven turns; see doc/eca-output-limit-issue.md.")))
 
 (defn -main [& args]
-  (if (some #(= "--json" (str %)) args)
-    (println (json/generate-string (report) {:pretty true}))
-    (print-human!)))
+  (let [args (mapv str args)]
+    (cond
+      (some #{"--reap" "--kill-strays"} args)
+      (let [{:keys [found killed]} (reap/kill-strays!)]
+        (println (str "grog doctor: reaped " killed "/" found " stray grog-mcp process(es)")))
+
+      (some #{"--json"} args)
+      (println (json/generate-string (report) {:pretty true}))
+
+      :else (print-human!))))
