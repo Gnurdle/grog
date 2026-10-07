@@ -13,7 +13,8 @@
 # electron-builder builds NSIS in two passes — `makensis` emits an intermediate
 # installer, then it RUNS that installer under Wine to capture the uninstaller it
 # writes at runtime; Wine is also used for rcedit (grog icon + version stamping).
-# See the comment in scripts/build_dist.clj.
+# See the comment in scripts/build_dist.clj. The NSIS installer is 32-bit, so the
+# runner needs a 32-bit-capable Wine (i386 + wine32) and a display (Xvfb).
 #
 # This repo is PUBLIC, so standard GitHub-hosted runners and Actions storage are
 # free — no secrets are required to build or to run any of these checks. Smoke
@@ -43,10 +44,10 @@ jobs:
     name: unit + compile gate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -65,7 +66,7 @@ jobs:
           sudo ./install
 
       - name: Set up Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: npm
@@ -117,10 +118,10 @@ jobs:
     permissions:
       contents: write   # required to attach installers to a Release on tags
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -139,16 +140,24 @@ jobs:
           sudo ./install
 
       - name: Set up Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: clients/web/package-lock.json
 
-      - name: Install Wine + FUSE
+      - name: Install Wine (32-bit) + Xvfb + FUSE
+        # NSIS installers are 32-BIT. The runner's stock `wine` is 64-bit-only, so
+        # electron-builder's "run the installer under Wine to capture the
+        # uninstaller" pass dies with:
+        #   wine: failed to load C:\windows\syswow64\ntdll.dll (c0000135)
+        # Adding the i386 architecture + wine32 gives Wine a working 32-bit
+        # subsystem. Xvfb supplies the $DISPLAY Wine's windowed bits want on a
+        # headless box (the "nodrv_CreateWindow / no driver" errors).
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y wine
+          sudo apt-get install -y wine wine32 wine64 xvfb xauth
           # libfuse2 is needed for the AppImage step; on 24.04 it is libfuse2t64
           sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
 
@@ -168,7 +177,8 @@ jobs:
         run: npm ci
 
       - name: Build both jars + renderer + Windows NSIS + Linux AppImage
-        run: bb dist --target all
+        # xvfb-run gives Wine a display for the NSIS uninstaller pass
+        run: xvfb-run -a bb dist --target all
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
