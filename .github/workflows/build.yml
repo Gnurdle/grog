@@ -201,7 +201,3 @@ jobs:
           files: |
             dist/*.exe
             dist/*.AppImage
-_notes: true
-          files: |
-            dist/*.exe
-            dist/*.AppImage
