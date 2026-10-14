@@ -10,6 +10,11 @@ contextBridge.exposeInMainWorld("grogAPI", {
   // server notifications: {"method":"event","params":{...:sessionId}} and
   // {"method":"question", ...}
   onNotify: (f) => ipcRenderer.on("grog:notify", (_e, msg) => f(msg)),
+  // the log pane: turn the live feed on/off (the invoke returns the current tail,
+  // so the pane is never blank) and receive each new line. The log FILE is
+  // written regardless — this only decides whether the client renders it.
+  logSubscribe: (on) => ipcRenderer.invoke("grog:log-subscribe", on),
+  onLogLine: (f) => ipcRenderer.on("grog:log-line", (_e, line) => f(line)),
   // window focus — required by the question-visibility rule (§3.4.1)
   onFocus: (f) => ipcRenderer.on("grog:focus", (_e, focused) => f(focused)),
   focused: () => ipcRenderer.invoke("grog:focused"),

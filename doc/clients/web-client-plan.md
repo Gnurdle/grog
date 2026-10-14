@@ -147,10 +147,14 @@ local engine; disabled/loud-hint when unconfigured.
   bytes to a temp WAV and runs the local engine via `execFile` (whisper.cpp),
   then deletes it. Silence markers → `""` (mirrors `grog.voice/clean-transcript`).
 - **Config**: `GROG_VOICE_COMMAND` (JSON array or shell string; `{wav}`
-  substituted) — default is `whisper-cli -m <model> -f {wav} -nt`, model under
-  `~/.config/grog/models` (or `GROG_VOICE_MODEL`), falling back to the common
-  local build at `~/whisper.cpp/build/bin/whisper-cli`. `GROG_VOICE_ENABLED=0`
-  disables; `GROG_VOICE_MAX_SECONDS` (default 60) caps recording.
+  substituted) — default is `whisper-cli -m <model> -f {wav} -nt`. The model is
+  resolved from `$GROG_VOICE_MODEL` → `<app>/models` → `<repo>/models` →
+  `$XDG_DATA_HOME/grog/models` (~/.local/share/grog/models — the documented spot
+  for one the user supplies) → `~/whisper.cpp/models`; the engine falls back to
+  the common local build at `~/whisper.cpp/build/bin/whisper-cli`. Neither piece
+  is bundled, and nothing is looked for under the config home.
+  `GROG_VOICE_ENABLED=0` disables;
+  `GROG_VOICE_MAX_SECONDS` (default 60) caps recording.
 - **preload**: `grogAPI.voiceStatus()` / `voiceTranscribe(bytes)`.
 - **Mic permission**: `session.defaultSession.setPermissionRequestHandler` grants
   `media`; `getUserMedia` also needs a secure context (`localhost` dev and

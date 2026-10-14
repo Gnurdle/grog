@@ -82,15 +82,29 @@
 
 (defn save-eca-model!
   "Persist the chosen model as `:eca :model` in grog.edn atomically, preserving
-  every other key — the DEFAULT model for the GUI's ECA chat.
+  every other key — the GLOBAL big-slot default for the GUI's ECA chat.
 
-  CALLED whenever the user picks a model (`grog.client.local/set-model!`): a
-  pick is the default from then on, so every new session and every restart uses
-  it until the user picks again. It wins over `:llm :model` (see
-  `grog.config/eca-model`); the picker writes the provider-QUALIFIED id
-  (`openrouter/…`, `ollama/…`) so ECA can resolve it without guessing."
+  Called only when the user ticks \"set as global default\" in the models dialog
+  (`grog.client.local/set-model-fn` with `:global true`). A plain pick writes the
+  PROJECT manifest instead (`grog.projects/set-project-model!`), so one project's
+  choice never rewrites every other project (or every future session).
+
+  It wins over `:llm :model` (see `grog.config/eca-model`); the picker writes the
+  provider-QUALIFIED id (`openrouter/…`, `ollama/…`) so ECA can resolve it
+  without guessing."
   [m]
   (persist! #(assoc-in % [:eca :model] (str m)))
+  m)
+
+(defn save-eca-small-model!
+  "Persist `m` as `:eca :small-model` in grog.edn atomically — the GLOBAL default
+  for the small slot, the counterpart of `save-eca-model!`.
+
+  Also called only for the \"set as global default\" tick. There is no delete
+  here on purpose: the global small default is set or left unset, and unsetting
+  it is an explicit config edit, not something a dialog should do by accident."
+  [m]
+  (persist! #(assoc-in % [:eca :small-model] (str m)))
   m)
 
 ;; --- fetching available models ----------------------------------------------

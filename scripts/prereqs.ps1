@@ -232,6 +232,16 @@ if (-not $Minimal) {
   # but no recognition data, and OCR fails without it.
   Ensure 'tesseract-languages' $null      @()
 
+  # Voice input: the desktop client shells out to whisper.cpp for local
+  # speech-to-text, and needs TWO pieces - the ENGINE and a speech MODEL. Only
+  # the engine is installable here: `whisper-cpp` lives in scoop's default
+  # `main` bucket (no bucket add needed) and shims whisper-cli.exe onto PATH,
+  # which is exactly what grog's voice code looks for. There is no model package
+  # to install (scoop's own manifest notes say "Whisper Model files are not
+  # included") and grog ships none, so the model is the user's - see
+  # models/README.md for the one command that fetches it.
+  Ensure 'whisper-cpp'        'whisper-cli' @('--help')
+
   Step 'LibreOffice'
   if ($Full) {
     # ~350 MB from a mirror redirector, fetched in ONE connection by default -
@@ -312,6 +322,7 @@ $Checks = @(
   @{ Label = 'tesseract'; App = 'tesseract';       Probe = 'tesseract' }
   @{ Label = 'pdftoppm';  App = 'poppler';         Probe = 'pdftoppm' }
   @{ Label = 'soffice';   App = 'libreoffice';     Probe = 'soffice' }
+  @{ Label = 'whisper-cli'; App = 'whisper-cpp';   Probe = 'whisper-cli' }
 )
 foreach ($c in $Checks) {
   $onPath = (Get-Command $c.Probe -ErrorAction SilentlyContinue).Source

@@ -72,7 +72,11 @@
     :hint {:windows "scoop install jq" :posix "apt install jq"}}
    {:id "node" :names ["node" "node.exe"] :version ["--version"] :required? false
     :capability "the Electron client (not needed when driving the spine directly)"
-    :hint {:windows "scoop install nodejs-lts" :posix "apt install nodejs"}}])
+    :hint {:windows "scoop install nodejs-lts" :posix "apt install nodejs"}}
+   {:id "whisper-cli" :names ["whisper-cli" "whisper-cli.exe"] :version ["--help"] :required? false
+    :capability "voice input (local speech-to-text; also needs a ggml model — see models/README.md)"
+    :hint {:windows "scoop install whisper-cpp"
+           :posix   "Arch: pacman -S whisper-cpp · other distros: build whisper.cpp (provides whisper-cli), or set $GROG_VOICE_COMMAND"}}])
 
 (defn- search-path
   "First executable named one of `names` on PATH (PATHEXT-aware on Windows)."

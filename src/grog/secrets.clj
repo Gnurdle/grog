@@ -292,8 +292,33 @@
       (println (str "grog: note: '" account "' is not a declared account — proceeding anyway. "
                     "(Declared: " (str/join ", " (sort (known-account-set))) ")")))))
 
+(defn unquote-value
+  "Strip ONE matching pair of surrounding quotes — single or double — from a
+  command-line value, then trim.
+
+  Quoting is shell habit and here it is a footgun: storing the quotes as part of
+  the credential makes the provider reject a key that looks correct in every
+  listing, with an error that names nothing. Only a MATCHED pair is removed: an
+  unbalanced leading quote is left alone, because a secret may legitimately begin
+  with a quote character and silently deleting one corrupts it.
+
+  Written with (int c) = 34 / 39 rather than quote character literals on purpose —
+  the function that handles quotes should not itself depend on escaping them."
+  [s]
+  (let [t (str/trim (str s))
+        n (count t)
+        c (int (first t))]
+    (if (and (>= n 2)
+             (or (= c 34) (= c 39))          ; 34 = double quote, 39 = single quote
+             (= c (int (last t))))
+      (str/trim (subs t 1 (dec n)))
+      t)))
+
 (defn set-secret!
   "Persist `password` for `account` under service `grog`.
+
+  A surrounding QUOTE PAIR on `password` is stripped first (see `unquote-value`),
+  so `/secret set LLM_API_KEY \"sk-...\"` stores the key and not the quoting.
 
   ANY account name is accepted — see `note-unknown-account!`. (The model-facing
   allowlist is a different thing and stays: `with_api_key` only ever uses
@@ -303,30 +328,31 @@
   keyring backend is available. Returns
   `{:backend :keyring|:file :reason str|nil}`."
   [^String account ^String password]
-  (when (str/blank? account)
-    (throw (ex-info "account (key) is required" {})))
-  (when (str/blank? password)
-    (throw (ex-info "value must be non-empty" {})))
-  (note-unknown-account! account)
-  (note-in-ledger! account)
-  (try
-    (with-open [^Keyring kr (Keyring/create)]
-      (.setPassword kr service-id account password))
-    (reset! !keyring-unreachable false)
-    (reset! !backend :keyring)
-    {:backend :keyring}
-    (catch BackendNotSupportedException e
-      (write-secret-file! account password)
-      (reset! !backend :file)
-      {:backend :file :reason (str "no OS secret backend: " (.getMessage e))})
-    (catch PasswordAccessException e
-      (write-secret-file! account password)
-      (reset! !backend :file)
-      {:backend :file :reason (.getMessage e)})
-    (catch Exception e
-      (write-secret-file! account password)
-      (reset! !backend :file)
-      {:backend :file :reason (.getMessage e)})))
+  (let [password (unquote-value password)]
+    (when (str/blank? account)
+      (throw (ex-info "account (key) is required" {})))
+    (when (str/blank? password)
+      (throw (ex-info "value must be non-empty" {})))
+    (note-unknown-account! account)
+    (note-in-ledger! account)
+    (try
+      (with-open [^Keyring kr (Keyring/create)]
+        (.setPassword kr service-id account password))
+      (reset! !keyring-unreachable false)
+      (reset! !backend :keyring)
+      {:backend :keyring}
+      (catch BackendNotSupportedException e
+        (write-secret-file! account password)
+        (reset! !backend :file)
+        {:backend :file :reason (str "no OS secret backend: " (.getMessage e))})
+      (catch PasswordAccessException e
+        (write-secret-file! account password)
+        (reset! !backend :file)
+        {:backend :file :reason (.getMessage e)})
+      (catch Exception e
+        (write-secret-file! account password)
+        (reset! !backend :file)
+        {:backend :file :reason (.getMessage e)}))))
 
 (defn delete-secret!
   "Remove `account` from the OS keyring (best effort) and the secrets file.

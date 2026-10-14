@@ -65,3 +65,20 @@ body{ background:#020617; color:#eaf7f8;
 /* inline images (markdown ![alt](src)) — capped, never swallow the transcript */
 .md img{ max-width:100%; height:auto; border:1px solid var(--grog-border);
          border-radius:.4rem; vertical-align:middle }
+
+/* the status-bar usage number: jump to a BRIGHT colour, hold a beat, then fade
+   back to the status bar's OWN colour over ~3s. Replays from the start on every
+   update, because that span is keyed on the session's usage tick — a changed key
+   remounts the element, and a remount restarts the animation. No JS, no timers.
+   The two colours are local custom properties (keyframes resolve them against the
+   element); the base is the status bar's own text-slate-400, so it lands exactly
+   on the colour it would have had — nothing shifts permanently. */
+.usage-flash{ --usage-base:#94a3b8;              /* = text-slate-400 (status bar) */
+              --usage-hot:#7dd3fc;               /* sky-300 — bright, same palette */
+              color:var(--usage-base);
+              animation:grog-usage-flash 3s linear 1 }
+@keyframes grog-usage-flash{
+  0%{ color:var(--usage-hot); text-shadow:0 0 8px var(--usage-hot) }
+  8%{ color:var(--usage-hot); text-shadow:0 0 8px var(--usage-hot) }
+  100%{ color:var(--usage-base); text-shadow:none }
+}

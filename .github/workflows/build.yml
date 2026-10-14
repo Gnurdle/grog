@@ -177,7 +177,10 @@ jobs:
         run: npm ci
 
       - name: Build both jars + renderer + Windows NSIS + Linux AppImage
-        # xvfb-run gives Wine a display for the NSIS uninstaller pass
+        # xvfb-run gives Wine a display for the NSIS uninstaller pass.
+        # Installers ship NO speech model: voice input needs whisper.cpp's
+        # engine (from the user's package manager) plus a ggml model the user
+        # supplies — see models/README.md for where the client looks.
         run: xvfb-run -a bb dist --target all
 
       - name: Upload installers
@@ -195,6 +198,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.AppImage
+_notes: true
           files: |
             dist/*.exe
             dist/*.AppImage

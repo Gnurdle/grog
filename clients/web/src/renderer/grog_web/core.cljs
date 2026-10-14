@@ -42,7 +42,10 @@
       "reasonText"      {:kind :thinking :text (str (or text ""))}
       "toolCalled"      {:kind :tool     :text (str "⚙ " (or summary name "tool"))}
       "toolCallRun"     {:kind :tool     :text (str "⚙ " (or summary name "tool"))}
-      "usage"           {:kind :usage    :text (usage-text content)}
+      ;; "usage" is deliberately NOT a segment here. It arrives mid-stream, and a
+      ;; segment landing between two :answer/:thinking chunks BREAKS the
+      ;; consecutive-run coalescing in `append-segment` — the answer gets split in
+      ;; half every time usage updates. It belongs in the status bar; see `:ev`.
       ;; an assistant image (from an MCP tool's image content block or image
       ;; generation) — ECA sends it inline as base64; render it, don't text it.
       "image"           {:kind :image    :media_type (str (or (:mediaType content) "image/png"))
@@ -50,9 +53,19 @@
       ;; lifecycle / noise — deliberately not painted
       ("reasonStarted" "reasonFinished" "progress" "metadata"
        "toolCallPrepare" "toolCallRunning") nil
-      ;; unknown: log for discovery, don't paint a raw map
-      (do (.log js/console "[grog-web] unhandled content type:" (pr-str type))
-          nil))))
+      ;; UNKNOWN — now PAINTED, not merely logged. This branch used to return nil,
+      ;; which is how ECA's `tool-call-dropped` notice ("the model emitted a DSML
+      ;; tool call that could not be parsed … the call was dropped") became
+      ;; invisible in the UI: a real diagnostic, discarded for not appearing in the
+      ;; list above. Any unknown type carrying text is shown as a diagnostic line,
+      ;; so the next notice ECA invents is visible without anyone remembering to
+      ;; add it here — a hard-coded list is a thing that goes stale.
+      (let [msg (str (or text summary name ""))]
+        (if (str/blank? msg)
+          (do (.log js/console "[grog-web] unhandled content type (no text):" (pr-str type))
+              nil)
+          (do (.log js/console "[grog-web] unhandled content type:" (pr-str type) msg)
+              {:kind :line :text (str "⚠ " (or name type) ": " msg)}))))))
 
 ;; The project the client opens is decided by the SPINE (`startup`), never
 ;; hard-coded here. It used to be a literal "grog" — the developer's own
@@ -76,7 +89,9 @@
 (def ^:private help-rows
   [["/help"    "this list — everything grog can be told to do"           "—"]
    ["/project" "list · switch · create (/project new <name>) · delete"   "Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1‑9 jump"]
-   ["/model"   "show or switch this session's model"                     "⚙ Settings"]
+   ["/model"   "set the big/small models (per project, or global default)" "⚙ Settings → Models…"]
+   ["/big"     "run the BIG model for this session"                       "status-bar badge (amber)"]
+   ["/small"   "run the SMALL model — or big, if none is set"             "status-bar badge (emerald)"]
    ["/secret"  "store or remove a key — values are never printed"        "—"]
    ["/clear"   "start a fresh conversation"                              "—"]
    ["/doctor"  "check what is installed and whether it holds together"   "—"]
@@ -108,6 +123,11 @@
   (fn [_ _]
     {:sessions {} :order [] :active nil :focused? true
      :connected? false :socket-path "" :opened? false :font-size 16
+     ;; the log pane (off unless the user turns it on; persisted like font-size).
+     ;; `:log-lines` is a bounded TAIL — the file is the record, this is a viewer.
+     ;; `:log-scope` :project keeps this session's lines plus everything
+     ;; unattributed (client/global) — see `log-foreign?`.
+     :log-open? false :log-lines [] :log-path nil :log-scope :project
      :dialog nil :dialog-input "" :q-input "" :projects []
      ;; startup (from the spine's `startup` call): which project to open, and
      ;; whether an LLM is even reachable — if not, the client shows the "Job 1"
@@ -121,12 +141,22 @@
      :model-sources [["local" "Local"]]
      ;; provider picker (settings dialog): the shipped catalogue (resources/
      ;; providers.edn via the server's `providers` method) + what :llm points at.
-     :providers nil :provider-current nil
+     ;; `:provider-query` / `:provider-open?` drive the searchable combo box.
+     :providers nil :provider-current nil :provider-query "" :provider-open? false
      ;; The composer draft and its attachments are PER SESSION
      ;; ([:sessions sid :input] / [:sessions sid :attachments]) so swapping
      ;; projects cannot leak one project's text or image into another — they are
      ;; not top-level keys. See the :input / :attach-* events and their subs.
-     :voice nil :recording? false :transcribing? false}))
+     :voice nil :recording? false :transcribing? false
+     ;; MODELS dialog (big/small): one editable draft per slot + the "also set as
+     ;; global default" tick, seeded from the focused session when it opens (see
+     ;; :dialog-open). The dialog is separate from Settings, which now only SHOWS
+     ;; the two models read-only.
+     :models-big "" :models-small ""
+     :models-big-global? false :models-small-global? false
+     ;; which slot the SHARED catalogue list fills (the BIG / SMALL tabs at the
+     ;; top of the dialog) — the list has one search box, so it targets one slot.
+     :models-slot :big}))
 
 (rf/reg-sub :db (fn [db _] db))
 (defn- sess-of [db id] (get-in db [:sessions id]))
@@ -195,6 +225,11 @@
                       {:id id :project (:project snap)
                        :model (:model snap) :status (or (:status snap) "idle")
                        :version (:version snap)
+                       ;; big/small slots: the effective model is `:model`; these
+                       ;; two are each slot's resolved id and which is active.
+                       :model-slot (keyword (or (:model-slot snap) "big"))
+                       :big-model (:big-model snap)
+                       :small-model (:small-model snap)
                        :trust (boolean (:trust snap))
                        :running? (boolean (:running? snap))
                        :transcript (if (:banner snap)
@@ -446,12 +481,23 @@
 
 (rf/reg-event-fx :dialog-open
   (fn [{:keys [db]} [_ kind initial]]
-    (cond-> {:db (assoc db :dialog kind :dialog-input (or initial ""))}
-      ;; the project picker needs the live list from the server
-      (= kind :projects) (assoc :dispatch [:fetch-projects])
-      ;; the settings dialog opens onto the model picker's current source, and
-      ;; loads the provider catalogue alongside it
-      (= kind :settings) (assoc :dispatch-n [[:models-fetch nil] [:providers-load]]))))
+    (let [sess (get-in db [:sessions (:active db)])]
+      (cond-> {:db (assoc db :dialog kind :dialog-input (or initial "")
+                          ;; the provider combo starts collapsed / unsearched
+                          :provider-query "" :provider-open? false)}
+        ;; the project picker needs the live list from the server
+        (= kind :projects) (assoc :dispatch [:fetch-projects])
+        ;; the settings dialog loads the provider catalogue (its model section is
+        ;; read-only now — editing models happens in the Models… dialog)
+        (= kind :settings) (assoc :dispatch-n [[:providers-load]])
+        ;; the MODELS dialog seeds its two boxes from the focused session's
+        ;; resolved big/small models and loads the catalogue to browse.
+        (= kind :models)
+        (assoc :db (assoc db :dialog :models :model-query "" :models-slot :big
+                          :models-big (or (:big-model sess) (:model sess) "")
+                          :models-small (or (:small-model sess) "")
+                          :models-big-global? false :models-small-global? false)
+               :dispatch [:models-fetch nil])))))
 
 ;; --- project list (server `projects` method) -------------------------------
 
@@ -466,6 +512,17 @@
     {}))
 (rf/reg-event-db :dialog-input (fn [db [_ s]] (assoc db :dialog-input s)))
 (rf/reg-event-db :dialog-close (fn [db _] (assoc db :dialog nil)))
+;; models dialog (big/small): draft boxes, the global tick, and which slot the
+;; shared catalogue list fills.
+(rf/reg-event-db :models-draft
+  (fn [db [_ slot v]] (assoc db (if (= :small slot) :models-small :models-big) v)))
+(rf/reg-event-db :models-global
+  (fn [db [_ slot on?]]
+    (assoc db (if (= :small slot) :models-small-global? :models-big-global?) (boolean on?))))
+;; which slot the SHARED catalogue list fills when you click a model
+(rf/reg-event-db :models-target
+  (fn [db [_ slot]]
+    (assoc db :models-slot (if (= :small slot) :small :big))))
 
 ;; --- model picker ----------------------------------------------------------
 ;;
@@ -553,6 +610,24 @@
         (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] set-provider failed: " (.-message e))]))))
     {}))
 
+;; --- the provider combo box -------------------------------------------------
+;; A native <select> can be neither sorted nor searched, so the settings picker
+;; is a small combo: a search field that filters the shipped catalogue and a
+;; list sorted by label. `:provider-query` is the search string, `:provider-open?`
+;; whether the list is showing.
+
+(rf/reg-event-db :provider-query
+  (fn [db [_ q]] (assoc db :provider-query (or q "") :provider-open? true)))
+
+(rf/reg-event-db :provider-open
+  (fn [db [_ open?]] (assoc db :provider-open? (boolean open?))))
+
+;; choose a provider: close + clear the box, then do the real work.
+(rf/reg-event-fx :provider-pick
+  (fn [{:keys [db]} [_ id]]
+    {:db (assoc db :provider-query "" :provider-open? false)
+     :dispatch [:set-provider id]}))
+
 (rf/reg-event-db :status-line
   (fn [db [_ sid text]]
     (let [sid (or sid (:active db))]
@@ -584,13 +659,20 @@
       (cond
         (= :content kind)
         (let [c (:content ev)
-              db2 (append-segment db sid (line-of c))
-              ;; output is flowing now, so it is no longer "waiting on the model"
-              db2 (cond-> db2
+              usage? (= "usage" (:type c))
+              db2 (cond-> db
+                    ;; NOT a transcript segment (see `line-of`): appending it would
+                    ;; split a running answer or thinking block in two.
+                    (not usage?) (append-segment sid (line-of c))
+                    ;; output is flowing now, so it is no longer "waiting on the model"
                     (contains? model-output-types (str (:type c)))
                     (assoc-in [:sessions sid :waiting?] false))]
-          (if (= "usage" (:type c))
-            (assoc-in db2 [:sessions sid :usage] c)
+          (if usage?
+            (-> db2
+                (assoc-in [:sessions sid :usage] c)
+                ;; a tick per update, so the status bar can flash (its span is
+                ;; keyed on this — a changed key remounts it and replays the CSS)
+                (update-in [:sessions sid :usage-tick] (fnil inc 0)))
             db2))
         (= :user kind)     (append-segment db sid {:kind :user :text (str (:text ev))})
         (= :line kind)     (append-segment db sid {:kind :line :text (str (:text ev))})
@@ -600,14 +682,31 @@
                                (= "idle" v) (set-running sid false)))
         (= :running kind)  (set-running db sid (boolean (:value ev)))
         (= :trust kind)    (assoc-in db [:sessions sid :trust] (boolean (:value ev)))
-        (= :model kind)    (assoc-in db [:sessions sid :model] (:value ev))
+        (= :model kind)    (cond-> (assoc-in db [:sessions sid :model] (:value ev))
+                             ;; the `model` event also carries the slot state
+                             ;; (`:slot`/`:big`/`:small`) — see grog.client.local
+                             (contains? ev :slot)
+                             (assoc-in [:sessions sid :model-slot] (keyword (str (:slot ev))))
+                             (contains? ev :big)
+                             (assoc-in [:sessions sid :big-model] (:big ev))
+                             (contains? ev :small)
+                             (assoc-in [:sessions sid :small-model] (:small ev)))
         (= :vision kind)   (assoc-in db [:sessions sid :vision?] (:value ev))
         (= :clear kind)    (assoc-in db [:sessions sid :transcript] [])
         (= :approval kind) (assoc-in db [:sessions sid :pending-approval] (dissoc ev :answer))
-        (= :question kind) (-> db
-                               (assoc-in [:sessions sid :pending-question] (dissoc ev :answer))
-                               (update-in [:sessions sid :transcript] (fnil conj [])
-                                          {:kind :line :text "[LLM question pending]"}))
+        (= :question kind)
+        (let [q (dissoc ev :answer)
+              opts (:options q)]
+          ;; Echo the question INTO the transcript so it lands in the chat log
+          ;; (not only in a transient popup). No focus/window change here — the
+          ;; tab turns brown and `question-panel` offers the controls.
+          (-> db
+              (assoc-in [:sessions sid :pending-question] q)
+              (update-in [:sessions sid :transcript] (fnil conj [])
+                         {:kind :line
+                          :text (str "❓ " (or (:prompt q) "the model is asking")
+                                     (when (seq opts)
+                                       (str "   [" (str/join " / " (map opt-label opts)) "]")))})))
         :else db))))
 
 (rf/reg-event-db :running
@@ -721,6 +820,13 @@
             (rf/dispatch [:help id])
             {:db (assoc-in db [:sessions id :input] "")})
 
+        ;; `/big` and `/small` switch the model SLOT — handled locally (like
+        ;; /help) so it is instant and never reaches the model. The server
+        ;; resolves the fallback (no small model ⇒ still big) and reports back.
+        (and id (empty? atts) (re-matches #"(?i)/(big|small)" (str/trim txt)))
+        (do (rf/dispatch [:set-model-slot id (keyword (str/lower-case (subs (str/trim txt) 1)))])
+            {:db (assoc-in db [:sessions id :input] "")})
+
         (and id (or (seq (str/trim txt)) (seq atts)))
         (do
           ;; sending is an explicit "take me to the latest" — re-pin even if the
@@ -762,19 +868,43 @@
       {:db (assoc-in db [:sessions id :trust] on)})))
 
 (rf/reg-event-fx :set-model
-  (fn [{:keys [db]} [_ id model source]]
-    (let [m (str/trim (str model))]
+  (fn [{:keys [db]} [_ id model source opts]]
+    (let [m (str/trim (str model))
+          slot (or (:slot opts) :big)
+          global? (boolean (:global opts))]
       (if (seq m)
         (do
           ;; `source` is the picker's PLACE ("local"/"remote"). The server turns
           ;; that into a provider before qualifying — it knows the config; this
           ;; side only knows the tab.
+          ;; `:slot` picks wide/narrow (big/small); `:global` writes the GLOBAL
+          ;; default into grog.edn instead of this project's manifest.
           (-> (.call js/window.grogAPI "set-model"
-                     (clj->js (cond-> {:id id :model m}
+                     (clj->js (cond-> {:id id :model m :slot (name slot) :global global?}
                                 source (assoc :source (str source)))))
               (.catch (fn [e] (rf/dispatch [:status-line id (str "[grog] set-model failed: " (.-message e))]))))
-          {:db (assoc db :dialog nil)})
+          ;; the models dialog stays open (it has its own Close); the server
+          ;; pushes the new slot state back as a `model` event.
+          {:db db})
         {}))))
+
+(rf/reg-event-fx :settings-save
+  "Save the Settings dialog's model AND dismiss the dialog. A `Save` button is
+  expected to close; `:set-model` alone deliberately does not (that behaviour is
+  for the models dialog's per-slot Apply, which has its own Close). `source` is
+  forwarded so a double-click from the catalogue still qualifies the provider."
+  (fn [_ [_ id model source]]
+    {:dispatch-n [[:set-model id model source] [:dialog-close]]}))
+
+(rf/reg-event-fx :set-model-slot
+  "Switch which slot a turn runs (/big, /small). Per session; the server owns the
+  fallback (a small slot with no small model keeps running big) and reports the
+  result back as a `model` event."
+  (fn [{:keys [db]} [_ id slot]]
+    (-> (.call js/window.grogAPI "set-model-slot"
+               (clj->js {:id id :slot (name (if (= :small slot) :small :big))}))
+        (.catch (fn [e] (rf/dispatch [:status-line id (str "[grog] set-model-slot failed: " (.-message e))]))))
+    {:db db}))
 
 (rf/reg-event-fx :answer-approval
   (fn [{:keys [db]} [_ sid approval-id decision]]
@@ -896,6 +1026,9 @@
 ;; provider picker: the shipped catalogue + what :llm currently points at.
 (rf/reg-sub :providers (fn [db _] (:providers db)))
 (rf/reg-sub :provider-current (fn [db _] (:provider-current db)))
+;; the provider combo box's search string + open flag.
+(rf/reg-sub :provider-query (fn [db _] (:provider-query db)))
+(rf/reg-sub :provider-open? (fn [db _] (:provider-open? db)))
 (rf/reg-sub :pending-questions
   (fn [db _] (->> (:sessions db) (keep (fn [[id s]] (when (:pending-question s) id))) set)))
 
@@ -1007,13 +1140,18 @@
 ;; Milliseconds between rain steps during the intro sweep. The RAF loop runs
 ;; every frame (~60fps) but only paints once this much time has elapsed, so
 ;; the glyphs fall at a calm, readable pace instead of a frantic blur.
-(def ^:private matrix-frame-ms 55)
+;; Halved from 55: the opening downpour runs at double pace (~33ms a step at
+;; 60fps — the gate quantises to whole frames).
+(def ^:private matrix-frame-ms 27.5)
 
 ;; After the first sweep — the leading glyphs have fallen off the bottom of
-;; the canvas — the rain settles: it steps ~3x slower and only a fraction of
-;; the columns keep falling, so the splash calms down behind the logo instead
-;; of holding the full opening downpour. Bump the density to keep more columns.
-(def ^:private matrix-frame-ms-settled (* 3 matrix-frame-ms))
+;; the canvas — the rain settles: it steps slower and only a fraction of the
+;; columns keep falling, so the splash calms down behind the logo instead of
+;; holding the full opening downpour. Bump the density to keep more columns.
+;; No longer derived from the intro (it was `* 3`): the trickle is now half its
+;; old PACE (165ms -> 330ms) while the intro went the other way, so the two
+;; knobs move independently instead of fighting each other.
+(def ^:private matrix-frame-ms-settled 330)
 (def ^:private matrix-settled-density 0.33)
 
 ;; The rain's alphabet. Classic Matrix uses half-width katakana, but this box
@@ -1115,7 +1253,11 @@
          [:div {:class "relative z-10 flex flex-col items-center gap-3 w-full max-h-full min-h-0"}
           ;; the logo yields space first (min-h-0 + shrink + explicit max-height)
           ;; so the snark line and hint below it are never clipped at the bottom.
-          [:img {:src "logo.jpg" :alt "grog"
+          ;; logo.PNG, not the jpg: the splash floats this at opacity-50 over the
+          ;; matrix canvas, and the jpg's flattened black background painted a
+          ;; dark rectangle over the rain. The png's alpha lets the rain through
+          ;; and gives rounded-xl/shadow-2xl the letters' silhouette to work with.
+          [:img {:src "logo.png" :alt "grog"
                  :class "w-auto max-w-[70vw] min-h-0 shrink object-contain rounded-xl shadow-2xl opacity-50"
                  :style {:max-height "50vh"}}]
           ;; which build this is — the spine stamps it into the jar; nil when an
@@ -1168,29 +1310,156 @@
              state (cond pend? :question waiting? :waiting running? :streaming :else :idle)]
          ^{:key id}
          [:div {:on-click #(rf/dispatch [:select-tab id])
-                :title (cond pend? "Answer needed — the grog window has been raised; answer to continue"
+                ;; A question does NOT raise or focus the window — the tab just
+                ;; turns BROWN, so say that, rather than implying it did.
+                :title (cond pend? "Answer needed — open this tab to answer (focus was not stolen)"
                              waiting? "Waiting on the model…"
                              running? "Streaming"
                              :else "Idle")
                 :class (str "group flex items-center gap-2 px-3 py-2 rounded-t-md text-sm cursor-pointer "
-                            (if pend? "bg-amber-500/10 border border-amber-500/40 border-b-0 text-amber-200"
+                            (if pend? "bg-amber-800/30 border border-amber-700/70 border-b-0 text-amber-100"
                                 (if (= id active) "bg-sky-500/15 border border-sky-500/40 border-b-0 text-sky-200"
                                     "text-slate-400 hover:bg-slate-800")))}
           [:span {:class (str "w-2 h-2 rounded-full "
                               (case state
-                                :question  "bg-amber-400 animate-pulse"
+                                :question  "bg-amber-600 animate-pulse"
                                 ;; violet = sent, but no output yet
                                 :waiting   "bg-fuchsia-400 animate-pulse"
                                 :streaming "bg-sky-400 animate-pulse"
                                 "bg-emerald-500/50"))}]
           (get-in sessions [id :project])
-          (when pend? [:span {:class "px-1 rounded bg-amber-500/20 text-[0.64rem] text-amber-300"} "?"])
+          (when pend? [:span {:class "px-1 rounded bg-amber-700/40 text-[0.64rem] text-amber-100"} "?"])
           [:span {:class "ml-1 opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-300"
                   :on-click (fn [e] (.stopPropagation e)
                               (rf/dispatch [:close-active id]))} "✕"]]) )
      [:div {:class "ml-auto flex items-center gap-1 text-xs pr-1"}
       [:button {:title "New tab (Ctrl+T)" :class "px-2 py-1 rounded text-slate-400 hover:bg-slate-800"
                 :on-click #(rf/dispatch [:dialog-open :projects ""])} "+"] ]]))
+
+;; --- the log pane (toolbar toggle) -------------------------------------------
+;;
+;; grog writes ONE log per client RUN — `~/grog.<pid>.log`, holding the client's
+;; own lines, the spine's stderr and the renderer's console — so "the project's
+;; log" is a FILTER over that one stream, not a different file. The spine tags
+;; each session's lines `[<session-id>]` (see grog.eca/connect!), using the same
+;; id the renderer keys its sessions by, which is what makes the filter exact
+;; rather than a guess at a project name. Anything untagged is client/global and
+;; is always shown: a line we cannot place is kept, because hiding a diagnostic
+;; that turns out to matter is worse than showing one that does not.
+
+(rf/reg-sub :log-open? (fn [db _] (:log-open? db)))
+(rf/reg-sub :log-lines (fn [db _] (:log-lines db)))
+(rf/reg-sub :log-path (fn [db _] (:log-path db)))
+(rf/reg-sub :log-scope (fn [db _] (:log-scope db)))
+
+(def ^:private log-max-lines 400)
+
+(defonce ^:private !log-el (atom nil))
+(defonce ^:private !log-follow? (atom true))
+
+(defn- log-foreign?
+  "True when `line` belongs to an open session that is NOT the active one — the
+  only lines the project scope hides."
+  [line active others]
+  (boolean (some (fn [sid] (str/includes? line (str "[" sid "]")))
+                 (remove #(= active %) others))))
+
+(defn- log-on-scroll! [e]
+  (let [el (.-currentTarget e)]
+    ;; slack, so our own scrollTop write (rounded by the browser) cannot flip
+    ;; follow off and on again on every line
+    (reset! !log-follow? (>= (.-scrollTop el) (- (.-scrollHeight el) (.-clientHeight el) 24)))))
+
+(defn- log-follow! []
+  (when-let [el @!log-el]
+    (when @!log-follow? (set! (.-scrollTop el) (.-scrollHeight el)))))
+
+(defn- log-subscribe!
+  "Turn the main process's log feed on/off. The invoke hands back the current
+  tail, so a pane that opens never starts empty. Persisted like font-size: having
+  asked for the log once, a developer expects it there next launch."
+  [on?]
+  (try (.setItem (.-localStorage js/window) "grog-web.log-open" (if on? "1" "0"))
+       (catch :default _ nil))
+  (when-let [api js/window.grogAPI]
+    (-> (.logSubscribe api on?)
+        (.then (fn [r]
+                 (when r
+                   (rf/dispatch [:log-tail (.-path r)
+                                 (vec (array-seq (or (.-lines r) #js [])))])))))))
+
+(rf/reg-event-db
+ :log-tail
+ (fn [db [_ path lines]]
+   (assoc db :log-path path
+          :log-lines (vec (take-last log-max-lines (or lines []))))))
+
+(rf/reg-event-db
+ :log-line
+ (fn [db [_ line]]
+   (if-not (:log-open? db)
+     db  ; closed: the tail is re-fetched when it opens, so dropping is free
+     (let [ls (conj (vec (:log-lines db)) line)]
+       (assoc db :log-lines (if (> (count ls) log-max-lines)
+                              (subvec ls (- (count ls) log-max-lines))
+                              ls))))))
+
+(rf/reg-event-db :log-clear (fn [db _] (assoc db :log-lines [])))
+(rf/reg-event-db :set-log-scope (fn [db [_ scope]] (assoc db :log-scope scope)))
+
+(rf/reg-event-fx
+ :toggle-log
+ (fn [{:keys [db]} _]
+   (let [on? (not (:log-open? db))]
+     ;; starting/stopping the feed is the main process's business — this only
+     ;; flips the flag
+     (log-subscribe! on?)
+     {:db (assoc db :log-open? on?)})))
+
+(defn- log-pane []
+  (let [open?    @(rf/subscribe [:log-open?])
+        lines    @(rf/subscribe [:log-lines])
+        lpath    @(rf/subscribe [:log-path])
+        scope    @(rf/subscribe [:log-scope])
+        active   @(rf/subscribe [:active])
+        sessions @(rf/subscribe [:sessions])
+        project  (get-in sessions [active :project])
+        shown    (if (= :all scope)
+                   lines
+                   (remove #(log-foreign? % active (keys sessions)) lines))]
+    (when open?
+      ;; PASS the fn, don't call it. `(r/after-render (f))` calls f immediately and
+      ;; enqueues its RETURN value — nil here — which reagent asserts on
+      ;; ("Enqueued function must not be nil") and which takes the whole renderer
+      ;; down. The transcript's `(r/after-render scroll-end!)` next door is the
+      ;; pattern; keeping the two visually identical is the point.
+      (r/after-render log-follow!)
+      [:div {:class "shrink-0 rounded-md border border-slate-700 bg-[#0b0c0f] overflow-hidden"}
+       [:div {:class "flex items-center gap-2 px-2 py-1 border-b border-slate-800 text-[0.64rem] text-slate-500"}
+        [:span {:class "font-medium text-slate-300"} "log"]
+        [:button {:title (if (= :all scope)
+                           "Showing every session — click for this one only"
+                           "This session, plus client/global lines — click for all")
+                  :class (str "px-1.5 rounded border "
+                              (if (= :all scope)
+                                "border-slate-700 text-slate-400"
+                                "border-sky-500/50 text-sky-200"))
+                  :on-click #(rf/dispatch [:set-log-scope (if (= :all scope) :project :all)])}
+         (if (= :all scope) "all" (or project "this"))]
+        [:span {:class "flex-1 truncate font-mono text-slate-600"} (or lpath "")]
+        [:button {:title "Open the log file itself" :class "hover:text-sky-300"
+                  :on-click #(when lpath (js/window.grogAPI.openPath lpath))} "↗"]
+        [:button {:title "Clear this pane — the file keeps everything" :class "hover:text-sky-300"
+                  :on-click #(rf/dispatch [:log-clear])} "⌫"]
+        [:button {:title "Hide — the log keeps being written" :class "hover:text-rose-300"
+                  :on-click #(rf/dispatch [:toggle-log])} "✕"]]
+       [:div {:ref (fn [el] (reset! !log-el el))
+              :on-scroll log-on-scroll!
+              :class "h-40 overflow-y-auto px-2 py-1 font-mono text-[0.64rem] leading-snug text-slate-400 whitespace-pre-wrap break-all"}
+        (if (seq shown)
+          (for [[i l] (map-indexed vector shown)]
+            ^{:key i} [:div l])
+          [:div {:class "text-slate-600"} "(nothing yet — the pane follows the log as it lands)"])]])))
 
 (defn- toolbar []
   (let [active @(rf/subscribe [:active])
@@ -1199,7 +1468,8 @@
         st @(rf/subscribe [:voice])
         recording? @(rf/subscribe [:recording?])
         transcribing? @(rf/subscribe [:transcribing?])
-        voice? (and st (:enabled st))]
+        voice? (and st (:enabled st))
+        log? @(rf/subscribe [:log-open?])]
     [:div {:class "flex items-center gap-1 text-xs px-3 pt-2"}
      [:button {:disabled (not active)
                :class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium disabled:opacity-40"
@@ -1240,7 +1510,15 @@
                :on-click #(rf/dispatch [:copy-transcript])} "⧉"]
      [:button {:disabled (not active) :title "Dump the whole session to a standalone HTML file (Ctrl+Shift+E)"
                :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
-               :on-click #(rf/dispatch [:export-html])} "⤓"]]))
+               :on-click #(rf/dispatch [:export-html])} "⤓"]
+     ;; the log is a property of the CLIENT, not of any one session — no :disabled
+     [:button {:title "Show the grog log — client, spine and renderer console (off by default)"
+               :class (str "px-3 py-1.5 rounded-md border "
+                           (if log?
+                             "bg-sky-500/20 border-sky-500/50 text-sky-200"
+                             "bg-slate-800 border-slate-700 text-slate-300"))
+               :on-click #(rf/dispatch [:toggle-log])}
+      "log"]]))
 
 (defn- composer []
   (let [txt @(rf/subscribe [:input]) active @(rf/subscribe [:active])
@@ -1259,6 +1537,7 @@
                    (when (str/starts-with? (str (.-type f)) "image/")
                      (attach-image-bytes! f))))))}
      [toolbar]
+     [log-pane]
      (when (seq atts)
        (into [:div {:class "flex flex-wrap gap-2"}]
              (for [[i a] (map-indexed vector atts)]
@@ -1309,8 +1588,31 @@
      [:span {:class "flex items-center gap-1.5"}
       [:span {:class (str "w-2 h-2 rounded-full " (if connected? "bg-emerald-400" "bg-rose-500"))}]
       (if connected? "server attached" "server unreachable")]
+     ;; BIG/SMALL slot badge — the thing that tells you which model a turn will
+     ;; run, and whether `/small` actually took effect (it does not when no small
+     ;; model is configured). Big is highlighted amber; small is a calm emerald.
+     (when sess
+       (let [slot (if (= :small (:model-slot sess)) :small :big)
+             no-small? (and (= :small slot) (not (:small-model sess)))]
+         [:span {:class (str "cursor-pointer hover:underline "
+                             (if (= :small slot) "text-emerald-300" "text-amber-300 font-medium"))
+                 :title (cond
+                          no-small? "small slot selected, but no small model is set — still running big"
+                          (= :small slot) "running the small model"
+                          :else "running the big model")
+                 :on-click #(rf/dispatch [:dialog-open :models ""])}
+          (str (if (= :small slot) "small" "big")
+               (when no-small? " (no small → big)"))]))
      (when sess [:span (str "model: " (or (:model sess) "?"))])
-     (when-let [u (:usage sess)] [:span (str (:sessionTokens u) " tok · $" (:sessionCost u))])
+     ;; usage shows HERE and nowhere else. `:key` on the tick remounts this span on
+     ;; every update, which replays the CSS flash — the number blinks, then fades
+     ;; back to normal. No JS, no timers, and it can't fragment the transcript.
+     (let [u (:usage sess)]
+       (when (and u (:sessionTokens u))
+         [:span {:key (:usage-tick sess 0)
+                 :class "usage-flash"
+                 :title "session tokens · cost"}
+          (usage-text u)]))
      (when sess
        (let [r? (:running? sess) w? (:waiting? sess)]
          [:span {:class (cond w? "text-fuchsia-300" r? "text-sky-300" :else "text-slate-500")}
@@ -1360,35 +1662,41 @@
                      :class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
                      :on-click #(ans :approve)} "Approve"]]]]))))
 
-(defn- question-dialog []
-  (let [focused @(rf/subscribe [:focused]) active @(rf/subscribe [:active])
+(defn- question-panel
+  "The model's LLM question, shown INLINE above the composer — never as a modal.
+
+  It deliberately does NOT steal focus: there is no `:autoFocus`, and the window
+  is never raised (main.js excludes `question` from `needsAttention`). The tab
+  turns brown with a `?` badge, and the `:ev` `:question` branch echoes the
+  prompt into the transcript, so the question lands in the chat log too."
+  []
+  (let [active @(rf/subscribe [:active])
         sess (get-in @(rf/subscribe [:sessions]) [active])
         qin @(rf/subscribe [:q-input])]
-    (when (and focused active (:pending-question sess))
+    (when (and active (:pending-question sess))
       (let [q (:pending-question sess) sid active
             ans (fn [res] (rf/dispatch [:answer-question sid res]))]
-        [overlay
-         [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[620px]"}
-          [:div {:class "text-slate-200 text-sm font-medium"} "❓ The model is asking"]
-          [:div {:class "text-slate-300 text-sm"} (:prompt q)]
-          (when (seq (:options q))
-            [:div {:class "space-y-1"}
-             (for [[i o] (map-indexed vector (:options q))]
-               ^{:key i}
-               [:button {:class "w-full text-left px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-200 hover:border-sky-500"
-                         :on-click #(ans {:cancelled false :answer (opt-label o)})}
-                (opt-label o)])])
-          (when (:allowFreeform? q)
-            [:input {:value qin :placeholder "or type an answer…" :autoFocus true
-                     :on-change #(rf/dispatch [:q-input (.. % -target -value)])
-                     :on-key-down #(when (= "Enter" (.-key %))
-                                     (ans {:cancelled false :answer qin}))
-                     :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}])
-          [:div {:class "flex gap-2 justify-end text-sm"}
-           [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
-                     :on-click #(ans {:cancelled true :answer nil})} "Cancel"]
-           [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
-                     :on-click #(ans {:cancelled false :answer qin})} "Answer"]]]]))))
+        [:div {:class "mx-3 mb-2 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 space-y-2"}
+         [:div {:class "text-amber-100 text-xs font-medium"} "❓ The model is asking"]
+         [:div {:class "text-amber-50 text-sm"} (:prompt q)]
+         (when (seq (:options q))
+           [:div {:class "space-y-1"}
+            (for [[i o] (map-indexed vector (:options q))]
+              ^{:key i}
+              [:button {:class "w-full text-left px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-200 hover:border-amber-500"
+                        :on-click #(ans {:cancelled false :answer (opt-label o)})}
+               (opt-label o)])])
+         (when (:allowFreeform? q)
+           [:input {:value qin :placeholder "or type an answer…"
+                    :on-change #(rf/dispatch [:q-input (.. % -target -value)])
+                    :on-key-down #(when (= "Enter" (.-key %))
+                                    (ans {:cancelled false :answer qin}))
+                    :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"}])
+         [:div {:class "flex gap-2 justify-end text-sm"}
+          [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
+                    :on-click #(ans {:cancelled true :answer nil})} "Cancel"]
+          [:button {:class "px-3 py-1.5 rounded-md bg-amber-500 text-slate-950 font-medium"
+                    :on-click #(ans {:cancelled false :answer qin})} "Answer"]]]))))
 
 (defn- project-manager []
   (let [in @(rf/subscribe [:dialog-input])
@@ -1437,6 +1745,61 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Cancel"]]]]))
 
+(defn- provider-combo
+  "Sorted, searchable provider picker. `ps` is the shipped catalogue and
+  `cur-id` the provider currently in grog.edn. A native <select> cannot be
+  sorted or searched, so this is a small combo box: a search field that opens a
+  list of providers sorted by label, filtered on label / id / url."
+  [ps cur-id]
+  (let [q @(rf/subscribe [:provider-query])
+        open? @(rf/subscribe [:provider-open?])
+        cur (first (filter #(= cur-id (:id %)) ps))
+        sorted (sort-by (comp str/lower-case str :label) ps)
+        shown (if (str/blank? q)
+                sorted
+                (let [qq (str/lower-case q)]
+                  (filterv (fn [{:keys [id label url]}]
+                             (or (str/includes? (str/lower-case (str label)) qq)
+                                 (str/includes? (str/lower-case (str id)) qq)
+                                 (str/includes? (str/lower-case (str url)) qq)))
+                           sorted)))]
+    [:div {:class "space-y-1"}
+     [:div {:class "flex items-center gap-1"}
+      [:input {:value q
+               :placeholder (if cur (str (:label cur) " · " (:id cur)) "search providers…")
+               :on-focus #(rf/dispatch [:provider-open true])
+               :on-change #(rf/dispatch [:provider-query (.. % -target -value)])
+               :on-key-down #(case (.-key %)
+                               "Escape" (do (rf/dispatch [:provider-open false])
+                                            (.blur (.-target %)))
+                               "Enter" (when-let [f (first shown)]
+                                         (.preventDefault %)
+                                         (rf/dispatch [:provider-pick (:id f)]))
+                               nil)
+               :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
+      [:button {:class "px-2 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-xs shrink-0"
+                :title (if open? "hide the provider list" "browse all providers")
+                :on-click #(rf/dispatch [:provider-open (not open?)])}
+       (if open? "▴" "▾")]]
+     (when open?
+       (into [:div {:class "max-h-56 overflow-y-auto rounded-md border border-slate-700"}]
+             (if (seq shown)
+               (for [{:keys [id label url]} shown]
+                 ^{:key id}
+                 [:button {:class (str "w-full text-left px-3 py-1.5 hover:bg-slate-800 "
+                                       (if (= id cur-id) "text-sky-300" "text-slate-200"))
+                           :title url
+                           :on-click #(rf/dispatch [:provider-pick id])}
+                  [:div {:class "text-xs"}
+                   (str label (when (= id cur-id) "  ✓"))]
+                  [:div {:class "text-[0.64rem] font-mono text-slate-500 truncate"} url]])
+               [[:div {:class "p-2 text-xs text-slate-500"}
+                 (str "no provider matches “" q "”")]])))
+     [:div {:class "text-[0.7rem] text-slate-500"}
+      (if cur
+        (str "selected: " (:label cur) " · " (:id cur))
+        (str (count ps) " providers · type to filter, click to choose"))]]))
+
 (defn- settings-dialog []
   (let [in @(rf/subscribe [:dialog-input]) active @(rf/subscribe [:active])
         sess (get-in @(rf/subscribe [:sessions]) [active])
@@ -1458,9 +1821,15 @@
       [:label {:class "text-xs text-slate-400"} "model"]
       [:input {:value in :autoFocus true :placeholder (or (:model sess) "provider/model")
                :on-change #(rf/dispatch [:dialog-input (.. % -target -value)])
-               :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:set-model active in]))
+               :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:settings-save active in]))
                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-      [:div {:class "text-[0.7rem] text-slate-500"} "sets the DEFAULT model — saved to grog.edn, used by this and every new session"]
+      [:div {:class "text-[0.7rem] text-slate-500"} "sets THIS project's model — saved to the project, used by every session in it"]
+      ;; the fuller editor: BIG + SMALL slots, each with its own global tick
+      [:div {:class "flex items-center gap-2"}
+       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-200 text-xs"
+                 :on-click #(rf/dispatch [:dialog-open :models ""])} "Models… (big / small)"]
+       [:span {:class "text-[0.7rem] text-slate-500"}
+        "set a SMALL model for /small, and per-slot global defaults"]]
 
       ;; provider picker — the shipped catalogue (resources/providers.edn, over
       ;; the server's `providers` method). Picking one writes :llm :url to
@@ -1472,17 +1841,10 @@
         [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
          [:label {:class "text-xs text-slate-400"} "provider"]
          (if (seq ps)
-           ;; a combo-box, not a wall of buttons — one control, and it scales to
-           ;; the whole catalogue without re-flowing the dialog.
-           [:select {:value (or cur-id "")
-                     :on-change #(let [v (.. % -target -value)]
-                                   (when (seq v) (rf/dispatch [:set-provider v])))
-                     :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}
-            (when-not cur-id
-              [:option {:value ""} "— pick a provider —"])
-            (for [{:keys [id label url]} ps]
-              ^{:key id}
-              [:option {:value id :title url} label])]
+           ;; a sorted, searchable combo box, not a wall of buttons — one
+           ;; control, and it scales to the whole catalogue without re-flowing
+           ;; the dialog.
+           [provider-combo ps cur-id]
            [:div {:class "text-xs text-slate-500"} "loading…"])
          [:div {:class "text-[0.7rem] text-slate-500"}
           (if cur
@@ -1529,7 +1891,7 @@
                  ^{:key m}
                  [:div {:class "px-2 py-1 text-[0.7rem] font-mono text-slate-300 hover:bg-slate-800 cursor-pointer"
                         :on-click #(rf/dispatch [:dialog-input m])
-                        :on-double-click #(rf/dispatch [:set-model active m src])}
+                        :on-double-click #(rf/dispatch [:settings-save active m src])}
                   m])))
        [:div {:class "text-[0.7rem] text-slate-500"}
         (str (count shown) " model" (when (not= 1 (count shown)) "s")
@@ -1558,7 +1920,118 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Cancel"]
        [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
-                 :on-click #(rf/dispatch [:set-model active in])} "Save"]]]]))
+                 :on-click #(rf/dispatch [:settings-save active in])} "Save"]]]]))
+
+(defn- models-dialog
+  "BIG / SMALL model editor. Two slots, each with its own draft box, its own
+  'also set as the global default' tick, and an Apply; ONE shared catalogue list
+  fills whichever slot is TARGETED (the tabs at the top). This is the dialog
+  `:dialog-open :models` has always seeded state for — the server does the
+  resolution (project manifest, else the global default) and reports the result
+  back as a `model` event, so the dialog can stay open."
+  []
+  (let [active @(rf/subscribe [:active])
+        sess   (get-in @(rf/subscribe [:sessions]) [active])
+        db     @(rf/subscribe [:db])
+        slot   (if (= :small (:models-slot db)) :small :big)
+        big    (or (:models-big db) "")
+        small  (or (:models-small db) "")
+        big-g? (boolean (:models-big-global? db))
+        small-g? (boolean (:models-small-global? db))
+        src    (effective-source db)
+        pickers (or (seq @(rf/subscribe [:model-sources])) [["local" "Local"]])
+        q      @(rf/subscribe [:model-query])
+        cat    @(rf/subscribe [:catalogue])
+        all    (or (get cat (keyword src)) [])
+        shown  (if (str/blank? q)
+                 all
+                 (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
+        loading-src? (some #(= (keyword src) %) (:loading cat))
+        target (if (= :small slot) small big)
+        apply! (fn [s v g] (rf/dispatch [:set-model active v src {:slot s :global g}]))
+        slot-row
+        (fn [s desc v g?]
+          [:div {:class (str "rounded-lg border p-2 space-y-1 "
+                             (if (= s slot) "border-sky-500" "border-slate-700"))}
+           [:div {:class "flex items-center gap-2"}
+            [:button {:class (str "px-2 py-0.5 rounded text-[0.7rem] font-medium "
+                                  (if (= s :big)
+                                    "bg-amber-500/20 text-amber-300"
+                                    "bg-emerald-500/20 text-emerald-300"))
+                      :title (str "browse the catalogue into the " (name s) " slot")
+                      :on-click #(rf/dispatch [:models-target s])}
+             (str (str/upper-case (name s)) (when (= s slot) " ←"))]
+            [:input {:value v
+                     :placeholder (if (= s :small) "(none — always runs big)" "provider/model")
+                     :on-change #(rf/dispatch [:models-draft s (.. % -target -value)])
+                     :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
+            [:button {:class "px-2 py-1.5 rounded-md bg-sky-500 text-slate-950 text-xs font-medium"
+                      :on-click #(apply! s v g?)} "Apply"]]
+           [:div {:class "flex items-center justify-between text-[0.64rem] text-slate-500"}
+            [:span desc]
+            [:label {:class "flex items-center gap-1 cursor-pointer"}
+             [:input {:type "checkbox" :checked g?
+                      :on-change #(rf/dispatch [:models-global s (.. % -target -checked)])}]
+             "also set as the global default"]]])]
+    [overlay
+     [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[620px] max-h-[88vh] overflow-y-auto"}
+      [:div {:class "flex items-center justify-between"}
+       [:div {:class "text-slate-200 text-sm font-medium"} "Models"]
+       [:div {:class "text-[0.7rem] text-slate-500"} (str "project: " (:project sess))]]
+      [:div {:class "text-[0.7rem] text-slate-500"}
+       "BIG runs unless /small is active. A project's own model beats the global default; with no SMALL set, /small still runs BIG."]
+      [:div {:class "space-y-2"}
+       (slot-row :big "runs unless /small is active" big big-g?)
+       (slot-row :small "only when /small is active" small small-g?)]
+
+      ;; one shared catalogue list, filling the TARGETED slot
+      [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
+       [:div {:class "text-[0.7rem] text-slate-400"}
+        (str "browse — click fills the " (str/upper-case (name slot)) " box, double-click applies")]
+       [:div {:class "flex items-center gap-1"}
+        (into [:span {:class "flex items-center gap-1"}]
+              (for [[id label] pickers]
+                ^{:key id}
+                [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
+                                      (if (= id src)
+                                        "bg-sky-600 border-sky-500 text-slate-950 font-medium"
+                                        "bg-slate-800 border-slate-700 text-slate-300"))
+                          :on-click #(rf/dispatch [:models-source id])}
+                 label]))
+        [:button {:class "ml-auto px-2 py-1 rounded text-[0.7rem] bg-slate-800 border border-slate-700 text-slate-300"
+                  :title "refresh this source"
+                  :on-click #(rf/dispatch [:models-fetch :force])} "↻"]]
+       [:input {:value q :placeholder "search models…"
+                :on-change #(rf/dispatch [:model-query (.. % -target -value)])
+                :on-key-down #(when (= "Escape" (.-key %)) (rf/dispatch [:model-query ""]))
+                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-500"}]
+       (into [:div {:class "max-h-48 overflow-y-auto rounded-md border border-slate-700"}]
+             (cond
+               loading-src?
+               [[:div {:class "p-2 text-xs text-slate-500"} (str "loading " src "…")]]
+
+               (empty? shown)
+               [[:div {:class "p-2 text-xs text-slate-500"}
+                 (if (nil? (get cat (keyword src)))
+                   "press ↻ to fetch"
+                   (if (= "local" src)
+                     "no local models — is ollama running?"
+                     "the provider listed no models"))]]
+
+               :else
+               (for [m shown]
+                 ^{:key m}
+                 [:div {:class (str "px-2 py-1 text-[0.7rem] font-mono cursor-pointer hover:bg-slate-800 "
+                                    (when (= m target) "bg-slate-800 text-sky-300"))
+                        :on-click #(rf/dispatch [:models-draft slot m])
+                        :on-double-click #(apply! slot m false)}
+                  m])))
+       [:div {:class "text-[0.7rem] text-slate-500"}
+        (str (count shown) " model" (when (not= 1 (count shown)) "s")
+             " · click fills the " (str/upper-case (name slot)) " box · double-click applies")]]
+      [:div {:class "flex justify-end"}
+       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
+                 :on-click #(rf/dispatch [:dialog-close])} "Close"]]]]))
 
 (defn- mcp-row
   "One shipped MCP server: label, what it gives you, and either a readiness word
@@ -1718,12 +2191,15 @@
         ;; you switch to opens at the bottom, not at the previous tab's scroll.
         active ^{:key active} [transcript active]
         :else  [:div {:class "flex-1 grid place-items-center text-slate-500"} "connecting…"])
+      ;; the model's question sits INLINE above the composer — non-modal, no
+      ;; focus steal. (approval-dialog stays modal: a blocked turn needs a yes.)
+      [question-panel]
       [composer]
       [status-bar]]
      [approval-dialog]
-     [question-dialog]
      (when (= :projects dialog) [project-manager])
-     (when (= :settings dialog) [settings-dialog])]))
+     (when (= :settings dialog) [settings-dialog])
+     (when (= :models dialog) [models-dialog])]))
 
 ;; --- init ------------------------------------------------------------------
 
@@ -1738,6 +2214,12 @@
       (if (js/isNaN n) 16 n))])
   (.onNotify js/window.grogAPI
              (fn [msg] (rf/dispatch [:notify (js->clj msg :keywordize-keys true)])))
+  ;; the log pane: every line the main process writes, and — if the pane was on
+  ;; last launch — turn the feed back on so it is live from the start
+  (.onLogLine js/window.grogAPI (fn [line] (rf/dispatch [:log-line line])))
+  (when (= "1" (try (.getItem (.-localStorage js/window) "grog-web.log-open")
+                    (catch :default _ nil)))
+    (rf/dispatch [:toggle-log]))
   (.onFocus js/window.grogAPI (fn [f] (rf/dispatch [:focus (boolean f)])))
   ;; global shortcuts (§3.1)
   (.addEventListener

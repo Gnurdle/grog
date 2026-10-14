@@ -67,11 +67,22 @@ function install() {
     stream = null; // logging must never prevent the app from starting
   }
 
+  // A bounded tail kept in memory, plus whoever is watching it. The FILE is the
+  // record; this is a viewer (the client's log pane), and bounded on purpose so a
+  // long session cannot accumulate a second copy of the log in RAM.
+  const TAIL = 400;
+  const recent = [];
+  const listeners = new Set();
+
   const write = (line) => {
+    const text = typeof line === "string" ? line : util.inspect(line);
+    recent.push(text);
+    if (recent.length > TAIL) recent.splice(0, recent.length - TAIL);
+    for (const f of listeners) { try { f(text); } catch (_) { /* ignore */ } }
+    // Failing to open the file must not blind the pane either: notice, then persist.
     if (!stream) return;
     try {
-      const s = typeof line === "string" ? line : util.inspect(line);
-      stream.write(s.endsWith("\n") ? s : s + "\n");
+      stream.write(text.endsWith("\n") ? text : text + "\n");
     } catch (_) { /* ignore */ }
   };
 
@@ -94,6 +105,10 @@ function install() {
     path: file,
     write,
     tee,
+    // The client's log pane: `tail()` for an opening view, `onLine` for the live
+    // follow (returns an unsubscribe). Both are cheap when nobody is watching.
+    tail: (n = TAIL) => recent.slice(-n),
+    onLine: (f) => { listeners.add(f); return () => listeners.delete(f); },
     // The spine's stdout is the JSON-RPC wire (NDJSON): machine protocol, not
     // diagnostic text, and high volume. Off by default; GROG_LOG_WIRE=1 when
     // you need to see exactly what crossed it.

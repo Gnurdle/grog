@@ -226,6 +226,18 @@
   (or (some-> (get-in (grog) [:eca :model]) str str/trim not-empty)
       (some-> (get-in (grog) [:llm :model]) str str/trim not-empty)))
 
+(defn eca-small-model
+  "The GLOBAL default for the SMALL model slot — `:eca :small-model`, else
+  `:llm :small-model`.
+
+  nil when unset, which is the normal case: the feature is opt-in, and with no
+  small model anywhere a session simply keeps running the big model (`/small`
+  is then a no-op, not an error). Mirrors `eca-model` so big and small resolve
+  the same way and either can live beside the other under `:eca` or `:llm`."
+  []
+  (or (some-> (get-in (grog) [:eca :small-model]) str str/trim not-empty)
+      (some-> (get-in (grog) [:llm :small-model]) str str/trim not-empty)))
+
 (defn eca-model-source
   "Which key `eca-model` took its value from: `:eca`, `:llm`, or nil.
 
@@ -265,6 +277,24 @@
   (let [v (get-in (grog) [:eca :binary])]
     (when-let [s (some-> v str str/trim not-empty interpolate-env-var not-empty)]
       (platform/expand-home s))))
+
+(def ^:private default-eca-log-level "warn")
+
+(defn eca-log-level
+  "ECA's log verbosity, handed to `eca server` as `--log-level` (`:eca :log-level`
+  in grog.edn). One of \"info\" \"warn\" \"error\" \"debug\"; anything else falls
+  back to the default.
+
+  Defaults to **warn**, not ECA's own \"info\": at info, ECA relays every MCP
+  child's stderr into its log — and each server namespace carries a top-level
+  `(set! *warn-on-reflection* true)`, so one launch dumps hundreds of Clojure
+  reflection warnings into grog's log through the ECA stderr relay. Set
+  \"info\" (or \"debug\") in grog.edn when you actually want that firehose."
+  []
+  (let [v (some-> (get-in (grog) [:eca :log-level]) str str/trim str/lower-case)]
+    (if (contains? #{"info" "warn" "error" "debug"} v)
+      v
+      default-eca-log-level)))
 
 (defn- interpolate-env-var
   "Replace `${ENV}` and `${ENV:-default}` in a string with environment variable values."

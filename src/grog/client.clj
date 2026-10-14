@@ -51,7 +51,12 @@
   (steer! [this id text])  ; steer a running turn
   (stop! [this id])
   (answer! [this id ans])  ; ans = {:approval-id .. :decision ..}
-  (set-model! [this id model] [this id model source])
+  (set-model! [this id model] [this id model source] [this id model source opts])
+  ;; opts (optional map): {:slot :big|:small  :global true?}
+  ;;   :slot   which slot the model is being set for (default :big)
+  ;;   :global write grog.edn's `:eca :model`/`:eca :small-model` (the default
+  ;;           every project inherits) instead of this project's manifest
+  (set-model-slot! [this id slot]) ; switch the active slot (:big / :small)
   (set-trust! [this id on?])
   (subscribe! [this id f])   ; f receives stamped events, per session
   (unsubscribe! [this id f]))
@@ -95,7 +100,9 @@
 (defn answer! [id ans] (answer! (need) id ans))
 (defn set-model!
   ([id model] (set-model! (need) id model))
-  ([id model source] (set-model! (need) id model source)))
+  ([id model source] (set-model! (need) id model source))
+  ([id model source opts] (set-model! (need) id model source opts)))
+(defn set-model-slot! [id slot] (set-model-slot! (need) id slot))
 (defn set-trust! [id on?] (set-trust! (need) id on?))
 (defn subscribe! [id f] (subscribe! (need) id f))
 (defn unsubscribe! [id f] (unsubscribe! (need) id f))

@@ -3,15 +3,17 @@
   dependencies, via `javax.sound.sampled`), write a WAV, and transcribe it with a
   configurable external command.
 
-  Grog deliberately does NOT bundle an STT engine. `:voice :command` points at
-  one that reads a WAV file and prints the transcript on stdout — e.g.
-  whisper.cpp, openai-whisper, vosk, or a cloud CLI. `{wav}` in the command is
-  replaced with the recorded file path.
+  Grog bundles NEITHER half of speech-to-text: the engine and the model are both
+  yours to install (no package manager ships a whisper model — see
+  models/README.md). `:voice :command` points at an engine that reads a WAV file
+  and prints the transcript on stdout — e.g. whisper.cpp, openai-whisper, vosk,
+  or a cloud CLI. `{wav}` in the command is replaced with the recorded file path.
 
   Config (grog.edn):
     :voice {:enabled true
-            ;; whisper.cpp (local, offline):
-            :command [\"whisper-cli\" \"-m\" \"/models/ggml-base.en.bin\"
+            ;; whisper.cpp (local, offline) — YOUR install: engine on PATH,
+            ;; model wherever you downloaded it:
+            :command [\"whisper-cli\" \"-m\" \"~/whisper.cpp/models/ggml-base.en.bin\"
                       \"-f\" \"{wav}\" \"-nt\" \"-otxt\"]
             :sample-rate 16000
             :max-seconds 60}

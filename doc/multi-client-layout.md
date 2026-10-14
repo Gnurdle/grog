@@ -33,7 +33,7 @@ badge.
 ## Where things live
 
 ```
-grog-2/
+grog/
   deps.edn            ; thin: aliases only, no heavy deps at top level
                       ;   :core  :server  :client  :mcp  :endpoint
 

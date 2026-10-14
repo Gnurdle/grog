@@ -101,8 +101,12 @@ same file — add a key when you need it.
 :skills    {:roots ["skills"]}
 
 ;; --- voice (push-to-talk) ---
+;; The desktop client ignores this block: it reads $GROG_VOICE_COMMAND /
+;; $GROG_VOICE_MODEL. This is for the CLI's grog.voice — point it at YOUR
+;; whisper.cpp install (engine on PATH; grog ships no engine and no model).
 :voice {:enabled true
-        :command ["whisper-cli" "-m" "/models/ggml-base.en.bin" "-f" "{wav}" "-nt"]
+        :command ["whisper-cli" "-m" "~/whisper.cpp/models/ggml-base.en.bin"
+                  "-f" "{wav}" "-nt"]
         :sample-rate 16000
         :max-seconds 60
         ;; press = record, release = transcribe. Avoid alt+SPACE (window menu)

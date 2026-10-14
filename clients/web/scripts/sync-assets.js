@@ -21,7 +21,7 @@ const repoRoot = path.resolve(webRoot, "..", "..");
 
 // [source, relative to <repo>] -> [destination, relative to <web>]
 const ASSETS = [
-  ["logo.jpg", "resources/public/logo.jpg"],   // the splash art
+  ["logo.png", "resources/public/logo.png"],   // the splash art (RGBA, transparent bg)
   ["snake.png", "resources/public/snake.png"], // the ouroboros emblem (onboarding)
 ];
 

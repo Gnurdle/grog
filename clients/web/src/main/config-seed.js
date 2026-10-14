@@ -50,6 +50,20 @@ function configHome(env) {
 }
 
 /**
+ * grog's data home — where the user puts DATA that grog reads but deliberately
+ * does not ship (today: the whisper speech model). Not the config home: a
+ * 148 MB model is not a config file. Same XDG convention as configHome, on
+ * every OS (Windows included), minus a bespoke override — `$GROG_VOICE_MODEL`
+ * already names one file explicitly:
+ *   ${XDG_DATA_HOME:-~/.local/share}/grog
+ */
+function dataHome(env) {
+  env = env || process.env;
+  const xdg = typeof env.XDG_DATA_HOME === "string" ? env.XDG_DATA_HOME.trim() : "";
+  return path.join(xdg || path.join(os.homedir(), ".local", "share"), "grog");
+}
+
+/**
  * Every `*.example` shipped with the app, sorted by name. `[]` when the package
  * has none (a dev tree that never ran `bb dist`, say).
  * Each entry: {name "grog.edn.example", target "grog.edn", from "<abs path>"}.
@@ -127,4 +141,4 @@ function createConfig(plan) {
   return written;
 }
 
-module.exports = { configHome, availableExamples, planOffer, createConfig, ONBOARDING_MARKER };
+module.exports = { configHome, dataHome, availableExamples, planOffer, createConfig, ONBOARDING_MARKER };

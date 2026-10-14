@@ -265,6 +265,27 @@
     (read-manifest d)
     {}))
 
+(defn project-model
+  "A project's OWN model, from its manifest, or nil to fall back to the global
+  default.
+
+  This is what makes the model PER PROJECT: `project.edn` carries `:model`, and a
+  pick in the settings dialog writes THERE rather than into grog.edn — so
+  switching projects switches models, and one project's choice never rewrites
+  another's (or every future session's)."
+  [name]
+  (some-> (manifest-for name) :model str str/trim not-empty))
+
+(defn project-small-model
+  "A project's OWN SMALL-slot model, from its manifest `:small-model`, or nil.
+
+  nil is normal: the small slot then falls back to the global small model, and
+  with no small model anywhere the session always runs the big model. The big
+  slot keeps living in `:model` (see `project-model`) so existing manifests and
+  readers are untouched."
+  [name]
+  (some-> (manifest-for name) :small-model str str/trim not-empty))
+
 (defn write-manifest!
   "Write/update a project's `project.edn`, preserving other keys. `m` is a map
   of manifest fields (:description :model :mcp :appearance ...)."
@@ -275,6 +296,25 @@
     (spit f (with-out-str (pprint/pprint (into (sorted-map) merged)))
           :encoding "UTF-8")
     merged))
+
+(defn set-project-model!
+  "Record `model` as `name`'s model in its manifest (the per-project default).
+  Returns the model, or nil when it was blank."
+  [name model]
+  (let [m (some-> model str str/trim not-empty)]
+    (when m (write-manifest! name {:model m}))
+    m))
+
+(defn set-project-small-model!
+  "Record `model` as `name`'s SMALL-slot model in its manifest (the per-project
+  small default). Returns the model, or nil when it was blank.
+
+  A blank value is a no-op, matching `set-project-model!`: clearing the small
+  slot back to *none* is a deliberate separate act, not an accidental empty box."
+  [name model]
+  (let [m (some-> model str str/trim not-empty)]
+    (when m (write-manifest! name {:small-model m}))
+    m))
 
 (defn ensure-project-dir!
   "Create (if needed) and return the project dir for `name`."
@@ -378,7 +418,10 @@
   (relative to the project dir). Used to decide what counts as \"relevant context\".
   The project chat log (`dialog/thread.edn`) is excluded — it is the conversation
   itself, replayed (bounded) by `grog.project-dialog/thread-as-system-appendix`
-  where wanted, never re-embedded as raw standing context."
+  where wanted, never re-embedded as raw standing context.
+
+  `notes/archive/` is skipped: retired notes stay on disk (readable, greppable,
+  still found by `project_search`) but stop being standing context."
   [^File proj-dir]
   (letfn [(walk [^File base]
             (when (.isDirectory base)
@@ -387,11 +430,102 @@
                    (sort-by #(.getName ^File %))
                                        (mapcat (fn [^File f]
                                                 (cond
-                                                  (.isDirectory f) (walk f)
+                                                  (.isDirectory f)
+                                                  (if (= "archive" (.getName f)) [] (walk f))
+
                                                   (context-text-file? f) [f]
                                                   :else []))))))]
     (vec (mapcat (fn [root] (walk (io/file proj-dir root)))
                  ["notes" "dialog"]))))
+
+;; --- the context digest ------------------------------------------------------
+;;
+;; Inlining every note in full is what turned a project's rules file into 131 KB
+;; of standing context: roughly a third of a session's window, spent before the
+;; model reads a single file, and growing by one handoff per session. So a note
+;; now contributes
+;;
+;;   * one synopsis LINE, as a RETRIEVAL CUE — not a title. "Odoo: :sql removed,
+;;     Select-O-Matic over XML-RPC, :allow-write false, instance arg required"
+;;     is what makes a session go and look; "Odoo revision" is not; and
+;;   * for the single newest note, its opening lines — the current state.
+;;
+;; The whole of any note is one `project_search` away (it indexes `notes/` and the
+;; dialog log), a plain file read, or — once mirrored into the project's assoc
+;; store — one `assoc_get` by key. Keeping the corpus out of the rules file is
+;; only half the trick; the index line has to carry enough signal that a session
+;; knows WHEN to fetch.
+
+(def ^:private digest-head-lines
+  "Lines of the NEWEST note inlined verbatim (the current state)."
+  25)
+
+(def ^:private digest-synopsis-chars
+  "Cap on a note's one-line synopsis: long enough to carry the facts that make a
+  session fetch the note, short enough that a dozen of them stay cheap."
+  160)
+
+(defn- note-date
+  "`YYYY-MM-DD` for a note — a date in its NAME when it has one (handoffs do),
+  else the file's mtime."
+  ^String [^File f]
+  (or (re-find #"\d{4}-\d{2}-\d{2}" (.getName f))
+      (str (java.time.LocalDate/ofInstant
+             (java.time.Instant/ofEpochMilli (.lastModified f))
+             (java.time.ZoneId/systemDefault)))))
+
+(defn- note-label
+  "`notes/handoff-2026-10-09.md` — parent dir + name, so the digest line is
+  enough to go and read the thing."
+  ^String [^File f]
+  (let [p (.getParentFile f)]
+    (if p (str (.getName p) "/" (.getName f)) (.getName f))))
+
+(defn- note-synopsis
+  "The first heading (else the first non-blank line) of a note, collapsed to one
+  line and capped — a cue for retrieval, not a summary of the whole file."
+  ^String [^File f]
+  (when-let [lines (some->> (read-text-file f)
+                            str/split-lines
+                            (map str/trim)
+                            (remove str/blank?))]
+    (let [heading (some (fn [l] (when (str/starts-with? l "#") l)) lines)
+          s (-> (or heading (first lines))
+                (str/replace #"^#+\s*" "")
+                (str/replace #"\s+" " ")
+                str/trim)]
+      (when (seq s)
+        (if (> (count s) digest-synopsis-chars)
+          (str (subs s 0 (dec digest-synopsis-chars)) "…")
+          s)))))
+
+(defn- context-digest
+  "The markdown body for a project's context notes: newest note's opening lines,
+  then one cue line per note, then how to get the rest."
+  [files]
+  (if-not (seq files)
+    []
+    (let [newest-first (->> files (sort-by (fn [^File f] (.lastModified f))) reverse vec)
+          ^File newest (first newest-first)
+          head (some->> (read-text-file newest)
+                        str/split-lines
+                        (take digest-head-lines))]
+      (concat
+       [(str "### Notes — " (count files) " file(s), one line each\n\n"
+             "These lines are RETRIEVAL CUES, not the notes themselves. Before answering\n"
+             "anything about why something is the way it is — or re-deciding something\n"
+             "already decided — fetch the note: `project_search` for a phrase from it,\n"
+             "read the file, or `assoc_get` its mirrored key in the project store.\n")]
+       (map (fn [^File f]
+              (str "- **" (note-date f) "** `" (note-label f) "` — "
+                   (or (note-synopsis f) "(no synopsis)")))
+            newest-first)
+       ["\n### Newest note — opening lines only, the full text is in the file\n"
+        (str "`" (note-label newest) "`\n")]
+       ;; blockquoted so a note's OWN headings and code fences cannot collide with
+       ;; the digest's markdown (the text is for reading, not for re-rendering)
+       (map #(str "> " %) (or head [""]))))))
+
 
 (defn dir-listing
   "A short human-readable listing of a project dir (top-level entries), for context."
@@ -409,9 +543,10 @@
 
 (defn load-context
   "Load a project's relevant context as a markdown string: a short header with the
-  project path, manifest description (if any), and top-level layout, then the
-  contents of its `notes/` text files (best effort; the `dialog/thread.edn` chat
-  log is deliberately excluded). Returns nil when no project / no dir."
+  project path, manifest description (if any), and top-level layout, then a DIGEST
+  of its `notes/` — one retrieval-cue line per note, plus the newest note's opening
+  lines (see `context-digest`). The `dialog/thread.edn` chat log is deliberately
+  excluded. Returns nil when no project / no dir."
   ^String [proj]
   (when-let [proj-dir (project-dir (or proj (project-name)))]
     (let [proj (or proj (project-name))]
@@ -421,11 +556,7 @@
         (let [manifest (read-manifest proj-dir)
               desc (some-> (:description manifest) str str/trim not-empty)
               files (list-context-files proj-dir)
-              body (mapcat (fn [^File f]
-                             (if-let [txt (read-text-file f)]
-                               [(str "### " (.getPath f) "\n\n" txt "\n")]
-                               []))
-                           files)]
+              body (context-digest files)]
           (->> (concat
                 [(str "### Project directory\n\n"
                       (.getPath proj-dir)

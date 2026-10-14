@@ -32,11 +32,19 @@
     steer           {:id .. :text ..}                   -> nil
     stop            {:id ..}                            -> nil
     answer          {:id .. :approval-id .. :decision ..} -> nil
-    set-model       {:id .. :model .. :source? ..}      -> nil
+    set-model       {:id .. :model .. :source? .. :slot? .. :global? ..} -> nil
                                         (:source is the picker transport —
                                         `openrouter`/`ollama` — so an id is
                                         qualified exactly, never mistaken for a
-                                        native provider of the same name)
+                                        native provider of the same name.
+                                        :slot is `big` (default) or `small`;
+                                        :global writes grog.edn's
+                                        `:eca :model`/`:eca :small-model` instead
+                                        of the project manifest)
+    set-model-slot  {:id .. :slot ..}                   -> nil
+                                        switch which slot a turn runs (`big` or
+                                        `small`); a small slot with no small
+                                        model keeps running big
     set-trust       {:id .. :on ..}                     -> nil
     providers       {}                                  -> {:providers [catalogue ..]
                                                             :current {:url .. :provider ..}}
@@ -422,8 +430,15 @@
               ;; catalogue whenever the id also existed locally.
               "set-model" (do (client/set-model! (:id params) (:model params)
                                                  (models/picker-source->provider
-                                                  (:source params)))
+                                                  (:source params))
+                                                 {:slot (keyword (or (:slot params) "big"))
+                                                  :global (boolean (:global params))})
                               nil)
+              ;; Switch which SLOT a turn runs (big/small). Per session — the
+              ;; slot does not persist; a new session starts on big.
+              "set-model-slot" (do (client/set-model-slot! (:id params)
+                                                           (keyword (or (:slot params) "big")))
+                                   nil)
               "set-trust" (do (client/set-trust! (:id params) (boolean (:on params))) nil)
               ;; The settings provider picker. `providers` is the shipped
               ;; catalogue (grog.providers), plus what :llm currently points at.

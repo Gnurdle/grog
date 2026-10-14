@@ -785,7 +785,12 @@
                                   " top-level keys=" (count base)
                                   " providers=" (count (:providers base {}))
                                   " defaultModel=" (pr-str (:defaultModel base)))))
-         raw-model (or (config/eca-model)
+         ;; PER PROJECT: a project's own `:model` (project.edn) beats the global
+         ;; default, so each project can run a different model and the generated
+         ;; config reflects it.
+         proj-model (projects/project-model project)
+         raw-model (or proj-model
+                       (config/eca-model)
                        (when-let [m (:defaultModel base)] m))
          ;; ECA resolves models as `provider/name`, so the default model must be
          ;; provider-qualified (`ollama/…`, `openrouter/…`). A bare local id such
@@ -798,7 +803,7 @@
          ;; name (`deepseek/deepseek-v4.1-flash`) is not read as a provider of
          ;; that name. The catalog that would otherwise disambiguate it only
          ;; arrives once ECA is already running.
-         src (when (= :llm (config/eca-model-source))
+         src (when (or proj-model (= :llm (config/eca-model-source)))
                (models/provider-prefix-for-url llm-url))
          model (models/qualify-eca-model raw-model src llm-url)
          _ (eca-config-debug! "raw model=" (pr-str raw-model)

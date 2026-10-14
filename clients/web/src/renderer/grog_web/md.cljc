@@ -58,10 +58,19 @@
         (when (and (> j (+ i 2)) (not (space? (inc i))) (not (space? (dec j))))
           [(into [:strong] (inline (subs s (+ i 2) j))) (+ j 2)]))
 
+      ;; `__` strong obeys the SAME intraword rule as `_` below — a `__` between
+      ;; two alphanumerics is not emphasis. Without this, `server__tool` MCP names
+      ;; (eca__read_file, grog-mcp__assoc_store) parse their `__` as <strong> and
+      ;; the names are mangled — in the live client and in the HTML export.
       (= two "__")
-      (when-let [j (str/index-of s "__" (+ i 2))]
-        (when (and (> j (+ i 2)) (not (space? (inc i))) (not (space? (dec j))))
-          [(into [:strong] (inline (subs s (+ i 2) j))) (+ j 2)]))
+      (when (and (< (+ i 2) n)
+                 (or (zero? i) (not (alnum? (nth s (dec i)))))
+                 (not (space? (+ i 2))))
+        (when-let [j (str/index-of s "__" (+ i 2))]
+          (when (and (> j (+ i 2))
+                     (not (space? (dec j)))
+                     (or (>= (+ j 2) n) (not (alnum? (nth s (+ j 2))))))
+            [(into [:strong] (inline (subs s (+ i 2) j))) (+ j 2)])))
 
       (= two "~~")
       (when-let [j (str/index-of s "~~" (+ i 2))]

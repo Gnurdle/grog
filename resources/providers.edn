@@ -138,6 +138,12 @@
    :docs "https://docs.hyperbolic.xyz"
    :note "open-weight hosting"}
 
+  {:id "reflection" :label "Reflection AI" :kind :remote
+   :url "https://api.reflection.ai/openai/v1"
+   :key-env "REFLECTION_API_KEY" :sample "Beam-501B-A23B"
+   :docs "https://developers.reflection.ai"
+   :note "NOT /v1 — the OpenAI-compatible base ends in /openai/v1; beta (waitlist)"}
+
   ;; --- local / self-hosted (no key) ---------------------------------------
   {:id "ollama" :label "Ollama" :kind :local
    :url "http://localhost:11434/v1"

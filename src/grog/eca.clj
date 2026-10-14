@@ -129,15 +129,18 @@
 ;; ECA binary resolution
 ;; ---------------------------------------------------------------------------
 ;; On Linux (and typical dev setups) `eca` sits on the global PATH, so the bare
-;; name works. On Windows that is NOT the case: the ECA server ships as
-;; `eca.exe` bundled inside the VS Code extension ("editor-code-assistant.eca-*")
-;; and is normally started by VS Code with an explicit absolute path, so the bare
-;; name isn't resolvable here. We therefore resolve the binary in order:
+;; name works. On Windows that is NOT the case: ECA's own installer puts
+;; `eca.exe` in %LOCALAPPDATA%\eca, and anything else on the PATH is some other
+;; tool's copy — an editor extension's, say — which is exactly the copy grog must
+;; NOT end up driving, since it is likely a different (older) build than the one
+;; grog means to use. We therefore resolve the binary in order:
 ;;   1. an explicit `:eca-binary` path the caller supplied (if it exists),
 ;;   2. the bare name via the OS PATH lookup,
-;;   3. well-known install locations (VS Code extension dirs, scoop shims, npm
-;;      global, ~/.local, /usr/local)
-;; so it works on Windows too.
+;;   3. grog's own install (%LOCALAPPDATA%\eca) and generic bin locations
+;;      (scoop shims, npm global, ~/.local, /usr/local)
+;; Editor-extension directories are deliberately NOT probed — see `candidate-dirs`.
+;; Ordering alone is not a guarantee, though: with `:eca-binary` unset, step 2
+;; takes whatever `eca` the PATH offers. Point `:eca :binary` at the copy you mean.
 
 (defn- windows?
   "True when running on a Microsoft Windows OS."
@@ -188,26 +191,19 @@
   [name]
   (boolean (path-executable-file name)))
 
-(defn- extension-eca-dirs
-  "Candidate ECA directories found in a VS Code `extensions` folder: every
-  `editor-code-assistant.eca-*/` directory and its `bin/` subfolder."
-  [^java.io.File extensions-dir]
-  (try
-    (when (and extensions-dir (.isDirectory extensions-dir))
-      (->> (.listFiles extensions-dir)
-           (filter #(and (.isDirectory ^java.io.File %)
-                         (str/starts-with? (.getName ^java.io.File %) "editor-code-assistant")))
-           (mapcat (fn [^java.io.File d]
-                     [d (java.io.File. d "bin")]))))
-    (catch Throwable _ nil)))
-
 (defn- candidate-dirs
   "Directory roots to probe for an `eca`/`eca.exe`/`eca.cmd` binary.
 
   ORDER MATTERS. grog's OWN install (`%LOCALAPPDATA%\\eca`) comes FIRST, so a box
-  that also has the VS Code extension does not silently drive VS CODE's ECA
-  instead of the one grog shipped. The VS Code extension dirs are a FALLBACK —
-  useful only when grog has no copy of its own."
+  that also has an editor extension does not silently drive the EXTENSION's ECA
+  instead of the one grog shipped.
+
+  It deliberately does NOT probe editor extension directories (VS Code's
+  `~/.vscode/extensions/editor-code-assistant*/`, nor the Scoop VS Code copy
+  under `scoop/apps/vscode/data/extensions`). grog drives the ECA it ships, or
+  the one the user pointed `:eca :binary` at — never a copy some other tool
+  happens to have left on the disk, which is the kind of invisible dependency
+  that only ever announces itself as the question: why is my ECA an old build?."
   []
   (let [home (System/getProperty "user.home")
         userprofile (System/getenv "USERPROFILE")
@@ -216,13 +212,6 @@
       ;; grog's own installed ECA — the one we expect to drive.
       (when-let [localappdata (System/getenv "LOCALAPPDATA")]
         [(java.io.File. localappdata "eca")])
-      ;; VS Code user extensions (Windows + POSIX): ~/.vscode/extensions
-      (extension-eca-dirs (io/file home ".vscode" "extensions"))
-      ;; VS Code scoop installs: %USERPROFILE%\scoop\apps\vscode\{version,current}
-      (when-let [scoop-vscode (when userprofile (io/file userprofile "scoop/apps/vscode"))]
-        (when (.isDirectory scoop-vscode)
-          (mapcat (fn [^java.io.File v] (extension-eca-dirs (io/file v "data/extensions")))
-                  (.listFiles scoop-vscode))))
       ;; scoop shims: %USERPROFILE%\scoop\shims
       (when userprofile [(io/file userprofile "scoop/shims")])
       ;; npm global bin on Windows: %APPDATA%\npm
@@ -243,11 +232,61 @@
                 (map (fn [n] (java.io.File. dir n)) names)))
             (candidate-dirs))))
 
+;; ---------------------------------------------------------------------------
+;; The ECA we ship
+;; ---------------------------------------------------------------------------
+;; A jar is how grog gets its OWN ECA into an install (scripts/eca-jar.sh builds
+;; it from the patched fork). Without this, a packaged app falls through to
+;; whatever `eca` the machine happens to have — an old release, or the copy a
+;; different editor's extension left behind — which is exactly how you end up
+;; running an ECA that does not contain your fixes.
+
+(def ^:private eca-java-flags
+  "JVM flags for running the ECA jar — the same two the spine and the MCP bundle
+  are launched with (see grog.eca-config and the client's SPINE_JAVA_FLAGS)."
+  ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+   "--enable-native-access=ALL-UNNAMED"])
+
+(defn- spine-jar-dir
+  "The directory of the running spine jar when the spine IS being run from one
+  (`java -cp <dir>/grog-spine.jar clojure.main -m grog.server`), else nil — so a
+  built source tree can find the ECA jar sitting beside it."
+  []
+  (try
+    (let [cp (System/getProperty "java.class.path" "")]
+      (some (fn [^String entry]
+              (when (str/ends-with? entry "grog-spine.jar")
+                (.getParentFile (java.io.File. entry))))
+            (str/split cp #"[:;]")))
+    (catch Throwable _ nil)))
+
+(defn- bundled-eca-jar
+  "The ECA uberjar grog should drive, or nil when there is none.
+
+  1. `GROG_ECA_JAR` — set by the desktop client for a packaged install, where the
+     jar travels in resources/jars (a read-only squashfs mount) and so cannot be
+     found by searching. Mirrors `GROG_MCP_JAR`.
+  2. beside the running spine jar — covers `java -cp target/grog-spine.jar …` in a
+     built source tree.
+
+  Deliberately NOT a search: a shipped grog drives the ECA it ships."
+  ^java.io.File []
+  (or (when-let [p (some-> (System/getenv "GROG_ECA_JAR") str str/trim not-empty)]
+        (let [f (java.io.File. p)]
+          (when (.isFile f) f)))
+      (when-let [dir (spine-jar-dir)]
+        (let [f (java.io.File. dir "eca.jar")]
+          (when (.isFile f) f)))))
+
 (defn- resolve-eca-binary!
   "Resolve the ECA server binary to an absolute path (or a PATH-resolvable name).
   Prefers an explicit, existing `eca-binary`; else a PATH-hit for the bare name;
   else the first existing/candidate found in known install locations. Falls back
   to the caller's value.
+  This is the FALLBACK path only: `make-connection!` prefers the ECA jar grog
+  ships (`bundled-eca-jar`) before ever getting here, so reaching this means
+  there is no bundled jar AND nothing was configured explicitly — the case where
+  a PATH hit can silently pick up some other install's ECA.
   `extra-args` are the args grog will pass after `server`; a `--config-file` arg
   is inspected only to keep this simple — returns just the binary."
   [^String eca-binary]
@@ -335,10 +374,36 @@
                      (lf (str "eca handle error: " (.getMessage e)))))))
           (recur))))))
 
+(defn- eca-argv-prefix
+  "The command that starts ECA, up to and including `server` — the caller's args
+  follow it.
+
+  A JAR runs through java (with the same two flags the spine and the MCP bundle
+  are launched with). Anything else IS the command, which is also how a wrapper
+  script works — e.g. `~/.local/bin/eca-local`, which runs ECA from a source tree."
+  [^java.io.File jar binary]
+  ;; an explicit `:eca :binary` may itself point at a jar — a jar always runs
+  ;; through java, whichever route it arrived by
+  (let [jar (or jar
+                (when-let [b (some-> binary str not-empty)]
+                  (when (str/ends-with? b ".jar") (java.io.File. b))))]
+    (if jar
+      (into ["java"] (concat eca-java-flags ["-jar" (.getAbsolutePath jar) "server"]))
+      [(str binary) "server"])))
+
 (defn- make-connection!
   "Spawn `eca server` and wire up streams. Does NOT handshake."
   [opts]
-  (let [eca-binary      (resolve-eca-binary! (or (:eca-binary opts) "eca"))
+  (let [;; Precedence: an explicit :eca-binary is the caller's own choice and wins
+        ;; outright (that is how a dev checkout drives its live source); else the ECA
+        ;; jar grog SHIPS; else a PATH / well-known-location binary. Without the jar
+        ;; step in the middle, a packaged app has no ECA of its own to fall back on.
+        explicit    (some-> (:eca-binary opts) str str/trim not-empty)
+        eca-jar     (when-not explicit (bundled-eca-jar))
+        eca-binary  (when-not eca-jar (resolve-eca-binary! (or explicit "eca")))
+        ;; a jar runs through java; a binary IS the command (which is also how a
+        ;; wrapper script works — e.g. ~/.local/bin/eca-local running the source).
+        argv-prefix (eca-argv-prefix eca-jar eca-binary)
         args            (:args opts)
         env             (:env opts)
         cwd             (:cwd opts)
@@ -353,8 +418,13 @@
                                 "chat/askQuestion" {:result {:answer nil :cancelled true}}
                                 "editor/getDiagnostics" {:result {:diagnostics []}}
                                 {:result {}})))
-        _ (when log-fn (log-fn (str "eca binary: " eca-binary)))
-        pb (ProcessBuilder. ^java.util.List (into [eca-binary "server"] (map str (or args []))))
+        _ (when log-fn
+            (log-fn (str "eca binary: "
+                         (if eca-jar
+                           (str (.getAbsolutePath ^java.io.File eca-jar)
+                                " (bundled jar, via java -jar)")
+                           (str eca-binary)))))
+        pb (ProcessBuilder. ^java.util.List (into argv-prefix (map str (or args []))))
         pending (ConcurrentHashMap.)
         al (AtomicLong. 0)
         write-lock (Object.)
@@ -465,7 +535,17 @@
     (throw (ex-info (str "ECA already connected for session " (pr-str id)
                          "; disconnect! first")
                     {:id id})))
-  (let [conn (make-connection! opts)]
+  (let [;; Tag ECA's own lines with the session they belong to. grog writes ONE
+        ;; log per client RUN (client + spine + renderer interleaved), so without
+        ;; this a session's stderr is anonymous — `chat=<uuid>` names a chat, not
+        ;; a project — and the client's log pane could not tell one project's
+        ;; chatter from another's. `[<id>]` uses the same id the renderer keys its
+        ;; sessions by, so the pane's filter is exact; the client tags the
+        ;; renderer's own lines the same way.
+        opts (if-let [lf (:log-fn opts)]
+               (assoc opts :log-fn (fn [line] (lf (str "[" id "] " line))))
+               opts)
+        conn (make-connection! opts)]
     ;; Register the connection before the handshake so send-request! / send-notify!
     ;; (which require a live connection) work during connect!.
     (swap! !conns assoc id conn)

@@ -11,17 +11,25 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.platform :as platform])
   (:import (java.io File)
            (java.nio.file Path)))
 
 (defn- resolve-skill-path!
-  "File for `path` as given: absolute, or relative to the repo root."
+  "File for `path` as given: `~` expanded, then absolute, or relative to the repo
+  root.
+
+  The `~` expansion matters: a skills root is a CONFIG value, and a config value
+  should not have to hardcode `/home/<user>`. Before this, `\"~/x/skills\"` was not
+  absolute, so it silently resolved to a bogus `~/x/skills` directory UNDER the
+  repo root — a path that looks right and is wrong."
   ^File [^String path]
-  (let [f (io/file path)]
+  (let [expanded (platform/expand-home (str path))
+        f (io/file expanded)]
     (if (.isAbsolute f)
       f
-      (.getCanonicalFile (io/file (cfg/repo-root) path)))))
+      (.getCanonicalFile (io/file (cfg/repo-root) expanded)))))
 
 (def ^:private skill-md-filename "SKILL.md")
 (def ^:private skill-edn-filename "skill.edn")

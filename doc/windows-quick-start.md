@@ -74,6 +74,7 @@ scoop install nodejs-lts             # Node.js
 scoop install babashka
 scoop install ripgrep jq
 scoop install poppler tesseract tesseract-languages
+scoop install whisper-cpp            # voice input (optional)
 scoop install extras/libreoffice
 ```
 
@@ -81,6 +82,21 @@ scoop install extras/libreoffice
 ships the OCR engine but no recognition data on its own, and without the
 language files OCR fails. (They can also be fetched by hand from
 <https://github.com/tesseract-ocr/tessdata_fast>.)
+
+**Voice input** needs two pieces, both yours. The **engine** is `whisper-cpp`
+(it lives in scoop's default `main` bucket) — `scoop install whisper-cpp` puts
+`whisper-cli` on `PATH`. The **model** no package manager provides (scoop's
+manifest says so itself), so fetch one into the directory grog looks in:
+
+```powershell
+$d = "$env:USERPROFILE\.local\share\grog\models"
+New-Item -ItemType Directory -Force $d | Out-Null
+curl.exe -L -o "$d\ggml-base.en.bin" `
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+grog ships no model — no 148 MB blob rides in the installer. Sizes and the other
+directories it searches: `models/README.md`.
 
 **Close and reopen your terminal** afterwards — PATH changes only apply to new
 shells.
@@ -104,6 +120,7 @@ java -version & bash --version & node --version & eca --version
 | Node.js | for a bundle | runs the app runtime |
 | Babashka | no | `run_babashka`, and the build scripts |
 | LibreOffice, Tesseract, Poppler, ripgrep, jq | no | one feature each |
+| whisper-cpp | no | voice input (local speech-to-text) |
 
 A missing optional tool only disables the features that need it. After grog is
 installed, `grog doctor` lists every tool, its version, and what it unlocks.

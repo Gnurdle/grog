@@ -18,7 +18,8 @@
   `running?` down and says so loudly, `/yolo` toggles through ECA's trust,
   steer-vs-queue is the view's call (it reads `running?` from the shared
   state)."
-  (:require [grog.chat :as chat]
+  (:require [clojure.string :as str]
+            [grog.chat :as chat]
             [grog.client :as client]
             [grog.config :as config]
             [grog.eca :as eca]
@@ -65,6 +66,36 @@
   [state text]
   (chat/publish! state {:type :line :text (str text)}))
 
+;; --- big/small model slots --------------------------------------------------
+;;
+;; A session runs one of two slots. `:model` (in the chat state) is the
+;; EFFECTIVE model — what `send-fn` hands to ECA; `:big-model`/`:small-model`
+;; hold each slot's resolved id and `:model-slot` says which is active.
+;;
+;; Resolution (big/small are independent, Global → Project):
+;;   big   = project manifest `:model`          ?? global `config/eca-model`
+;;   small = project manifest `:small-model`    ?? global `config/eca-small-model`
+;; and the small slot is opt-in: with no small model anywhere the session
+;; ALWAYS runs big ("if small model not selected, then it's always running big").
+
+(defn- slot-models
+  "Resolve the big/small model ids for `project`, provider-qualified for ECA.
+  Returns `{:big <id-or-nil> :small <id-or-nil>}` (nil = nothing configured)."
+  [project]
+  (let [url (try (config/llm-url) (catch Exception _ nil))
+        q (fn [m] (when (some-> m str str/trim not-empty)
+                    (models/qualify-eca-model m nil url)))]
+    {:big   (q (or (projects/project-model project) (config/eca-model)))
+     :small (q (or (projects/project-small-model project) (config/eca-small-model)))}))
+
+(defn- slot-model
+  "The model a session RUNS for `slot`, given its resolved slot atoms: the small
+  model only when the SMALL slot is selected AND one exists, else big. The
+  single place the \"no small ⇒ always big\" rule lives."
+  [state slot]
+  (let [big @(:big-model state) small @(:small-model state)]
+    (if (and (= :small slot) small) small big)))
+
 (defn- make-session!
   "Build one session: state, queue, ECA handlers, connection, worker. Starts
   the worker; does NOT connect (lazy)."
@@ -75,12 +106,18 @@
         ;; shared connection would make a second tab fail "already connected").
         id (str project "#" (System/nanoTime))
         queue (LinkedBlockingQueue.)
+        slots (slot-models project)
         state (chat/make-state
                 {:project project
                  :chat-id (projects/active-project-chat-id)
-                 :model (models/qualify-eca-model (config/eca-model)
-                                                  nil
-                                                  (try (config/llm-url) (catch Exception _ nil)))})
+                 ;; BIG/SMALL SLOTS (per session). A session STARTS on the big
+                 ;; slot; it lasts until the user /small's away or the session
+                 ;; ends. `:model` is the effective id a turn runs; the other
+                 ;; two atoms let a client show both and switch instantly.
+                 :model (:big slots)
+                 :model-slot :big
+                 :big-model (:big slots)
+                 :small-model (:small slots)})
         {:keys [connected running? last-sent pending-steer]} state
         ;; escape hatch for adapters that must capture the live state (the
         ;; server wires its console publisher before open! returns)
@@ -122,7 +159,12 @@
                                        :event-handler event-handler
                                        :request-handler (chat/make-request-handler state)
                                        :eca-binary (config/eca-binary)
-                                       :args ["--config-file" cfg]
+                                       ;; --log-level: see config/eca-log-level.
+                                       ;; Defaults to warn so ECA stops relaying
+                                       ;; the MCP children's reflection warnings
+                                       ;; into the grog log.
+                                       :args ["--config-file" cfg
+                                              "--log-level" (config/eca-log-level)]
                                        :env (chat/provider-env)
                                        :log-fn (fn [line] (dbg! "eca:" line))
                                        :trace-fn trace-fn)]
@@ -210,32 +252,78 @@
           (cancel/cancel!)
           (reset! running? false))
         set-model-fn
-        (fn [nm source]
-          (let [mid (models/qualify-eca-model nm
+        (fn [nm source & [opts]]
+          (let [slot (if (= :small (:slot opts)) :small :big)
+                global? (boolean (:global opts))
+                mid (models/qualify-eca-model nm
                                               source
                                               (try (config/llm-url) (catch Exception _ nil)))]
-            ;; A PICK IS THE DEFAULT from now on. Persisting it (`:eca :model` in
-            ;; grog.edn) means every NEW session and every restart uses it — not
-            ;; just this tab — until the user picks again. That is what the
-            ;; settings dialog promises; per-session-only was the old behaviour.
             (when mid
-              (try (models/save-eca-model! mid)
-                   ;; grog.config caches the merged config and only re-reads on
-                   ;; `reload!`; without this, a NEW session in this same process
-                   ;; (swap projects, new tab) would still generate its ECA config
-                   ;; from the STALE cache and ignore the freshly-chosen default.
-                   (config/reload!)
-                   (catch Throwable e (dbg! "save default model failed:" (.getMessage e)))))
-            (when (and @connected mid)
-              (eca/selected-model! id mid {:chatId @(:chat-id state)}))
-            (reset! (:model state) mid)
-            ;; the view reacts to this event to update the footer + status line
-            (chat/publish! state {:type :model
-                                  :value mid
-                                  :text (str "model: " mid)})))
+              ;; WHERE the pick is written is the point of the models dialog:
+              ;;   global? -> grog.edn `:eca :model` / `:eca :small-model`, the
+              ;;              default every project inherits
+              ;;   else    -> THIS project's manifest `:model` / `:small-model`
+              ;; A plain pick stays per project, so a choice in one project
+              ;; never rewrites another's (or every future session's). grog.edn
+              ;; remains the fallback for a project that has not chosen yet.
+              (try
+                (if global?
+                  (do (if (= :small slot)
+                        (models/save-eca-small-model! mid)
+                        (models/save-eca-model! mid))
+                      ;; grog.config CACHES; re-read so a new session in THIS
+                      ;; process inherits the new global default.
+                      (config/reload!))
+                  (if (= :small slot)
+                    (projects/set-project-small-model! project mid)
+                    (projects/set-project-model! project mid)))
+                (catch Throwable e (dbg! "save model failed:" (.getMessage e)))))
+            (when mid
+              ;; remember it in the slot the user edited ...
+              (reset! (if (= :small slot) (:small-model state) (:big-model state)) mid)
+              ;; build the transcript note up front so the parens stay shallow
+              (let [effective (slot-model state @(:model-slot state))
+                    note (str (if global? "global " "project ") (name slot)
+                              " model set: " mid
+                              (when (not= effective mid)
+                                (str " (active slot is " (name @(:model-slot state))
+                                     " — running " effective ")")))]
+                ;; only a change to the ACTIVE slot changes what we actually run
+                (reset! (:model state) effective)
+                (when (and @connected effective)
+                  (eca/selected-model! id effective {:chatId @(:chat-id state)}))
+                ;; the view reacts to this event to update the footer, status
+                ;; line and both slot readouts
+                (chat/publish! state {:type :model
+                                      :value effective
+                                      :slot @(:model-slot state)
+                                      :big @(:big-model state)
+                                      :small @(:small-model state)
+                                      :text (str "model: " effective)})
+                (line! state note)))))
         ;; slash-command seam: /eca-model has no transport, so it qualifies with
-        ;; source=nil (the url/config heuristics decide).
+        ;; source=nil (the url/config heuristics decide). It edits the BIG slot —
+        ;; /small edits the small one, /big and /small switch the active slot.
         set-model-1 (fn [nm] (set-model-fn nm nil))
+        set-slot-fn
+        (fn [slot]
+          (let [slot (if (= :small slot) :small :big)
+                small @(:small-model state)
+                effective (slot-model state slot)]
+            (reset! (:model-slot state) slot)
+            (when (and @connected effective)
+              (eca/selected-model! id effective {:chatId @(:chat-id state)}))
+            (reset! (:model state) effective)
+            (chat/publish! state {:type :model
+                                  :value effective
+                                  :slot slot
+                                  :big @(:big-model state)
+                                  :small small
+                                  :text (str "model: " effective)})
+            (line! state (if (and (= :small slot) (not small))
+                           "model slot: small — no small model configured, running big"
+                           (str "model slot: " (name slot)
+                                (when effective (str " (" effective ")")))))))
         set-trust-fn
         (fn [on?]
           (let [next (if (nil? on?) (not @(:trust state)) on?)]
@@ -268,6 +356,7 @@
          :disconnect! disconnect-fn!
          :stop! stop-fn!
          :set-model! set-model-fn
+         :set-model-slot! set-slot-fn
          :set-trust! set-trust-fn}]
     ;; start worker — the headless core owns the queue loop and slash-command
     ;; routing; :console/:quit! are the view-provided seams
@@ -275,6 +364,7 @@
                                {:send send-fn
                                 :set-model! set-model-1
                                 :set-yolo! set-trust-fn
+                                :set-model-slot! set-slot-fn
                                 :console console
                                 :quit! quit!}))
     sess-map))
@@ -318,6 +408,8 @@
       (chat/answer-approval! (:state s) approval-id decision)))
   (set-model! [_ id model] ((:set-model! (sess id)) model nil))
   (set-model! [_ id model source] ((:set-model! (sess id)) model source))
+  (set-model! [_ id model source opts] ((:set-model! (sess id)) model source opts))
+  (set-model-slot! [_ id slot] ((:set-model-slot! (sess id)) (keyword slot)))
   (set-trust! [_ id on?] ((:set-trust! (sess id)) on?))
   (subscribe! [_ id f] (chat/subscribe! (:state (sess id)) f))
   (unsubscribe! [_ id f] (chat/unsubscribe! (:state (sess id)) f)))

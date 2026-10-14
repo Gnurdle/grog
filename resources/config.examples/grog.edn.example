@@ -31,6 +31,7 @@
         :github     {:url "https://models.inference.ai.azure.com"                      :model "gpt-4o-mini"}
         :novita     {:url "https://api.novita.ai/v3/openai"                            :model "meta-llama/llama-3.3-70b-instruct"}
         :hyperbolic {:url "https://api.hyperbolic.xyz/v1"                              :model "meta-llama/Llama-3.3-70B-Instruct"}
+        :reflection {:url "https://api.reflection.ai/openai/v1"                        :model "Beam-501B-A23B"}
 
         ;; local — no key (run the server yourself)
         :ollama     {:url "http://localhost:11434/v1"                                  :model "qwen3:8b" :api-key nil}
@@ -54,8 +55,12 @@
                   "Review project memory if useful (memory_namespaces / memory_list_keys / memory_load). If nothing needs attention, one-line OK."}]}
 
  :voice {:enabled true                         ; push-to-talk mic button
-         :command                              ; WAV in ({wav}), text on stdout
-         ["whisper-cli" "-m" "~/.config/grog/models/ggml-base.en.bin"
+         :command                              ; WAV in ({wav}), text on stdout.
+         ;; The DESKTOP client never reads this block: it takes its engine from
+         ;; $GROG_VOICE_COMMAND / $GROG_VOICE_MODEL. This is only for the CLI
+         ;; (grog.voice) — point it at YOUR whisper.cpp install, engine on PATH
+         ;; and model wherever you put it (grog ships neither).
+         ["whisper-cli" "-m" "~/whisper.cpp/models/ggml-base.en.bin"
           "-f" "{wav}" "-nt"]
          :sample-rate 16000
          :max-seconds 60}                      ; auto-stop after this long

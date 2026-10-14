@@ -21,6 +21,46 @@
   - Other `:name` values (e.g. `notes`, `facts`) live beside the project store when a project is
     active, also per-project.
 
+- **The store is a GRAPH, and it beats a wad of files — reach for it first.** A value may
+  REFERENCE another entry with `${other-key}`, expanded when read, so ONE entry can own a fact
+  and every other entry can point at it instead of copying it. Copies drift; references cannot.
+  (This has already been paid for once: a single moved path silently rotted 8 memory keys, 9 note
+  files and a generated rules file.) So:
+
+  - Before writing a note file, ask: is this a **fact to remember** (→ `assoc_store`) or a
+    **document a human will open and edit** (→ a file)? Default to the store. A file is for the
+    user's eyes, for a committed config, or for a build artifact.
+  - **One fact per key**, namespaced with dots (`repo.*`, `playbook.*`, `handoff.*`, `workflow.*`).
+  - **Never paste the same text twice.** Store it once and reference `${it}` — an entry that is
+    mostly `${refs}` is an *index*, and indexes are cheap.
+  - `${key}` resolves **depth-limited (5 hops)** and **cycle-safe**; a reference that does not
+    resolve stays **visible** as `${whatever}` rather than becoming an empty value. `$${key}` is
+    the escape for the literal characters. `assoc_search` returns values **unexpanded** (it is a
+    *finder*); `assoc_get` is the *reader*.
+  - **Dated history stays dated.** A handoff note is a record of what happened — correct the
+    *live* facts and leave the record alone; do not rewrite history to keep the store tidy.
+  - Unsure how to file something? Start from the index key **`playbook.assoc-index`** (global) —
+    which carries a README of the toolbox: `assoc_span` (prefix + window, newest-first) is how
+    you read a log, `assoc_append` (mints the UTC key for you) is how you write one,
+    `assoc_count`/`assoc_prune` size and trim it, and `assoc_write`/`assoc_rename` keep an
+    entry and the thing that points at it consistent.
+
+- **This is the self-licking ice cream cone.** Persistent memory is what lets grog improve
+  itself: every session starts amnesiac, and this store is the only thing that carries forward,
+  so a fact, a correction or a decision written once changes what you do in every later session.
+  The loop closes on itself — and it only closes if the writing actually happens. A session that
+  learns something and stores nothing has thrown it away. (That is also why the letters live in
+  the store and not in a wad of files: a file is copied and rots; an entry is referenced and
+  cannot.)
+
+  **The same loop then asks for TOOLS, not one-offs.** When something bespoke works — a script
+  you just wrote, a procedure you just worked out — promote it instead of walking away:
+  `save_skill` writes a reusable capability (`skill.edn` + `SKILL.md`) under `:skills :roots`,
+  and that root list IS the scope choice — the global root helps every project, a project root
+  helps this one. A one-off that stays a one-off is a capability you will rebuild from scratch
+  next session. **Growing the toolset, globally or in a project, is the objective**; anything
+  learned on the way belongs in the store.
+
 - **Per-project tasks** (user-instigated). Each project has a task list kept in
   `~/grog-projects/<proj>/tasks.edn`, managed with the **`/tasks`** chat command
   (`/tasks add`, `/tasks done <id>`, `/tasks rm <id>`, `/tasks due`). Tasks are

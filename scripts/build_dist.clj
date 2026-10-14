@@ -5,6 +5,10 @@
 ;;                             [--skip-web] [--no-package] [--bundle]
 ;;                             [--version X.Y.Z]
 ;;
+;; The installers ship NO speech model: voice input needs whisper.cpp's engine
+;; (the user's package manager) plus a ggml model the user supplies — see
+;; models/README.md for where the client looks for one.
+;;
 ;; --target defaults to `all` (--win nsis AND --linux) — a plain `bb dist`
 ;; builds the WHOLE release. It used to default to the host OS, so running it
 ;; on Linux silently produced no Windows installer.
@@ -230,6 +234,7 @@
                       ;; headers printed below and in the failure message.
                       ;;   mcp   -> grog_mcp/target/grog-mcp-<v>.jar   (all 12 MCP servers)
                       ;;   spine -> target/grog-spine.jar              (the backend)
+                      ;;   eca   -> target/eca.jar                     (the PATCHED ECA)
                       ;;   web   -> resources/public/js/main.js + css/output.css
                       (not skip-jars?)
                       (conj {:name "mcp" :dir (fs/file root "grog_mcp")
@@ -238,6 +243,15 @@
                       (not skip-jars?)
                       (conj {:name "spine" :dir root
                              :args ["clojure" "-T:build" "spine" ":version" (pr-str version)]})
+
+                      ;; The ECA the app runs. POSIX-only job (the script is a shell
+                      ;; script) because the jar it produces is platform-independent:
+                      ;; a Windows pack reuses the one built on Linux. With no `sh`,
+                      ;; assemble! below insists target/eca.jar is already there
+                      ;; rather than quietly shipping an install that has no ECA.
+                      (and (not skip-jars?) (fs/which "sh"))
+                      (conj {:name "eca" :dir root
+                             :args ["sh" "scripts/eca-jar.sh"]})
 
                       (not skip-web?)
                       (conj {:name "web" :dir web :args [(npm-cmd) "run" "build"]}))
@@ -302,13 +316,19 @@
         tgz (fs/file out (str base ".tar.gz"))
         zp (fs/file out (str base ".zip"))
         spine (fs/file root "target/grog-spine.jar")
-        mcp (newest (fs/file root "grog_mcp/target") #"grog-mcp-.*\.jar")]
+        mcp (newest (fs/file root "grog_mcp/target") #"grog-mcp-.*\.jar")
+        eca (fs/file root "target/eca.jar")]
     (when-not (fs/exists? spine) (die "spine jar missing - run without --skip-jars"))
     (when-not mcp (die "grog-mcp jar missing - run without --skip-jars"))
+    ;; An install with no ECA of its own drives whatever `eca` the machine happens
+    ;; to have (grog.eca/resolve-eca-binary!), so packing without this one means
+    ;; packing without the ECA fixes. Build it: scripts/eca-jar.sh.
+    (when-not (fs/exists? eca)
+      (die "eca jar missing - run scripts/eca-jar.sh (builds the patched ECA)"))
     (fs/create-dirs out)
     (fs/delete-if-exists tgz)
     (fs/delete-if-exists zp)
-    (say "packing the bundle (tree + both jars, no node_modules)")
+    (say "packing the bundle (tree + all three jars, no node_modules)")
     (apply sh! root "tar" "-czf" tgz-rel (concat tar-excludes ["."]))
     (say "tarball:" (str tgz))
     (if (fs/which "zip")
@@ -321,6 +341,7 @@
                    :built (str (java.time.Instant/now))
                    :contains ["target/grog-spine.jar"
                               (str "grog_mcp/target/" (fs/file-name mcp))
+                              "target/eca.jar  (the patched ECA the app drives)"
                               "clients/web/resources/public/ (built)"
                               "scripts/grog-client[.bat]"]
                    :next "extract, then follow doc/windows-quick-start.md"}))
@@ -379,6 +400,19 @@
                 (finally (fs/delete-tree tmp))))
             (when-not (fs/exists? (fs/file cache "rcedit-x64.exe"))
               (die "winCodeSign cache seeding produced no rcedit - cannot package"))))))))
+
+;; --- voice model -------------------------------------------------------------
+;; grog ships NO speech model: voice input needs whisper.cpp's engine (from the
+;; user's package manager) AND a ggml model — and NO package manager ships
+;; models. Arch's `whisper-cpp` is engine + libs only, and scoop's manifest says
+;; it outright: "Whisper Model files are not included." So the model is the
+;; user's to install; models/README.md documents where the client looks
+;; ($GROG_VOICE_MODEL -> XDG data home -> ./models -> ~/whisper.cpp/models).
+;;
+;; It is deliberately NOT bundled: 148 MB in every download, for a feature most
+;; users never click. (History: it WAS bundled for a day on 2026-10-13 — twice
+;; over, once inside the spine jar — and the installer went 282 MB -> 550 MB.
+;; Both copies are gone; keep big DATA out of the classpath roots.)
 
 (defn- wine-on-path? []
   (boolean (or (fs/which "wine") (fs/which "wine64"))))
@@ -469,6 +503,14 @@
     (when (some #{"--bundle"} args)
       (assemble! (assoc opts :for-os (os-tag))))
     (let [packaged? (not (some #{"--no-package"} args))]
+      ;; electron-builder would fail on the missing extraResource with a bare
+      ;; "file not found"; say what to do instead. This is the `--skip-jars`
+      ;; (dist:fast) path: it REUSES jars, so the ECA jar must already be there
+      ;; from an earlier build — and an install with no ECA of its own drives
+      ;; whatever `eca` the machine has.
+      (when (and packaged? (not (fs/exists? (fs/file root "target/eca.jar"))))
+        (die (str "eca jar missing - run scripts/eca-jar.sh first (or `bb dist` "
+                  "without --skip-jars); the app must ship its own ECA")))
       (when packaged?
         (doseq [t targets] (package! (assoc opts :for-os t))))
       ;; Report the artifacts that were actually produced rather than

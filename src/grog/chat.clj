@@ -59,15 +59,27 @@
 
     :project :chat-id :status :model :trust :usage :connected :running?
     :history :last-sent :pending-steer     — chat-loop state
+    :model-slot :big-model :small-model    — the big/small slots (see below)
     :subs                                  — event-stream subscribers
 
   The core calls it `:trust`; `build-session!` keeps the local name `yolo-ref`
-  so its downstream references don't churn."
-  [{:keys [project chat-id model]}]
+  so its downstream references don't churn.
+
+  BIG/SMALL SLOTS — `:model` is the EFFECTIVE model (what a turn actually runs);
+  `:big-model`/`:small-model` are each slot's resolved id, and `:model-slot`
+  (`:big` by default) says which one is active. `grog.client.local` owns the
+  resolution (project manifest, else the global default; a small slot with no
+  small model keeps running big), so the core only carries the three atoms and
+  reports them in `snapshot` — a client can show both models and the active one
+  without knowing the fallback rules."
+  [{:keys [project chat-id model model-slot big-model small-model]}]
   (let [st {:project   (some-> project str)
             :chat-id   (atom chat-id)
             :status    (atom "idle")
             :model     (atom model)
+            :model-slot  (atom (or model-slot :big))
+            :big-model   (atom big-model)
+            :small-model (atom small-model)
             :trust     (atom false)
             :usage     (atom {:turn-tokens 0 :turn-cost 0.0
                               :session-tokens 0 :session-cost nil})
@@ -98,6 +110,9 @@
    :chat-id   @(:chat-id state)
    :status    @(:status state)
    :model     @(:model state)
+   :model-slot  @(:model-slot state)
+   :big-model   @(:big-model state)
+   :small-model @(:small-model state)
    :trust     @(:trust state)
    :usage     @(:usage state)
    :connected @(:connected state)
@@ -457,6 +472,9 @@
     :send       (fn [history text contexts] -> history)  hand an LLM turn over
     :set-model! (fn [name])  /eca-model — qualify, push to ECA, footer, status
     :set-yolo!  (fn [on?])   /yolo (nil toggles)
+    :set-model-slot! (fn [:big|:small])  /big and /small — switch the active slot
+                 (the slot itself is resolved by the adapter: a small slot with
+                 no small model configured keeps running big)
     :console    (fn [] -> Writer)  called once per turn; `*out*`/`*err*` bind
                  to it so slash-command output lands in the transcript. The
                  GUI supplies a fresh `transcript/console-writer` (it buffers
@@ -467,7 +485,7 @@
   The console binding wraps the whole route (the `:user` echo publishes
   before it, as before), because `route-slash-command!` prints its handlers'
   output to `*out*`."
-  [state {:keys [send set-model! set-yolo! console quit!]} text contexts]
+  [state {:keys [send set-model! set-yolo! set-model-slot! console quit!]} text contexts]
   (cancel/clear!)
   ;; echo the user's input (prompt or command) as a bubble. `/secret KEY VALUE`
   ;; carries a credential: publish a MASKED form so the value never reaches the
@@ -486,6 +504,15 @@
                   (let [m (re-matches #"(?i)^/yolo(?:\s+(on|off))?$" (str/trim text))
                         on? (when (second m) (= "on" (str/lower-case (second m))))]
                     (when set-yolo! (set-yolo! on?))
+                    @(:history state))
+
+                  ;; /big and /small switch the model SLOT. Handled here (not in
+                  ;; `grog.core`) because the slot is session state the adapter
+                  ;; owns; and handled BEFORE the `route-slash-command!` fallback
+                  ;; so these never reach the LLM as a prompt.
+                  (re-matches #"(?i)^/(big|small)$" (str/trim text))
+                  (let [m (re-matches #"(?i)^/(big|small)$" (str/trim text))]
+                    (when set-model-slot! (set-model-slot! (keyword (str/lower-case (second m)))))
                     @(:history state))
 
                   :else

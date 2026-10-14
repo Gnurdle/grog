@@ -41,6 +41,7 @@ LLM_API_KEY <value>`, then restart), and a getting-started project named
 | Tesseract | `tesseract --version` | OCR |
 | Poppler | `pdftoppm -v` | PDF → PNG |
 | ripgrep, jq | `rg --version`, `jq --version` | project search; shell one-liners |
+| whisper-cli | `whisper-cli --help` | voice input (optional) — Arch: `sudo pacman -S whisper-cpp` |
 
 List everything, with versions and install hints:
 
@@ -51,6 +52,20 @@ clojure -M -m grog.doctor --json
 
 Optional tools are just that — a missing one disables the features that need it
 and `grog doctor` says which.
+
+**Voice input** needs two pieces, both yours: the whisper.cpp **engine** on
+`PATH` (Arch packages it — `sudo pacman -S whisper-cpp` → `/usr/bin/whisper-cli`;
+elsewhere build whisper.cpp or set `$GROG_VOICE_COMMAND`) and a **ggml model**,
+which no package manager provides:
+
+```sh
+mkdir -p ~/.local/share/grog/models
+curl -L -o ~/.local/share/grog/models/ggml-base.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+grog ships neither half — no 148 MB blob rides in the installer. Sizes, the
+other directories it searches, and `$GROG_VOICE_MODEL`: `models/README.md`.
 
 ## 2. Install
 

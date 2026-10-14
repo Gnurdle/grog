@@ -85,6 +85,16 @@ if (!PACKAGED && !looksLikeGrogRoot(GROG_HOME)) {
 // it beside the app; from a source tree the backend finds it itself.
 const MCP_JAR = PACKAGED ? packagedJar("grog-mcp-") : null;
 
+// The ECA the agent loop runs. Same story as MCP_JAR, and it matters more: ECA is
+// resolved by the BACKEND at runtime, so an install with no ECA of its own falls
+// through to whatever `eca` is on the user's PATH — an old release, or the copy
+// some other editor's extension left behind — and then none of the ECA-side fixes
+// grog carries are in play. The jar is built from the patched fork by
+// scripts/eca-jar.sh and travels in resources/jars (see doc/eca-fork.md). The
+// backend prefers it only when no explicit `:eca :binary` is configured, so a dev
+// checkout pointing at live source still wins.
+const ECA_JAR = PACKAGED ? packagedJar("eca") : null;
+
 // grog's OWN documentation travels in the bundle (electron-builder
 // extraResources -> resources/docs). A packaged AppImage mounts it read-only
 // inside the squashfs, so the spine cannot find it by searching — the client
@@ -113,6 +123,7 @@ const SPINE_ENV_EXTRA = Object.assign(
     GROG_DOCS_DIR: DOCS_DIR,
   },
   MCP_JAR ? { GROG_MCP_JAR: MCP_JAR } : {},
+  ECA_JAR ? { GROG_ECA_JAR: ECA_JAR } : {},
 );
 
 // Spine launch: prefer the self-contained spine jar when it exists (no Clojure
@@ -188,16 +199,15 @@ function connect() {
 let readyResolve = null;
 const ready = new Promise((r) => { readyResolve = r; });
 
-// A tool approval or an LLM question BLOCKS the agent until the user answers.
-// The renderer only paints those dialogs while the window is focused, so when
-// the window sits behind another app the request is invisible — the "the dialog
-// pops up behind instead of in front" bug. Bring the window forward; if the OS
-// refuses focus (Windows' foreground lock), flash the taskbar as the fallback.
+// A tool approval BLOCKS the agent until the user answers, so raising the window
+// is worth the intrusion. An LLM QUESTION deliberately does NOT: yanking focus
+// mid-keystroke is hostile, and the renderer now surfaces a question as a BROWN
+// TAB plus a non-modal prompt that paints whether or not the window is focused
+// (core.cljs `question-panel`). So questions never reach `requestAttention`.
 function needsAttention(msg) {
-  if (msg.method === "question") return true;
   if (msg.method === "event") {
     const t = msg.params && msg.params.type;
-    return t === "approval" || t === "question";
+    return t === "approval";
   }
   return false;
 }
@@ -372,22 +382,25 @@ const call = async (method, params) => {
 const VOICE_ENABLED = process.env.GROG_VOICE_ENABLED !== "0";
 const VOICE_MAX_SECONDS = Number(process.env.GROG_VOICE_MAX_SECONDS || 60);
 
-// The whisper model nothing provides by default. A PACKAGED install has no
-// ~/.config/grog/models/ggml-base.en.bin, and nothing seeds one — so voice was
-// silently "enabled" and only failed on first use. Look for a model, in order:
-//   $GROG_VOICE_MODEL           explicit override
-//   <config home>/models/…      what the docs / grog.edn examples name
-//   <resourcesPath>/models/…    a model shipped INSIDE a packaged app
-//   <repo>/resources/models/…   the same, running from a source tree
-// The last two let a distro build ship a model (drop one in resources/models);
-// if none is found we still return the conventional path so the error NAMES it.
+// The whisper model is NOT bundled: voice input needs whisper.cpp's engine AND
+// a ggml model, and no package manager ships the model (Arch's `whisper-cpp`
+// and scoop's are engine-only — scoop's manifest says so itself). So the model
+// is the user's to install, and the installers stay small. Look for one, in
+// order:
+//   $GROG_VOICE_MODEL          explicit override
+//   <resourcesPath>/models/…   if a packager chose to bundle one anyway
+//   <repo>/models/…            a source tree (drop a ggml-*.bin in ./models)
+//   <data home>/grog/models/…  where the docs say to put one — writable on
+//                              every install, including an AppImage
+//   ~/whisper.cpp/models/…     YOUR own whisper.cpp checkout (the engine
+//                              fallback below looks in the same tree)
 function voiceModelCandidates() {
   const names = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-small.en.bin", "ggml-base.bin"];
   const dirs = [
-    // honour GROG_CONFIG_HOME / XDG_CONFIG_HOME, exactly like the rest of grog
-    path.join(configSeed.configHome(), "models"),
     path.join(process.resourcesPath || "", "models"),
-    path.join(__dirname, "..", "..", "..", "..", "resources", "models"),
+    path.join(__dirname, "..", "..", "..", "..", "models"),
+    path.join(configSeed.dataHome(), "models"),
+    path.join(os.homedir(), "whisper.cpp", "models"),
   ];
   const cands = [];
   if (process.env.GROG_VOICE_MODEL) cands.push(process.env.GROG_VOICE_MODEL);
@@ -399,7 +412,10 @@ function voiceModelPath() {
   const found = voiceModelCandidates().find((p) => {
     try { return fs.existsSync(p); } catch { return false; }
   });
-  return found || path.join(configSeed.configHome(), "models", "ggml-base.en.bin");
+  // Not found: name the DATA home. It is always writable — an AppImage's own
+  // models/ dir is a read-only squashfs mount — and it is where the docs tell
+  // the user to put one. Never a path under the config home.
+  return found || path.join(configSeed.dataHome(), "models", "ggml-base.en.bin");
 }
 
 // Resolve an executable: an explicit path is checked directly, a bare name is
@@ -702,6 +718,18 @@ function offerConfigCreation() {
 ipcMain.handle("grog:call", (_e, method, params) => call(method, params));
 ipcMain.handle("grog:focused", () => !!(win && win.isFocused()));
 ipcMain.handle("grog:socket-path", () => SOCKET_PATH);
+
+// The in-client log pane (a toolbar toggle, off by default). The log FILE is
+// always written — this only decides whether new lines are pushed to the
+// renderer, so an unopened pane costs nothing.
+let logStreaming = false;
+LOG.onLine((line) => {
+  if (logStreaming && win && !win.isDestroyed()) win.webContents.send("grog:log-line", line);
+});
+ipcMain.handle("grog:log-subscribe", (_e, on) => {
+  logStreaming = !!on;
+  return { path: LOG.path, lines: LOG.tail() };
+});
 // Open a documentation file that ships INSIDE the app bundle (the onboarding
 // page and, later, the desktop entry point at these). `rel` is docs-relative and
 // is CONFINED to DOCS_DIR, so the renderer cannot ask us to open arbitrary paths.

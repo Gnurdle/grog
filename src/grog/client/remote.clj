@@ -262,6 +262,12 @@
   (set-model! [_ id model source]
     (call "set-model" (cond-> {:id id :model model}
                         source (assoc :source (str source)))))
+  (set-model! [_ id model source opts]
+    (call "set-model" (cond-> {:id id :model model}
+                        source (assoc :source (str source))
+                        (:slot opts) (assoc :slot (name (:slot opts)))
+                        (:global opts) (assoc :global true))))
+  (set-model-slot! [_ id slot] (call "set-model-slot" {:id id :slot (name slot)}))
   (set-trust! [_ id on?] (call "set-trust" {:id id :on (boolean on?)}))
   (subscribe! [_ id f]
     (when-let [{:keys [subs]} (get @!sessions id)]
