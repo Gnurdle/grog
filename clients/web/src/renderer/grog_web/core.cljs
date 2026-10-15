@@ -1080,13 +1080,17 @@
                   :on-click #(rf/dispatch [:save-image media_type base64])} "↓ Downloads"]]])
 
     :else
+    ;; :user / :tool / :usage are NOT Markdown — they render verbatim, so a URL
+    ;; in a tool result (a run page, a docs link) used to be dead text.
+    ;; `md/linkify` only turns bare http(s) URLs into links; every other byte,
+    ;; whitespace included, is left exactly as it is.
     [:div {:class (str "text-sm " (if (= :user kind) "text-right" ""))}
      [:span {:class (str (case kind :tool "role-tool" :user "role-user" "role-snark")
                          " text-[0.7rem] mr-2 align-top")}
       (role-label kind)]
      [:span {:class (case kind :user "seg-user" :tool "seg-tool" "seg-answer")
              :style {:white-space "pre-wrap"}}
-      text]]))
+      (md/linkify text)]]))
 
 (defonce ^:private !scroll-el (atom nil))
 
@@ -1099,6 +1103,89 @@
 ;; How close to the bottom still counts as "at the bottom" (px) — a little slack
 ;; so sub-pixel / rounding gaps never flip following off spuriously.
 (def ^:private scroll-slack-px 48)
+
+;; SMOOTH PINS — a JUMP-sized gap (a whole message, tool result or code block
+;; landed, or the reader came back to the bottom) is animated; the per-token
+;; deltas of a stream stay INSTANT, because a smooth scroll restarted on every
+;; delta never catches up and leaves the newest line below the fold. Honours
+;; prefers-reduced-motion.
+(def ^:private smooth-gap-px 320)
+
+;; Our own animation fires scroll events with `scrollTop < max`, which
+;; `on-scroll!` would read as "the reader scrolled up" — flipping `!follow?` off
+;; and stranding the view mid-scroll. So an animated pin is MARKED and its events
+;; are ignored until it lands. A pin that outlives the deadline was interrupted
+;; (the reader took over, or the tab was hidden), so at that point the position
+;; is believed and following switches off.
+(defonce ^:private !pin-anim? (atom false))
+(defonce ^:private !pin-deadline (atom 0))
+(defonce ^:private !pin-raf (atom nil))
+;; Start of the in-flight pin, on the SAME clock `requestAnimationFrame` reports
+;; (a DOMHighResTimeStamp, ms since page load). Captured from the first frame so
+;; the two can never disagree.
+(defonce ^:private !pin-t0 (atom nil))
+
+;; PACE OF THE SMOOTH PIN. A FIXED, short duration — the same shape as the
+;; browser's own `behavior:"smooth"`, which is what a smooth scroll should feel
+;; like. Deliberately NOT scaled by distance: that made a jump-sized gap crawl
+;; (up to 8s), which read as "slow", not "smooth". Still eased out, so it arrives
+;; and STOPS.
+(def ^:private smooth-ms 220)
+
+(def ^:private reduced-motion?
+  (boolean (and (exists? js/window)
+                (fn? (.-matchMedia js/window))
+                (.-matches (.matchMedia js/window "(prefers-reduced-motion: reduce)")))))
+
+(defn- stop-pin!
+  "Cancel an in-flight animated pin: it landed, the reader took over (a wheel,
+  a touch, a click), or a newer pin replaced it. Idempotent."
+  []
+  (when-let [id @!pin-raf]
+    (.cancelAnimationFrame js/window id)
+    (reset! !pin-raf nil))
+  (reset! !pin-anim? false)
+  (reset! !pin-deadline 0)
+  (reset! !pin-t0 nil))
+
+(defn- animate-pin!
+  "Ease `n` to the bottom over our own requestAnimationFrame loop — a FIXED
+  `smooth-ms`, eased out — and mark the pin as ours so `on-scroll!` ignores the
+  events it fires. Each frame interpolates from the position the pin started at
+  toward the CURRENT bottom, so a transcript that keeps growing is chased and the
+  finish is still exactly the bottom.
+
+  The clock is taken FROM THE FRAME CALLBACK itself. `requestAnimationFrame`
+  reports a DOMHighResTimeStamp (ms since page load), NOT the epoch `Date.now()`
+  uses; mixing the two made the progress ratio hugely negative, which pinned
+  `scrollTop` at 0 (a jump to the TOP) and never let the loop finish."
+  [^js n]
+  (stop-pin!)
+  (let [start (.-scrollTop n)
+        bottom (fn [] (max 0 (- (.-scrollHeight n) (.-clientHeight n))))]
+    (reset! !pin-t0 nil)
+    (reset! !pin-anim? true)
+    (reset! !pin-deadline (+ (.now js/Date) smooth-ms 1500))
+    (letfn [(step [now]
+              (when-not @!pin-t0 (reset! !pin-t0 now))
+              (let [p (js/Math.min 1.0 (/ (- now @!pin-t0) smooth-ms))
+                    ;; easeOutCubic: quick to leave, gentle to arrive
+                    eased (- 1 (js/Math.pow (- 1 p) 3))]
+                (set! (.-scrollTop n) (+ start (* (- (bottom) start) eased)))
+                (if (< p 1.0)
+                  (reset! !pin-raf (.requestAnimationFrame js/window step))
+                  (do (set! (.-scrollTop n) (bottom))
+                      (stop-pin!)))))]
+      (reset! !pin-raf (.requestAnimationFrame js/window step)))))
+
+(defn- pin!
+  "Scroll `n` to the bottom. `smooth?` animates it (our own tween) and marks the
+  pin as ours; anything else is an instant write, which is what a streaming pin
+  must be."
+  [^js n smooth?]
+  (if (and smooth? (fn? (.-requestAnimationFrame js/window)))
+    (animate-pin! n)
+    (do (stop-pin!) (set! (.-scrollTop n) (.-scrollHeight n)))))
 
 (defn- at-bottom?
   "True when `n` is scrolled to (or within `scroll-slack-px` of) the bottom."
@@ -1113,13 +1200,25 @@
   ;; no longer drags the reader back down if they have scrolled up.
   (when (and @!follow? (some? @!scroll-el))
     (let [n @!scroll-el]
-      (set! (.-scrollTop n) (.-scrollHeight n)))))
+      (if @!pin-anim?
+        ;; Our animation is still travelling: let it finish. Past the deadline it
+        ;; was interrupted, so believe the position rather than the flag.
+        (when (> (.now js/Date) @!pin-deadline)
+          (reset! !pin-anim? false)
+          (when-not (at-bottom? n) (reset! !follow? false)))
+        (let [gap (- (.-scrollHeight n) (.-scrollTop n) (.-clientHeight n))]
+          (pin! n (and (not reduced-motion?) (> gap smooth-gap-px))))))))
 
 (defn- on-scroll! [e]
-  ;; Called on every scroll, including our own programmatic ones — setting the
-  ;; position to the bottom keeps `following?` true, so there is no feedback
-  ;; fight; any upward scroll flips it off.
-  (reset! !follow? (at-bottom? (.-currentTarget e))))
+  ;; Called on every scroll, including our own programmatic ones. While a smooth
+  ;; pin is in flight its events are OURS and must not be mistaken for the reader
+  ;; scrolling up. Otherwise: setting the position to the bottom keeps
+  ;; `following?` true, so there is no feedback fight, and any upward scroll
+  ;; flips it off.
+  (if (and @!pin-anim? (<= (.now js/Date) @!pin-deadline))
+    (when (at-bottom? (.-currentTarget e)) (reset! !pin-anim? false))
+    (do (reset! !pin-anim? false)
+        (reset! !follow? (at-bottom? (.-currentTarget e))))))
 
 (defn- has-messages?
   "True once a real turn has happened (the splash logo retires then, like
@@ -1284,6 +1383,12 @@
         [:div {:class "relative flex-1 min-h-0"}
          [:div {:ref (fn [el] (reset! !scroll-el el))
                 :on-scroll on-scroll!
+                ;; the reader taking over must CANCEL our tween — the browser
+                ;; used to do this for a native smooth scroll; a hand-rolled one
+                ;; would otherwise fight the wheel/scrollbar for its duration.
+                :on-wheel (fn [_] (stop-pin!))
+                :on-mouse-down (fn [_] (stop-pin!))
+                :on-touch-start (fn [_] (stop-pin!))
                 :class "absolute inset-0 overflow-y-auto px-6 py-4 space-y-3"}
           (if (has-messages? segs)
             (for [[i seg] (map-indexed vector segs)]
@@ -1518,7 +1623,10 @@
                              "bg-sky-500/20 border-sky-500/50 text-sky-200"
                              "bg-slate-800 border-slate-700 text-slate-300"))
                :on-click #(rf/dispatch [:toggle-log])}
-      "log"]]))
+      "log"]
+     ;; (the temporary smooth-scroll pace slider that lived here was removed — the
+     ;; pin is now a fixed `smooth-ms`, matching the browser's own smooth scroll.)
+     ]))
 
 (defn- composer []
   (let [txt @(rf/subscribe [:input]) active @(rf/subscribe [:active])

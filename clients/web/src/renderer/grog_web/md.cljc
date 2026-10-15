@@ -8,7 +8,8 @@
 
   Block level: fenced + indented code, ATX headings, GFM pipe tables,
   bullet/ordered lists, blockquotes, horizontal rules, paragraphs.
-  Inline: code spans, bold, italic, strikethrough, links, backslash escapes.
+  Inline: code spans, bold, italic, strikethrough, links, bare-URL autolinks,
+  backslash escapes.
 
   Portable (.cljc, no reader conditionals) so the same code is unit-tested on the
   JVM with babashka and shipped to the browser build — one implementation, one
@@ -22,6 +23,117 @@
   <text-markdown> forms) so the content parses as plain Markdown."
   [s]
   (str/replace (or s "") #"(?is)</?text[-/]markdown/?>" ""))
+
+;; --- bare URLs ---------------------------------------------------------------
+;; A URL that arrives as TEXT stays text — unclickable in the client and in the
+;; exported HTML. This makes links out of them. It is a POST-PASS over rendered
+;; hiccup rather than a rule inside the inline parser, and that is the point:
+;; text inside [:a] (a link's own label), [:code] and [:pre] is skipped
+;; structurally, so a URL in a code span stays code and a link label can never
+;; end up as a link inside a link. `linkify` exposes the same pass for plain,
+;; non-Markdown text (tool output, a user message), which never reaches the
+;; parser at all.
+;;
+;; ONLY http(s) is matched, deliberately: `javascript:`, `data:` and `file:`
+;; never turn into a clickable href out of a model's or a tool's output.
+
+(def ^:private url-junk
+  "Trailing characters that end a SENTENCE rather than a URL."
+  #{\., \, \; \: \! \? \" \' \* \_ \~})
+
+(def ^:private url-closers {\) \( \] \[ \} \{})
+
+(defn- ws? [c] (contains? #{\space \tab \newline \return \formfeed} c))
+
+(defn- url-stop? [c] (or (ws? c) (contains? #{\< \> \" \'} c)))
+
+(defn- trim-url
+  "Trim trailing punctuation off `(subs s i j)`, returning the new end index — or
+  nil when nothing URL-shaped is left. A closing bracket survives only while it
+  balances an opener INSIDE the URL: `https://x/a(b)` keeps its `)`, while
+  `(https://x)` does not."
+  [^String s ^long i ^long j]
+  (let [floor (+ i 8)]                        ; never eat into `https://` itself
+    (loop [j j]
+      (if (<= j floor)
+        nil
+        (let [c (nth s (dec j))
+              opener (get url-closers c)]
+          (if (or (contains? url-junk c)
+                  (and opener (let [seg (subs s i j)]
+                                (< (count (filter #(= opener %) seg))
+                                   (count (filter #(= c %) seg))))))
+            (recur (dec j))
+            j))))))
+
+(defn- url-at
+  "If a bare http(s) URL starts at `i`, return `[href end]`; else nil. The URL
+  runs to the first whitespace, angle bracket or quote — which is what makes
+  `<https://x>` link x without its brackets — and trailing sentence punctuation
+  is trimmed off the end."
+  [^String s ^long i]
+  (let [c (when (< i (count s)) (nth s i))]
+    (when (or (= c \h) (= c \H))
+      (let [n (count s)
+            head (str/lower-case (subs s i (min n (+ i 8))))]
+        (when (or (str/starts-with? head "http://") (str/starts-with? head "https://"))
+          (let [end (loop [k i] (if (and (< k n) (not (url-stop? (nth s k)))) (recur (inc k)) k))]
+            (when-let [e (trim-url s i end)]
+              [(subs s i e) e])))))))
+
+(defn- autolink-str
+  "Split a plain string into a seq of nodes: the text as it was, with each bare
+  URL as an [:a]. The link's visible text is the URL itself and is NOT re-parsed
+  — a URL carrying `_` or `__` must not come back as emphasis."
+  [s]
+  (let [s (str s) n (count s)]
+    (loop [i 0 start 0 out []]
+      (if (>= i n)
+        (seq (if (< start n) (conj out (subs s start)) out))
+        (if-let [[href ni] (url-at s i)]
+          (let [out (if (< start i) (conj out (subs s start i)) out)]
+            (recur ni ni (conj out [:a {:href href} href])))
+          (recur (inc i) start out))))))
+
+(def ^:private no-link-tags
+  "Inside these, text is verbatim: another <a> would be a nested link, and code
+  has to stay code."
+  #{:a :code :pre})
+
+(declare autolink-node)
+
+(defn- autolink-children
+  "Walk children, splicing a TEXT child into its linkified nodes (so the result
+  stays flat) and walking every other node as one."
+  [kids]
+  (reduce (fn [acc kid]
+            (if (string? kid)
+              (into acc (autolink-str kid))
+              (conj acc (autolink-node kid))))
+          [] kids))
+
+(defn- autolink-node [node]
+  (cond
+    (string? node) (autolink-str node)
+    (and (vector? node) (keyword? (first node)))
+    (let [[tag attrs kids] (if (map? (second node))
+                             [(first node) (second node) (drop 2 node)]
+                             [(first node) nil (rest node)])]
+      (if (contains? no-link-tags tag)
+        node
+        (if attrs
+          (into [tag attrs] (autolink-children kids))
+          (into [tag] (autolink-children kids)))))
+    (sequential? node) (mapv autolink-node node)
+    :else node))
+
+(defn linkify
+  "Bare URLs in PLAIN text (a tool result, a user message) → clickable [:a]
+  nodes. Nothing else is interpreted — no emphasis, no code spans — because tool
+  output is not Markdown and restyling it would be a bug. Returns a seq of
+  strings and nodes."
+  [s]
+  (autolink-str (or s "")))
 
 ;; --- inline -----------------------------------------------------------------
 
@@ -295,7 +407,8 @@
 ;; --- entry ------------------------------------------------------------------
 
 (defn ->hiccup
-  "Render `md` (a Markdown string) to a vector of hiccup blocks. `nil` is treated
-  as empty (a transcript segment can carry no text at all)."
+  "Render `md` (a Markdown string) to a vector of hiccup blocks, with bare URLs
+  in text turned into links. `nil` is treated as empty (a transcript segment can
+  carry no text at all)."
   [md]
-  (parse-blocks (strip-wrappers (or md ""))))
+  (mapv autolink-node (parse-blocks (strip-wrappers (or md "")))))

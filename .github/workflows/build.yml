@@ -86,6 +86,7 @@ jobs:
           node scripts/log-test.js
           node scripts/config-seed-test.js
           node scripts/desktop-install-test.js
+          bb clients/web/scripts/md-test.clj
 
       - name: Provider catalogue test
         run: bb scripts/providers-test.clj
