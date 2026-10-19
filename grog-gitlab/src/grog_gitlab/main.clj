@@ -542,6 +542,32 @@
     :schema (json/write-str {:type :object :properties {:project (:project ps) :state {:type "string"}} :required ["project"]})
     :fn (fn [a] (t-list-project-issues a))}])
 
+(defn- normalize-args
+  "Keywordize MCP tool-argument keys. Arguments arrive STRING-keyed over the
+  wire: the SDK deserializes the JSON `arguments` object without keywordizing,
+  and every tool fn here reads keyword keys (`(:project args)`, `(:instance a)`).
+
+  This MUST run inside the tool wrapper, not only in `parse-args`: under the
+  bundled `grog_mcp.main` (the single grog-mcp process that serves every
+  server's tools) the specs are consumed by the bundle's own `tool` fn, so this
+  server's `parse-args` is never called. Both entry points route through here."
+  [arguments]
+  (cond
+    (nil? arguments) {}
+    (map? arguments) (into {} (map (fn [[k v]] [(keyword (name (str k))) v])) arguments)
+    (instance? java.util.Map arguments) (into {} (map (fn [[k v]] [(keyword (name (str k))) v])) arguments)
+    (string? arguments) (try (normalize-args (json/read-str arguments)) (catch Exception _ {}))
+    :else {}))
+
+(defn- parse-args [arguments] (normalize-args arguments))
+
+(defn- wrap-args
+  "Return `spec` with its :fn wrapped so it keywordizes incoming arguments.
+  Applied to every tool so the standalone server and the bundled one behave
+  identically."
+  [{tool-fn :fn :as spec}]
+  (assoc spec :fn (fn [a] (tool-fn (normalize-args a)))))
+
 (defn build-tools
   "Build the full tool list. Reads the current config once so the instance enum
   reflects exactly the pre-configured instances. Prepends the two selection tools
@@ -558,29 +584,29 @@
         instance-names (mapv :name instances)
         instance-summaries (mapv (fn [i] {:name (:name i) :url (:url i)}) instances)]
     (into
-     [{:name "gitlab_list_instances"
-       :description "List the pre-configured GitLab instances the model may use. Returns name/url only (never tokens)."
-       :schema (json/write-str {:type :object :properties {} :required []})
-       :fn (fn [_] {:instances instance-summaries})}
+     (mapv wrap-args
+           [{:name "gitlab_list_instances"
+             :description "List the pre-configured GitLab instances the model may use. Returns name/url only (never tokens)."
+             :schema (json/write-str {:type :object :properties {} :required []})
+             :fn (fn [_] {:instances instance-summaries})}
 
-      {:name "gitlab_use_instance"
-       :description (str "Select which pre-configured GitLab instance to use for all subsequent calls. "
-                         "You can ONLY pick one of these names; arbitrary endpoints are not allowed. "
-                         "Available: " (str/join ", " instance-names))
-       :schema (json/write-str {:type :object
-                                :properties {:instance {:type :string
-                                                        :enum instance-names}}
-                                :required [:instance]})
-       :fn (fn [a]
-             (let [name (str (or (:instance a) ""))]
-               (if-let [inst (get by-name name)]
-                 (do (reset! current* name)
-                     (instance-auth! inst)  ; warm the token cache
-                     {:instance name :url (:url inst) :authenticated true})
-                 (throw (ex-info (str "Unknown GitLab instance '" name "'. Available: "
-                                      (str/join ", " instance-names)) {})))))}
-      ]
-     resource-tools)))
+            {:name "gitlab_use_instance"
+             :description (str "Select which pre-configured GitLab instance to use for all subsequent calls. "
+                               "You can ONLY pick one of these names; arbitrary endpoints are not allowed. "
+                               "Available: " (str/join ", " instance-names))
+             :schema (json/write-str {:type :object
+                                      :properties {:instance {:type :string
+                                                              :enum instance-names}}
+                                      :required [:instance]})
+             :fn (fn [a]
+                   (let [name (str (or (:instance a) ""))]
+                     (if-let [inst (get by-name name)]
+                       (do (reset! current* name)
+                           (instance-auth! inst)  ; warm the token cache
+                           {:instance name :url (:url inst) :authenticated true})
+                       (throw (ex-info (str "Unknown GitLab instance '" name "'. Available: "
+                                            (str/join ", " instance-names)) {})))))}])
+     (mapv wrap-args resource-tools))))
 
 ;; ---------------------------------------------------------------------------
 ;; MCP server wiring (same pattern as the other grog-* servers)
@@ -589,12 +615,6 @@
 (defn- text-content ^McpSchema$TextContent [^String s] (McpSchema$TextContent. s))
 (defn- text-result ^McpSchema$CallToolResult [^String s] (McpSchema$CallToolResult. [(text-content s)] false))
 (defn- error-result ^McpSchema$CallToolResult [^String s] (McpSchema$CallToolResult. [(text-content s)] true))
-
-(defn- parse-args [arguments]
-  (cond (map? arguments) (into {} (map (fn [[k v]] [(keyword (name (str k))) v])) arguments)
-        (instance? java.util.Map arguments) (into {} (map (fn [[k v]] [(keyword (name (str k))) v])) arguments)
-        (string? arguments) (try (json/read-str arguments) (catch Exception _ {}))
-        :else {}))
 
 (defn- tool
   [{:keys [name description schema fn]}]

@@ -400,6 +400,15 @@
       (and (number? v) (pos? (long v))) (long v)
       :else nil)))
 
+(defn tool-search-threshold
+  "How many tools a turn may send before the agent loop hides the MCP long tail
+  behind `tool_search` (deferred/lazy tool loading). nil → the loop's own default
+  (20). Set a LARGE value (e.g. 10000) to send every schema, i.e. to disable lazy
+  loading — the A/B switch for scripts/tool-search-test.clj and grog's evals."
+  []
+  (let [v (get-in (effective-llm-cfg) [:tool-search-threshold])]
+    (when (and (number? v) (pos? (long v))) (long v))))
+
 (defn max-tool-result-chars
   "Max characters for individual tool results. Results longer than this are truncated
    with a note. Default 50000 (~10–15K tokens). Set to nil in grog.edn to disable."

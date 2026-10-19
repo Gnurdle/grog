@@ -74,9 +74,9 @@
     :capability "the Electron client (not needed when driving the spine directly)"
     :hint {:windows "scoop install nodejs-lts" :posix "apt install nodejs"}}
    {:id "whisper-cli" :names ["whisper-cli" "whisper-cli.exe"] :version ["--help"] :required? false
-    :capability "voice input (local speech-to-text; also needs a ggml model — see models/README.md)"
-    :hint {:windows "scoop install whisper-cpp"
-           :posix   "Arch: pacman -S whisper-cpp · other distros: build whisper.cpp (provides whisper-cli), or set $GROG_VOICE_COMMAND"}}])
+    :capability "voice input (local speech-to-text; also needs a ggml-*.bin — any directory on PATH works, see models/README.md)"
+    :hint {:windows "scoop install whisper-cpp  ·  then put a ggml-*.bin anywhere on PATH"
+           :posix   "Arch: pacman -S whisper-cpp · other distros: build whisper.cpp (provides whisper-cli)  ·  then put a ggml-*.bin anywhere on PATH, or set $GROG_VOICE_COMMAND"}}])
 
 (defn- search-path
   "First executable named one of `names` on PATH (PATHEXT-aware on Windows)."

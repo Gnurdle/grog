@@ -76,11 +76,14 @@
   @!impl)
 
 (defn- need
-  "The active adapter, lazily installing the local one on first use so the
-  single-process path needs no ceremony."
+  "The active adapter, lazily installing the default on first use.
+
+  The DEFAULT IS THE LOOP (`grog.client.loop`) — grog's own agent engine. ECA is
+  no longer what a grog session runs. Install another adapter explicitly
+  (`grog.client.local` still exists for reference) to override."
   []
   (or @!impl
-      (do ((requiring-resolve 'grog.client.local/install!))
+      (do ((requiring-resolve 'grog.client.loop/install!))
           @!impl)
       (throw (ex-info "grog.client: no adapter installed" {}))))
 

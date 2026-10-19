@@ -13,8 +13,12 @@ and scoop's manifest says it outright: *"Whisper Model files are not included"*)
 
 ## Get a model
 
-    mkdir -p ~/.local/share/grog/models
-    curl -L -o ~/.local/share/grog/models/ggml-base.en.bin \
+**Put it anywhere on your `PATH`** — that is the default search, no configuration
+needed. `~/.local/bin` is the usual per-user choice (it is already on `PATH` on
+most Linux setups); anywhere else already on `PATH` works just as well, including
+the directory the engine itself lives in:
+
+    curl -L -o ~/.local/bin/ggml-base.en.bin \
       https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 
 `base.en` (~148 MB) is the quality pick. `tiny.en` (~75 MB) is much faster and
@@ -22,20 +26,22 @@ noticeably worse at dictation; `small.en` / `medium.en` are better and bigger.
 Built whisper.cpp yourself? `./models/download-ggml-model.sh base.en` drops it in
 `~/whisper.cpp/models`, which grog also searches.
 
+Any file named `ggml-*.bin` is recognised — it does not have to be one of the
+names above.
+
 ## Where the client looks (first hit wins)
 
-1. `$GROG_VOICE_MODEL` — an explicit path; any filename
-2. `<app>/models/ggml-*.bin` — if a packager chose to bundle one anyway
-3. `<repo>/models/ggml-*.bin` — this directory, running from source
-4. `$XDG_DATA_HOME/grog/models/ggml-*.bin` — i.e. `~/.local/share/grog/models`,
-   which is what the recipe above fills in. **Not the config home**: that holds
-   configuration, and a 148 MB model is not a config file.
-5. `~/whisper.cpp/models/ggml-*.bin` — your own whisper.cpp checkout
+1. `$GROG_VOICE_MODEL` — an explicit path, if you want to pin one
+2. **every directory on `PATH`** — the default, and the first place it looks
+3. `$XDG_DATA_HOME/grog/models/ggml-*.bin` — i.e. `~/.local/share/grog/models`
+4. `<app>/models/ggml-*.bin` — if a packager chose to bundle one anyway
+5. `<repo>/models/ggml-*.bin` — this directory, running from source
+6. `~/whisper.cpp/models/ggml-*.bin` — your own whisper.cpp checkout
 
-The searched names are `ggml-base.en.bin`, `ggml-tiny.en.bin`,
-`ggml-small.en.bin`, `ggml-base.bin`. When the engine or the model is missing the
-toolbar mic is disabled and its tooltip says exactly which — set the env var,
-drop the file, or set `$GROG_VOICE_COMMAND` to your own transcriber.
+The engine is on `PATH`, so a model dropped beside `whisper-cli` is found with
+**no configuration at all**. When the engine or the model is missing the toolbar
+mic is disabled and its tooltip says exactly which — put the file on `PATH`, or
+set `$GROG_VOICE_COMMAND` to your own transcriber.
 
 ## Why this directory exists
 

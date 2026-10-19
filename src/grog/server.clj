@@ -99,7 +99,7 @@
             [grog.chat :as chat]
             [grog.bootstrap :as bootstrap]
             [grog.client :as client]
-            [grog.client.local :as local]
+            [grog.client.loop :as loop-client]
             [grog.config :as config]
             [grog.docs :as docs]
             [grog.mcp-http :as mcp-http]
@@ -598,7 +598,7 @@
   ;; stdout is the RPC channel in stdio mode — route the Clojure process streams
   ;; to stderr so stray printlns (Java or Clojure) can't corrupt frames.
   (alter-var-root #'*out* (constantly *err*))
-  (client/set-impl! (local/->LocalClient))
+  (client/set-impl! (loop-client/->LoopClient))
   ;; Reap stray grog-mcp JVMs orphaned by earlier hard deaths (force-kill, Task
   ;; Manager, a service stop that skipped shutdown hooks) — BEFORE we start our
   ;; own endpoint, so we never reap the one we are about to spawn.
@@ -631,7 +631,7 @@
     (.addShutdownHook
      (Runtime/getRuntime)
      (Thread. (fn []
-                (local/mark-shutting-down!)
+                (loop-client/mark-shutting-down!)
                 (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
                      (catch Throwable _ nil))
                 (try (mcp-http/stop!) (catch Throwable _ nil))
@@ -650,7 +650,7 @@
         (try
           (serve-stdio! hub questions)
           (finally
-            (local/mark-shutting-down!)
+            (loop-client/mark-shutting-down!)
             (try (doseq [{:keys [id]} (client/sessions)] (client/close! id))
                  (catch Throwable _ nil))
             (try (mcp-http/stop!) (catch Throwable _ nil))

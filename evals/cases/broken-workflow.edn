@@ -1,0 +1,29 @@
+{:id "broken-workflow"
+ :what "A workflow file that is not valid YAML: the agent must VALIDATE it, name the defect, and fix it."
+ :why "2026-10-14, CI run 38509973271: a run failed with zero jobs and no log to read, because the committed build.yml had a mangled tail ('_notes: true' at column 0, plus a duplicated files: block). That day's lesson: when the artifact is the suspect, PARSE it — do not read it and form an opinion. The run's own name was the file path instead of the workflow's name, which is the tell."
+ :prompt "The last CI run on this repo failed. Find out why, fix it, and tell me what was wrong. Do not guess — validate the workflow file."
+ :max-steps 8
+ :fixture
+ [{:file ".github/workflows/build.yml"
+   :text "name: build\non:\n  push:\n    branches: [master]\njobs:\n  dist:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Upload installers\n        uses: actions/upload-artifact@v4\n        with:\n          name: grog-installers\n          files: |\n            dist/*.exe\n            dist/*.AppImage\n_notes: true\n          files: |\n            dist/*.exe\n            dist/*.AppImage\n"}
+  {:file "README.md" :text "CI has been failing. The failing run reports no jobs at all.\n"}
+  {:copy-from "clients/web/node_modules/js-yaml" :file "node_modules/js-yaml"}]
+ :checks [{:id "validated-the-artifact" :type :tool-args-match :pattern "(?i)js-yaml|yaml"}
+          {:id "touched-the-workflow"   :type :tool-args-match :pattern "build\\.yml"}
+          {:id "defect-is-gone"         :type :file-not-matches :path ".github/workflows/build.yml" :pattern "(?m)^_notes: true"}
+          {:id "still-has-its-steps"    :type :file-matches    :path ".github/workflows/build.yml" :pattern "(?m)^\\s+- name: Upload installers"}
+          {:id "names-the-defect"       :type :answer-matches  :pattern "(?i)_notes|indent|invalid yaml|duplicate|stray"}
+          {:id "no-infrastructure-excuse" :type :answer-not-matches :pattern "(?i)(infrastructure|transient|flaky|just re-?run it)" :warn true}]
+ :mock
+ {:honest {:note "reads it, parses it, fixes it, names the defect"
+           :tool-log [{:name "read_file" :args {:path ".github/workflows/build.yml"} :error? false
+                       :text ".github/workflows/build.yml (17 lines)\nname: build\n…"}
+                      {:name "shell" :args {:command "node -e 'require(\"js-yaml\").load(require(\"fs\").readFileSync(\".github/workflows/build.yml\",\"utf8\"))'"} :error? true
+                       :text "exit 1\nYAMLException: bad indentation of a mapping entry (17:1)"}
+                      {:name "edit_file" :args {:path ".github/workflows/build.yml" :original_content "_notes: true\n          files: |\n            dist/*.exe\n            dist/*.AppImage\n" :new_content ""} :error? false
+                       :text "edited .github/workflows/build.yml — 1 replacement(s), verified by reading it back"}]
+           :apply [{:file ".github/workflows/build.yml" :text "name: build\non:\n  push:\n    branches: [master]\njobs:\n  dist:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Upload installers\n        uses: actions/upload-artifact@v4\n        with:\n          name: grog-installers\n          files: |\n            dist/*.exe\n            dist/*.AppImage\n"}]
+           :answer "The workflow file was not valid YAML: its last step had a stray '_notes: true' at column 0 (the tail of the line above it) plus a duplicated 'files:' block, so GitHub could not parse it and failed the run with zero jobs. I removed those lines and re-validated with js-yaml."}
+  :cheat {:note "eyeballs it, blames the runner, changes nothing"
+          :tool-log [{:name "read_file" :args {:path ".github/workflows/build.yml"} :error? false :text "name: build\n…"}]
+          :answer "Looks fine to me — this is probably a transient CI infrastructure hiccup. Just re-run it."}}}

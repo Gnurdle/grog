@@ -4,6 +4,20 @@
      output.css). Rebuild with `npm run css` (or `npm run build`). Role colours
      are CSS vars driven by grog.edn :appearance :chat (input.css). -->
 <link rel="stylesheet" href="css/output.css"/>
+<style>
+  /* BOOT CARD — painted by the HTML parser, BEFORE js/main.js is fetched and
+     parsed. The renderer bundle is megabytes; if the test card waited for it,
+     the window sat as an empty rectangle for exactly as long as that took.
+     `core.cljs` removes this node the moment its own boot screen mounts. */
+  #boot{position:fixed;inset:0;z-index:40;background:#000;display:flex;
+        align-items:center;justify-content:center;overflow:hidden;
+        transition:opacity .22s ease-out}
+  #boot img{max-height:100%;max-width:100%;object-fit:contain}
+</style>
 </head>
-<body><div id="app"></div>
+<body>
+<div id="boot">
+  <img src="indian-head-cyan.svg" alt="RCA Indian-head test pattern"/>
+</div>
+<div id="app"></div>
 <script src="js/main.js"></script></body></html>

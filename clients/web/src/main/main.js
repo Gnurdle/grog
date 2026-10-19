@@ -382,29 +382,58 @@ const call = async (method, params) => {
 const VOICE_ENABLED = process.env.GROG_VOICE_ENABLED !== "0";
 const VOICE_MAX_SECONDS = Number(process.env.GROG_VOICE_MAX_SECONDS || 60);
 
-// The whisper model is NOT bundled: voice input needs whisper.cpp's engine AND
-// a ggml model, and no package manager ships the model (Arch's `whisper-cpp`
-// and scoop's are engine-only — scoop's manifest says so itself). So the model
-// is the user's to install, and the installers stay small. Look for one, in
-// order:
+// Any `ggml-*.bin` in `dir`, best-first. Reading the directory (instead of
+// testing four hard-coded names) means the model the user ACTUALLY has is
+// found — ggml-large-v3, ggml-small.bin, anything — instead of being ignored
+// because it is not on our list.
+const PREFERRED_MODELS = ["ggml-base.en.bin", "ggml-small.en.bin", "ggml-tiny.en.bin", "ggml-base.bin"];
+
+function ggmlModelsIn(dir) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names
+    .filter((n) => /^ggml-.*\.bin$/i.test(n))
+    .sort((a, b) => {
+      const ra = PREFERRED_MODELS.indexOf(a);
+      const rb = PREFERRED_MODELS.indexOf(b);
+      return (ra < 0 ? PREFERRED_MODELS.length : ra) - (rb < 0 ? PREFERRED_MODELS.length : rb);
+    })
+    .map((n) => path.join(dir, n));
+}
+
+function pathDirs() {
+  return (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+}
+
+// Where the whisper MODEL is looked for, in order:
 //   $GROG_VOICE_MODEL          explicit override
-//   <resourcesPath>/models/…   if a packager chose to bundle one anyway
-//   <repo>/models/…            a source tree (drop a ggml-*.bin in ./models)
-//   <data home>/grog/models/…  where the docs say to put one — writable on
+//   every directory on PATH    <- the engine lives there, so a model dropped
+//                                 beside `whisper-cli` needs no configuration;
+//                                 this is the FIRST place we look after the
+//                                 override
+//   <data home>/grog/models/   where the docs say to put one — writable on
 //                              every install, including an AppImage
-//   ~/whisper.cpp/models/…     YOUR own whisper.cpp checkout (the engine
-//                              fallback below looks in the same tree)
+//   <resourcesPath>/models     if a packager bundled one anyway
+//   <repo>/models              a source tree
+//   ~/whisper.cpp/models       a local whisper.cpp checkout
+//
+// The model is NOT bundled: no package manager ships one (Arch's `whisper-cpp`
+// and scoop's are engine-only — scoop's manifest says so itself).
 function voiceModelCandidates() {
-  const names = ["ggml-base.en.bin", "ggml-tiny.en.bin", "ggml-small.en.bin", "ggml-base.bin"];
-  const dirs = [
-    path.join(process.resourcesPath || "", "models"),
-    path.join(__dirname, "..", "..", "..", "..", "models"),
-    path.join(configSeed.dataHome(), "models"),
-    path.join(os.homedir(), "whisper.cpp", "models"),
-  ];
   const cands = [];
   if (process.env.GROG_VOICE_MODEL) cands.push(process.env.GROG_VOICE_MODEL);
-  for (const d of dirs) for (const n of names) cands.push(path.join(d, n));
+
+  // PATH first: that is where the engine is, so that is where a hand-placed
+  // model most often is too.
+  for (const d of pathDirs()) cands.push(...ggmlModelsIn(d));
+
+  const dirs = [
+    path.join(configSeed.dataHome(), "models"),
+    path.join(process.resourcesPath || "", "models"),
+    path.join(__dirname, "..", "..", "..", "..", "models"),
+    path.join(os.homedir(), "whisper.cpp", "models"),
+  ];
+  for (const d of dirs) cands.push(...ggmlModelsIn(d));
   return cands;
 }
 
@@ -482,7 +511,8 @@ function voiceStatus() {
   else if (!whichBin(argv[0]))
     reason = `engine not found: ${argv[0]} — install whisper.cpp, or set GROG_VOICE_COMMAND`;
   else if (model && !fs.existsSync(model))
-    reason = `speech model not found: ${model} — put a ggml model there or set GROG_VOICE_MODEL`;
+    reason = `speech model not found: no ggml-*.bin in any directory on PATH — ` +
+             `put one there (e.g. beside whisper-cli), or set GROG_VOICE_MODEL`;
   return {
     enabled: VOICE_ENABLED && argv.length > 0 && !reason,
     reason,

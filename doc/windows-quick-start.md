@@ -86,17 +86,17 @@ language files OCR fails. (They can also be fetched by hand from
 **Voice input** needs two pieces, both yours. The **engine** is `whisper-cpp`
 (it lives in scoop's default `main` bucket) — `scoop install whisper-cpp` puts
 `whisper-cli` on `PATH`. The **model** no package manager provides (scoop's
-manifest says so itself), so fetch one into the directory grog looks in:
+manifest says so itself), so fetch one **anywhere on your `PATH`** — that is the
+default search, no config parameter:
 
 ```powershell
-$d = "$env:USERPROFILE\.local\share\grog\models"
-New-Item -ItemType Directory -Force $d | Out-Null
+$d = "$env:USERPROFILE\scoop\shims"     # already on PATH
 curl.exe -L -o "$d\ggml-base.en.bin" `
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
 
-grog ships no model — no 148 MB blob rides in the installer. Sizes and the other
-directories it searches: `models/README.md`.
+grog ships no model — no 148 MB blob rides in the installer. Any `ggml-*.bin`
+is recognised; sizes and the fallback directories: `models/README.md`.
 
 **Close and reopen your terminal** afterwards — PATH changes only apply to new
 shells.

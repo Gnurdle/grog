@@ -91,6 +91,11 @@ jobs:
       - name: Provider catalogue test
         run: bb scripts/providers-test.clj
 
+      - name: Agent loop offline tests (stop conditions + repetition guard)
+        run: |
+          clojure -M scripts/stop-condition-test.clj
+          clojure -M scripts/tool-search-test.clj
+
       - name: Spine compiles
         run: clojure -J--add-opens=java.base/java.lang=ALL-UNNAMED -M -e "(require 'grog.server 'grog.config 'grog.models 'grog.chat 'grog.client.local 'grog.eca-config 'grog.doctor) (println :SPINE-OK)"
 

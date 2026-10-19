@@ -84,7 +84,7 @@ Tool paths are taken as given — absolute, or relative to the repo/conversation
 ### Core runtime
 
 - **OpenAI-compatible `/v1/chat/completions`** with **tool calling** (use a model that supports tools) — either local (Ollama) or remote (OpenRouter etc.).
-- **Multi-step rounds** — **unlimited by default** in grog/ECA (the agent loops until it returns text without `tool_calls`). The jobs/chron loop is also uncapped unless you opt into `:cli :chat-tool-loop-limit`.
+- **Multi-step rounds** — **unlimited by default** in grog/ECA (the agent loops until it returns text without `tool_calls`). The jobs/chron loop is also uncapped unless you opt into `:cli :chat-tool-loop-limit`. The in-house loop (`grog.agent.loop`) is uncapped too: `:max-steps` is nil unless you set `:cli :chat-tool-loop-limit`, so there is no hidden ceiling. What protects against a stuck model is a **repetition guard** — an identical tool call (same name, same arguments) is *warned* on the 2nd occurrence and **refused** on the 3rd — not a step count.
 - **Rich GUI transcript** — streaming assistant/thinking/tool cards, markdown, GFM tables, collapsible thinking, drag-to-select copy, and HTML preview/export.
 - **Session history** — `:cli :chat-history-turns` plus **`/clear`** / **`/fresh`**.
 - **Thinking streamed live** into collapsible sections; answer renders as markdown as it completes. (Console ANSI streaming applies to the one-shot/background loop only.)

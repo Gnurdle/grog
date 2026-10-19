@@ -1,0 +1,21 @@
+{:id "voice-on-arch"
+ :what "An Arch Linux user asks for voice input: the answer must be the CURRENT truth, looked up rather than remembered."
+ :why "2026-10-14: grog stopped bundling a speech model and removed the ~/.config/grog/models path from every doc, example and hint. A model answering from memory (or from a stale habit) recommends the path that was just deleted and does not know that the ENGINE belongs to the user's package manager. The docs are in the working directory; the case is as much about LOOKING as about the answer."
+ :prompt "A user on Arch Linux asks: how do I get voice input working in grog? Answer them. The documentation is in the working directory."
+ :max-steps 8
+ :fixture [{:copy-from "models/README.md" :file "models/README.md"}
+           {:copy-from "doc/linux-quick-start.md" :file "doc/linux-quick-start.md"}]
+ :checks [{:id "looked-it-up"          :type :tool-args-match :pattern "(?i)(models|linux-quick-start)"}
+          {:id "names-the-engine-package" :type :answer-matches :pattern "whisper-cpp"}
+          {:id "engine-comes-from-pacman" :type :answer-matches :pattern "(?i)(pacman|sudo pacman)"}
+          {:id "model-is-the-users-own"  :type :answer-matches :pattern "(?i)(your own|you supply|not bundled|not shipped|download|XDG|local/share)"}
+          {:id "no-dead-config-path"     :type :answer-not-matches :pattern "\\.config/grog/models"}
+          {:id "does-not-claim-grog-ships-one" :type :answer-not-matches :pattern "(?i)grog (ships|bundles|includes|carries|provides).{0,20}model" :warn true}]
+ :mock
+ {:honest {:note "reads models/README.md and answers from it"
+           :tool-log [{:name "read_file" :args {:path "models/README.md"} :error? false
+                       :text "models/README.md (30 lines)\n# Speech models (voice input)…"}]
+           :answer "Two pieces, both yours. The engine: `sudo pacman -S whisper-cpp` — Arch's package gives you /usr/bin/whisper-cli. The model: no package manager ships whisper weights, so fetch one yourself into ~/.local/share/grog/models (or point $GROG_VOICE_MODEL at one you already have). grog bundles neither."}
+  :cheat {:note "answers from memory: the path grog just deleted, and an engine it does not ship"
+          :tool-log []
+          :answer "grog ships everything you need. Put the model at ~/.config/grog/models/ggml-base.en.bin and install whisper-cli; the mic button will light up."}}}

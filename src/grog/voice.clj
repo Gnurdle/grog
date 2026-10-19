@@ -41,12 +41,45 @@
   []
   (true? (:enabled (voice-cfg))))
 
+(defn- path-dirs
+  "Every directory on PATH."
+  []
+  (->> (str/split (or (System/getenv "PATH") "")
+                  (re-pattern (java.util.regex.Pattern/quote
+                               (str File/pathSeparator))))
+       (remove str/blank?)))
+
+(defn path-model
+  "First `ggml-*.bin` found on PATH, preferring base.en → small.en → tiny.en.
+
+  This is the DEFAULT model lookup: the engine is on PATH, so a model dropped in
+  the same directory needs no configuration at all. Any `ggml-*.bin` name is
+  accepted — the preferred list only decides the ORDER when several are present."
+  []
+  (let [preferred ["ggml-base.en.bin" "ggml-small.en.bin" "ggml-tiny.en.bin" "ggml-base.bin"]
+        rank (fn [^String p]
+               (let [i (.indexOf ^java.util.List preferred (.getName (io/file p)))]
+                 (if (neg? i) (count preferred) i)))
+        found (for [d (path-dirs)
+                    :let [dir (io/file d)]
+                    :when (.isDirectory ^File dir)
+                    f (or (.listFiles ^File dir) (make-array File 0))
+                    :when (re-matches #"(?i)ggml-.*\.bin" (.getName ^File f))]
+                (.getAbsolutePath ^File f))]
+    (first (sort-by rank found))))
+
 (defn command
-  "The transcription argv (vector of strings), or nil when unset/empty."
+  "The transcription argv (vector of strings), or nil when nothing can be run.
+
+  `:voice :command` wins when set. With NO command configured this defaults to
+  whisper.cpp with the first `ggml-*.bin` on PATH (`path-model`) — put the engine
+  and the model on PATH and voice works with no configuration."
   []
   (let [c (:command (voice-cfg))]
-    (when (and (sequential? c) (seq c))
-      (mapv str c))))
+    (cond
+      (and (sequential? c) (seq c)) (mapv str c)
+      :else (when-let [m (path-model)]
+              ["whisper-cli" "-m" m "-f" "{wav}" "-nt"]))))
 
 (defn sample-rate []
   (let [v (:sample-rate (voice-cfg))]

@@ -123,6 +123,8 @@
   (fn [_ _]
     {:sessions {} :order [] :active nil :focused? true
      :connected? false :socket-path "" :opened? false :font-size 16
+     ;; per-kind transcript overrides (font/size/colour); {} = all defaults
+     :seg-styles {}
      ;; the log pane (off unless the user turns it on; persisted like font-size).
      ;; `:log-lines` is a bounded TAIL — the file is the record, this is a viewer.
      ;; `:log-scope` :project keeps this session's lines plus everything
@@ -478,6 +480,68 @@
 (rf/reg-event-fx :bump-font
   (fn [{:keys [db]} [_ d]]
     {:dispatch [:set-font-size (+ (or (:font-size db) default-font) d)]}))
+
+;; --- per-kind transcript styling --------------------------------------------
+;; Every segment kind (user prompt, answer, thinking, tool output, status line,
+;; startup snark) can carry its OWN font family, size and colour. Stored like the
+;; font size: renderer-local (`localStorage`), because it is presentation, not
+;; configuration — and applied as an inline override on top of the CSS classes,
+;; so an unset field falls back to the stylesheet exactly as before.
+
+(def ^:private seg-kinds [:user :answer :thinking :tool :line :snark])
+
+(def ^:private seg-kind-labels
+  {:user "prompt (your message)" :answer "answer" :thinking "thinking"
+   :tool "tool output" :line "status line" :snark "startup snark"})
+
+(defn- seg-style-css
+  "The inline style map for `kind`, from the user's overrides. Absent fields are
+  simply not emitted, so the CSS class keeps winning."
+  [styles kind]
+  (let [s (get styles kind)]
+    (when (seq s)
+      (cond-> {}
+        (:font s)  (assoc :font-family (case (:font s)
+                                         :mono "var(--grog-mono)"
+                                         :serif "Georgia, 'Times New Roman', serif"
+                                         nil))
+        (:size s)  (assoc :font-size (str (:size s) "px"))
+        (:color s) (assoc :color (:color s))))))
+
+(defn- save-seg-styles! [styles]
+  (try (.setItem (.-localStorage js/window) "grog-web.seg-styles"
+                 (js/JSON.stringify (clj->js styles)))
+       (catch :default _ nil)))
+
+(rf/reg-event-fx :set-seg-style
+  (fn [{:keys [db]} [_ kind field value]]
+    (let [kind (keyword kind)
+          field (keyword field)
+          styles (if (or (nil? value) (= "" value))
+                   (update-in (:seg-styles db) [kind] dissoc field)
+                   (assoc-in (:seg-styles db) [kind field] value))
+          ;; drop kinds that no longer override anything, so the stored map stays
+          ;; a description of the DIFFERENCE from the defaults
+          styles (into {} (remove (fn [[_ v]] (empty? v)) styles))]
+      (save-seg-styles! styles)
+      {:db (assoc db :seg-styles styles)})))
+
+(rf/reg-event-fx :load-seg-styles
+  (fn [{:keys [db]} [_ styles]]
+    {:db (assoc db :seg-styles (or styles {}))}))
+
+(rf/reg-event-fx :reset-seg-styles
+  (fn [{:keys [db]} _]
+    (save-seg-styles! {})
+    {:db (assoc db :seg-styles {})}))
+
+(rf/reg-event-fx :reset-seg-style
+  (fn [{:keys [db]} [_ kind]]
+    (let [styles (dissoc (:seg-styles db) (keyword kind))]
+      (save-seg-styles! styles)
+      {:db (assoc db :seg-styles styles)})))
+
+(rf/reg-sub :seg-styles (fn [db _] (:seg-styles db)))
 
 (rf/reg-event-fx :dialog-open
   (fn [{:keys [db]} [_ kind initial]]
@@ -1011,6 +1075,7 @@
 (rf/reg-sub :socket-path (fn [db _] (:socket-path db)))
 (rf/reg-sub :retry (fn [db _] (:retry db)))
 (rf/reg-sub :bootstrap-needed? (fn [db _] (:bootstrap-needed? db)))
+(rf/reg-sub :opened? (fn [db _] (boolean (:opened? db))))
 (rf/reg-sub :bootstrap-configured? (fn [db _] (:bootstrap-configured? db)))
 (rf/reg-sub :bootstrap-mcps (fn [db _] (:bootstrap-mcps db)))
 (rf/reg-sub :docs-dir (fn [db _] (:docs-dir db)))
@@ -1038,10 +1103,14 @@
   (case kind :answer "answer" :thinking "think" :tool "tool"
         :user "user" :usage "usage" "·"))
 
-(defn- segment-view [sid {:keys [kind text media_type base64]}]
+(defn- segment-view
+  "One transcript segment."
+  [sid {:keys [kind text media_type base64]}]
+  (let [styles @(rf/subscribe [:seg-styles])
+        st (seg-style-css styles kind)]
   (cond
     (= :snark kind)
-    [:div {:class "text-center seg-snark italic text-sm py-1"} text]
+    [:div {:class "text-center seg-snark italic text-sm py-1" :style st} text]
 
     ;; assistant answer / reasoning render as Markdown — real <table>s and
     ;; monospace <pre>/<code>.
@@ -1052,7 +1121,8 @@
                          (if (= :thinking kind) "role-think" "role-answer"))}
       (role-label kind)]
      (into [:div {:class (str "flex-1 min-w-0 md "
-                              (if (= :thinking kind) "seg-think" "seg-answer"))}]
+                              (if (= :thinking kind) "seg-think" "seg-answer"))
+                    :style st}]
            (md/->hiccup text))]
 
     ;; an assistant image: shown SMALL inline (a preview — it must not swallow
@@ -1089,8 +1159,8 @@
                          " text-[0.7rem] mr-2 align-top")}
       (role-label kind)]
      [:span {:class (case kind :user "seg-user" :tool "seg-tool" "seg-answer")
-             :style {:white-space "pre-wrap"}}
-      (md/linkify text)]]))
+             :style (merge {:white-space "pre-wrap"} st)}
+      (md/linkify text)]])))
 
 (defonce ^:private !scroll-el (atom nil))
 
@@ -1908,6 +1978,36 @@
         (str "selected: " (:label cur) " · " (:id cur))
         (str (count ps) " providers · type to filter, click to choose"))]]))
 
+(defn- seg-style-row
+  "One kind's font / size / colour controls. Empty controls mean `inherit`, so
+  clearing a field restores the stylesheet default for that kind."
+  [kind]
+  (let [styles @(rf/subscribe [:seg-styles])
+        s (get styles kind)
+        put! (fn [field value] (rf/dispatch [:set-seg-style kind field value]))
+        font (name (or (:font s) :sans))]
+    [:div {:class "flex items-center gap-2"}
+     [:span {:class "w-32 shrink-0 text-[0.7rem] text-slate-400"} (get seg-kind-labels kind (name kind))]
+     [:select {:value font
+               :on-change #(let [v (.. % -target -value)]
+                             (put! :font (when-not (= v "sans") (keyword v))))
+               :class "rounded bg-[#121212] border border-slate-700 text-[0.7rem] text-slate-200 px-1 py-1"}
+      [:option {:value "sans"} "body"]
+      [:option {:value "mono"} "mono"]
+      [:option {:value "serif"} "serif"]]
+     [:input {:type "number" :min 8 :max 40
+              :value (or (:size s) "")
+              :placeholder "px"
+              :on-change #(let [v (.. % -target -value)
+                                n (js/parseInt v)]
+                            (put! :size (if (js/isNaN n) nil n)))
+              :class "w-16 rounded bg-[#121212] border border-slate-700 text-[0.7rem] text-slate-200 px-1 py-1"}]
+     [:input {:type "color" :value (or (:color s) "#cbd5e1") :title "colour"
+              :on-change #(put! :color (.. % -target -value))
+              :class "h-6 w-8 rounded border border-slate-700 bg-transparent p-0"}]
+     [:button {:class "text-[0.7rem] text-slate-500 hover:text-rose-300"
+               :on-click #(rf/dispatch [:reset-seg-style kind])} "reset"]]))
+
 (defn- settings-dialog []
   (let [in @(rf/subscribe [:dialog-input]) active @(rf/subscribe [:active])
         sess (get-in @(rf/subscribe [:sessions]) [active])
@@ -2015,6 +2115,14 @@
         [:button {:class "px-3 py-1 rounded bg-slate-800 border border-slate-700 text-slate-400"
                   :on-click #(rf/dispatch [:set-font-size 16])} "reset"]]
        [:div {:class "text-[0.7rem] text-slate-500"} "Ctrl+= / Ctrl+- / Ctrl+0 · saved locally"]]
+      [:div {:class "border-t border-slate-700 pt-3 space-y-1"}
+       [:label {:class "text-xs text-slate-400"} "text per message type"]
+       (for [k seg-kinds] ^{:key k} [seg-style-row k])
+       [:div {:class "flex justify-end"}
+        [:button {:class "text-[0.7rem] text-slate-500 hover:text-rose-300"
+                  :on-click #(rf/dispatch [:reset-seg-styles])} "reset all"]]
+       [:div {:class "text-[0.7rem] text-slate-500"}
+        "font, size and colour for each message type · saved locally"]]
       [:div {:class "border-t border-slate-700 pt-3 space-y-1"}
        [:label {:class "text-xs text-slate-400"} "voice input"]
        [:div {:class "text-xs text-slate-300"}
@@ -2286,10 +2394,53 @@
       (when docs
         [:div {:class "text-[0.7rem] text-slate-500 font-mono"} (str "docs: " docs)])]]))
 
+(defn- drop-boot-card!
+  "Remove the STATIC boot card that index.html paints before any JS runs. That
+  card exists so the window is never an empty rectangle while the renderer
+  bundle is parsed; once the real boot screen is on screen, it has done its job."
+  []
+  (when-let [el (.getElementById js/document "boot")]
+    (set! (.. el -style -opacity) "0")
+    (js/setTimeout (fn [] (when-let [e (.getElementById js/document "boot")]
+                            (.remove e)))
+                   240)))
+
+(defn- boot-screen
+  "The Indian-head test card, shown from the moment the window paints until a
+  session is open (or the spine has told us onboarding is due) — i.e. while the
+  spine is starting up. Unmounting this is what hands the screen to the matrix
+  splash, so the test card is never on screen at the same time as the rain.
+
+  The CARD IS THE WHOLE SCREEN: no caption, no status line. There is nothing
+  here to say that the outline does not already say, and the text was the one
+  part of it that changed with engine state."
+  []
+  (r/create-class
+   {:component-did-mount (fn [_] (drop-boot-card!))
+    :reagent-render
+    (fn []
+      [:div {:class "fixed inset-0 z-40 bg-black flex items-center justify-center overflow-hidden"}
+       ;; VECTOR (the 3774 paths are vector; only the portrait is an embedded
+       ;; raster): white knocked out as fill-opacity, ink #20A9C4 dimmed to
+       ;; #0a333b at 30% opacity (the file says so itself). Scales to any window
+       ;; size without resampling.
+       [:img {:src "indian-head-cyan.svg"
+              :alt "RCA Indian-head test pattern"
+              :class "max-h-full max-w-full object-contain"}]])}))
+
 (defn- shell []
   (let [active @(rf/subscribe [:active]) dialog @(rf/subscribe [:ui-dialog])
-        boot? @(rf/subscribe [:bootstrap-needed?])]
-    [:div {:class "app h-screen w-screen flex flex-col overflow-hidden"}
+        boot? @(rf/subscribe [:bootstrap-needed?])
+        opened? @(rf/subscribe [:opened?])]
+    (if-not (or opened? boot?)
+      ;; boot phase: the spine is still coming up
+      [boot-screen]
+      ;; boot phase is over: make sure the static card cannot outlive it (a hot
+      ;; reload into an already-open session would otherwise leave it covering
+      ;; the app, because `boot-screen` — which normally removes it — never mounts)
+      (do
+        (r/after-render (fn [] (drop-boot-card!)))
+        [:div {:class "app h-screen w-screen flex flex-col overflow-hidden"}
      [banner]
      [:div {:class "flex-1 min-h-0 flex flex-col overflow-hidden"}
       [tab-strip]
@@ -2307,7 +2458,7 @@
      [approval-dialog]
      (when (= :projects dialog) [project-manager])
      (when (= :settings dialog) [settings-dialog])
-     (when (= :models dialog) [models-dialog])]))
+     (when (= :models dialog) [models-dialog])]))))
 
 ;; --- init ------------------------------------------------------------------
 
@@ -2320,6 +2471,15 @@
                  (catch :default _ nil))
           n (js/parseInt (or s "16"))]
       (if (js/isNaN n) 16 n))])
+  ;; restore the per-kind transcript styles (font/size/colour overrides)
+  (rf/dispatch-sync
+   [:load-seg-styles
+    (let [s (try (.getItem (.-localStorage js/window) "grog-web.seg-styles")
+                 (catch :default _ nil))]
+      (if s
+        (try (js->clj (js/JSON.parse s) :keywordize-keys true)
+             (catch :default _ {}))
+        {}))])
   (.onNotify js/window.grogAPI
              (fn [msg] (rf/dispatch [:notify (js->clj msg :keywordize-keys true)])))
   ;; the log pane: every line the main process writes, and — if the pane was on
