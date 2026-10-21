@@ -6,4 +6,16 @@
         :output-dir "resources/public/js"
         :asset-path "/js"
         :modules {:main {:init-fn grog-web.core/init}}
-        :devtools {:http-port 9633 :http-root "resources/public"}}}}
+        :devtools {:http-port 9633 :http-root "resources/public"}}
+  ;; Offline REGRESSION build for the renderer's event logic — no browser, no
+  ;; Electron, no spine. `npm run test:renderer` compiles this and runs
+  ;; target/renderer-test.js (CI: the "Renderer compiles and its event tests pass"
+  ;; step, because it needs node_modules). It exists because the reported bug —
+  ;; "during initial onboarding I try to set my secret and nothing scrolls; it's
+  ;; in the HTML dump but the output screen is inert" — was invisible to every
+  ;; other test here: the command RAN and its output WAS published, into a surface
+  ;; the onboarding page was covering. Only asserting on the events and the
+  ;; subscriptions the components read can catch that class of bug.
+  :renderer-test {:target :node-script
+                  :main grog-web.renderer-test/main
+                  :output-to "target/renderer-test.js"}}}

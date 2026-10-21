@@ -33,7 +33,11 @@
      has LOADED go on the wire, and a tool attaches to the conversation the moment
      the model searches for it. See `grog.agent.tool-search` for the ranking and
      the reasoning; the short version is that paying for 65 schemas to call 2 is
-     the single largest waste this loop had."
+     the single largest waste this loop had. The DEFERRED tools' NAMES — and a line
+     saying they reach EXTERNAL systems, not the local filesystem — are still
+     appended to the system message (they cost no schemas), because a small/local
+     model that never thinks to call `tool_search` would otherwise behave as if it
+     had no MCP tools at all (and would grep the disk for an Odoo question)."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
             [grog.agent.mcp :as mcp]
@@ -250,6 +254,26 @@
         (assoc r :text "(the tool returned no output — do not read that as success)")
         r))))
 
+(defn- merge-usage
+  "Fold one STEP's usage into the turn accumulator: every numeric leaf ADDS, any
+  other value (booleans, ids) is superseded by the newer step.
+
+  A multi-step turn makes SEVERAL billed API calls, and each one reports its OWN
+  tokens and cost. The turn's true total is the SUM. The first version did
+  `(reset! !usage usage)`, so a turn reported only its LAST step — measured
+  2026-10-19, a 2-step turn reported $0.000156 / 1,702 tok where the two calls
+  really cost $0.000325 / 3,403 tok. Under-reporting by ~half is the worst kind:
+  it looks like a plausible small number, not a bug. (The old
+  `parse-cost`/`tokens->cost` ECA path had the same shape of accounting done in
+  ECA's `usage-sumary`; that code is gone, and this is where it lives now.)"
+  [a b]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    (and (map? a) (map? b))     (merge-with merge-usage a b)
+    (and (number? a) (number? b)) (+ a b)
+    :else b))
+
 (defn run-turn!
   "Run one turn to completion.
 
@@ -275,8 +299,12 @@
   Tool loading: when the toolbelt is bigger than `:tool-threshold` (default 20),
   the MCP tools are DEFERRED — the model sees `tool_search` plus the local/session
   tools plus whatever a previous turn loaded, and `tool_search` attaches the rest
-  on demand. Set `:tool-threshold` to a large number to send every schema (the
-  pre-lazy behaviour, and the A/B in `scripts/tool-search-test.clj`)."
+  on demand. The DEFERRED tools' NAMES — plus a line saying they are for EXTERNAL
+  systems, not the local filesystem — are appended to the system message (names
+  cost no schemas) so a model that never calls `tool_search` still knows they
+  exist and reaches for one instead of grepping the disk. Set `:tool-threshold` to
+  a large number to send every schema (the pre-lazy behaviour, and the A/B in
+  `scripts/tool-search-test.clj`)."
   [{:keys [llm message cwd mcp on-event max-steps history system cancel steer
            approve approval approved-tools max-context-tokens tool-threshold
            extra-tools local-handlers loaded-tools max-loaded-tools]}]
@@ -326,7 +354,28 @@
         ;; HOW MANY TIMES each identical call has been made this turn. The loop
         ;; detector; see `repetition-*` and the guard at the call site.
         !reps (atom {})
-        !msgs (atom (vec (concat (when system [{:role "system" :content system}])
+        ;; TELL THE MODEL WHAT IS DEFERRED. Lazy loading hides the MCP schemas
+        ;; behind `tool_search` to avoid paying for ~70 schemas every step — but a
+        ;; small/local model will not reliably CALL `tool_search`, so with no hint
+        ;; it effectively has no MCP tools at all. Tool NAMES are cheap (no
+        ;; schemas), so append them to the system message: a model that knows
+        ;; `grog-mcp__assoc_store` exists can search for it by name and attach its
+        ;; schema. An empty `:deferred` (non-lazy, or nothing deferred) leaves the
+        ;; system message exactly as the caller passed it.
+        deferred-names (when lazy? (mapv tool-search/tool-name @!deferred))
+        system* (if (seq deferred-names)
+                  (str (if (seq (str/trim (str system))) (str system "\n\n") "")
+                       "DEFERRED TOOLS — available, but their schemas are NOT loaded, so they "
+                       "are NOT in your tool list. These talk to EXTERNAL systems (Odoo, GitLab, "
+                       "trading, email, web search, memory, office documents). If the user asks "
+                       "about one of those, the answer is NOT on the local filesystem — call "
+                       "`tool_search` with words describing what you want to do (e.g. \"odoo "
+                       "users in production\", \"open merge requests\"), then call the matching "
+                       "tool on your next step. Only use find_files/grep for questions about "
+                       "FILES or CODE on this machine. Behind tool_search:\n"
+                       (str/join ", " deferred-names))
+                  system)
+        !msgs (atom (vec (concat (when (seq (str system*)) [{:role "system" :content system*}])
                                  history
                                  [{:role "user" :content message}])))
         !log (atom [])
@@ -378,11 +427,11 @@
                                              :tools (prompt-tools)
                                              :on-delta (fn [c] (emit {:kind :answer :text c}))
                                              :on-reasoning (fn [c] (emit {:kind :thinking :text c}))))]
-          (when usage (reset! !usage usage))
+          (when usage (swap! !usage merge-usage usage))
           (doseq [m malformed]
             (emit {:kind :tool :text (str "[bad arguments] " (:why m) " raw=" (:raw m))}))
           (if (empty? tool-calls)
-            (do (emit {:kind :usage :text (pr-str (or usage {}))})
+            (do (emit {:kind :usage :text (pr-str (or @!usage {}))})
                 {:status :done :messages @!msgs :steps step :usage @!usage
                  :text text :reasoning reasoning :tool-log @!log
                  :loaded-tools (vec @!loaded)})

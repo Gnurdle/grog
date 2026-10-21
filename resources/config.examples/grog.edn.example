@@ -3,8 +3,8 @@
 
 {:llm {:url   "https://openrouter.ai/api/v1"   ; OpenAI-compatible endpoint
        :model "moonshotai/kimi-k3"             ; THE model: chat + grog's own calls
-       ;; No :api-key on purpose — absent means "read the OS keyring", so store it
-       ;; once:  /secret set LLM_API_KEY sk-or-v1-…   (`false` = no key at all)
+       ;; There is NO :api-key field. A key NEVER lives in a config file — it goes
+       ;; in the OS keyring once:  /secret set LLM_API_KEY sk-or-v1-…
        ;; :profiles is grog's PROVIDER CATALOGUE — named alternate endpoints.
        ;; Select one with /model or the settings provider picker. The full,
        ;; machine-readable list is resources/providers.edn; every URL below is an
@@ -34,11 +34,20 @@
         :reflection {:url "https://api.reflection.ai/openai/v1"                        :model "Beam-501B-A23B"}
 
         ;; local — no key (run the server yourself)
-        :ollama     {:url "http://localhost:11434/v1"                                  :model "qwen3:8b" :api-key nil}
-        :lmstudio   {:url "http://localhost:1234/v1"                                   :model "qwen2.5-7b-instruct" :api-key nil}
-        :llamacpp   {:url "http://localhost:8080/v1"                                   :model "local-model" :api-key nil}
-        :vllm       {:url "http://localhost:8000/v1"                                   :model "local-model" :api-key nil}
-        :litellm    {:url "http://localhost:4000/v1"                                   :model "gpt-4o-mini" :api-key nil}}}   ; a local relay in front of many providers
+        :ollama     {:url "http://localhost:11434/v1"                                  :model "qwen3:8b"}
+        :lmstudio   {:url "http://localhost:1234/v1"                                   :model "qwen2.5-7b-instruct"}
+        :llamacpp   {:url "http://localhost:8080/v1"                                   :model "local-model"}
+        :vllm       {:url "http://localhost:8000/v1"                                   :model "local-model"}
+        :litellm    {:url "http://localhost:4000/v1"                                   :model "gpt-4o-mini"}}}   ; a local relay in front of many providers
+
+ ;; PER-SLOT MODELS (optional) — the BIG and SMALL slots each own their TRANSPORT
+ ;; and their model id TOGETHER, so they never share an endpoint by accident.
+ ;; `/big` runs the big slot, `/small` the small one; the Models… dialog writes
+ ;; these. A slot with no map of its own falls back to the shared :llm block (the
+ ;; big slot) or is simply unset (the small slot — `/small` then keeps running
+ ;; big). Uncomment to set them here instead of the dialog:
+ ;;   :big-model   {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k3"}
+ ;;   :small-model {:url "http://localhost:11434/v1"    :model "qwen3:8b"}
 
  :babashka {:enabled true}                     ; the run_babashka tool
 

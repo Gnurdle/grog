@@ -796,14 +796,15 @@
          ;; provider-qualified (`ollama/…`, `openrouter/…`). A bare local id such
          ;; as `qwen3.5:4b-tweaked` would make ECA fail with
          ;; "API url not found … provider 'qwen3.5:4b-tweaked'".
-         llm-url (try (config/llm-url) (catch Exception _ nil))
-         ;; A model taken from the :llm block (the single-model case) is a RAW
-         ;; catalog id, and its provider is whatever :llm :url points at — pass
-         ;; that explicitly, so an OpenRouter org that shares a native provider's
-         ;; name (`deepseek/deepseek-v4.1-flash`) is not read as a provider of
-         ;; that name. The catalog that would otherwise disambiguate it only
-         ;; arrives once ECA is already running.
-         src (when (or proj-model (= :llm (config/eca-model-source)))
+         llm-url (try (config/big-model-url) (catch Exception _ nil))
+         ;; A model taken from a config block (the single-model case) is a RAW
+         ;; catalog id, and its provider is whatever the BIG slot's `:url` points
+         ;; at (falling back to `:llm :url`) — pass that explicitly, so an
+         ;; OpenRouter org that shares a native provider's name
+         ;; (`deepseek/deepseek-v4.1-flash`) is not read as a provider of that
+         ;; name. The catalog that would otherwise disambiguate it only arrives
+         ;; once ECA is already running.
+         src (when (or proj-model (config/eca-model-source))
                (models/provider-prefix-for-url llm-url))
          model (models/qualify-eca-model raw-model src llm-url)
          _ (eca-config-debug! "raw model=" (pr-str raw-model)

@@ -27,7 +27,7 @@
   (platform/windows?))
 
 (defn config-home-dir
-  "Where grog keeps its user-level config and generated/secrets files (see
+  "Where grog keeps its user-level config and generated files (see
   `grog.platform/config-home-dir`)."
   ^File []
   (platform/config-home-dir))
@@ -213,42 +213,60 @@
        f
        (io/file (repo-root) (platform/fix-drive-relative (str f)))))))
 
+(defn- non-blank
+  "`v` as a trimmed string, or nil when blank/nil."
+  [v]
+  (some-> v str str/trim not-empty))
+
+(defn slot-map
+  "The grog.edn map for a model SLOT (`:big` / `:small`) — the top-level
+  `:big-model` / `:small-model` map.
+
+  This is the SINGLE place a slot keeps its TRANSPORT (`:url`), its optional
+  `:api-key` and its model id (`:model`) TOGETHER, so each slot is
+  self-contained: the big slot and the small slot never share an endpoint by
+  accident. Empty map when absent."
+  [slot]
+  (let [m (get (grog) (if (= :small slot) :small-model :big-model))]
+    (if (map? m) m {})))
+
 (defn eca-model
-  "The model the ECA agent runs — `:eca :model`, else `:llm :model`.
+  "The BIG slot's model id: `:big-model :model`, else the legacy `:eca :model`,
+  else `:llm :model`.
 
-  ONE MODEL BY DEFAULT: `:llm :model` is the model, and both grog's own calls
-  and the agent use it. `:eca :model` exists only to run the agent on a
-  DIFFERENT model than grog's own calls — set it and it wins.
-
-  nil when neither is set (ECA then falls back to the `defaultModel` in its own
+  nil when none is set (ECA then falls back to the `defaultModel` in its own
   ~/.config/eca/config.json)."
   []
-  (or (some-> (get-in (grog) [:eca :model]) str str/trim not-empty)
-      (some-> (get-in (grog) [:llm :model]) str str/trim not-empty)))
+  (or (non-blank (get-in (grog) [:big-model :model]))
+      (non-blank (get-in (grog) [:eca :model]))
+      (non-blank (get-in (grog) [:llm :model]))))
 
 (defn eca-small-model
-  "The GLOBAL default for the SMALL model slot — `:eca :small-model`, else
-  `:llm :small-model`.
+  "The SMALL slot's model id: `:small-model :model`, else the legacy
+  `:eca :small-model`, else `:llm :small-model`.
 
   nil when unset, which is the normal case: the feature is opt-in, and with no
   small model anywhere a session simply keeps running the big model (`/small`
   is then a no-op, not an error). Mirrors `eca-model` so big and small resolve
-  the same way and either can live beside the other under `:eca` or `:llm`."
+  the same way."
   []
-  (or (some-> (get-in (grog) [:eca :small-model]) str str/trim not-empty)
-      (some-> (get-in (grog) [:llm :small-model]) str str/trim not-empty)))
+  (or (non-blank (get-in (grog) [:small-model :model]))
+      (non-blank (get-in (grog) [:eca :small-model]))
+      (non-blank (get-in (grog) [:llm :small-model]))))
 
 (defn eca-model-source
-  "Which key `eca-model` took its value from: `:eca`, `:llm`, or nil.
+  "Which key `eca-model` took its value from: `:big-model`, `:eca`, `:llm`, or
+  nil.
 
-  `grog.eca-config` needs this to qualify a `:llm`-sourced model correctly: its
-  provider is then whatever `:llm :url` points at, and saying so explicitly
-  stops an OpenRouter org like `deepseek/…` being read as a native provider of
-  that name."
+  `grog.eca-config` needs this to qualify a config-sourced model correctly: its
+  provider is then whatever the slot's `:url` points at (falling back to
+  `:llm :url`), and saying so explicitly stops an OpenRouter org like
+  `deepseek/…` being read as a native provider of that name."
   []
   (cond
-    (some-> (get-in (grog) [:eca :model]) str str/trim not-empty) :eca
-    (some-> (get-in (grog) [:llm :model]) str str/trim not-empty) :llm
+    (non-blank (get-in (grog) [:big-model :model])) :big-model
+    (non-blank (get-in (grog) [:eca :model]))       :eca
+    (non-blank (get-in (grog) [:llm :model]))       :llm
     :else nil))
 
 (defn eca-provider-overrides
@@ -322,31 +340,20 @@
                         {:path [:llm :model]})))))
 
 (defn llm-api-key
-  "API key for OpenAI-compatible providers. Supports `${ENV}` and `${ENV:-default}` interpolation.
-   Reads :llm :api-key (inline, not recommended) or OS keyring LLM_API_KEY.
+  "API key for OpenAI-compatible providers — from the OS keyring, account
+  `LLM_API_KEY`.
 
-   An ABSENT `:llm :api-key` means \"fall back to the keyring\" — a user who only
-   ever ran `/secret set LLM_API_KEY …` has no `:api-key` at all. (This used to
-   return nil without consulting the keyring, so their key was silently ignored.)
+  There is deliberately NO inline key in grog.edn: `:llm :api-key` is not read
+  at all, so a key VALUE can never live in a config file (a leftover one is
+  ignored, not honoured). A secret belongs in the keyring:
 
-   To genuinely disable the key — a backend that needs none, e.g. local Ollama —
-   set `:api-key false` (in the config, or as a session override)."
+      /secret set LLM_API_KEY <value>
+
+  Returns nil when unset, or when the keyring is unreachable. (Sending a key to
+  a local endpoint that ignores it is harmless, so there is no `:api-key false`
+  switch any more — the field itself is gone.)"
   []
-  (let [override @!llm-override
-        explicit? (contains? override :api-key)
-        key-src (if explicit?
-                  (:api-key override)
-                  (:api-key (get-in (grog) [:llm] {})))]
-    (cond
-      (false? key-src)
-      nil
-
-      :else
-      (or (some-> (some-> key-src str str/trim not-empty)
-                  interpolate-env-var
-                  not-empty)
-          (when-not explicit?
-            (some-> (secrets/get-secret "LLM_API_KEY") not-empty))))))
+  (some-> (secrets/get-secret "LLM_API_KEY") not-empty))
 
 (defn llm-auth-headers
   "Authorization headers. Bearer token when an API key is configured."
@@ -408,6 +415,53 @@
   []
   (let [v (get-in (effective-llm-cfg) [:tool-search-threshold])]
     (when (and (number? v) (pos? (long v))) (long v))))
+
+(defn slot-url
+  "The TRANSPORT url for a model SLOT (`:big` / `:small`): the slot's own
+  `:url` (`:big-model :url` / `:small-model :url`), else the legacy shared
+  `:llm :url`.
+
+  Each slot owns its own endpoint, so the small slot can run a local model
+  (Ollama, llama.cpp, …) while the big slot runs a remote one (OpenRouter, …)
+  without either ever being POSTed to the other's transport."
+  [slot]
+  (or (some-> (get-in (slot-map slot) [:url]) str str/trim not-empty)
+      (llm-url)))
+
+(defn slot-model-id
+  "The model id stored in a SLOT's own map (`:big-model :model` /
+  `:small-model :model`), or nil. This is the raw, unqualified catalog id; its
+  provider is whatever `slot-url` points at."
+  [slot]
+  (some-> (get-in (slot-map slot) [:model]) str str/trim not-empty))
+
+(defn slot-api-key
+  "The API key for a SLOT: the slot's own `:api-key`, else the shared keyring
+  `LLM_API_KEY`. A local endpoint ignores it; a remote one needs it."
+  [slot]
+  (or (some-> (get-in (slot-map slot) [:api-key]) str str/trim not-empty)
+      (llm-api-key)))
+
+(defn small-model-url
+  "URL (transport) for the small model slot. See `slot-url`."
+  []
+  (slot-url :small))
+
+(defn big-model-url
+  "URL (transport) for the big model slot. See `slot-url`."
+  []
+  (slot-url :big))
+
+(defn small-model-key
+  "API key for the small model slot. See `slot-api-key`."
+  []
+  (slot-api-key :small))
+
+(defn big-model-key
+  "API key for the big model slot. See `slot-api-key`."
+  []
+  (slot-api-key :big))
+
 
 (defn max-tool-result-chars
   "Max characters for individual tool results. Results longer than this are truncated

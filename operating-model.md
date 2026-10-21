@@ -82,9 +82,8 @@ handles data. Access is the point, but it needs a trust model:
   may use.
 - **Secrets held apart, in the system secrets store** — credentials are not environment
   variables and not config-file entries. They live in the OS keyring under a service
-  name (with a fallback secrets file owned only by the installation, outside the shared
-  work, for headless/remote setups). The companion reads them from the store when a
-  capability needs them; nothing about them enters version control or the shared layer.
+  name, and nowhere else. The companion reads them from the store when a capability
+  needs them; nothing about them enters version control or the shared layer.
 - **The shared layer stays clean** — nothing private or secret is committed; the shared
   layer is assumed visible to everyone who clones it.
 

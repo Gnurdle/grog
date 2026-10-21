@@ -25,7 +25,8 @@
   consumed on the CALLING thread so `on-delta` fires as data actually arrives."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [grog.agent.dsml :as dsml])
   (:import (java.io BufferedReader InputStreamReader InputStream)))
 
 (def ^:private sse-prefix "data:")
@@ -111,7 +112,15 @@
                         {:status status :endpoint endpoint
                          :body (subs (str text) 0 (min 2000 (count (str text))))})))
       (let [!text (atom []) !reason (atom []) !tools (atom {})
-            !usage (atom nil) !finish (atom nil)]
+            !usage (atom nil) !finish (atom nil)
+            ;; DSML (DeepSeek) tool-call markup is stripped from the stream as it
+            ;; arrives, so raw markup never reaches the client; captured blocks
+            ;; are recovered into tool calls below if the provider sent none.
+            dsml-filt (dsml/make-filter)
+            emit-text! (fn [s]
+                         (when (seq s)
+                           (swap! !text conj s)
+                           (when on-delta (on-delta s))))]
         (pump-sse! (:body resp)
                    (fn [payload]
                      (let [frame (try (json/parse-string payload true)
@@ -123,8 +132,7 @@
                            (let [d (:delta ch)]
                              (when-let [c (:content d)]
                                (when (seq c)
-                                 (swap! !text conj c)
-                                 (when on-delta (on-delta c))))
+                                 (emit-text! ((:push! dsml-filt) c))))
                              (let [r (or (:reasoning d) (:reasoning_content d))]
                                (when (seq r)
                                  (swap! !reason conj r)
@@ -144,7 +152,14 @@
                                                               (update :arguments
                                                                       (fn [a] (str (or a "")
                                                                                    (or (get-in tc [:function :arguments]) "")))))))))))))))))))
-        (let [{:keys [calls malformed]} (assemble-tool-calls @!tools)]
+        ;; flush whatever the stripper still holds (its look-back tail, and a block
+        ;; cut off mid-stream), then recover DSML if no STRUCTURED calls arrived.
+        (emit-text! ((:finish! dsml-filt)))
+        (let [{:keys [calls malformed]} (assemble-tool-calls @!tools)
+              calls (if (seq calls)
+                      calls
+                      (let [blocks ((:blocks dsml-filt))]
+                        (if (dsml/dsml? blocks) (dsml/recover blocks) [])))]
           {:text (apply str @!text)
            :reasoning (apply str @!reason)
            :tool-calls calls

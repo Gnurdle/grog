@@ -107,7 +107,7 @@ jobs:
         working-directory: grog_mcp
         run: clojure -M:test
 
-      - name: Renderer compiles (0 warnings)
+      - name: Renderer compiles and its event tests pass
         working-directory: clients/web
         env:
           # the compile check needs shadow-cljs, not the Electron binary
@@ -115,6 +115,10 @@ jobs:
         run: |
           npm ci
           npx shadow-cljs compile app
+          # the renderer's EVENT logic (no browser, no Electron, no spine) — the
+          # onboarding-page vs. slash-command-output regression. Runs HERE, not in
+          # "Offline JS tests", because it needs node_modules (npm ci is above).
+          npm run test:renderer
 
   dist:
     name: installers

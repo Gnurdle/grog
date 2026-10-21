@@ -25,7 +25,7 @@
   Credentials are NEVER in the config: each account NAMES the store entry that
   holds its value — `:password-secret` for LOGIN/PLAIN, `:refresh-secret` for
   XOAUTH2 — and this server reads that entry from grog's secret store itself
-  (OS keyring, service \"grog\"; `<config-home>/secrets.edn` on headless boxes).
+  (OS keyring, and only there — never a file).
   Set one with `/secret set <NAME> <value>`. There is deliberately no env-var
   and no credential-file path: mail accounts can be configured without bound, so
   the account name is carried in the config rather than derived from it.
@@ -122,23 +122,6 @@
 (def ^:private ^String keyring-service "grog")
 (def ^:private keyring-read-timeout-ms 4000)
 
-(defn- config-home-dir
-  "grog's config home: $GROG_CONFIG_HOME, else $XDG_CONFIG_HOME/grog, else
-  ~/.config/grog. Mirrors grog.platform/config-home-dir so the secrets file
-  fallback is found even on a relocated config home."
-  ^String []
-  (or (some-> (System/getenv "GROG_CONFIG_HOME") str str/trim not-empty)
-      (if-let [xdg (some-> (System/getenv "XDG_CONFIG_HOME") str str/trim not-empty)]
-        (str xdg "/grog")
-        (str (or (some-> (System/getenv "HOME") str str/trim not-empty)
-                 (System/getProperty "user.home"))
-             "/.config/grog"))))
-
-(defn- secrets-file
-  "grog's headless fallback: `<config-home>/secrets.edn`, an {account password} map."
-  ^java.io.File []
-  (io/file (config-home-dir) "secrets.edn"))
-
 (defn- keyring-secret
   "Read `account` from the OS keyring (service \"grog\"). Time-bounded: without a
   working Secret Service / D-Bus (SSH, containers) `Keyring/create` can block
@@ -154,19 +137,11 @@
           v (deref f keyring-read-timeout-ms ::timeout)]
       (when-not (= ::timeout v) v))))
 
-(defn- file-secret
-  ^String [^String account]
-  (try
-    (let [f (secrets-file)]
-      (when (.exists f)
-        (some-> (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
-                (get account) str str/trim not-empty)))
-    (catch Throwable _ nil)))
-
 (defn- lookup-secret
-  "OS keyring first, then grog's secrets file. nil when neither has it."
+  "Read `account` from the OS keyring (service \"grog\"). nil when absent.
+  Secret values live ONLY in the keyring — never in a file."
   ^String [^String account]
-  (or (keyring-secret account) (file-secret account)))
+  (keyring-secret account))
 
 (defn- store-secret
   "Resolve the store entry a mail account NAMES for its credential — or throw an
@@ -184,14 +159,14 @@
                       {:mail-account name :field field}))
       (or (lookup-secret acct)
           (throw (ex-info (str "Mail account '" name "' " kind " using the store account '" acct
-                               "' (" field "), but nothing is stored under that name — checked the "
-                               "OS keyring (service '" keyring-service "') and "
-                               (.getPath (secrets-file)) ". Set it with:  /secret set " acct " <value>")
+                               "' (" field "), but nothing is stored under that name in the "
+                               "OS keyring (service '" keyring-service "')."
+                               " Set it with:  /secret set " acct " <value>")
                           {:account acct :field field :mail-account name}))))))
 
 (defn credential-provider
   "Resolve a credential for `account` from grog's secret store — the OS keyring
-  (service grog), falling back to `<config-home>/secrets.edn` on headless boxes.
+  (service grog) — the only place a secret value ever lives.
   The account metadata only carries the field NAME; the secret is never read
   from the environment, a credential file, a tool argument or a tool result.
 

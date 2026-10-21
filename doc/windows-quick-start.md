@@ -230,8 +230,8 @@ does the same thing.
 |---|---|
 | settings | `%USERPROFILE%\.config\grog\grog.edn` |
 | first run | If `grog.edn` is missing the client **writes one** from the bundled example (and logs the exact path). Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are left beside it as `*.example`. |
-| other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
-| secrets | the Windows credential store; `secrets.edn` is the fallback |
+| other config | `%USERPROFILE%\.config\grog\{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn}` |
+| secrets | the Windows credential store — values are never written to a file |
 | projects | `%USERPROFILE%\grog-projects\<project>\{notes,dialog,state}` |
 | profile / cache | `%LOCALAPPDATA%\grog` — Chromium's private store (cache, Local Storage). Deliberately **Local**, not Roaming |
 | run log | `%USERPROFILE%\grog.<pid>.log` — client-written, newest match (`$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts\grog-client.bat` also saves a stream copy to `%TEMP%\grog-client-<n>.log` |

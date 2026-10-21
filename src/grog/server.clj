@@ -33,13 +33,15 @@
     stop            {:id ..}                            -> nil
     answer          {:id .. :approval-id .. :decision ..} -> nil
     set-model       {:id .. :model .. :source? .. :slot? .. :global? ..} -> nil
-                                        (:source is the picker transport —
-                                        `openrouter`/`ollama` — so an id is
-                                        qualified exactly, never mistaken for a
-                                        native provider of the same name.
+                                        (:source is the picker PLACE —
+                                        `local`/`remote` — resolved against the
+                                        SLOT's transport so an id is qualified
+                                        against that slot's provider, never
+                                        mistaken for a native provider of the
+                                        same name.
                                         :slot is `big` (default) or `small`;
                                         :global writes grog.edn's
-                                        `:eca :model`/`:eca :small-model` instead
+                                        `:big-model`/`:small-model` map instead
                                         of the project manifest)
     set-model-slot  {:id .. :slot ..}                   -> nil
                                         switch which slot a turn runs (`big` or
@@ -50,21 +52,22 @@
                                                             :current {:url .. :provider ..}}
                                         the shipped provider catalogue (grog.providers)
                                         plus what :llm currently points at.
-    set-provider    {:id? .. :url? .. :model? ..}       -> {:url .. :model ..
+    set-provider    {:slot? .. :id? .. :url? .. :model? ..}  -> {:url .. :model ..
                                                             :restart-required true}
-                                        write :llm :url (+ :model) for a catalogue
-                                        :id (or an explicit :url). GLOBAL change,
-                                        applied on the NEXT start.
-    models          {:source? .. :force? ..}            -> {:eca [..]
-                                                            :openrouter [..]
-                                                            :ollama [..]
+                                        write a SLOT's transport url (+ sample
+                                        :model) for a catalogue :id (or an
+                                        explicit :url). Defaults to the BIG slot.
+                                        GLOBAL change, applied on the NEXT start.
+    models          {:slot? .. :source? .. :force? ..}  -> {:local [..]
+                                                            :remote [..]
                                                             :loading [..]}
-                                        the settings-dialog model catalogue.
-                                        Answers from cache; an uncached (or
-                                        :force'd) remote source is fetched on a
-                                        BACKGROUND thread and arrives later as a
-                                        `models` notification, so a slow network
-                                        never blocks this request loop.
+                                        one SLOT's model catalogue (:slot,
+                                        default big). `:remote` lists that slot's
+                                        OWN transport. Answers from cache; an
+                                        uncached (or :force'd) source is fetched
+                                        on a BACKGROUND thread and arrives later
+                                        as a `models` notification, so a slow
+                                        network never blocks this request loop.
     answer-question {:question-id .. :result ..}        -> nil
     projects        {}                                  -> [{:name .. :description ..} ..]
     create-project  {:name .. :description ..}          -> nil
@@ -84,8 +87,9 @@
                                         for answer-question, then cancels — the
                                         wire version of the local wedge-safety
                                         rule (a missing client can't hang a turn)
-    models   {:source .. :models [..]}  a background model-catalogue refresh
-                                        completing (see `models` above)
+    models   {:slot .. :source .. :models [..]}  a background model-catalogue
+                                        refresh completing (see `models` above —
+                                        the slot says which picker to fill)
     running  {:sessionId .. :value ..}  a turn STARTED or FINISHED. The server
                                         owns the turn lifecycle; clients use
                                         this for the busy indicator (tab dot /
@@ -154,6 +158,13 @@
 (defn- log! [& xs]
   (binding [*out* *err*]
     (apply println xs)))
+
+(defn- reload-config!
+  "Re-read grog.edn after a model/transport save so the change is LIVE (the next
+  turn resolves the new endpoint) instead of waiting for a restart. Best
+  effort — a bad config edit must not fail the RPC."
+  []
+  (try (config/reload!) (catch Throwable _ nil)))
 
 ;; --- stdout writer ---------------------------------------------------------
 
@@ -285,9 +296,9 @@
   "True when GROG ITSELF has a usable brain: a model AND a URL are configured,
   and a key is available from something grog owns.
 
-  A key counts if it resolves in grog's own secret store (keyring / secrets.edn),
-  the endpoint is local (no key needed), or `:llm :api-key` is explicitly
-  `false`. ECA's OWN config is deliberately NOT consulted: onboarding exists to
+  A key counts if it resolves in grog's own secret store (the OS keyring), or
+  the endpoint is local (no key needed). ECA's OWN config is deliberately NOT
+  consulted: onboarding exists to
   set up GROG's secret store, so a fresh grog whose only key lives in ECA's
   config (which a reset or a config-home wipe does NOT touch) must still read as
   unconfigured and show the 'Job 1' steps — otherwise the user is never told
@@ -297,12 +308,11 @@
   Every accessor is wrapped: `llm-url`/`eca-model` THROW when unset, and
   `llm-api-key` may consult the OS keyring. This must never throw."
   []
-  (let [url   (try (some-> (config/llm-url) str str/trim not-empty) (catch Throwable _ nil))
+  (let [url   (try (some-> (config/big-model-url) str str/trim not-empty) (catch Throwable _ nil))
         model (try (some-> (config/eca-model) str str/trim not-empty) (catch Throwable _ nil))]
     (boolean
      (and url model
           (or (try (some-> (config/llm-api-key) str str/trim not-empty) (catch Throwable _ nil))
-              (false? (get-in (config/grog) [:llm :api-key]))
               (boolean (re-find local-url-re (str url))))))))
 
 (defn- bootstrap-info
@@ -363,10 +373,13 @@
                        (assoc snap
                               :banner (soul/startup-snark-line)
                               :version (version/label)
-                              ;; which model sources the picker should offer:
-                              ;; eca + whatever provider :llm :url implies +
-                              ;; ollama. Never a hard-coded provider list.
-                              :model-sources (models/model-sources)
+                              ;; per-slot picker state — each slot owns its own
+                              ;; transport (url) + provider + sources, so the
+                              ;; BIG and SMALL pickers never share one endpoint.
+                              :model-slots {:big (models/slot-info :big)
+                                            :small (models/slot-info :small)}
+                              ;; kept for older clients: the BIG slot's sources.
+                              :model-sources (models/model-sources :big)
                               ;; whether an LLM is actually reachable (else the
                               ;; client shows the Job 1 onboarding page) + where
                               ;; the docs are.
@@ -407,33 +420,56 @@
                                            {:approval-id (:approval-id params)
                                             :decision (keyword (:decision params))})
                            nil)
-              ;; Model catalogue for the settings picker. Answers from cache and
-              ;; refreshes the source on a BACKGROUND thread, because a network
-              ;; fetch here would block this single request loop (and so every
-              ;; other client) for up to the HTTP timeout. The refreshed list
-              ;; arrives as a `models` broadcast. `:source eca` is ECA's own
-              ;; catalogue (populated on connect) and needs no fetch.
-              ;; Any source `models` knows how to fetch is allowed — that is the
-              ;; configured provider by name, not just openrouter/ollama.
-              "models" (let [src (keyword (or (:source params) "eca"))
-                             known (models/catalogue)]
+              ;; Model catalogue for the settings picker, for ONE SLOT. Answers
+              ;; from cache and refreshes the source on a BACKGROUND thread,
+              ;; because a network fetch here would block this single request
+              ;; loop (and so every other client) for up to the HTTP timeout.
+              ;; The refreshed list arrives as a `models` broadcast carrying the
+              ;; slot, so the client knows which picker to fill. `:source` is a
+              ;; PLACE ("local"/"remote"); `:remote` lists the slot's OWN
+              ;; transport (its url), so big and small browse different lists.
+              "models" (let [slot (keyword (or (:slot params) "big"))
+                             slot (if (= :small slot) :small :big)
+                             src  (keyword (or (:source params) "remote"))
+                             known (models/catalogue slot)]
                          (when (or (boolean (:force params))
                                    (nil? (get known src)))
                            (models/fetch-async!
-                            src
+                            slot src
                             (fn [s ms]
-                              (broadcast! "models" {:source (name s) :models ms}))))
+                              (broadcast! "models" {:slot (name slot)
+                                                    :source (name s)
+                                                    :models ms}))))
                          known)
               ;; The picker sends a PLACE ("local"/"remote"); qualification needs
-              ;; a PROVIDER. Translate here, where the config is known — losing
-              ;; that signal made remote picks fall through to the ollama
-              ;; catalogue whenever the id also existed locally.
-              "set-model" (do (client/set-model! (:id params) (:model params)
-                                                 (models/picker-source->provider
-                                                  (:source params))
-                                                 {:slot (keyword (or (:slot params) "big"))
-                                                  :global (boolean (:global params))})
-                              nil)
+              ;; a PROVIDER, resolved from that SLOT's transport url. Translate
+              ;; here, where the config is known — losing that signal made remote
+              ;; picks fall through to the ollama catalogue whenever the id also
+              ;; existed locally.
+              "set-model" (let [slot (keyword (or (:slot params) "big"))
+                                slot (if (= :small slot) :small :big)
+                                source (str (:source params))
+                                ;; A pick from the "local" source means THIS slot
+                                ;; runs locally, so persist ollama's endpoint as
+                                ;; the slot's own transport — otherwise the stored
+                                ;; local id would be POSTed to whatever remote url
+                                ;; the slot still pointed at. ("remote" picks keep
+                                ;; the slot's configured remote url as-is.)
+                                local-url (when (= source "local")
+                                            (str (str/replace (config/ollama-host) #"/+$" "")
+                                                 "/v1"))
+                                opts (cond-> {:slot slot
+                                              :global (boolean (:global params))}
+                                       (seq (:url params)) (assoc :url (:url params))
+                                       local-url (assoc :url local-url))]
+                            (client/set-model! (:id params) (:model params)
+                                               (models/picker-source->provider source slot)
+                                               opts)
+                            ;; a global pick writes grog.edn; reload so a NEW
+                            ;; session in this process sees it (the running
+                            ;; session's state was already updated by the loop).
+                            (reload-config!)
+                            nil)
               ;; Switch which SLOT a turn runs (big/small). Per session — the
               ;; slot does not persist; a new session starts on big.
               "set-model-slot" (do (client/set-model-slot! (:id params)
@@ -441,28 +477,32 @@
                                    nil)
               "set-trust" (do (client/set-trust! (:id params) (boolean (:on params))) nil)
               ;; The settings provider picker. `providers` is the shipped
-              ;; catalogue (grog.providers), plus what :llm currently points at.
-              ;; `set-provider` writes :llm :url (+ :model) into grog.edn — a
-              ;; GLOBAL change, applied on the next start (config is snapshotted
-              ;; per session); the client is told that and says so.
+              ;; catalogue (grog.providers), plus each SLOT's current transport
+              ;; (`:slots`) and the big slot's as `:current` for older clients.
+              ;; `set-provider` writes the SLOT's own transport url (+ sample
+              ;; model) into grog.edn and reloads config, so the new endpoint is
+              ;; live for the NEXT turn (no restart needed).
               "providers" (let [llm (models/llm-config)]
                             {:providers (providers/entries)
+                             :slots {:big (models/slot-info :big)
+                                     :small (models/slot-info :small)}
                              :current {:url (:url llm) :model (:model llm)
                                        :provider (models/provider-prefix-for-url (:url llm))}})
               "set-provider"
-              (let [{:keys [id url model]} params
+              (let [{:keys [id url model slot]} params
+                    slot (if (= :small (keyword (or slot "big"))) :small :big)
                     entry (when id (providers/by-id id))
                     new-url (or url (:url entry))
                     new-model (or model (:sample entry))]
                 (when (str/blank? (str new-url))
                   (throw (ex-info "set-provider needs :id or :url" {:id id})))
-                (models/save-fields! (cond-> {:url new-url}
-                                       (and new-model (not (str/blank? (str new-model))))
-                                       (assoc :model new-model)))
-                (let [llm (models/llm-config)]
-                  (assoc llm
-                         :provider (models/provider-prefix-for-url (:url llm))
-                         :restart-required true)))
+                ;; The slot OWNS its transport: write `[:big-model :url]` /
+                ;; `[:small-model :url]`, not the shared `:llm :url`.
+                (models/save-slot-url! slot new-url)
+                (when (and new-model (not (str/blank? (str new-model))))
+                  (models/save-slot-model! slot new-model))
+                (reload-config!)
+                (assoc (models/slot-info slot) :restart-required false))
               "answer-question"
               (do (when-let [p (get @questions (:question-id params))]
                     (deliver p (or (:result params) {:cancelled true :answer nil})))

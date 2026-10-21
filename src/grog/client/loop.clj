@@ -79,6 +79,13 @@
   model pick changes the endpoint a turn actually calls rather than only the
   text in the status bar.
 
+  SLOT-AWARE. `:slot` (`:big` by default) selects which transport the resolved
+  model will use — `:small-model :url`/`:small-model :key` for the small slot,
+  `:big-model :url`/`:big-model :key` for the big slot, each falling back to the
+  shared `:llm :url`/`:llm :api-key`. This is what keeps a local model id from
+  being POSTed to OpenRouter, and a remote model id from being POSTed to
+  localhost.
+
   THE CONFIGURED ENDPOINT WINS. `:llm :url` is the url a turn will really call and
   the source of its key, so when it is set, an id whose first segment names some
   OTHER provider is a model id from the configured provider's own catalogue —
@@ -91,23 +98,45 @@
   ECA's catalogue (so it depends on that having arrived, and trusts any segment
   ECA knows), which is right for the ECA model and unpredictable for this one.
 
-  With no `:llm :url`, the id's own segment is the only hint available, and an
-  unresolvable one is REFUSED rather than sent somewhere merely plausible — a
-  wrong endpoint is worse than a missing one."
-  [model-id]
+  With no `:llm :url` and no explicit source, the id's own segment is the only
+  hint available, and an unresolvable one is REFUSED rather than sent somewhere
+  merely plausible — a wrong endpoint is worse than a missing one."
+  [model-id & [source slot]]
   (let [mid (some-> model-id str str/trim not-empty)
-        cfg-url (try (config/llm-url) (catch Throwable _ nil))
+        src (when source (str source str/lower-case not-empty))
+        entry (when src (try (providers/by-id src) (catch Throwable _ nil)))
+        src-url (when entry (:url entry))
+        cfg-url (try (case slot
+                       :small (config/small-model-url)
+                       :big   (config/big-model-url)
+                       (config/llm-url))
+                     (catch Throwable _ nil))
+        cfg-key (try (case slot
+                       :small (config/small-model-key)
+                       :big   (config/big-model-key)
+                       (config/llm-api-key))
+                     (catch Throwable _ nil))
         cfg-prov (when cfg-url (try (models/provider-prefix-for-url cfg-url)
                                     (catch Throwable _ nil)))
         i (when mid (str/index-of mid "/"))
         seg (when i (subs mid 0 i))
         rest-of (when i (subs mid (inc i)))]
     (cond
+      ;; Explicit source (from the picker): use that provider's own URL. A
+      ;; local model (ollama) must hit localhost:11434, not the configured
+      ;; remote endpoint (OpenRouter, etc.).
+      src-url
+      (let [prefixed? (= seg src)]
+        {:url src-url
+         :model (or (when prefixed? rest-of) mid)
+         :key (provider-key src)})
+
+      ;; No explicit source: the configured endpoint is the only hint.
       cfg-prov
       (let [prefixed? (= seg cfg-prov)]
         {:url cfg-url
          :model (or (when prefixed? rest-of) mid)
-         :key (provider-key cfg-prov)})
+         :key cfg-key})
 
       :else
       (let [entry (when seg (try (providers/by-id seg) (catch Throwable _ nil)))]
@@ -273,7 +302,15 @@
           ;; a nested loop: isolated message list, NO event fan-out (the parent
           ;; sees only the answer), the SAME approval gate — a subagent must not
           ;; be a way to run a shell command the user would have refused.
-          (let [res (loop/run-turn! {:llm (resolve-llm @(:model state))
+          ;;
+          ;; SUBS RUN THE SMALL SLOT. The old call passed the ACTIVE model id
+          ;; (`@(:model state)`) but resolved it against the SMALL transport, so
+          ;; on `/big` a subagent POSTed the big model id to the small endpoint
+          ;; (a local ollama, say) and 404'd. The id and the transport must come
+          ;; from the SAME slot: the small slot when a small model is configured,
+          ;; else the big slot.
+          (let [sub-slot (if @(:small-model state) :small :big)
+                res (loop/run-turn! {:llm (resolve-llm (slot-model state sub-slot) nil sub-slot)
                                      :message (str prompt)
                                      :cwd (or sub-cwd cwd)
                                      :mcp @!mcp
@@ -331,7 +368,7 @@
           (try (project-dialog/append-turn! :user (str text)) (catch Throwable _ nil))
           (try
             (let [t0 (System/currentTimeMillis)
-                  res (loop/run-turn! {:llm (resolve-llm @(:model state))
+                  res (loop/run-turn! {:llm (resolve-llm @(:model state) nil @(:model-slot state))
                                        :message (str text)
                                        :cwd cwd
                                        :mcp @!mcp
@@ -381,7 +418,13 @@
                     sess-cost (when (or cost (:session-cost prev))
                                 (+ (double (or (:session-cost prev) 0.0))
                                    (double (or cost 0.0))))
-                    fmt (fn [d] (format "%.4f" (double d)))]
+                    fmt (fn [d]
+                          (let [a (Math/abs (double d))]
+                            (cond
+                              (>= a 0.01)   (format "%.2f" d)
+                              (>= a 0.001)  (format "%.5f" d)
+                              (>= a 1e-4)   (format "%.7f" d)
+                              :else          (format "%.9f" d))))] ; $0.000000001+
                 (swap! (:usage state) assoc
                        :turn-tokens tok
                        :turn-cost (or cost 0.0)
@@ -422,7 +465,15 @@
         (fn [nm source & [opts]]
           (let [slot (if (= :small (:slot opts)) :small :big)
                 global? (boolean (:global opts))
+                url (some-> (:url opts) str str/trim not-empty)
                 mid (some-> nm str str/trim not-empty)]
+            ;; A pick made against a slot's own transport persists that transport
+            ;; too, so the slot keeps its own endpoint (`[:big-model :url]` /
+            ;; `[:small-model :url]`) instead of silently inheriting the shared
+            ;; `:llm :url`. Applied on the next start (config is file-snapshot).
+            (when url
+              (try (models/save-slot-url! slot url)
+                   (catch Throwable e (dbg! "save slot url failed:" (.getMessage e)))))
             (when mid
               (try
                 (if global?
@@ -443,7 +494,7 @@
                                       :big @(:big-model state)
                                       :small @(:small-model state)
                                       :text (str "model: " effective)})
-                (let [r (resolve-llm effective)]
+                (let [r (resolve-llm effective source slot)]
                   (line! state (str (if global? "global " "project ") (name slot)
                                     " model set: " mid
                                     " → " (:url r) " · " (:model r)

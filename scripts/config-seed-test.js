@@ -35,7 +35,6 @@ fs.mkdirSync(path.join(res, "config.examples"), { recursive: true });
 const ex = (n, body) => fs.writeFileSync(path.join(res, "config.examples", n), body);
 ex("grog.edn.example", "{:llm {:url \"\" :model \"\"}}\n");
 ex("odoo-instances.edn.example", "{:instances []}\n");
-ex("secrets.edn.example", "{}\n");
 fs.writeFileSync(path.join(res, "config.examples", "README.md"), "not an example\n");
 
 // --- configHome resolution (mirrors grog.platform/config-home-dir) ----------
@@ -51,8 +50,8 @@ check("default is ~/.config/grog (Windows included)", () =>
 // --- what ships ------------------------------------------------------------
 check("availableExamples ignores README.md and maps target names", () => {
   const a = availableExamples(res);
-  assert.deepStrictEqual(a.map((e) => e.name), ["grog.edn.example", "odoo-instances.edn.example", "secrets.edn.example"]);
-  assert.deepStrictEqual(a.map((e) => e.target), ["grog.edn", "odoo-instances.edn", "secrets.edn"]);
+  assert.deepStrictEqual(a.map((e) => e.name), ["grog.edn.example", "odoo-instances.edn.example"]);
+  assert.deepStrictEqual(a.map((e) => e.target), ["grog.edn", "odoo-instances.edn"]);
   assert.ok(a[0].from.endsWith(path.join("config.examples", "grog.edn.example")));
 });
 check("no config.examples in the package -> []", () =>
@@ -63,7 +62,7 @@ check("planOffer: missing grog.edn -> needsMain", () => {
   const p = planOffer({ resourcesPath: res, configHome: home });
   assert.strictEqual(p.needsMain, true);
   assert.strictEqual(p.grogEdn, path.join(home, "grog.edn"));
-  assert.deepStrictEqual(p.optional.map((e) => e.name), ["odoo-instances.edn.example", "secrets.edn.example"]);
+  assert.deepStrictEqual(p.optional.map((e) => e.name), ["odoo-instances.edn.example"]);
   assert.ok(!fs.existsSync(home), "planOffer must not create the config home");
 });
 check("planOffer: existing grog.edn -> no offer", () => {
@@ -82,10 +81,9 @@ check("planOffer: no examples shipped -> no offer", () => {
 check("createConfig writes grog.edn + the optional *.example files", () => {
   const p = planOffer({ resourcesPath: res, configHome: home });
   const w = createConfig(p);
-  assert.strictEqual(w.length, 3);
+  assert.strictEqual(w.length, 2);
   assert.ok(fs.existsSync(path.join(home, "grog.edn")));
   assert.ok(fs.existsSync(path.join(home, "odoo-instances.edn.example")));
-  assert.ok(fs.existsSync(path.join(home, "secrets.edn.example")));
   assert.ok(!fs.existsSync(path.join(home, "README.md")), "README.md must not be copied");
   assert.strictEqual(fs.readFileSync(path.join(home, "grog.edn"), "utf8"), "{:llm {:url \"\" :model \"\"}}\n");
 });
@@ -110,7 +108,7 @@ check("createConfig never overwrites an existing file", () => {
 check("createConfig creates the config home if absent", () => {
   const fresh = path.join(tmp, "fresh-home");
   const w = createConfig(planOffer({ resourcesPath: res, configHome: fresh }));
-  assert.strictEqual(w.length, 3);
+  assert.strictEqual(w.length, 2);
   assert.ok(fs.existsSync(path.join(fresh, "grog.edn")));
 });
 

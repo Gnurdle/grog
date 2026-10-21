@@ -146,8 +146,8 @@ Open the run log and check, in order. The client writes one file per instance �
 |---|---|
 | settings | `~/.config/grog/grog.edn` |
 | first run | If `grog.edn` is missing the client **writes one** from the bundled example (and logs the exact path). Edit it — model, provider, API key — and restart; until then grog runs on defaults and cannot reach a model. The optional examples (odoo, imap, gitlab, imaging, secrets) are left beside it as `*.example`. |
-| other config | `~/.config/grog/{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn, secrets.edn}` |
-| secrets | the OS secret store (Secret Service); `secrets.edn` is the fallback |
+| other config | `~/.config/grog/{odoo-instances.edn, imap-accounts.edn, imaging.edn, office.edn}` |
+| secrets | the OS secret store (Secret Service) — values are never written to a file |
 | projects | `~/grog-projects/<project>/{notes,dialog,state}` |
 | run log | the client's `~/grog.<pid>.log` (newest; `$GROG_LOG` overrides the base, `$GROG_UI_LOG_KEEP` the count). `scripts/grog-client` also saves a stream copy to `$XDG_STATE_HOME/grog/client.log` |
 | version | `VERSION` at the tree root; stamped into the jars as `grog-version.edn`, and shown on the client's startup screen |

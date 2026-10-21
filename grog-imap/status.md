@@ -40,8 +40,8 @@ application-code and MCP paths are disjoint:
   `(imap/connect (assoc account :password (app/get-secret ...)))`. The secret
   never leaves the app process and never touches the MCP or the model.
 - **The MCP** (`main.clj`) resolves the credential itself from **grog's secret
-  store** — the OS keyring (service `grog`), with `<config-home>/secrets.edn` as
-  the headless fallback — using the store account each account's metadata NAMES
+  store** — the OS keyring (service `grog`), and only there — using the store
+  account each account's metadata NAMES
   (`:password-secret` for LOGIN/PLAIN, `:refresh-secret` for XOAUTH2), and
   injects the resolved credential into the same `core` connect call. There is
   deliberately no env-var and no `~/.grog-imap-<name>` credential file: mail

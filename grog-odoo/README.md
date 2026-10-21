@@ -96,8 +96,8 @@ Point `GROG_ODOO_CONFIG` at an **EDN** file (legacy JSON also accepted):
   argument is optional, since it is unambiguous.
 - `:password-secret` names an **account in grog's secret store** — the password
   itself is never in this file. Store each one once:
-  `/secret set ODOO_STAGE_PASSWORD <value>` (OS keyring; grog's `secrets.edn` is
-  the headless fallback). This is the **only** credential source: there is no
+  `/secret set ODOO_STAGE_PASSWORD <value>` (OS keyring only — never a file).
+  This is the **only** credential source: there is no
   `:password` field, no `${ENV}` credential and no credential file, because
   several instances can be configured and each carries the NAME of its account.
 - `:allow-write` (default **false**) is the per-instance write switch. False

@@ -27,7 +27,7 @@
 
   * `:password-secret` names an ACCOUNT in grog's secret store — the password
     itself is NEVER in this file. Set it with `/secret set ODOO_STAGE_PASSWORD
-    <value>` (OS keyring; grog's `secrets.edn` is the headless fallback). This
+    <value>` (OS keyring only — never a file). This
     server reads the store ITSELF rather than receiving the value in its
     environment: everything in an MCP server's env map is written verbatim into
     the generated ECA config, so an env-injected password would sit on disk in
@@ -143,25 +143,11 @@
                  (System/getProperty "user.home"))
              "/.config/grog"))))
 
-(defn- secrets-file
-  "grog's file fallback: `<config-home>/secrets.edn`, an EDN map of
-  {account password}. Mirrors grog.secrets/secrets-file so a headless Linux box
-  — where the keyring backend is unreachable — still works."
-  ^java.io.File []
-  (io/file (config-home-dir) "secrets.edn"))
-
-(defn- file-secret ^String [^String account]
-  (try
-    (let [f (secrets-file)]
-      (when (.exists f)
-        (some-> (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))
-                (get account) str str/trim not-empty)))
-    (catch Throwable _ nil)))
-
 (defn- lookup-secret
-  "OS keyring first, then grog's secrets file. nil when neither has it."
+  "Read `account` from the OS keyring (service \"grog\"). nil when absent.
+  Secret values live ONLY in the keyring — never in a file."
   ^String [^String account]
-  (or (keyring-secret account) (file-secret account)))
+  (keyring-secret account))
 
 (defn- reject-inline-password!
   "Refuse an instance that still carries an inline `:password`.
@@ -321,8 +307,8 @@
   (if-let [acct (:password-secret inst)]
     (or (lookup-secret acct)
         (throw (ex-info (str "Instance '" (:name inst) "': no secret for account '" acct
-                             "' in the OS keyring (service '" keyring-service "') "
-                             "or in " (.getPath (secrets-file)) ". Set it with:  "
+                             "' in the OS keyring (service '" keyring-service "')."
+                             " Set it with:  "
                              "/secret set " acct " <value>")
                         {:instance (:name inst) :secret acct})))
     (let [suggested (str "ODOO_" (str/upper-case (str (:name inst))) "_PASSWORD")]

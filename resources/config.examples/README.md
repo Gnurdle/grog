@@ -21,7 +21,6 @@ On Windows that expands to `C:\Users\you\.config\grog\`.
 | `gitlab-instances.edn.example` | grog-gitlab | multi-instance list (token-file paths) | ✅ rename to `gitlab-instances.edn` |
 | `odoo-instances.edn.example` | grog-odoo | Odoo instances (url/db/user/password/allow-write) | ✅ rename to `odoo-instances.edn` |
 | `imap-accounts.edn.example` | grog-imap | IMAP account metadata (never secrets) | ✅ rename to `imap-accounts.edn` |
-| `secrets.edn.example` | grog core | OS-keyring **fallback** file (owner-only) | ⚠️ generated automatically; only needed if you have no keyring |
 
 ## Do NOT copy these
 
@@ -43,8 +42,8 @@ example can confuse the runtime — delete them from `~/.config/grog` instead:
 
 ## Notes
 
-- Secrets normally live in the **OS keyring** (`/secret set <ACCOUNT> <value>`),
-  never in config files. `secrets.edn` is only the headless fallback.
+- Secrets live **only in the OS keyring** (`/secret set <ACCOUNT> <value>`) — a
+  secret VALUE is never written to a config file.
 - File paths support a leading `~` (home-relative) in most servers, and
   `${ENV}` / `${ENV:-default}` interpolation in many EDN fields.
 - After changing any server config, **restart grog** (MCP tool lists and config

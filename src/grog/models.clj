@@ -80,32 +80,53 @@
   []
   (sort (map name (keys (or (:profiles (llm-config)) {})))))
 
+(defn save-slot-model!
+  "Persist `m` as the model id of a model SLOT (`:big` / `:small`) in grog.edn
+  atomically, preserving every other key: `[:big-model :model]` or
+  `[:small-model :model]`.
+
+  The id is the RAW, transport-relative catalog id (a plain
+  `moonshotai/kimi-k3` under an openrouter URL), so it resolves against
+  `config/slot-url` for that slot."
+  [slot m]
+  (let [k (if (= :small slot) :small-model :big-model)]
+    (persist! #(assoc-in % [k :model] (str m)))
+    m))
+
+(defn save-slot-url!
+  "Persist a model SLOT's TRANSPORT url in grog.edn atomically:
+  `[:big-model :url]` or `[:small-model :url]`. A nil/blank `url` clears the
+  slot's own transport so it falls back to the shared `:llm :url`."
+  [slot url]
+  (let [k (if (= :small slot) :small-model :big-model)
+        u (some-> url str str/trim not-empty)]
+    (persist! (fn [m]
+                (if u
+                  (assoc-in m [k :url] u)
+                  (update m k (fn [cur] (dissoc (or cur {}) :url))))))
+    url))
+
 (defn save-eca-model!
-  "Persist the chosen model as `:eca :model` in grog.edn atomically, preserving
-  every other key — the GLOBAL big-slot default for the GUI's ECA chat.
+  "Persist `m` as the BIG slot's model id (`[:big-model :model]`) in grog.edn
+  atomically — the GLOBAL big default for the GUI's chat.
 
   Called only when the user ticks \"set as global default\" in the models dialog
-  (`grog.client.local/set-model-fn` with `:global true`). A plain pick writes the
-  PROJECT manifest instead (`grog.projects/set-project-model!`), so one project's
-  choice never rewrites every other project (or every future session).
-
-  It wins over `:llm :model` (see `grog.config/eca-model`); the picker writes the
-  provider-QUALIFIED id (`openrouter/…`, `ollama/…`) so ECA can resolve it
-  without guessing."
+  (`grog.client.loop`'s `set-model-fn` with `:global true`). A plain pick writes
+  the PROJECT manifest instead (`grog.projects/set-project-model!`), so one
+  project's choice never rewrites every other project (or every future session)."
   [m]
-  (persist! #(assoc-in % [:eca :model] (str m)))
-  m)
+  (save-slot-model! :big m))
 
 (defn save-eca-small-model!
-  "Persist `m` as `:eca :small-model` in grog.edn atomically — the GLOBAL default
-  for the small slot, the counterpart of `save-eca-model!`.
+  "Persist `m` as the SMALL slot's model id (`[:small-model :model]`) in
+  grog.edn atomically — the GLOBAL small default, the counterpart of
+  `save-eca-model!`.
 
   Also called only for the \"set as global default\" tick. There is no delete
   here on purpose: the global small default is set or left unset, and unsetting
   it is an explicit config edit, not something a dialog should do by accident."
   [m]
-  (persist! #(assoc-in % [:eca :small-model] (str m)))
-  m)
+  (save-slot-model! :small m))
 
 ;; --- fetching available models ----------------------------------------------
 ;;
@@ -115,7 +136,10 @@
 
 (defn fetch-provider-models
   "The model ids the CONFIGURED provider advertises, via its OpenAI-compatible
-  `GET <:llm :url>/models`.
+  `GET <url>/models`.
+
+  With no argument, `url` is the BIG slot's transport (`config/big-model-url`);
+  pass a url to list a DIFFERENT slot's provider (the small slot's own endpoint).
 
   There is nothing provider-specific here on purpose: openrouter, fireworks, a
   self-hosted server and everything else in between expose that endpoint and the
@@ -123,19 +147,20 @@
   Authorization header is sent when a key resolves (a public listing ignores it).
 
   Best effort: `[]` on failure, offline, or an unparseable body."
-  []
-  (try
-    (let [base (-> (str (config/llm-url)) str/trim (str/replace #"/+$" ""))
-          key  (try (config/llm-api-key) (catch Throwable _ nil))
-          resp (http/get (str base "/models")
-                         (cond-> {:as :json :throw-exceptions false
-                                  :socket-timeout 15000 :conn-timeout 5000}
-                           (seq key) (assoc :headers {"Authorization" (str "Bearer " key)})))]
-      (->> (get-in resp [:body :data])
-           (keep (fn [m] (some-> (:id m) str str/trim not-empty)))
-           (distinct)
-           (sort)))
-    (catch Throwable _ [])))
+  ([] (fetch-provider-models (try (config/big-model-url) (catch Throwable _ nil))))
+  ([url]
+   (try
+     (let [base (-> (str url) str/trim (str/replace #"/+$" ""))
+           key  (try (config/llm-api-key) (catch Throwable _ nil))
+           resp (http/get (str base "/models")
+                          (cond-> {:as :json :throw-exceptions false
+                                   :socket-timeout 15000 :conn-timeout 5000}
+                            (seq key) (assoc :headers {"Authorization" (str "Bearer " key)})))]
+       (->> (get-in resp [:body :data])
+            (keep (fn [m] (some-> (:id m) str str/trim not-empty)))
+            (distinct)
+            (sort)))
+     (catch Throwable _ []))))
 
 (defn fetch-ollama-models
   "Return a sorted list of local Ollama model names (best effort; empty if Ollama
@@ -347,34 +372,40 @@
 ;; duplicate network calls.
 (defonce ^:private inflight* (atom #{}))
 
-(defn- configured-url []
-  (try (config/llm-url) (catch Throwable _ nil)))
+(defn- slot-url*
+  "A slot's transport url, or nil (never throws — a config with no url at all is
+  a valid, if unconfigured, state)."
+  [slot]
+  (try (config/slot-url slot) (catch Throwable _ nil)))
 
-(defn- configured-provider
-  "The provider `:llm :url` points at, as a name, or nil."
-  []
-  (provider-prefix-for-url (configured-url)))
+(defn- slot-provider
+  "The provider a SLOT's transport url points at, as a name, or nil."
+  [slot]
+  (provider-prefix-for-url (slot-url* slot)))
 
 (defn picker-source->provider
-  "Translate a picker SOURCE into the PROVIDER to qualify a model with.
+  "Translate a picker SOURCE into the PROVIDER to qualify a model with, for a
+  given SLOT (default `:big`).
 
   The picker's sources name PLACES, not companies:
-    \"local\"  -> \"ollama\"        (that is what a local server is, here)
-    \"remote\" -> the provider `:llm :url` points at (openrouter, fireworks, …)
+    \"local\"  -> \"ollama\"             (that is what a local server is, here)
+    \"remote\" -> the provider the SLOT's transport url points at
+                  (openrouter, fireworks, …)
   A provider name, nil, or anything else passes through unchanged.
 
   Without this the source is lost, and qualification falls back to guessing —
   which scoped a REMOTE model to ollama whenever its id happened to also exist
   in the local ollama (`qwen2.5-coder:7b` is on OpenRouter *and* in your ollama)."
-  [source]
-  (case (str source)
-    "local"  "ollama"
-    "remote" (configured-provider)
-    (let [s (str source)]
-      (when (seq s) s))))
+  ([source] (picker-source->provider source :big))
+  ([source slot]
+   (case (str source)
+     "local"  "ollama"
+     "remote" (slot-provider slot)
+     (let [s (str source)]
+       (when (seq s) s)))))
 
 (defn- local-url?
-  "True when `:llm :url` is a server on THIS machine — loopback only.
+  "True when `url` is a server on THIS machine — loopback only.
 
   A private-range address is deliberately NOT local: a model server on the LAN is
   somewhere else, and treating it as \"this machine\" would make the local tab
@@ -387,63 +418,85 @@
                  (str/includes? u "0.0.0.0")))))
 
 (defn- source-fetcher
-  "The fetch fn for a picker `source`, or nil when there is none.
+  "The fetch fn for a picker `source` on a SLOT, or nil when there is none.
 
   There are only two sources, and neither is a host name:
-    :local   this machine      — ollama's `/api/tags`
-    :remote  the provider `:llm :url` points at — its OpenAI-compatible `/models`
+    :local   this machine        — ollama's `/api/tags`
+    :remote  the SLOT's transport — its OpenAI-compatible `/models`
   A provider NAME is still accepted, so an older client asking for \"openrouter\"
   gets the right list rather than nothing."
-  [source]
+  [slot source]
   (let [s (name source)]
     (cond
       (= s "local")               fetch-ollama-models
-      (= s "remote")              fetch-provider-models
-      (= s (configured-provider)) fetch-provider-models
+      (= s "remote")              #(fetch-provider-models (slot-url* slot))
+      (= s (slot-provider slot))  #(fetch-provider-models (slot-url* slot))
       :else                       nil)))
 
 (defn fetch-async!
-  "Refresh `source` on a background thread, unless that fetch is already running.
-  Calls `(done! source models)` when it lands. Returns true when a fetch was
-  actually started."
-  [source done!]
-  (if-let [fetch (source-fetcher source)]
-    (if (contains? @inflight* source)
-      false
-      (do
-        (swap! inflight* conj source)
-        (future
-          (let [ms (try (vec (fetch)) (catch Throwable _ []))]
-            (swap! catalogue* assoc source ms)
-            (swap! inflight* disj source)
-            (try (done! source ms) (catch Throwable _ nil))))
-        true))
-    false))
+  "Refresh `source` for a SLOT (`:big`/`:small`) on a background thread, unless
+  that fetch is already running. Calls `(done! source models)` when it lands.
+  Returns true when a fetch was actually started."
+  [slot source done!]
+  (let [k [slot source]]
+    (if-let [fetch (source-fetcher slot source)]
+      (if (contains? @inflight* k)
+        false
+        (do
+          (swap! inflight* conj k)
+          (future
+            (let [ms (try (vec (fetch)) (catch Throwable _ []))]
+              (swap! catalogue* assoc k ms)
+              (swap! inflight* disj k)
+              (try (done! source ms) (catch Throwable _ nil))))
+          true))
+      false)))
 
 (defn catalogue
-  "What the picker can show right now, keyed by SOURCE — `:local` and `:remote`.
+  "What the picker can show for a SLOT right now, keyed by SOURCE — `:local` and
+  `:remote`.
 
-  Both start as nil (never fetched). ECA's own catalogue is deliberately NOT a
-  source here: which models ECA can resolve is an implementation detail of the
-  agent, not somewhere a user picks a model."
-  []
-  (merge (cond-> {:local nil}
-           (not (local-url? (configured-url))) (assoc :remote nil))
-         {:loading (vec (sort @inflight*))}
-         @catalogue*))
+  Each source starts as nil (never fetched). Keyed per slot so the big and small
+  slots browse their OWN transports independently. ECA's own catalogue is
+  deliberately NOT a source here: which models ECA can resolve is an
+  implementation detail of the agent, not somewhere a user picks a model."
+  [slot]
+  (let [local? (local-url? (slot-url* slot))
+        loading (vec (sort (for [[s src] @inflight* :when (= s slot)]
+                             (name src))))
+        fetched (into {} (for [[[s src] v] @catalogue* :when (= s slot)]
+                           [(keyword src) v]))]
+    (merge (if local? {:local nil} {:local nil :remote nil})
+           {:loading loading}
+           fetched)))
 
 (defn model-sources
-  "The picker's sources as `[[id label] …]` — LOCAL and REMOTE, nothing else.
+  "The picker's sources for a SLOT, as `[[id label] …]` — LOCAL and REMOTE.
 
-  `local` is the machine you are on (ollama). `remote` is whatever provider
-  `:llm :url` points at: openrouter for one user, fireworks for the next —
-  the LABEL does not change, because what the user is choosing is where the
-  model runs, not which company hosts it.
+  `local` is the machine you are on (ollama). `remote` is whatever provider the
+  SLOT's transport url points at: openrouter for one user, fireworks for the
+  next — the LABEL does not change, because what the user is choosing is where
+  the model runs, not which company hosts it.
 
-  When the configured provider already IS local, only `local` is offered — two
-  tabs onto the same list is noise. There is no `eca` source: that was an
+  When the slot's transport already IS local, only `local` is offered — two tabs
+  onto the same list is noise. There is no `eca` source: that was an
   implementation detail leaking into a user-facing choice."
-  []
-  (if (local-url? (configured-url))
+  [slot]
+  (if (local-url? (slot-url* slot))
     [["local" "Local"]]
     [["local" "Local"] ["remote" "Remote"]]))
+
+(defn slot-info
+  "Per-slot picker state for a client: the slot's transport url, its resolved
+  model id, its derived provider, whether it is local, and the sources it
+  offers."
+  [slot]
+  (let [u (slot-url* slot)]
+    {:slot (name slot)
+     :url u
+     :model (if (= :small slot)
+              (try (config/eca-small-model) (catch Throwable _ nil))
+              (try (config/eca-model) (catch Throwable _ nil)))
+     :provider (provider-prefix-for-url u)
+     :local? (local-url? u)
+     :sources (model-sources slot)}))

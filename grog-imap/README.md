@@ -87,7 +87,7 @@ The library never acquires or stores secrets. The caller injects them:
 | Path | How |
 |------|-----|
 | App code | pass a credential map (`{:password ...}` or `{:refresh-token ...}`) or a `[account] -> credential` fn to `connect-account!` |
-| MCP | each account **NAMES** the store account holding its credential — `:password-secret` (LOGIN/PLAIN), `:refresh-secret` (XOAUTH2) — and the server reads the value from **grog's secret store**: the OS keyring (service `grog`), with `<config-home>/secrets.edn` as the headless fallback. Set one with `/secret set <NAME> <value>` |
+| MCP | each account **NAMES** the store account holding its credential — `:password-secret` (LOGIN/PLAIN), `:refresh-secret` (XOAUTH2) — and the server reads the value from **grog's secret store**: the OS keyring (service `grog`), and only there. Set one with `/secret set <NAME> <value>` |
 
 There is no env-var credential and no `~/.grog-imap-<name>` file: several mail
 accounts can be configured, so each carries the *name* of its store entry rather

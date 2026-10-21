@@ -892,7 +892,7 @@
   (if (brave/brave-search-configured?)
     "Brave web search: enabled (model may call `brave_web_search`)"
     (str "Brave web search: off — store token via /secret set " secrets/brave-search-api-account
-         " <value> (OS keyring, or file store on headless systems)")))
+         " <value>")))
 
 (defn- llm-status-line []
   (let [name (config/provider-name)
@@ -965,7 +965,7 @@
     "  /jobs — add|list|next|status (needs :edn-store + active project); queue in memory namespace grog-jobs under the project"
     "  /chron — show chron scheduler status"
     "  /shell [command] — run one line via sh -lc under repo root cwd, or /shell alone for interactive subshell (exit to return)"
-    "  /secret — list known secret keys and set/unset status (values never printed); /secret set <KEY> <value> (or /secret <KEY> <value>) stores in the OS keyring, falling back to <config-home>/secrets.edn on headless/unsupported systems; /secret rm <KEY> removes; /secret file|backend | status"
+    "  /secret — list known secret keys and set/unset status (values never printed); /secret set <KEY> <value> (or /secret <KEY> <value>) stores in the OS keyring (values are NEVER written to a file); /secret rm <KEY> removes; /secret backend | status"
     "  /doctor — probe external dependencies (bash/java/bb/eca/soffice/tesseract/pdftoppm/rg/jq/node) with paths+versions, and audit config solvency with provenance (which file each effective key came from); broken EDN is reported by file"
     "  /reset — FACTORY RESET (airbag): /reset prints a plan and changes nothing; /reset --yes moves the config home + the getting-started project into a timestamped backup, removes the saved sessions, and deletes the credentials grog created (from the secret ledger). Your other projects are untouched. Restart after."
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
@@ -973,7 +973,7 @@
     "  /model — show current LLM model and URL, plus any :llm :profiles"
     "  /model reset — clear the session model override"
     "  /model <name> — switch to a model name for this session (e.g. qwen2.5-coder:7b-instruct)"
-    "  /model <profile> — switch to a named profile from :llm :profiles (can override :url, :model, :api-key, etc.)"
+    "  /model <profile> — switch to a named profile from :llm :profiles (can override :url, :model, etc.)"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
     ""
@@ -1332,17 +1332,11 @@
         (str/blank? tail)
         (secrets/print-known-secrets-summary!)
 
-        ;; /secret file — show the fallback store path
-        (re-matches #"(?i)^(file|path|where)$" tail)
-        (println "Secret store file:" (.getPath (secrets/secrets-file)))
-
         ;; /secret backend — which backend is active
         (re-matches #"(?i)^(backend|status)$" tail)
         (let [b (secrets/backend-status)]
-          (println (if (= :keyring (:backend b))
-                     "Backend: OS keyring"
-                     (str "Backend: file fallback — " (:reason b))))
-          (println "Store file:" (:path b)))
+          (println (str "Backend: OS keyring"
+                        (when-let [r (:reason b)] (str " — " r)))))
 
         ;; /secret rm <KEY> | del <KEY> | delete <KEY>
         (re-matches #"(?i)^(rm|del|delete|unset)\s+\S+$" tail)
@@ -1353,10 +1347,8 @@
                   keyring-msg (case (:keyring res)
                                 :deleted "from OS keyring"
                                 :absent "(was not in keyring)"
-                                "(keyring unavailable; removed from file)")
-                  file-msg (when (= :removed (:file res)) "and from file store")
-                  where (str/join " " (remove nil? [keyring-msg file-msg]))]
-              (println (str/join " " ["Removed" (pr-str k) where])))
+                                "(keyring unavailable)")]
+              (println (str/join " " ["Removed" (pr-str k) keyring-msg])))
             (catch Exception e
               (println "grog:/secret error:" (.getMessage e)))))
 
@@ -1365,11 +1357,9 @@
         (let [[_ k v] (re-matches #"(?i)^set\s+(\S+)\s+([\s\S]+)$" (str/trim tail))]
           (if (and k (not (str/blank? k)) v (not (str/blank? (str/trim v))))
             (try
-              (let [res (secrets/set-secret! (str/trim k) (str/trim v))]
+              (let [_res (secrets/set-secret! (str/trim k) (str/trim v))]
                 (println "Stored" (pr-str (str/trim k))
-                         (if (= :keyring (:backend res))
-                           "in OS secret store (service \"grog\")."
-                           (str "in file store (OS backend unavailable: " (:reason res) ").")))
+                         "in the OS keyring (service \"grog\").")
                 (when (= "LLM_API_KEY" (str/trim k))
                   (println "LLM_API_KEY is set — it is used automatically by :llm requests.")))
               (catch Exception e
@@ -1380,16 +1370,14 @@
         :else
         (if-let [[k v] (parse-secret-key-value tail)]
           (try
-            (let [res (secrets/set-secret! k v)]
+            (let [_res (secrets/set-secret! k v)]
               (println "Stored" (pr-str k)
-                       (if (= :keyring (:backend res))
-                         "in OS secret store (service \"grog\")."
-                         (str "in file store (OS backend unavailable: " (:reason res) ").")))
+                       "in the OS keyring (service \"grog\").")
               (when (= secrets/llm-api-account k)
                 (println "LLM_API_KEY is set — it is used automatically by :llm requests.")))
             (catch Exception e
               (println "grog:/secret error:" (.getMessage e))))
-          (println "grog:/secret: try /secret (list), /secret set <KEY> <value>, /secret rm <KEY>, /secret file, /secret backend."))))
+          (println "grog:/secret: try /secret (list), /secret set <KEY> <value>, /secret rm <KEY>, /secret backend."))))
     true))
 
 (defn- handle-doctor-command! [line]

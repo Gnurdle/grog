@@ -36,8 +36,8 @@ Run the interactive consent from the REPL:
 
 For Microsoft, the same with `:provider :microsoft` (scope defaults to
 `https://outlook.office.com/IMAP.AccessAsUser.All offline_access`). Store the
-`refresh_token` as a secret (env var or secrets file) — never in config
-metadata or the MCP context.
+`refresh_token` as a secret (a keyring account, e.g. `:refresh-secret`) — never in
+config metadata or the MCP context.
 
 ## 3. Connect with XOAUTH2
 

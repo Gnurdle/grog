@@ -27,9 +27,9 @@
        (when (:sessionCost c) (str " · $" (:sessionCost c)))))
 
 (defn- line-of
-  "Map one raw ECA `content` to a transcript segment, or nil to skip it.
+  "Map one raw content to a transcript segment, or nil to skip it.
 
-  ECA streams many content types in a turn: reasoning (`reasonText` wrapped in
+  The agent loop streams many content types in a turn: reasoning (`reasonText` wrapped in
   `reasonStarted`/`reasonFinished`), tool lifecycle (`toolCallPrepare` →
   `toolCallRunning` → `toolCalled`/`toolCallRun`), plus `progress`/`metadata`
   chatter. Only the ones with user-meaningful payload are painted; the rest are
@@ -54,12 +54,13 @@
       ("reasonStarted" "reasonFinished" "progress" "metadata"
        "toolCallPrepare" "toolCallRunning") nil
       ;; UNKNOWN — now PAINTED, not merely logged. This branch used to return nil,
-      ;; which is how ECA's `tool-call-dropped` notice ("the model emitted a DSML
-      ;; tool call that could not be parsed … the call was dropped") became
-      ;; invisible in the UI: a real diagnostic, discarded for not appearing in the
-      ;; list above. Any unknown type carrying text is shown as a diagnostic line,
-      ;; so the next notice ECA invents is visible without anyone remembering to
-      ;; add it here — a hard-coded list is a thing that goes stale.
+      ;; which is how the agent loop's `tool-call-dropped` notice ("the model
+      ;; emitted a DSML tool call that could not be parsed … the call was
+      ;; dropped") became invisible in the UI: a real diagnostic, discarded for
+      ;; not appearing in the list above. Any unknown type carrying text is shown
+      ;; as a diagnostic line, so the next notice the loop invents is visible
+      ;; without anyone remembering to add it here — a hard-coded list is a thing
+      ;; that goes stale.
       (let [msg (str (or text summary name ""))]
         (if (str/blank? msg)
           (do (.log js/console "[grog-web] unhandled content type (no text):" (pr-str type))
@@ -89,7 +90,7 @@
 (def ^:private help-rows
   [["/help"    "this list — everything grog can be told to do"           "—"]
    ["/project" "list · switch · create (/project new <name>) · delete"   "Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1‑9 jump"]
-   ["/model"   "set the big/small models (per project, or global default)" "⚙ Settings → Models…"]
+   ["/model"   "edit each slot's own transport + model (per project / global)" "⚙ Settings → Models…"]
    ["/big"     "run the BIG model for this session"                       "status-bar badge (amber)"]
    ["/small"   "run the SMALL model — or big, if none is set"             "status-bar badge (emerald)"]
    ["/secret"  "store or remove a key — values are never printed"        "—"]
@@ -136,29 +137,27 @@
      ;; onboarding page instead of a transcript.
      :home-project nil :bootstrap-needed? false :bootstrap-configured? false
      :bootstrap-dismissed? false :bootstrap-mcps nil :docs-dir nil :first-run? false
-     ;; model picker (settings dialog): catalogue from the server, which source
-     ;; is being browsed, and the search string. `:model-sources` also comes from
-     ;; the server — Local and Remote only, never a hard-coded provider.
+     ;; model picker: catalogue from the server for the FOCUSED SLOT, which source
+     ;; is being browsed, and the search string. `:model-slots` (from the server)
+     ;; holds each slot's OWN transport url / provider / sources — big and small
+     ;; never share an endpoint. `:model-sources` is the big slot's (older key).
      :catalogue nil :model-source nil :model-query ""
-     :model-sources [["local" "Local"]]
-     ;; provider picker (settings dialog): the shipped catalogue (resources/
-     ;; providers.edn via the server's `providers` method) + what :llm points at.
-     ;; `:provider-query` / `:provider-open?` drive the searchable combo box.
+     :model-sources [["local" "Local"]] :model-slots nil
+     ;; provider picker (transport): the shipped catalogue (resources/
+     ;; providers.edn via the server's `providers` method) + what the picked slot
+     ;; points at. `:provider-query` / `:provider-open?` drive the searchable combo.
      :providers nil :provider-current nil :provider-query "" :provider-open? false
      ;; The composer draft and its attachments are PER SESSION
      ;; ([:sessions sid :input] / [:sessions sid :attachments]) so swapping
      ;; projects cannot leak one project's text or image into another — they are
      ;; not top-level keys. See the :input / :attach-* events and their subs.
      :voice nil :recording? false :transcribing? false
-     ;; MODELS dialog (big/small): one editable draft per slot + the "also set as
-     ;; global default" tick, seeded from the focused session when it opens (see
-     ;; :dialog-open). The dialog is separate from Settings, which now only SHOWS
-     ;; the two models read-only.
-     :models-big "" :models-small ""
-     :models-big-global? false :models-small-global? false
-     ;; which slot the SHARED catalogue list fills (the BIG / SMALL tabs at the
-     ;; top of the dialog) — the list has one search box, so it targets one slot.
-     :models-slot :big}))
+     ;; MODELS dialog: ONE slot at a time. `:models-slot` is the FOCUSED slot,
+     ;; seeded from the focused session's active `/big` `/small` slot when the
+     ;; dialog opens. `:models-draft` / `:models-global?` are that slot's editable
+     ;; model id and "also set as the global default" tick; its transport combo and
+     ;; catalogue follow the focus.
+     :models-draft "" :models-global? false :models-slot :big}))
 
 (rf/reg-sub :db (fn [db _] db))
 (defn- sess-of [db id] (get-in db [:sessions id]))
@@ -210,6 +209,7 @@
           db (-> db
                  (assoc :model-sources (or (seq (:model-sources snap))
                                            (:model-sources db)))
+                 (assoc :model-slots (or (:model-slots snap) (:model-slots db)))
                  (assoc :bootstrap-needed? (if (:bootstrap-dismissed? db)
                                              false
                                              (boolean (get-in snap [:bootstrap :needed?])))
@@ -245,6 +245,23 @@
   and it also stops `:open-ok` (another tab's snapshot) from bringing the page
   back."
   (fn [db _] (assoc db :bootstrap-needed? false :bootstrap-dismissed? true)))
+
+(rf/reg-event-fx :show-bootstrap
+  "Bring the getting-started landing back — the counterpart to `:dismiss-bootstrap`,
+  asked for from the toolbar so the onboarding prose is not lost once you have
+  typed anything.
+
+  It sets BOTH keys, and that is the whole subtlety: `:bootstrap-dismissed?` is
+  the latch that stops `:startup-ok`/`:open-ok` (another tab's snapshot) from
+  re-showing the page, so raising `:bootstrap-needed?` alone would be undone by
+  the next snapshot and read as a dead button."
+  (fn [{:keys [db]} _]
+    (if (:home-project db)
+      {:db (assoc db :bootstrap-needed? true :bootstrap-dismissed? false)}
+      ;; No startup answer yet ⇒ there is no landing to show (the page is
+      ;; rendered per-project, from what `startup`/`open` reported). Say so
+      ;; rather than flip a flag that draws nothing.
+      {:dispatch [:status-line nil "[grog] no getting-started page this launch"]})))
 
 (rf/reg-event-db :select-tab (fn [db [_ id]] (assoc db :active id)))
 (rf/reg-event-db :focus     (fn [db [_ f]] (assoc db :focused? f)))
@@ -545,23 +562,30 @@
 
 (rf/reg-event-fx :dialog-open
   (fn [{:keys [db]} [_ kind initial]]
-    (let [sess (get-in db [:sessions (:active db)])]
+    (let [sess (get-in db [:sessions (:active db)])
+          ;; the MODELS dialog focuses the session's ACTIVE `/big` `/small` slot
+          slot (if (= :small (:model-slot sess)) :small :big)]
       (cond-> {:db (assoc db :dialog kind :dialog-input (or initial "")
                           ;; the provider combo starts collapsed / unsearched
-                          :provider-query "" :provider-open? false)}
+                          :provider-query "" :provider-open? false
+                          ;; the big slot is the default focus for non-models dialogs
+                          :models-slot :big)}
         ;; the project picker needs the live list from the server
         (= kind :projects) (assoc :dispatch [:fetch-projects])
-        ;; the settings dialog loads the provider catalogue (its model section is
-        ;; read-only now — editing models happens in the Models… dialog)
-        (= kind :settings) (assoc :dispatch-n [[:providers-load]])
-        ;; the MODELS dialog seeds its two boxes from the focused session's
-        ;; resolved big/small models and loads the catalogue to browse.
+        ;; the settings dialog loads the provider catalogue + the big slot's
+        ;; models (its model section is read-only now — editing models happens
+        ;; in the Models… dialog)
+        (= kind :settings) (assoc :dispatch-n [[:providers-load] [:models-fetch nil]])
+        ;; the MODELS dialog seeds that slot's draft from its resolved model and
+        ;; loads that slot's transport catalogue + the provider list to browse.
         (= kind :models)
-        (assoc :db (assoc db :dialog :models :model-query "" :models-slot :big
-                          :models-big (or (:big-model sess) (:model sess) "")
-                          :models-small (or (:small-model sess) "")
-                          :models-big-global? false :models-small-global? false)
-               :dispatch [:models-fetch nil])))))
+        (assoc :db (assoc db :dialog :models :model-query "" :models-slot slot
+                          :models-draft (if (= :small slot)
+                                          (or (:small-model sess) "")
+                                          (or (:big-model sess) (:model sess) ""))
+                          :models-global? false
+                          :catalogue nil)
+               :dispatch-n [[:providers-load] [:models-fetch nil]])))))
 
 ;; --- project list (server `projects` method) -------------------------------
 
@@ -576,17 +600,23 @@
     {}))
 (rf/reg-event-db :dialog-input (fn [db [_ s]] (assoc db :dialog-input s)))
 (rf/reg-event-db :dialog-close (fn [db _] (assoc db :dialog nil)))
-;; models dialog (big/small): draft boxes, the global tick, and which slot the
-;; shared catalogue list fills.
+;; models dialog: the FOCUSED slot's draft model id and its "global default" tick.
 (rf/reg-event-db :models-draft
-  (fn [db [_ slot v]] (assoc db (if (= :small slot) :models-small :models-big) v)))
+  (fn [db [_ v]] (assoc db :models-draft v)))
 (rf/reg-event-db :models-global
-  (fn [db [_ slot on?]]
-    (assoc db (if (= :small slot) :models-small-global? :models-big-global?) (boolean on?))))
-;; which slot the SHARED catalogue list fills when you click a model
-(rf/reg-event-db :models-target
-  (fn [db [_ slot]]
-    (assoc db :models-slot (if (= :small slot) :small :big))))
+  (fn [db [_ on?]] (assoc db :models-global? (boolean on?))))
+;; Focus a SLOT: seed its draft from the session's resolved slot ids, reset the
+;; tick, drop the stale catalogue, and re-fetch for the slot's OWN transport.
+(rf/reg-event-fx :models-target
+  (fn [{:keys [db]} [_ slot]]
+    (let [slot (if (= :small slot) :small :big)
+          sess (get-in db [:sessions (:active db)])]
+      {:db (assoc db :models-slot slot :catalogue nil :model-query ""
+                  :models-draft (if (= :small slot)
+                                  (or (:small-model sess) "")
+                                  (or (:big-model sess) (:model sess) ""))
+                  :models-global? false)
+       :dispatch [:models-fetch nil]})))
 
 ;; --- model picker ----------------------------------------------------------
 ;;
@@ -606,16 +636,26 @@
      ;; background, so this is cheap on a source we already have
      :dispatch [:models-fetch nil]}))
 
-(defn- effective-source
-  "Which picker source is being browsed.
-
-  A source the user actually picked always wins. Until they pick one: `remote`
-  when a remote provider is configured (that is where a model usually comes
-  from), else `local`."
+(defn- slot-sources
+  "The sources the FOCUSED models-dialog slot offers, from the server's per-slot
+  info — `[[id label] …]`. Falls back to the big slot's, then Local only."
   [db]
-  (or (:model-source db)
-      (when (some #(= "remote" (first %)) (:model-sources db)) "remote")
-      "local"))
+  (let [slot (if (= :small (:models-slot db)) :small :big)]
+    (or (seq (get-in db [:model-slots slot :sources]))
+        (seq (:model-sources db))
+        [["local" "Local"]])))
+
+(defn- effective-source
+  "Which picker source is being browsed for the FOCUSED slot.
+
+  A source the user actually picked always wins (while the slot still offers it);
+  until they pick one: `remote` when the slot offers it, else `local`."
+  [db]
+  (let [ids (set (map first (slot-sources db)))]
+    (cond
+      (contains? ids (:model-source db)) (:model-source db)
+      (contains? ids "remote")           "remote"
+      :else                              "local")))
 
 (rf/reg-event-db :model-query
   (fn [db [_ q]] (assoc db :model-query q)))
@@ -624,19 +664,26 @@
   (fn [db [_ cat]] (assoc db :catalogue (js->clj cat :keywordize-keys true))))
 
 (rf/reg-event-db :models-source-loaded
-  (fn [db [_ {:keys [source models]}]]
-    (assoc-in db [:catalogue (keyword source)] (vec models))))
+  (fn [db [_ {:keys [source models slot]}]]
+    ;; a background refresh for a slot the dialog is no longer focused on is
+    ;; ignored — it would otherwise fill the wrong slot's list.
+    (if (and slot (not= (keyword slot) (if (= :small (:models-slot db)) :small :big)))
+      db
+      (assoc-in db [:catalogue (keyword source)] (vec models)))))
 
 (rf/reg-event-fx :models-fetch
-  "Ask for `source`'s models (default: whichever source is being browsed).
-  `force` re-fetches a source we already have cached."
+  "Ask the server for the FOCUSED slot's `source` models (default: whichever
+  source is being browsed). `force` re-fetches a source we already have cached.
+  The slot rides along so `:remote` lists that slot's OWN transport."
   (fn [{:keys [db]} [_ force]]
-         (-> (.call js/window.grogAPI
-                    "models"
-                    (clj->js (cond-> {:source (effective-source db)}
-                               force (assoc :force true))))
-        (.then (fn [cat] (rf/dispatch [:catalogue cat])))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] models failed: " (.-message e))]))))
+    (let [slot (if (= :small (:models-slot db)) :small :big)]
+      (-> (.call js/window.grogAPI
+                 "models"
+                 (clj->js (cond-> {:source (effective-source db)
+                                   :slot (name slot)}
+                            force (assoc :force true))))
+          (.then (fn [cat] (rf/dispatch [:catalogue cat])))
+          (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] models failed: " (.-message e))])))))
     {}))
 
 ;; --- provider picker -------------------------------------------------------
@@ -650,10 +697,17 @@
 (rf/reg-event-db :providers-loaded
   (fn [db [_ m]]
     (let [m (js->clj m :keywordize-keys true)]
-      (assoc db :providers (vec (:providers m)) :provider-current (:current m)))))
+      (assoc db :providers (vec (:providers m))
+                :provider-current (:current m)
+                ;; merge the server's per-slot transports into our slot map
+                :model-slots (merge (:model-slots db) (:slots m))))))
 
 (rf/reg-event-db :provider-current
-  (fn [db [_ cur]] (assoc db :provider-current cur)))
+  (fn [db [_ slot cur]]
+    (let [slot (if (= :small slot) :small :big)]
+      (-> db
+          (assoc :provider-current cur)
+          (update :model-slots #(assoc (or % {}) slot (merge (get % slot) cur)))))))
 
 (rf/reg-event-fx :providers-load
   (fn [_ _]
@@ -663,16 +717,19 @@
     {}))
 
 (rf/reg-event-fx :set-provider
-  (fn [_ [_ id]]
-    (-> (.call js/window.grogAPI "set-provider" (clj->js {:id id}))
-        (.then (fn [m]
-                 (let [m (js->clj m :keywordize-keys true)]
-                   (rf/dispatch [:provider-current {:url (:url m) :model (:model m)
-                                                    :provider (:provider m)}])
-                   (rf/dispatch [:status-line nil
-                                 (str "[grog] provider -> " (:url m) " · restart grog to apply")]))))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] set-provider failed: " (.-message e))]))))
-    {}))
+  (fn [_ [_ id slot]]
+    (let [slot (if (= :small slot) :small :big)]
+      (-> (.call js/window.grogAPI "set-provider" (clj->js {:id id :slot (name slot)}))
+          (.then (fn [m]
+                   (let [m (js->clj m :keywordize-keys true)]
+                     ;; the whole slot-info (url, provider, model, sources) so the
+                     ;; dialog's transport label AND source tabs follow the change
+                     (rf/dispatch [:provider-current slot m])
+                     (rf/dispatch [:models-fetch :force])
+                     (rf/dispatch [:status-line nil
+                                   (str "[grog] " (name slot) " transport -> " (:url m))]))))
+          (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] set-provider failed: " (.-message e))]))))
+      {})))
 
 ;; --- the provider combo box -------------------------------------------------
 ;; A native <select> can be neither sorted nor searched, so the settings picker
@@ -689,8 +746,9 @@
 ;; choose a provider: close + clear the box, then do the real work.
 (rf/reg-event-fx :provider-pick
   (fn [{:keys [db]} [_ id]]
-    {:db (assoc db :provider-query "" :provider-open? false)
-     :dispatch [:set-provider id]}))
+    (let [slot (if (= :small (:models-slot db)) :small :big)]
+      {:db (assoc db :provider-query "" :provider-open? false)
+       :dispatch [:set-provider id slot]})))
 
 (rf/reg-event-db :status-line
   (fn [db [_ sid text]]
@@ -866,6 +924,18 @@
     {}))
 
 (rf/reg-event-fx :send
+  "Send the composer's text (and attachments) for the active session.
+
+  A send also dismisses the getting-started landing, which is the fix for the
+  reported bug: that landing REPLACES the transcript (`shell` renders
+  `bootstrap-panel` in its place) and has no output surface of its own, while
+  `/secret set …` — the command the landing itself tells you to type — publishes
+  its confirmation AND its errors as `:line` segments INTO the transcript. The
+  page asked for a command and then swallowed the answer: success and failure
+  looked identical, and nothing scrolled, because no visible component read those
+  segments. `/help` and `/big`/`/small` are handled client-side and were
+  invisible on that page for the same reason. The toolbar's \"getting started\"
+  button (`:show-bootstrap`) brings the page back."
   (fn [{:keys [db]} _]
     (let [id (:active db)
           txt  (or (get-in db [:sessions id :input]) "")
@@ -875,7 +945,16 @@
                            (if (= kind :file)
                              {:type "file" :path path}
                              {:type "image" :mediaType media_type :base64 base64}))
-                         atts)]
+                         atts)
+          sending? (and id (or (seq (str/trim txt)) (seq atts)))
+          ;; Dismiss the getting-started landing on any send — but ONLY if it is
+          ;; actually up. Without the `:bootstrap-needed?` guard this fires on a
+          ;; NORMAL launch too (where the landing was never shown), and setting
+          ;; the latch there would make `:bootstrap-leavable?` true and offer an
+          ;; onboarding page over unrelated work.
+          db   (if (and sending? (:bootstrap-needed? db))
+                 (assoc db :bootstrap-needed? false :bootstrap-dismissed? true)
+                 db)]
       (cond
         ;; `/help` is answered LOCALLY — the same table as the onboarding panel,
         ;; UI triggers and all — instead of the spine's long text dump.
@@ -891,7 +970,7 @@
         (do (rf/dispatch [:set-model-slot id (keyword (str/lower-case (subs (str/trim txt) 1)))])
             {:db (assoc-in db [:sessions id :input] "")})
 
-        (and id (or (seq (str/trim txt)) (seq atts)))
+        sending?
         (do
           ;; sending is an explicit "take me to the latest" — re-pin even if the
           ;; reader had scrolled up
@@ -1075,6 +1154,15 @@
 (rf/reg-sub :socket-path (fn [db _] (:socket-path db)))
 (rf/reg-sub :retry (fn [db _] (:retry db)))
 (rf/reg-sub :bootstrap-needed? (fn [db _] (:bootstrap-needed? db)))
+;; The toolbar's way BACK to the landing. Shown only when there is something to go
+;; back to: the landing was left this session (`:bootstrap-dismissed?`, set by
+;; "Start chatting" or by sending anything) AND we are on the project the landing
+;; belongs to. Without that gate the button would sit on every project's toolbar
+;; forever and offer to show ouroboros prose over unrelated work.
+(rf/reg-sub :bootstrap-leavable?
+            (fn [db _] (boolean (and (:bootstrap-dismissed? db)
+                                     (let [p (:project (sess-of db (:active db)))]
+                                       (and p (= p (:home-project db))))))))
 (rf/reg-sub :opened? (fn [db _] (boolean (:opened? db))))
 (rf/reg-sub :bootstrap-configured? (fn [db _] (:bootstrap-configured? db)))
 (rf/reg-sub :bootstrap-mcps (fn [db _] (:bootstrap-mcps db)))
@@ -1694,6 +1782,15 @@
                              "bg-slate-800 border-slate-700 text-slate-300"))
                :on-click #(rf/dispatch [:toggle-log])}
       "log"]
+     ;; The getting-started landing is a VIEW, not a one-shot. Sending anything
+     ;; dismisses it so you can SEE the command output you asked for (see `:send`)
+     ;; — this is the way back to the prose, without a restart. Rendered only when
+     ;; it would actually do something (see `:bootstrap-leavable?`).
+     (when @(rf/subscribe [:bootstrap-leavable?])
+       [:button {:title "Show the getting-started page again"
+                 :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
+                 :on-click #(rf/dispatch [:show-bootstrap])}
+        "getting started"])
      ;; (the temporary smooth-scroll pace slider that lived here was removed — the
      ;; pin is now a fixed `smooth-ms`, matching the browser's own smooth scroll.)
      ]))
@@ -1846,12 +1943,17 @@
   It deliberately does NOT steal focus: there is no `:autoFocus`, and the window
   is never raised (main.js excludes `question` from `needsAttention`). The tab
   turns brown with a `?` badge, and the `:ev` `:question` branch echoes the
-  prompt into the transcript, so the question lands in the chat log too."
+  prompt into the transcript, so the question lands in the chat log too.
+
+  The panel only renders when the window IS focused (so it never grabs focus
+  from another application) AND the question's tab is active — mirroring the
+  approval-dialog guard."
   []
-  (let [active @(rf/subscribe [:active])
+  (let [focused @(rf/subscribe [:focused])
+        active @(rf/subscribe [:active])
         sess (get-in @(rf/subscribe [:sessions]) [active])
         qin @(rf/subscribe [:q-input])]
-    (when (and active (:pending-question sess))
+    (when (and focused active (:pending-question sess))
       (let [q (:pending-question sess) sid active
             ans (fn [res] (rf/dispatch [:answer-question sid res]))]
         [:div {:class "mx-3 mb-2 rounded-lg border border-amber-700/60 bg-amber-900/20 p-3 space-y-2"}
@@ -2037,7 +2139,7 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-200 text-xs"
                  :on-click #(rf/dispatch [:dialog-open :models ""])} "Models… (big / small)"]
        [:span {:class "text-[0.7rem] text-slate-500"}
-        "set a SMALL model for /small, and per-slot global defaults"]]
+        "each slot has its own transport + model; set a SMALL model for /small"]]
 
       ;; provider picker — the shipped catalogue (resources/providers.edn, over
       ;; the server's `providers` method). Picking one writes :llm :url to
@@ -2059,7 +2161,7 @@
             (str "current: " (:url cur) (when (:model cur) (str " · " (:model cur))))
             "current: from grog.edn")]
          [:div {:class "text-[0.7rem] text-slate-500"}
-          "writes :llm :url to grog.edn · restart to apply · keys via /secret"]])
+          "writes the BIG slot's transport to grog.edn · applied live · keys via /secret"]])
 
       ;; browse + search + pick. The list comes from the server; a source that
       ;; has never been fetched shows "loading…" and fills in via broadcast.
@@ -2139,23 +2241,26 @@
                  :on-click #(rf/dispatch [:settings-save active in])} "Save"]]]]))
 
 (defn- models-dialog
-  "BIG / SMALL model editor. Two slots, each with its own draft box, its own
-  'also set as the global default' tick, and an Apply; ONE shared catalogue list
-  fills whichever slot is TARGETED (the tabs at the top). This is the dialog
-  `:dialog-open :models` has always seeded state for — the server does the
-  resolution (project manifest, else the global default) and reports the result
-  back as a `model` event, so the dialog can stay open."
+  "BIG / SMALL model editor, ONE SLOT AT A TIME. The dialog opens FOCUSED on the
+  session's active `/big` `/small` slot; the BIG/SMALL tabs switch focus. Each
+  slot owns its OWN TRANSPORT (a provider combo) and its own model — the browsed
+  catalogue is fetched from the FOCUSED slot's transport, so big and small never
+  share an endpoint. Applying writes the project manifest (or, with the tick, the
+  global default) and the server pushes the new slot state back as a `model`
+  event, so the dialog can stay open."
   []
   (let [active @(rf/subscribe [:active])
         sess   (get-in @(rf/subscribe [:sessions]) [active])
         db     @(rf/subscribe [:db])
         slot   (if (= :small (:models-slot db)) :small :big)
-        big    (or (:models-big db) "")
-        small  (or (:models-small db) "")
-        big-g? (boolean (:models-big-global? db))
-        small-g? (boolean (:models-small-global? db))
+        draft  (or (:models-draft db) "")
+        global? (boolean (:models-global? db))
+        info   (get-in db [:model-slots slot])
+        cur-prov (:provider info)
+        cur-url  (:url info)
         src    (effective-source db)
-        pickers (or (seq @(rf/subscribe [:model-sources])) [["local" "Local"]])
+        pickers (slot-sources db)
+        provs  (or (seq @(rf/subscribe [:providers])) [])
         q      @(rf/subscribe [:model-query])
         cat    @(rf/subscribe [:catalogue])
         all    (or (get cat (keyword src)) [])
@@ -2163,47 +2268,67 @@
                  all
                  (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
         loading-src? (some #(= (keyword src) %) (:loading cat))
-        target (if (= :small slot) small big)
-        apply! (fn [s v g] (rf/dispatch [:set-model active v src {:slot s :global g}]))
-        slot-row
-        (fn [s desc v g?]
-          [:div {:class (str "rounded-lg border p-2 space-y-1 "
-                             (if (= s slot) "border-sky-500" "border-slate-700"))}
-           [:div {:class "flex items-center gap-2"}
-            [:button {:class (str "px-2 py-0.5 rounded text-[0.7rem] font-medium "
+        apply! (fn [v] (rf/dispatch [:set-model active (str v) src {:slot slot :global global?}]))
+        slot-tab
+        (fn [s desc]
+          ^{:key s}
+          [:button {:class (str "px-2.5 py-1 rounded text-[0.72rem] font-medium border "
+                                (if (= s slot)
                                   (if (= s :big)
-                                    "bg-amber-500/20 text-amber-300"
-                                    "bg-emerald-500/20 text-emerald-300"))
-                      :title (str "browse the catalogue into the " (name s) " slot")
-                      :on-click #(rf/dispatch [:models-target s])}
-             (str (str/upper-case (name s)) (when (= s slot) " ←"))]
-            [:input {:value v
-                     :placeholder (if (= s :small) "(none — always runs big)" "provider/model")
-                     :on-change #(rf/dispatch [:models-draft s (.. % -target -value)])
-                     :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
-            [:button {:class "px-2 py-1.5 rounded-md bg-sky-500 text-slate-950 text-xs font-medium"
-                      :on-click #(apply! s v g?)} "Apply"]]
-           [:div {:class "flex items-center justify-between text-[0.64rem] text-slate-500"}
-            [:span desc]
-            [:label {:class "flex items-center gap-1 cursor-pointer"}
-             [:input {:type "checkbox" :checked g?
-                      :on-change #(rf/dispatch [:models-global s (.. % -target -checked)])}]
-             "also set as the global default"]]])]
+                                    "bg-amber-500/20 text-amber-300 border-amber-500/50"
+                                    "bg-emerald-500/20 text-emerald-300 border-emerald-500/50")
+                                  "bg-slate-800 border-slate-700 text-slate-300"))
+                    :title desc
+                    :on-click #(rf/dispatch [:models-target s])}
+           (str (str/upper-case (name s)) (when (= s slot) " ←"))])]
     [overlay
      [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[620px] max-h-[88vh] overflow-y-auto"}
       [:div {:class "flex items-center justify-between"}
        [:div {:class "text-slate-200 text-sm font-medium"} "Models"]
        [:div {:class "text-[0.7rem] text-slate-500"} (str "project: " (:project sess))]]
       [:div {:class "text-[0.7rem] text-slate-500"}
-       "BIG runs unless /small is active. A project's own model beats the global default; with no SMALL set, /small still runs BIG."]
-      [:div {:class "space-y-2"}
-       (slot-row :big "runs unless /small is active" big big-g?)
-       (slot-row :small "only when /small is active" small small-g?)]
+       "Each slot runs its OWN transport. BIG runs unless /small is active; a project's own model beats the global default; with no SMALL set, /small still runs BIG."]
 
-      ;; one shared catalogue list, filling the TARGETED slot
+      ;; slot tabs — which slot is being edited (and whose transport is browsed)
+      [:div {:class "flex items-center gap-1"}
+       (slot-tab :big "runs unless /small is active")
+       (slot-tab :small "only when /small is active")
+       [:span {:class "ml-auto text-[0.7rem] text-slate-500"}
+        (str "editing the " (str/upper-case (name slot)) " slot")]]
+
+      ;; the focused slot: its TRANSPORT (provider) + model id + global tick
+      [:div {:class (str "rounded-lg border p-3 space-y-2 "
+                         (if (= slot :big) "border-amber-500/40" "border-emerald-500/40"))}
+       [:div {:class "flex items-center gap-2"}
+        [:span {:class "text-[0.7rem] w-16 text-slate-400"} "transport"]
+        (if (seq provs)
+          [provider-combo provs cur-prov]
+          [:div {:class "text-xs text-slate-500"} "loading…"])]
+       [:div {:class "text-[0.65rem] font-mono text-slate-500 truncate"}
+        (str "endpoint: " (or cur-url "(shared :llm :url)"))]
+       [:div {:class "flex items-center gap-2"}
+        [:span {:class "text-[0.7rem] w-16 text-slate-400"} "model"]
+        [:input {:value draft
+                 :placeholder (if (= slot :small) "(none — always runs big)" "provider/model")
+                 :on-change #(rf/dispatch [:models-draft (.. % -target -value)])
+                 :on-key-down #(when (= "Enter" (.-key %)) (apply! draft))
+                 :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
+        [:button {:class "px-2 py-1.5 rounded-md bg-sky-500 text-slate-950 text-xs font-medium"
+                  :on-click #(apply! draft)} "Apply"]
+        (when (= slot :small)
+          [:button {:class "px-2 py-1.5 rounded-md bg-slate-700 border border-slate-600 text-xs text-slate-300 hover:bg-slate-600"
+                    :on-click #(rf/dispatch [:models-draft (:big-model sess)])
+                    :title "copy the BIG model id into the SMALL box"}
+           "← BIG"])]
+       [:label {:class "flex items-center gap-1 cursor-pointer text-[0.64rem] text-slate-500"}
+        [:input {:type "checkbox" :checked global?
+                 :on-change #(rf/dispatch [:models-global (.. % -target -checked)])}]
+        "also set as the global default"]]
+
+      ;; catalogue for the FOCUSED slot's OWN transport
       [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
        [:div {:class "text-[0.7rem] text-slate-400"}
-        (str "browse — click fills the " (str/upper-case (name slot)) " box, double-click applies")]
+        (str "browse the " (str/upper-case (name slot)) " slot's transport — click fills the box, double-click applies")]
        [:div {:class "flex items-center gap-1"}
         (into [:span {:class "flex items-center gap-1"}]
               (for [[id label] pickers]
@@ -2238,13 +2363,13 @@
                (for [m shown]
                  ^{:key m}
                  [:div {:class (str "px-2 py-1 text-[0.7rem] font-mono cursor-pointer hover:bg-slate-800 "
-                                    (when (= m target) "bg-slate-800 text-sky-300"))
-                        :on-click #(rf/dispatch [:models-draft slot m])
-                        :on-double-click #(apply! slot m false)}
+                                    (when (= m draft) "bg-slate-800 text-sky-300"))
+                        :on-click #(rf/dispatch [:models-draft m])
+                        :on-double-click #(do (rf/dispatch [:models-draft m]) (apply! m))}
                   m])))
        [:div {:class "text-[0.7rem] text-slate-500"}
         (str (count shown) " model" (when (not= 1 (count shown)) "s")
-             " · click fills the " (str/upper-case (name slot)) " box · double-click applies")]]
+             " · click fills the box · double-click applies")]]
       [:div {:class "flex justify-end"}
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Close"]]]]))
@@ -2342,6 +2467,10 @@
            [:code "/secret set LLM_API_KEY <value>"]
            " — type it straight into the composer below. It goes to your OS keychain and stays there; "
            "grog never echoes it back."]
+          [:li "Send it (" [:span {:class "text-slate-100"} "Ctrl+Enter"]
+           ") and this page steps aside for the transcript, so you can read the result — "
+           "\"Stored … \" or the reason it failed. Bring the page back any time with "
+           [:code "getting started"] " on the toolbar."]
           [:li "Restart grog. This page retires the moment the brain is reachable."]]])
 
       ;; slash commands + how to get help

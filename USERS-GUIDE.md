@@ -34,9 +34,9 @@ The location is **platform-aware** and can be overridden with **`GROG_CONFIG_HOM
 
 > **Windows:** grog uses `~/.config/grog` (same as ECA's own `~/.config/eca`).
 
-Secrets and generated files (ECA config, IMAP/Odoo metadata, approved-tools,
-`secrets.edn`) live **in the same config home directory**, so moving to a new
-machine is "copy one folder + set one env var".
+Generated files (ECA config, IMAP/Odoo metadata, approved-tools) live **in the
+same config home directory**, so moving to a new machine is "copy one folder +
+set one env var". Secret VALUES are not there — they live in the OS keyring.
 
 > `~/.config/grog/grog.edn` is honored even when `$GROG_CONFIG_HOME` points
 > elsewhere.
@@ -126,8 +126,7 @@ like a packaged install.)*
 ```clojure
 {:llm {:url "http://localhost:11434/v1"      ; OpenAI-compatible /v1 endpoint
        :model "qwen3.5:9b"                    ; model id
-       ;; optional: inline key or ${ENV} reference (prefer keyring / file store)
-       ;; :api-key "${LLM_API_KEY}"
+       ;; no :api-key — keys live in the OS keyring:  /secret set LLM_API_KEY
        ;; optional: connection/read timeouts (seconds)
        ;; :conn-timeout-sec 60
        ;; :socket-timeout-sec 300
@@ -163,8 +162,9 @@ like a packaged install.)*
 
 ## 4. Secrets
 
-grog stores secrets in a **secret store** — the OS keyring when available, with
-an automatic **file fallback** for headless/remote systems.
+grog stores secrets in the **OS keyring** — macOS Keychain, Windows Credential
+Manager, Linux Secret Service / KWallet. A secret value is never written to a
+file.
 
 > **Rule of thumb:** never paste a real API key/token/password into `grog.edn`
 > or a committed file. Use `/secret`.
@@ -175,15 +175,15 @@ an automatic **file fallback** for headless/remote systems.
    - **Linux**: Secret Service (GNOME Keyring / KWallet) via D-Bus.
    - **Windows**: Credential Manager.
    - **macOS**: Keychain.
-2. **File fallback** (automatic): when the keyring is unsupported or
-   unreachable — headless Linux, SSH/WSL sessions, containers — grog reads and
-   writes `<config-home>/secrets.edn`. The file is created with owner-only
-   permissions where the OS supports it and lives **outside the repo**
-   (default `~/.config/grog/secrets.edn` on every OS; Windows uses the same
-   `.config` path).
+A secret VALUE is never written to a file — a key sitting in a config file is a
+leak waiting to be committed or synced. If no keyring is reachable — headless
+Linux, SSH/WSL, containers — a `/secret set` **fails with a clear error**; fix
+the keyring and retry. grog gives the keyring ~4s before declaring it
+unreachable.
 
-You never choose which backend — grog tries the keyring first and falls back
-automatically if it can't answer in ~4s.
+Only secret **names** ever appear in `.edn`: `secret-ledger.edn` (names grog
+created, so `/reset` can remove exactly those) and `:secrets {:accounts […]}` in
+`grog.edn`.
 
 ### 4.2 Built-in accounts
 
@@ -198,18 +198,17 @@ In **chat** (GUI or terminal):
 
 ```text
 /secret                       # list accounts + set/unset status (values never printed)
-/secret set LLM_API_KEY sk-...   # store a key (both backends)
+/secret set LLM_API_KEY sk-...   # store a key (OS keyring)
 /secret BRAVE_SEARCH_API ...     # alternative form — same effect
-/secret rm LLM_API_KEY           # remove from keyring and file store
-/secret file                     # show the fallback file path
-/secret backend                  # show which backend is active
+/secret rm LLM_API_KEY           # remove from the keyring
+/secret backend                  # show the keyring status
 ```
 
 **In the GUI**: Settings → Models → **Set default API key…** (or Clear API key).
 
-> Detecting which backend is in use is easy: `Startup banner` or `/secret`.
-> If it shows "file fallback" and you expected the keyring, make sure a Secret
-> Service (e.g. `gnome-keyring-daemon`) is running / unlocked in your session.
+> `Startup banner` or `/secret` show the keyring status. If it says the keyring
+> is unreachable, make sure a Secret Service (e.g. `gnome-keyring-daemon`) is
+> running and unlocked in your session.
 
 ### 4.4 Custom secret accounts
 
@@ -273,8 +272,7 @@ That's all you need for any OpenAI-compatible cloud provider.
   next launch, and the installer never downloads a second copy when one is
   already present. If it's somewhere else, set `:eca :binary` to the full path
   (e.g. `C:\Users\you\scoop\shims\eca.exe`).
-- **Secret backend**: Windows Credential Manager; falls back to
-  `~/.config/grog/secrets.edn` automatically if needed.
+- **Secret backend**: Windows Credential Manager.
 - **Tip**: set `GROG_CONFIG_HOME` once in the user environment if you'd rather
   keep config in a single folder you copy around.
 
@@ -285,7 +283,7 @@ That's all you need for any OpenAI-compatible cloud provider.
 - **Log files**: same rule as Windows — `<base>.<pid>.log`, where `<base>` is
   `$GROG_LOG` else `~/grog`.
 - **Secret backend**: Secret Service if a desktop session with a keyring is
-  running; otherwise falls back to `~/.config/grog/secrets.edn`.
+  running; without one, `/secret` reports the keyring unreachable.
 
 ---
 
@@ -315,11 +313,11 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | "grog: LLM request failed: connection refused" | Is your local server running? Is `:llm :url` correct (`http://localhost:11434/v1`)? |
 | 401 Unauthorized | Missing/incorrect key. `/secret set LLM_API_KEY …` or set `:api-key`, then restart. |
 | "No API key found" in failure hint | Same as above. |
-| "OS keyring did not respond within 4s" | On Linux: ensure a Secret Service is running. The file store takes over automatically. |
+| "OS keyring did not respond within 4s" | On Linux: ensure a Secret Service is running and unlocked; `/secret` reports the keyring unreachable until it is. |
 | `with_api_key` says "secret not set in store" | Store it with `/secret set <ACCOUNT> …` and confirm the account is in `:with-api-key :allowed-secrets`. |
 | Config changes "not applied" | grog reads config at startup. After editing `grog.edn`, restart (or use `/soul reload` where applicable). |
 | Windows: no config found | Your user `grog.edn` should be under `C:\Users\you\.config\grog\` (not AppData). |
-| Where's my `secrets.edn`? | `/secret file` prints its absolute path. |
+| Where are my secrets? | Only in the OS keyring — `/secret backend` reports it; values are never written to a file. |
 | Where's my client log? | `<base>.<pid>.log` — base is `$GROG_LOG` else `~/grog` (`%USERPROFILE%\grog`). The newest file is the running instance; the client prints its path at startup (`[grog-client] log file: …`). |
 
 ---
@@ -329,11 +327,10 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | Command | Effect |
 |---|---|
 | `/secret` | list accounts + set/unset status (values never printed) |
-| `/secret set <KEY> <value>` | store a secret (keyring or file fallback) |
+| `/secret set <KEY> <value>` | store a secret (OS keyring) |
 | `/secret <KEY> <value>` | short alias for the above |
 | `/secret rm <KEY>` | delete a secret |
-| `/secret file` | show the fallback store path |
-| `/secret backend` | show active backend |
+| `/secret backend` | show keyring status |
 | `/soul show/path/add/reload` | manage the persistent instructions (SOUL.md) |
 | `/model` | show current model / URL / profiles |
 | `/model reset` | revert session override to config file values |
@@ -350,7 +347,6 @@ In your config home (every OS: `~/.config/grog` — Windows is the same):
 | File | Purpose |
 |---|---|
 | `grog.edn` | your config (user-level) |
-| `secrets.edn` | fallback secret store (owner-only perms) |
 | `secret-ledger.edn` | names of secrets **grog itself wrote** (never values) — lets `/reset` remove exactly those |
 | `eca-config.generated.json` | merged ECA config (JSON — consumed by the ECA binary, which parses JSON) |
 | `odoo-instances.edn` / `imap-accounts.edn` | MCP metadata for Odoo/IMAP servers (EDN; `.json` also read) |
@@ -374,7 +370,7 @@ It removes **only what grog made**:
 | Removed | Note |
 |---|---|
 | the getting-started project (`ouroboros`) | copied into the backup dir first |
-| the config home (`~/.config/grog`) | MOVED into the backup — `grog.edn` and `secrets.edn` survive there |
+| the config home (`~/.config/grog`) | MOVED into the backup — `grog.edn` survives there |
 | saved session configs | they live under the config home |
 | credentials **grog created** | read from `secret-ledger.edn` (§9) and deleted from the keyring |
 

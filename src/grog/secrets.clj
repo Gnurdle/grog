@@ -1,18 +1,19 @@
 (ns grog.secrets
   "OS-backed secrets via [java-keyring](https://github.com/javakeyring/java-keyring)
-  (macOS Keychain, Windows Credential Manager, Linux Secret Service / KWallet)
-  with a **file fallback** so secrets keep working on headless/remote setups
-  where no OS secret backend is reachable (SSH sessions, WSL, containers).
+  (macOS Keychain, Windows Credential Manager, Linux Secret Service / KWallet).
 
   Credentials are addressed by **service** (fixed to `\"grog\"`) and **account**
-  (e.g. `BRAVE_SEARCH_API`, `LLM_API_KEY`).
+  (e.g. `BRAVE_SEARCH_API`, `LLM_API_KEY`) and live ONLY in the OS keyring.
 
-  Storage priority:
-    1. OS keyring — used whenever the backend responds.
-    2. `secrets.edn` in the platform config home (see `grog.platform/config-home-dir`)
-       — used when the OS backend is unsupported, unreachable, or rejects writes.
-       The file is created with owner-only permissions where the OS supports it
-       and lives **outside** the repo (never committed).
+  A secret VALUE is never written to a file. There is deliberately NO `.edn`
+  fallback: a key in a plaintext config file is a leak waiting to be committed,
+  backed up, or synced — and it will be. When no OS secret backend is reachable
+  (headless, SSH, a container), a write FAILS LOUDLY instead of silently
+  downgrading to a file.
+
+  Secret NAMES (never values) may appear in `.edn`: `secret-ledger.edn` records
+  the accounts grog created, and `:secrets {:accounts […]}` in grog.edn declares
+  names for the listing + `with_api_key` allowlist. A name is not a secret.
 
   `/secret` accepts **any** account name. The built-in accounts plus anything
   registered with `refresh-known-accounts!` (from `:secrets {:accounts …}` in
@@ -51,8 +52,6 @@
   "User-registered account defs (from grog.edn `:secrets {:accounts […]}`), added
   by `refresh-known-accounts!`."
   (atom []))
-
-(declare secrets-file)
 
 (defn all-known-secret-defs
   "Built-in plus user-registered secret account definitions."
@@ -98,16 +97,16 @@
   (boolean (when account ((known-account-set) account))))
 
 (def ^:private secret-verbs
-  #{"set" "rm" "del" "delete" "file" "backend" "list"})
+  #{"set" "rm" "del" "delete" "backend" "list"})
 
 (defn redact-secret-command
   "Mask the secret VALUE in a `/secret …` command line so it can be echoed into
   the transcript, logged, and persisted without leaking the credential.
 
   Handles both explicit (`/secret set KEY VALUE`) and short (`/secret KEY
-  VALUE`) forms; a bare `/secret`, `/secret file`, `/secret backend`, `/secret
-  list`, and `/secret rm KEY` carry no secret and pass through unchanged. Any
-  non-`/secret` line is returned as-is, so this is safe to apply to every turn."
+  VALUE`) forms; a bare `/secret`, `/secret backend`, `/secret list`, and
+  `/secret rm KEY` carry no secret and pass through unchanged. Any non-`/secret`
+  line is returned as-is, so this is safe to apply to every turn."
   [s]
   (let [t (some-> s str)]
     (if (nil? t)
@@ -124,26 +123,17 @@
 (defonce ^:private !keyring-unreachable (atom false))
 
 ;; Mirrors what storage backend is currently working, for /secret status + GUI.
-(defonce ^:private !backend (atom :keyring))
-
 (defn backend-status
-  "`{:backend :keyring|:file :reason str|nil :path str}` — which secret backend is
-  currently in use. `:keyring` until proved unreachable; `:file` once the OS
-  backend fails (e.g. headless Linux) so the file fallback takes over."
+  "`{:backend :keyring :reason str|nil}` — the keyring, or why it is unreachable.
+
+  This only REPORTS a broken keyring; it never downgrades storage anywhere else."
   []
   (if @!keyring-unreachable
-    {:backend :file
-     :reason "OS secret backend did not respond / is unsupported"
-     :path (.getPath (secrets-file))}
     {:backend :keyring
-     :path (.getPath (secrets-file))}))
+     :reason "OS secret backend did not respond / is unsupported"}
+    {:backend :keyring}))
 
-;; --- file fallback ---------------------------------------------------------
-
-(defn secrets-file
-  "The fallback secrets file: `<config-home>/secrets.edn` (outside the repo)."
-  ^java.io.File []
-  (io/file (platform/config-home-dir) "secrets.edn"))
+;; --- ledger (NAMES only — never values) ------------------------------------
 
 (defn secret-ledger-file
   "The ledger of secret ACCOUNT NAMES grog itself has written — names only,
@@ -189,48 +179,6 @@
   (try (let [f (secret-ledger-file)] (when (.exists f) (.delete f)))
        (catch Throwable _ nil)))
 
-(defn- harden-file! [^java.io.File f]
-  ;; Best effort: owner-only read/write, no other users, on platforms that
-  ;; support POSIX-style permissions (Windows ignores most of these).
-  (try (doto f
-         (.setReadable true true)
-         (.setWritable true true)
-         (.setExecutable false false))
-       (catch Throwable _ f))
-  f)
-
-(defn- read-secret-file
-  "File contents as `{account password}` (string keys), or nil."
-  []
-  (try
-    (let [f (secrets-file)]
-      (when (.exists f)
-        (let [v (edn/read-string {:eof nil} (slurp f :encoding "UTF-8"))]
-          (into {} (filter (fn [[k x]] (and (string? k) (string? x)))) v))))
-    (catch Throwable _ nil)))
-
-(defn- file-secret ^String [account]
-  (some-> (read-secret-file) (get account) str/trim not-empty))
-
-(defn- write-secret-file!
-  "Persist the whole file map (add/update `account`, or drop it when `value` is
-  nil). Creates the config home if needed, writes atomically, restricts perms."
-  [^String account ^String value]
-  (let [f (secrets-file)
-        cur (or (read-secret-file) {})
-        next (cond-> cur
-               (some? value) (assoc account value)
-               (nil? value)  (dissoc account))
-        tmp (io/file (str (.getPath f) ".tmp"))]
-    (when-let [parent (.getParentFile f)]
-      (.mkdirs parent))
-    (harden-file! tmp)
-    (spit tmp (pr-str (into (sorted-map) next)) :encoding "UTF-8")
-    (io/copy tmp f)
-    (harden-file! f)
-    (when (.exists tmp) (.delete tmp))
-    f))
-
 ;; --- OS keyring access -----------------------------------------------------
 
 (defn- fetch-secret-blocking!
@@ -244,38 +192,31 @@
 
 (defn get-secret
   "Return the secret for `account` under service `grog`, or nil if missing /
-  unsupported / error. Tries the OS keyring first (time-bounded so a hung backend
-  cannot freeze the JVM); falls back to the secrets file when the keyring is
-  unreachable or unsupported (headless Linux, WSL, SSH)."
+  unsupported / error. Reads the OS keyring ONLY (time-bounded so a hung backend
+  cannot freeze the JVM); a secret value never lives in a file."
   ^String [^String account]
   (when-not (str/blank? account)
-    (or
-     (when-not @!keyring-unreachable
-       (try
-         (let [f (future
-                   (try
-                     (fetch-secret-blocking! account)
-                     (catch BackendNotSupportedException _ ::unsupported)
-                     (catch Exception _ ::error)))
-               v (deref f keyring-read-timeout-ms ::timeout)]
-           (cond
-             (= ::timeout v)
-             (do (reset! !keyring-unreachable true)
-                 (reset! !backend :file)
-                 (binding [*out* *err*]
-                   (println "grog: OS keyring did not respond within"
-                            (long (/ keyring-read-timeout-ms 1000))
-                            "s; using file secret store."
-                            "(" (.getPath (secrets-file)) ")"))
-                 nil)
-             (= ::unsupported v)
-             (do (reset! !keyring-unreachable true)
-                 (reset! !backend :file)
-                 nil)
-             (= ::error v) nil
-             :else v))
-         (catch Exception _ nil)))
-     (file-secret account))))
+    (when-not @!keyring-unreachable
+      (try
+        (let [f (future
+                  (try
+                    (fetch-secret-blocking! account)
+                    (catch BackendNotSupportedException _ ::unsupported)
+                    (catch Exception _ ::error)))
+              v (deref f keyring-read-timeout-ms ::timeout)]
+          (cond
+            (= ::timeout v)
+            (do (reset! !keyring-unreachable true)
+                (binding [*out* *err*]
+                  (println "grog: OS keyring did not respond within"
+                           (long (/ keyring-read-timeout-ms 1000))
+                           "s; secrets are unavailable. grog will NOT fall back to a file."))
+                nil)
+            (= ::unsupported v)
+            (do (reset! !keyring-unreachable true) nil)
+            (= ::error v) nil
+            :else v))
+        (catch Exception _ nil)))))
 
 (defn- note-unknown-account!
   "One advisory line for an account grog has not heard of.
@@ -324,9 +265,8 @@
   allowlist is a different thing and stays: `with_api_key` only ever uses
   accounts listed in `:with-api-key :allowed-secrets`.)
 
-  Writes to the OS keyring, silently falling back to the secrets file when no
-  keyring backend is available. Returns
-  `{:backend :keyring|:file :reason str|nil}`."
+  Writes to the OS keyring ONLY. If no backend is available the write THROWS —
+  grog will never store a secret value in a file. Returns `{:backend :keyring}`."
   [^String account ^String password]
   (let [password (unquote-value password)]
     (when (str/blank? account)
@@ -334,74 +274,73 @@
     (when (str/blank? password)
       (throw (ex-info "value must be non-empty" {})))
     (note-unknown-account! account)
-    (note-in-ledger! account)
     (try
       (with-open [^Keyring kr (Keyring/create)]
         (.setPassword kr service-id account password))
       (reset! !keyring-unreachable false)
-      (reset! !backend :keyring)
+      (note-in-ledger! account)
       {:backend :keyring}
       (catch BackendNotSupportedException e
-        (write-secret-file! account password)
-        (reset! !backend :file)
-        {:backend :file :reason (str "no OS secret backend: " (.getMessage e))})
+        (throw (ex-info (str "no OS secret backend available (" (.getMessage e)
+                             "). grog will not write a secret to a file — fix the keyring "
+                             "(Secret Service / KWallet on Linux, Credential Manager on Windows, "
+                             "Keychain on macOS) and try again.")
+                        {:account account})))
       (catch PasswordAccessException e
-        (write-secret-file! account password)
-        (reset! !backend :file)
-        {:backend :file :reason (.getMessage e)})
+        (throw (ex-info (str "the OS secret backend rejected the write ("
+                             (.getMessage e) "). grog will not fall back to a file.")
+                        {:account account})))
       (catch Exception e
-        (write-secret-file! account password)
-        (reset! !backend :file)
-        {:backend :file :reason (.getMessage e)}))))
+        (throw (ex-info (str "could not write the secret to the OS keyring ("
+                             (.getMessage e) "). grog will not fall back to a file.")
+                        {:account account}))))))
 
 (defn delete-secret!
-  "Remove `account` from the OS keyring (best effort) and the secrets file.
+  "Remove `account` from the OS keyring (best effort).
 
   ANY account name is accepted — see `note-unknown-account!`; an undeclared
   name is a no-op advisory, never a rejection. Returns
-  `{:keyring :deleted|:absent|:unavailable :file :removed|:absent}`."
+  `{:keyring :deleted|:absent|:unavailable}`."
   [^String account]
   (when (str/blank? account)
     (throw (ex-info "account (key) is required" {})))
   (note-unknown-account! account)
-  (let [had-file? (some? (file-secret account))
-        _ (when had-file? (write-secret-file! account nil))
-        kr (try
+  (let [kr (try
              (with-open [^Keyring kr (Keyring/create)]
                (.deletePassword kr service-id account)
                :deleted)
              (catch PasswordAccessException _ :absent)
              (catch Exception _ :unavailable))]
-    (when (= :deleted kr)
-      (reset! !backend :keyring))
-    {:keyring kr :file (if had-file? :removed :absent)}))
+    {:keyring kr}))
 
 (defn- keyring-set? [^String account]
   (boolean (some-> (get-secret account) not-empty)))
 
 (defn print-known-secrets-summary!
-  "Print known secret keys and whether each is set in the active store. Never
-  prints values."
+  "Print the KNOWN secret keys — NAME and PURPOSE only. Values are NEVER printed.
+
+  The list is the built-in accounts, any declared in `:secrets {:accounts …}`,
+  and any account grog itself created (the ledger) — so a key you stored shows
+  up even if it was never declared. Whether each is set is shown; its value
+  never is."
   []
   (let [b (backend-status)
-        declared (set (map :account (all-known-secret-defs)))
-        extra (->> (or (read-secret-file) {}) keys (remove declared) sort)]
-    (println (str "Defined secrets (service " service-id "):"))
-    (doseq [{:keys [account description]} (all-known-secret-defs)]
-      (println "  " account "— " description)
-      (println "     store:" (if (keyring-set? account) "set" "unset")))
-    (when (seq extra)
-      (println)
-      (println "Other secrets in the file store (undeclared — still fully usable):")
-      (doseq [a extra]
-        (println "  " a "— store:" (if (keyring-set? a) "set" "unset"))))
+        defs (all-known-secret-defs)
+        desc-of (into {} (map (juxt :account :description) defs))
+        names (distinct (concat (map :account defs)
+                                (sort (ledger-accounts))))]
+    (println (str "Known secrets (service " service-id
+                  ") — names only; values are never shown:"))
+    (doseq [acct names]
+      (println (format "  %-22s %-8s %s"
+                       acct
+                       (if (keyring-set? acct) "[set]" "[unset]")
+                       (or (desc-of acct) "(no declared description)"))))
     (println)
-    (println "Backend:" (if (= :keyring (:backend b))
-                          "OS keyring"
-                          (str "file fallback (" (:path b) ")")))
-    (println "Set with:  /secret set <KEY> <value>   (or /secret <KEY> <value>)")
-    (println "Remove:    /secret rm <KEY>")
-    (println "Locations: /secret file   /secret backend")))
+    (println "Backend:" (str "OS keyring"
+                            (when-let [r (:reason b)] (str " — " r))))
+    (println "Set:    /secret set <KEY> <value>")
+    (println "Remove: /secret rm <KEY>")))
 
 (defn startup-status-line
   "One line for chat startup (Brave / keyring hint). Does not open the keyring —
@@ -409,6 +348,6 @@
   []
   (str "Secrets: service \"" service-id "\""
        (if @!keyring-unreachable
-         (str " — file store active (" (.getPath (secrets-file)) ")")
-         " — OS keyring (file store fallback on headless/remote)")
+         " — OS keyring UNREACHABLE (secrets unavailable)"
+         " — OS keyring")
        "; /secret set <KEY> <value>, /secret rm <KEY>"))

@@ -16,6 +16,7 @@
   , "start:win": "set NODE_ENV=production&& electron ."
   , "source": "NODE_ENV=production GROG_SPINE_CMD=clojure GROG_SPINE_ARGS=\"-M -m grog.server\" electron ."
   , "source:win": "set NODE_ENV=production&& set GROG_SPINE_CMD=clojure&& set GROG_SPINE_ARGS=-M -m grog.server&& electron ."
+  , "test:renderer": "shadow-cljs compile renderer-test && node target/renderer-test.js"
   , "prod": "npm run build && npm start"
   , "dist": "electron-builder --publish never"
   }
