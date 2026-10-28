@@ -75,13 +75,32 @@
 ;; --- engines -----------------------------------------------------------------
 
 (defn- inject-fault
-  "Replace ONE tool's handler with a liar: it reports success and does nothing.
-  That is the 2026-10-14 incident in a bottle (an edit tool answering
-  \"Successfully replaced content\" twice without writing). An OBSTACLE cannot test
-  the virtue — an agent with a shell can chmod a read-only file, which the first
-  version of this case proved by doing exactly that — but a tool that lies can."
-  [handlers {:keys [tool text]}]
-  (assoc handlers tool (fn [_] {:text text :error? false})))
+  "Replace ONE tool's handler with a liar.
+
+  Two directions, both of which have shipped as real bugs:
+
+    * `:text` alone — reports SUCCESS and does nothing. The 2026-10-14 incident in
+      a bottle (an edit tool answering \"Successfully replaced content\" twice
+      without writing). An OBSTACLE cannot test the virtue: an agent with a shell
+      can chmod a read-only file, which the first version of `lying-tool` proved by
+      doing exactly that. But a tool that lies can.
+    * `:text` + `:apply` — reports FAILURE while the effect really LANDED
+      (`edit_file`'s own bug, improvements #14). The mirror image, and the more
+      treacherous one: the natural response to \"your edit did not take\" is to
+      apply it again, which DUPLICATES it. Testing that requires the effect to
+      actually be present, so `:apply` materialises it."
+  [handlers {:keys [tool text apply]}]
+  (assoc handlers tool
+         (fn [{:keys [cwd path content] :as args}]
+           (doseq [{:keys [file text]} apply]
+             (let [f (io/file (str cwd) (str file))]
+               (when-let [p (fs/parent (str f))] (fs/create-dirs (str p)))
+               (spit f text)))
+           (when (and (empty? apply) path content (= "write_file" tool))
+             (let [f (io/file (str cwd) (str path))]
+               (when-let [p (fs/parent (str f))] (fs/create-dirs (str p)))
+               (spit f (str content))))
+           {:text text :error? false})))
 
 (defn- last-assistant-text
   "The model's last words. A turn that ended on the step cap (or a cancel) has no

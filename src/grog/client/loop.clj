@@ -9,7 +9,7 @@
   transport, the MCP client, the coding toolbelt, the approval gate and the
   question channel. What this namespace supplies: the SESSION — per-session
   state, the prompt queue + worker, provider-shaped history, cancel, steer,
-  model/trust slots, and the two blocking bridges (approve, ask) that turn an
+  model/trust, and the two blocking bridges (approve, ask) that turn an
   engine callback into a wire event and wait for the human.
 
   Blocking is the point, not a wart: the loop runs on the session's WORKER
@@ -19,6 +19,7 @@
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [grog.agent.context :as ctx]
             [grog.agent.loop :as loop]
             [grog.agent.mcp :as mcp]
             [grog.agent.tools :as tools]
@@ -40,6 +41,14 @@
 
 (defn- dbg! [& xs]
   (.println System/err (str "[grog-debug] " (apply str (interpose " " (map str xs))))))
+
+(defn- sdbg!
+  "`dbg!` for a line that belongs to ONE session, so it carries the session tag
+  the log pane filters on. Without it, `loop turn:` from four tabs is four
+  identical-looking lines in one file — which is how a hang took an hour to
+  attribute. Keeps the `[grog-debug]` marker, so existing greps still work."
+  [state & xs]
+  (chat/tagged! state "[grog-debug]" (apply str (interpose " " (map str xs)))))
 
 (def ^:private !sessions (atom {}))
 
@@ -79,13 +88,6 @@
   model pick changes the endpoint a turn actually calls rather than only the
   text in the status bar.
 
-  SLOT-AWARE. `:slot` (`:big` by default) selects which transport the resolved
-  model will use — `:small-model :url`/`:small-model :key` for the small slot,
-  `:big-model :url`/`:big-model :key` for the big slot, each falling back to the
-  shared `:llm :url`/`:llm :api-key`. This is what keeps a local model id from
-  being POSTed to OpenRouter, and a remote model id from being POSTed to
-  localhost.
-
   THE CONFIGURED ENDPOINT WINS. `:llm :url` is the url a turn will really call and
   the source of its key, so when it is set, an id whose first segment names some
   OTHER provider is a model id from the configured provider's own catalogue —
@@ -101,21 +103,13 @@
   With no `:llm :url` and no explicit source, the id's own segment is the only
   hint available, and an unresolvable one is REFUSED rather than sent somewhere
   merely plausible — a wrong endpoint is worse than a missing one."
-  [model-id & [source slot]]
+  [model-id & [source _slot]]
   (let [mid (some-> model-id str str/trim not-empty)
-        src (when source (str source str/lower-case not-empty))
+        src (when source (-> source str str/lower-case str/trim not-empty))
         entry (when src (try (providers/by-id src) (catch Throwable _ nil)))
         src-url (when entry (:url entry))
-        cfg-url (try (case slot
-                       :small (config/small-model-url)
-                       :big   (config/big-model-url)
-                       (config/llm-url))
-                     (catch Throwable _ nil))
-        cfg-key (try (case slot
-                       :small (config/small-model-key)
-                       :big   (config/big-model-key)
-                       (config/llm-api-key))
-                     (catch Throwable _ nil))
+        cfg-url (try (config/llm-url) (catch Throwable _ nil))
+        cfg-key (try (config/llm-api-key) (catch Throwable _ nil))
         cfg-prov (when cfg-url (try (models/provider-prefix-for-url cfg-url)
                                     (catch Throwable _ nil)))
         i (when mid (str/index-of mid "/"))
@@ -149,16 +143,77 @@
          :model (or rest-of mid)
          :key (provider-key seg)}))))
 
-;; --- model slots -------------------------------------------------------------
+;; --- the model --------------------------------------------------------------
+;;
+;; ONE model (2026-10-26). This used to resolve a big/small SLOT pair — the
+;; project manifest's `:small-model`, the global `:small-model`, the `/big`
+;; `/small` switch and the `/relay` cascade — and the two extra resolvers below
+;; are all that is left of it. The model is `projects/project-model` (per-project
+;; override) else `config/eca-model` (the global default).
 
-(defn- slot-model [state slot]
-  (let [big @(:big-model state) small @(:small-model state)]
-    (if (and (= :small slot) small) small big)))
+(defn- session-model
+  "The model id a session runs: the project's own, else the global default."
+  [project]
+  (some-> (or (projects/project-model project) (config/eca-model))
+          str str/trim not-empty))
 
-(defn- slot-models [project]
-  (let [q (fn [m] (some-> m str str/trim not-empty))]
-    {:big (q (or (projects/project-model project) (config/eca-model)))
-     :small (q (or (projects/project-small-model project) (config/eca-small-model)))}))
+(defn- model-status
+  "The `:model` event payload — the model id AND where it runs.
+
+  The status line needs the provider beside the model: `qwen3.8-…` on its own
+  does not say it is a local Strata server, and `aion-2.0` does not say
+  openrouter. Both come from the resolved transport, so they are correct even
+  when the model id carries no provider prefix of its own."
+  [model-id source]
+  (let [r (try (resolve-llm model-id source nil) (catch Throwable _ nil))
+        url (:url r)
+        prov (or (some-> source str str/trim not-empty)
+                 (try (models/provider-prefix-for-url url) (catch Throwable _ nil)))
+        label (try (config/model-label {:provider prov :url url :model (or (:model r) model-id)})
+                   (catch Throwable _ (str model-id)))]
+    {:value (or (:model r) model-id)
+     :model (or (:model r) model-id)
+     :url url
+     :provider prov
+     :label label
+     :text (str "model: " label)}))
+
+(defn- session-llm
+  "The transport a turn must ACTUALLY call, taken from the SESSION's own state —
+  the same url/provider/model the status line shows.
+
+  This is the fix for 'grog routes to a model other than the status line'.
+  A turn used to re-resolve its endpoint from the live config on every call
+  (`resolve-llm @:model nil`), while the status line was computed — once — from
+  the transport the PICK resolved to. The two are the same only by luck, and they
+  disagree the moment they can: a pick whose `source` named a provider other than
+  `:llm :url` (the status line says `strata · …` and the turn POSTs to
+  `:llm :url`), or a project pick that rewrote the GLOBAL `:llm :url` under a
+  session that is already running (the status line keeps the old endpoint, the
+  turn silently follows the new one). Either way the user is told one endpoint
+  and billed against another — the reported symptom.
+
+  Pinning is the honest rule: whatever the session advertises is what it runs.
+  `:url` is set once from the resolved pick and only changes when THIS session's
+  model is set again (see `make-session!` and `set-model-fn`), so a config write
+  from another project can no longer move a running session out from under its
+  own status line. The KEY is deliberately re-read here rather than pinned, so a
+  key added with `/secret` takes effect on the next turn; the URL is what must
+  not drift."
+  [state]
+  (let [url (some-> @(:url state) str str/trim not-empty)
+        model (some-> @(:model state) str str/trim not-empty)
+        prov (some-> @(:provider state) str str/trim not-empty)]
+    (if (nil? url)
+      ;; No transport was ever resolved for this session (an unconfigured model,
+      ;; or an id that named no known provider). Fall back to the config — the
+      ;; same resolution `model-status` would have recorded — rather than
+      ;; POSTing to a blank endpoint.
+      (resolve-llm model nil nil)
+      {:url url
+       :model model
+       :key (provider-key prov)})))
+
 
 (defn- abs-path
   "~ and relative paths resolve against `cwd` — the same rule the tools use."
@@ -194,13 +249,17 @@
         ;; An atom of a VECTOR, not a bare vector: the turn's reset must be a
         ;; mutation the send fn can see, since it closes over the atom.
         !loaded-tools (atom [])
-        slots (slot-models project)
+        model (session-model project)
+        mstatus (model-status model nil)
         state (chat/make-state {:project project
+                                ;; the same id the server stamps on the wire —
+                                ;; see `chat/session-tag` for why the log needs it
+                                :session-id id
                                 :chat-id (projects/active-project-chat-id)
-                                :model (:big slots)
-                                :model-slot :big
-                                :big-model (:big slots)
-                                :small-model (:small slots)})
+                                :model (:model mstatus)
+                                :model-label (:label mstatus)
+                                :provider (:provider mstatus)
+                                :url (:url mstatus)})
         {:keys [connected running?]} state
         cwd (or (some-> (projects/project-dir project) str) (System/getProperty "user.dir"))
         !messages (atom [])
@@ -297,20 +356,35 @@
                :error? false
                :image {:media_type mt :base64 b64}})))
 
+        ;; THE STALL KNOBS, resolved once per session: `:llm :socket-timeout-sec`
+        ;; (how long a silent provider is tolerated per attempt) and `:llm
+        ;; :stream-retries` (how many times an attempt that received NOTHING is
+        ;; re-sent). Both were hard-coded in the transport (300s / no retry), so a
+        ;; transient stall killed the turn with a bare `Read timed out` and there
+        ;; was nothing to tune. Every run-turn! in this session — main and
+        ;; subagent — merges these, so a subagent cannot silently keep the old
+        ;; behaviour. `:on-retry` is supplied per call site: only the turn the user
+        ;; is watching should announce its retries.
+        stall-opts
+        (fn [& [overrides]]
+          (merge {:socket-timeout-ms (try (config/llm-socket-timeout-ms)
+                                          (catch Throwable _ 300000))
+                  :stream-retries (try (config/llm-stream-retries)
+                                       (catch Throwable _ 2))}
+                 overrides))
+
         spawn-agent!
         (fn [{:keys [prompt sub-cwd]}]
           ;; a nested loop: isolated message list, NO event fan-out (the parent
           ;; sees only the answer), the SAME approval gate — a subagent must not
           ;; be a way to run a shell command the user would have refused.
           ;;
-          ;; SUBS RUN THE SMALL SLOT. The old call passed the ACTIVE model id
-          ;; (`@(:model state)`) but resolved it against the SMALL transport, so
-          ;; on `/big` a subagent POSTed the big model id to the small endpoint
-          ;; (a local ollama, say) and 404'd. The id and the transport must come
-          ;; from the SAME slot: the small slot when a small model is configured,
-          ;; else the big slot.
-          (let [sub-slot (if @(:small-model state) :small :big)
-                res (loop/run-turn! {:llm (resolve-llm (slot-model state sub-slot) nil sub-slot)
+          ;; SUBS RUN THE SESSION'S MODEL. This used to pick the SMALL slot (and
+          ;; before that, resolve the ACTIVE id against the small transport,
+          ;; which 404'd). There is one model now, so a subagent runs the same
+          ;; one the session does.
+          (let [res (loop/run-turn! {:llm (merge (session-llm state)
+                                                 (stall-opts {:on-retry nil}))
                                      :message (str prompt)
                                      :cwd (or sub-cwd cwd)
                                      :mcp @!mcp
@@ -339,9 +413,9 @@
                 (let [conn (mcp/start! (mcp/server-spec project))]
                   (mcp/handshake! conn)
                   (reset! !mcp conn)
-                  (dbg! "loop: MCP up," (count (mcp/list-tools! conn)) "tools"))
+                  (sdbg! state "loop: MCP up," (count (mcp/list-tools! conn)) "tools"))
                 (catch Throwable e
-                  (dbg! "loop: MCP unavailable:" (.getMessage e))
+                  (sdbg! state "loop: MCP unavailable:" (.getMessage e))
                   (line! state (str "[grog] MCP unavailable — local tools only: " (.getMessage e))))))
             (reset! connected true)))
 
@@ -368,11 +442,41 @@
           (try (project-dialog/append-turn! :user (str text)) (catch Throwable _ nil))
           (try
             (let [t0 (System/currentTimeMillis)
-                  res (loop/run-turn! {:llm (resolve-llm @(:model state) nil @(:model-slot state))
+                  ;; SAY SO when a retry happens — a five-minute silence followed by
+                  ;; an error is the thing that made the original failure
+                  ;; unreadable. Only THIS call site announces: it is the turn the
+                  ;; user is watching. A subagent retries quietly and reports once.
+                  turn-stall-opts
+                  (stall-opts
+                   {:on-retry (fn [{:keys [attempt retries error wait-ms]}]
+                                (line! state (str "[grog] LLM read stalled ("
+                                                  (.getMessage ^Throwable error)
+                                                  ") — retrying in " (long (/ (long wait-ms) 1000))
+                                                  "s (attempt " (inc (long attempt)) " of "
+                                                  (inc (long retries)) ")")))})
+                  res (loop/run-turn! {:llm (merge (session-llm state) turn-stall-opts)
                                        :message (str text)
                                        :cwd cwd
                                        :mcp @!mcp
-                                       :history @!messages
+                                       :history (let [h @!messages]
+                                                  ;; ONE system message, always. The loop
+                                                  ;; prepends `:system` itself, so replaying
+                                                  ;; the previous turn's list verbatim added a
+                                                  ;; SECOND copy of the ~1.6k-token prompt
+                                                  ;; every turn — and `compact-messages`
+                                                  ;; refuses to elide a leading system
+                                                  ;; message, so they accumulated until a long
+                                                  ;; session hit the context wall for no
+                                                  ;; visible reason. `run-turn!` now returns
+                                                  ;; `:messages` with its system message at
+                                                  ;; the head; the session owns the
+                                                  ;; CONVERSATION, the loop owns the SYSTEM.
+                                                  ;; (Roles seen on the wire 2026-10-27:
+                                                  ;; turn 2 sent ["system" "system" "user"
+                                                  ;; "user" "assistant".])
+                                                  (if (= "system" (:role (first h)))
+                                                    (vec (next h))
+                                                    h))
                                        :system loop/default-system-prompt
                                        :cancel !cancel
                                        :steer !steer
@@ -387,9 +491,49 @@
                                        ;; made a documented "unlimited" a hard cap.
                                        :max-steps (try (config/chat-tool-loop-limit)
                                                        (catch Throwable _ nil))
-                                       :max-context-tokens (or (try (config/max-context-tokens)
-                                                                    (catch Throwable _ nil))
-                                                               120000)
+                                       ;; THE CONTEXT BUDGET IS DERIVED FROM THIS
+                                       ;; SESSION'S OWN MODEL. Not a global constant:
+                                       ;; the user switches between a 32k local server
+                                       ;; and a 1M remote one, and one number cannot
+                                       ;; be right for both (too big = a hard 400
+                                       ;; with no answer; too small = a long
+                                       ;; conversation needlessly truncated).
+                                       ;; `context-budget` probes the endpoint that
+                                       ;; the STATUS LINE shows — the same url and
+                                       ;; model this turn POSTs to — and returns nil
+                                       ;; when it cannot learn the window. nil is
+                                       ;; deliberate: no proactive trim, send the
+                                       ;; conversation intact, and let the loop's
+                                       ;; overflow recovery learn the real limit from
+                                       ;; the first refusal. There is NO hardcoded
+                                       ;; fallback here any more: a constant arriving
+                                       ;; as a default IS the bug.
+                                       :max-context-tokens (try (models/context-budget-for
+                                                                 (:url (session-llm state))
+                                                                 (:model (session-llm state)))
+                                                                (catch Throwable _ nil))
+                                       ;; a REAL overflow teaches grog the window.
+                                       ;; The loop hands every refusal here so it can
+                                       ;; be persisted per (url, model) — the
+                                       ;; provider's own ceiling beats any probe, and
+                                       ;; the next turn then starts knowing.
+                                       :on-overflow (fn [{:keys [limit attempt]}]
+                                                      (when limit
+                                                        (try
+                                                          (models/remember-context-window!
+                                                           (:url (session-llm state))
+                                                           (:model (session-llm state))
+                                                           limit)
+                                                          (catch Throwable _ nil)))
+                                                      (line! state
+                                                             (str "[grog] context overflow — "
+                                                                  (if limit
+                                                                    (str "the model's window is " limit
+                                                                         " tokens (learned from the provider)")
+                                                                    "the model's window is unknown")
+                                                                  "; distilling the conversation and retrying"
+                                                                  (when (> (long (or attempt 1)) 1)
+                                                                    (str " (attempt " attempt ")")))))
                                        ;; lazy tool loading: keep the session's
                                        ;; loaded set across turns (and let the
                                        ;; threshold be raised to disable laziness)
@@ -439,15 +583,52 @@
                                              sess-cost (assoc :sessionCost (fmt sess-cost)))})))
               (when-let [reply (not-empty (str/trim (str (:text res))))]
                 (try (project-dialog/append-turn! :assistant reply) (catch Throwable _ nil)))
-              (dbg! "loop turn:" (:status res) "steps=" (:steps res)
+              (sdbg! state "loop turn:" (:status res) "steps=" (:steps res)
                     "ms=" (- (System/currentTimeMillis) t0)))
             (catch Throwable e
               ;; a one-line message is not a diagnosis — the crash that killed a
               ;; real bb-dev turn ("String cannot be cast to Associative") named
               ;; no frame at all. Print the stack into the per-instance log.
               (.printStackTrace e)
-              (dbg! "loop turn failed:" (.getMessage e))
-              (line! state (str "[grog] loop error: " (.getMessage e))))
+              (sdbg! state "loop turn failed:" (.getMessage e))
+              (let [d (ex-data e)]
+                (cond
+                  ;; A CONTEXT OVERFLOW THAT SURVIVED THE LOOP'S OWN RECOVERY.
+                  ;; The loop already distilled twice before giving up, so this is
+                  ;; a model that cannot take the conversation at all. The one
+                  ;; thing that must NOT happen is leaving `!messages` as it was:
+                  ;; the thread survives (nothing is deleted without the user
+                  ;; asking) but the SAME oversized prompt is not re-sent on the
+                  ;; next turn to fail identically. Distil what is stored, SAY so,
+                  ;; and let the user decide whether to continue, switch model or
+                  ;; /clear.
+                  (:overflow? d)
+                  (let [saved (count @!messages)
+                        _ (reset! !messages (ctx/distill @!messages {}))]
+                    (line! state (str "[grog] context overflow: " (.getMessage e)))
+                    (line! state (str "[grog] the conversation is kept — " saved " message(s) were "
+                                      "distilled in place so the next turn can proceed. "
+                                      "Pick a larger-context model with /model, or /clear to start over.")))
+
+                  (:stalled? d)
+                  ;; A STALL IS ITS OWN KIND OF FAILURE and it gets its own line.
+                  ;; `[grog] loop error: Read timed out` (2026-10-22) named no
+                  ;; endpoint, no model, no duration and no next step — the user's
+                  ;; bug report was the exception text, because that was all there
+                  ;; was. The transport now supplies a full sentence; keep the
+                  ;; partial answer if the stall happened mid-stream, since the
+                  ;; user watched it arrive and it should not be thrown away.
+                  (do
+                    (line! state (str "[grog] " (.getMessage e)))
+                    (when-let [p (not-empty (str/trim (str (:partial-text d))))]
+                      (chat/publish! state {:type :content
+                                            :content {:type "text"
+                                                      :text (str p "\n\n*[cut off by the stall above — "
+                                                                   "this is the partial answer]*")}})
+                      (try (project-dialog/append-turn! :assistant p) (catch Throwable _ nil))))
+
+                  :else
+                  (line! state (str "[grog] loop error: " (.getMessage e))))))
             (finally
               (reset! running? false)
               (chat/publish! state {:type :status :value "idle"})))
@@ -461,63 +642,83 @@
           (doseq [[_ p] @!questions] (deliver p {:cancelled true :answer nil}))
           (reset! running? false))
 
+        clear-fn!
+        (fn []
+          ;; `/clear` from the engine's point of view. `grog.chat` drops its
+          ;; `:history` and publishes the transcript wipe; THIS is the part only
+          ;; the adapter can do, because the context a turn replays lives here:
+          ;;
+          ;;   !messages      the conversation the next `run-turn!` prepends to —
+          ;;                  left alone, a "cleared" session still sent every
+          ;;                  prior turn (and every tool result) to the model,
+          ;;                  which is exactly the reported "context isn't reset"
+          ;;   !loaded-tools  tools `tool_search` attached FOR that conversation;
+          ;;                  a fresh one re-searches rather than inheriting them
+          ;;   !tasks         the todo list — a plan for a conversation that is
+          ;;                  gone would otherwise keep being "resumed"
+          ;;   !steer/!cancel leftovers from a stopped turn
+          ;;
+          ;; NOT reset: `!mcp` (a transport, not context — and restarting it per
+          ;; `/clear` would be a subprocess churn the user never asked for) and
+          ;; the `:usage` session totals (money already spent is not unspent;
+          ;; wiping that number would understate the cost of the session).
+          (reset! !messages [])
+          (reset! !loaded-tools [])
+          (reset! !tasks [])
+          (reset! !steer [])
+          (reset! !cancel false)
+          (swap! (:usage state) assoc :turn-tokens 0 :turn-cost 0.0)
+          ;; SAY what went, so "cleared" is a checkable claim rather than a hope:
+          ;; the failure mode this fixes is a wipe that looked like it worked.
+          ;;
+          ;; `line!` (a PUBLISHED event), not `println`. `println` only reaches the
+          ;; turn's console writer — which the CLI has and a HEADLESS/remote client
+          ;; does not, so the claim was invisible exactly where the state is most
+          ;; hidden. It is a statement about STATE, so it belongs on the wire.
+          (line! state (str "context cleared — 0 prior messages; loaded tools and the todo list "
+                            "reset (MCP connection and cost totals kept)")))
+
         set-model-fn
         (fn [nm source & [opts]]
-          (let [slot (if (= :small (:slot opts)) :small :big)
-                global? (boolean (:global opts))
+          (let [global? (boolean (:global opts))
                 url (some-> (:url opts) str str/trim not-empty)
                 mid (some-> nm str str/trim not-empty)]
-            ;; A pick made against a slot's own transport persists that transport
-            ;; too, so the slot keeps its own endpoint (`[:big-model :url]` /
-            ;; `[:small-model :url]`) instead of silently inheriting the shared
-            ;; `:llm :url`. Applied on the next start (config is file-snapshot).
+            ;; A pick made against a transport persists that transport too, so the
+            ;; model keeps its own endpoint (`[:llm :url]`) instead of silently
+            ;; inheriting a stale one. Applied on the next start (config is
+            ;; file-snapshot).
             (when url
-              (try (models/save-slot-url! slot url)
-                   (catch Throwable e (dbg! "save slot url failed:" (.getMessage e)))))
+              (try (models/save-model-url! url)
+                   (catch Throwable e (sdbg! state "save model url failed:" (.getMessage e)))))
             (when mid
               (try
                 (if global?
-                  (if (= :small slot)
-                    (models/save-eca-small-model! mid)
-                    (models/save-eca-model! mid))
-                  (if (= :small slot)
-                    (projects/set-project-small-model! project mid)
-                    (projects/set-project-model! project mid)))
-                (catch Throwable e (dbg! "save model failed:" (.getMessage e)))))
+                  (models/save-eca-model! mid)
+                  (projects/set-project-model! project mid))
+                (catch Throwable e (sdbg! state "save model failed:" (.getMessage e))))
+              ;; RECENTS: every pick lands at the front of the LRU shortlist, so
+              ;; the models you actually switch between are one click away next
+              ;; time. `source` is the picker's PLACE, which is not a provider —
+              ;; record the resolved provider instead so the entry can be
+              ;; LABELLED without re-deriving it.
+              (try
+                (let [r (resolve-llm mid source nil)]
+                  (models/push-recent! (:url r) (:model r)
+                                       (models/provider-prefix-for-url (:url r))))
+                (catch Throwable e (sdbg! state "recents push failed:" (.getMessage e)))))
             (when mid
-              (reset! (if (= :small slot) (:small-model state) (:big-model state)) mid)
-              (let [effective (slot-model state @(:model-slot state))]
-                (reset! (:model state) effective)
-                (chat/publish! state {:type :model
-                                      :value effective
-                                      :slot @(:model-slot state)
-                                      :big @(:big-model state)
-                                      :small @(:small-model state)
-                                      :text (str "model: " effective)})
-                (let [r (resolve-llm effective source slot)]
-                  (line! state (str (if global? "global " "project ") (name slot)
-                                    " model set: " mid
+              (let [ms (model-status mid source)]
+                (reset! (:model state) (:model ms))
+                (reset! (:model-label state) (:label ms))
+                (reset! (:provider state) (:provider ms))
+                (reset! (:url state) (:url ms))
+                (chat/publish! state (assoc ms :type :model))
+                (let [r (resolve-llm mid source nil)]
+                  (line! state (str (if global? "global " "project ")
+                                    "model set: " (:model ms)
                                     " → " (:url r) " · " (:model r)
                                     (when-not (:key r) "  [NO KEY — set one with /secret]"))))))))
         set-model-1 (fn [nm] (set-model-fn nm nil))
-
-        set-slot-fn
-        (fn [slot]
-          (let [slot (if (= :small slot) :small :big)
-                small @(:small-model state)
-                effective (slot-model state slot)]
-            (reset! (:model-slot state) slot)
-            (reset! (:model state) effective)
-            (chat/publish! state {:type :model
-                                  :value effective
-                                  :slot slot
-                                  :big @(:big-model state)
-                                  :small small
-                                  :text (str "model: " effective)})
-            (line! state (if (and (= :small slot) (not small))
-                           "model slot: small — no small model configured, running big"
-                           (str "model slot: " (name slot)
-                                (when effective (str " (" effective ")")))))))
 
         set-trust-fn
         (fn [on?]
@@ -526,6 +727,43 @@
             (chat/publish! state {:type :trust :value next})
             (line! state (str "trust (yolo) mode: "
                               (if next "ON — tool calls auto-approved" "off")))))
+
+        ;; `/model` inside a session: resolve what the user typed against the
+        ;; numbered recents list / profiles / a raw id, then switch for real
+        ;; (the same path a picker click takes, recents push included).
+        model-command-fn
+        (fn [line]
+          (let [m (re-matches #"(?i)^/model(?:\s+(.*))?$" (str/trim (str line)))
+                tail (str/trim (str (or (second m) "")))]
+            (if (= "reset" (str/lower-case tail))
+              (line! state "No session override to clear — grog runs the configured model. Use /model <n> or /model <name>.")
+              (let [c (try (config/resolve-model-choice tail) (catch Throwable _ {:kind :list}))]
+                (case (:kind c)
+                  :list
+                  (do (line! state (str "current: " (or @(:model-label state) @(:model state) "unset")))
+                      (let [choices (try (config/model-choices) (catch Throwable _ []))]
+                        (if (seq choices)
+                          (line! state (str "  " (str/join "   "
+                                                           (map (fn [{:keys [n label current?]}]
+                                                                  (str n ". " label (when current? " (current)")))
+                                                                choices))))
+                          (line! state "no recents yet — pick one in Settings → Models…, or /model <name>"))))
+
+                  :unknown
+                  (line! state (str "no model numbered " (:n c) " — the list has " (:max c)
+                                    " entries; run /model to see them"))
+
+                  :choice
+                  ;; set-model-fn persists the pick, updates the session state and
+                  ;; pushes the recents entry. `source` is nil: the id carries its
+                  ;; own provider, or keeps the configured transport.
+                  (set-model-fn (:model c) nil
+                                (cond-> {}
+                                  (:url c) (assoc :url (:url c))
+                                  ;; a numbered recent was, by definition, a
+                                  ;; deliberate choice — write it globally so it
+                                  ;; survives a project switch.
+                                  (:from-recent? c) (assoc :global true))))))))
 
         disconnect-fn!
         (fn []
@@ -542,13 +780,14 @@
         {:id id :project project :state state :queue queue
          :approvals !approvals :questions !questions :steer !steer :messages !messages
          :connect! connect-fn! :disconnect! disconnect-fn! :stop! stop-fn!
-         :set-model! set-model-fn :set-model-slot! set-slot-fn :set-trust! set-trust-fn}]
+         :set-model! set-model-fn :set-trust! set-trust-fn}]
     (.start (chat/chat-worker! state queue
                                {:send send-fn
                                 :set-model! set-model-1
                                 :set-yolo! set-trust-fn
-                                :set-model-slot! set-slot-fn
+                                :model-command! model-command-fn
                                 :console console
+                                :clear! clear-fn!
                                 :quit! quit!}))
     sess-map))
 
@@ -587,7 +826,6 @@
   (set-model! [_ id model] ((:set-model! (sess id)) model nil))
   (set-model! [_ id model source] ((:set-model! (sess id)) model source))
   (set-model! [_ id model source opts] ((:set-model! (sess id)) model source opts))
-  (set-model-slot! [_ id slot] ((:set-model-slot! (sess id)) (keyword slot)))
   (set-trust! [_ id on?] ((:set-trust! (sess id)) on?))
   (subscribe! [_ id f] (chat/subscribe! (:state (sess id)) f))
   (unsubscribe! [_ id f] (chat/unsubscribe! (:state (sess id)) f)))

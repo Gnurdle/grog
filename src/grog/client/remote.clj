@@ -157,7 +157,15 @@
               (reset! (:status state) (str v))
               (reset! (:running? state) (not= "idle" (str v))))
     :trust (reset! (:trust state) (boolean (:value ev)))
-    :model (reset! (:model state) (:value ev))
+    :model (do (reset! (:model state) (:value ev))
+               ;; the model event also carries WHERE it runs — the provider and
+               ;; the label the status line shows beside the id.
+               (when (contains? ev :label)
+                 (reset! (:model-label state) (:label ev)))
+               (when (contains? ev :provider)
+                 (reset! (:provider state) (:provider ev)))
+               (when (contains? ev :url)
+                 (reset! (:url state) (:url ev))))
     nil))
 
 (defn- fan-out!
@@ -208,8 +216,10 @@
 
 (defn- shadow-state
   "A local grog.chat state seeded from the server's open snapshot."
-  [{:keys [project chat-id model status trust usage connected running?]}]
-  (let [st (chat/make-state {:project project :chat-id chat-id :model model})]
+  [{:keys [project chat-id model model-label provider url status trust usage
+           connected running?]}]
+  (let [st (chat/make-state {:project project :chat-id chat-id :model model
+                             :model-label model-label :provider provider :url url})]
     (when status (reset! (:status st) (str status)))
     (reset! (:trust st) (boolean trust))
     (when usage (reset! (:usage st) usage))
@@ -265,10 +275,8 @@
   (set-model! [_ id model source opts]
     (call "set-model" (cond-> {:id id :model model}
                         source (assoc :source (str source))
-                        (:slot opts) (assoc :slot (name (:slot opts)))
                         (:url opts) (assoc :url (str (:url opts)))
                         (:global opts) (assoc :global true))))
-  (set-model-slot! [_ id slot] (call "set-model-slot" {:id id :slot (name slot)}))
   (set-trust! [_ id on?] (call "set-trust" {:id id :on (boolean on?)}))
   (subscribe! [_ id f]
     (when-let [{:keys [subs]} (get @!sessions id)]

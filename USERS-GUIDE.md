@@ -130,9 +130,11 @@ like a packaged install.)*
        ;; optional: connection/read timeouts (seconds)
        ;; :conn-timeout-sec 60
        ;; :socket-timeout-sec 300
-       ;; optional: token budget / tool-result cap
-       ;; :max-context-tokens 200000
+       ;; optional: cap individual tool results
        ;; :max-tool-result-chars 50000
+       ;; optional: LOWER the context budget (it is derived from the model's window
+       ;; automatically; a prompt that does not fit is distilled and retried, never fatal)
+       ;; :max-context-tokens 60000
        ;; optional: temperature, max output tokens
        ;; :temperature 0.7
        ;; :max-tokens 4096

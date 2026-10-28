@@ -29,9 +29,12 @@ left out (several were, and the sources list says what they were).
 | 11 | Background memory consolidation (`/dream`) | `autoDream.ts` | 🅿️ |
 | 12 | Hooks (PreToolUse / PostToolUse / Stop) | hook system | ⬜ |
 | 13 | Self-verifying `edit_file` (already grog's, mine the general rule) | — | ✅ exists |
-| 14 | `edit_file`'s own verification is wrong when the edit contains the anchor | — | 🔜 (bug) |
+| 14 | `edit_file`'s own verification was decided by an anchor COUNT | — | ✅ 2026-10-23 |
 | 15 | Explicit stop conditions in the task, not just a step cap | stop conditions | 🅿️ (b) done |
 | 16 | Conditional autonomy (asks when a human is present, runs when not) | cooperative/headless modes | ⬜ |
+| 17 | A stalled stream: retry before data, diagnose after it | retry/backoff on transient transport failure | ✅ 2026-10-22 |
+| 18 | One model + recents (the big/small slots and relay are gone) | — (grog's own) | ✅ 2026-10-26 |
+| 19 | Context overflow: derive the budget per model, and DISTILL + RETRY instead of dying | — (grog's own) | ✅ 2026-10-28 |
 
 ---
 
@@ -295,39 +298,59 @@ rule applied to the verifier itself.
 
 ---
 
-## 🔜 #14 — `edit_file`'s verification is wrong when the replacement contains the anchor (a BUG, hit twice on 2026-10-19)
+## ✅ #14 — `edit_file`'s verification was decided by an anchor COUNT (fixed 2026-10-23)
 
-**What happened.** On 2026-10-19, editing a file by appending a line *below* the
-anchor made `edit_file` answer:
+**The shape of the bug.** For two years' worth of sessions this tool has asked the
+wrong question. A self-verifying writer must prove the **effect** — the bytes on
+disk are what we set out to write — and `edit_file` instead graded itself on a
+derived statistic, *how many times the anchor still appears in the re-read file*.
+That statistic is a property of the **replacement text**, not of whether the edit
+happened, so every rule built on it eventually rejects a correct edit:
 
-> `EDIT FAILED VERIFICATION … No success is being claimed. written=N read-back=N anchor-remaining=1 new-occurrences=1`
+| rule | fails on |
+|---|---|
+| `(zero? old-left)` — original | any edit that keeps its anchor: the ordinary "append a line below" → reported failure for a landed write (hit twice 2026-10-19) |
+| `(<= old-left n-before)` — the first fix | any `new_content` **containing** the anchor: replacing `a` with `aa` → reported failure for a landed write (measured 2026-10-23) |
 
-…while the bytes **had** landed and `grep` confirmed them. It happened twice in one
-session, each time reading as churn in the transcript.
-
-**The defect.** The success test is
-
-```clojure
-(if (and ok? (or all_occurrences (zero? old-left))) (ok …) (bad …))
-```
-
-`old-left` is "how many times does the anchor still appear in the re-read file". An
-edit that ADDS text around the anchor leaves the anchor present — so `old-left` is
-1, and a perfectly good write is reported as a failed verification. `written=`
-`read-back=` being equal is the proof the write landed, and the code even prints it
-in the failure message.
+`written=` `read-back=` being equal was the proof the write landed, and the code
+printed it *inside* the failure message.
 
 **Why it matters more than it looks.** This is the inverted twin of the incident
 `tools.clj` was written to prevent. That tool lied "success" while doing nothing;
-this one tells the truth in the file and lies in the report. Both cost trust. An
+this one told the truth in the file and lied in the report. Both cost trust, and an
 agent that re-does a landed edit because the tool claimed failure will eventually
 **duplicate** it.
 
-**Do.** The check should be: the file now equals `want` (`ok?`), AND (for a
-non-`all_occurrences` edit) the anchor's occurrence count did not *increase*, AND
-the new text is present. Concretely, `old-left` should be compared against its
-count **before** the edit, not against zero. Add a test case to `evals/` — this is
-exactly the `:claim-matches-state` shape, inverted.
+**The fix (2026-10-23).** `ok?` — `(= want got)` — IS the verdict. It is sound
+rather than a relaxation: `want` is computed from `text`, which was read and
+checked for a present, unambiguous anchor *before* the file was touched, so
+`(= want got)` proves the edit landed — and it still catches 2026-10-14 (there
+`got` = `text` ≠ `want`). The anchor counts are now **diagnostics**, reported in the
+failure text as evidence, never asserted on. The threshold-free rule generalises:
+*if the last two attempts to fix a check both made it stricter or looser in one
+direction, the check is measuring the wrong thing.*
+
+Two more changes in the same function:
+
+- **A no-op is no longer reported as a replacement.** `edit_file` with an anchor
+  and `new_content` that change nothing used to answer *"1 replacement(s), verified
+  by reading it back"* for a file that did not move — the same lie in miniature. It
+  now says `NO CHANGE` so the model re-reads instead of believing it changed
+  something.
+- **The message names what was measured** (`1 replacement(s)`, or the real count
+  under `all_occurrences`).
+
+**Tests.** `scripts/edit-file-verify-test.clj` — 19 checks over the REAL
+`edit-file*` with real temp files (append-below, replacement-containing-anchor,
+removal, re-add, prepend, `all_occurrences`; refusals leave the file untouched; a
+no-op is a no-op; an unwritable file is still caught, so the fix did not buy
+credulity). **Proved discriminating, not decorative**: reverted to the previous
+code, the same file reports **2 FAILURES** (the anchor-containing replacement and
+the no-op); with the fix, 19/19. Wired into CI's agent-loop offline step.
+
+**Still worth doing:** an evals case of the `:claim-matches-state` shape, inverted —
+"the tool reports a failure and the state says success". The offline test covers the
+verifier; an eval would cover an agent's *response* to a lying report.
 
 ---
 
@@ -387,6 +410,159 @@ up. In a scripted run that is a 10-minute hang for a question nobody can answer.
 **Do.** Pass an explicit `:human-in-the-loop?`; when false, `ask_user` returns
 immediately ("no human is present in this run — decide and record the assumption")
 instead of blocking, and mutations follow the caller's policy without a dialog.
+
+---
+
+## ✅ #17 — A stalled stream: retry before data, diagnose after it
+
+**Done 2026-10-22.** `src/grog/agent/transport.clj` (`stream-chat!`), the knobs in
+`grog.config`, the wiring in `grog.client.loop`, and `scripts/stall-test.clj`
+(22 checks, no model, no network).
+
+**The evidence.** A turn died and the ONLY thing the user could report was the
+seven words the client rendered:
+
+```
+[grog] loop error: Read timed out
+```
+
+The cause was a `java.net.SocketTimeoutException` escaping `stream-chat!` uncaught
+and unretried. The read timeout was **hard-coded to 300000 ms** in the transport
+(ignoring `:llm :socket-timeout-sec`, which existed but only fed the *other*, ECA
+transport in `grog.core`), there was no retry, and the exception's own message was
+the entire diagnosis. Endpoint, model, how long it waited, whether any text had
+arrived, and what to raise — all absent, all known to the code that threw.
+
+**What it does.**
+
+- **Retry before data.** An attempt that received **zero** frames is re-sent
+  (`:llm :stream-retries`, default 2 → three tries, 1s then 2s backoff). Nothing
+  was received, so re-sending the identical body cannot duplicate anything. A
+  transient stall is now survivable — the test's turn recovers on the third try.
+- **No retry after data.** Once a frame has arrived the user has watched an answer
+  stream in; re-sending would replay it. Such a stall fails **once**, and the
+  partial answer is carried out on the exception (`:partial-text`) and rendered,
+  rather than thrown away.
+- **A diagnosis.** The failure names the endpoint, the model, the attempt count,
+  the elapsed time, whether it stalled before the first token or mid-answer, and
+  the knob to raise. The original exception is preserved as the cause for the log.
+- **HTTP errors are not stalls.** A 400/401/429 is the request's fault; it is
+  thrown on the first attempt and its body's `error.message` now appears **in the
+  message** (the client renders `getMessage`, so a body kept only in ex-data was
+  never seen).
+
+**Two bugs this found in existing code**, both fixed here:
+
+1. The DSML streaming filter holds back a ~32-char tail so an opening tag split
+   across chunks is recognised — and on a stall that tail was **never flushed**, so
+   the partial answer handed back was silently short (measured: "the answer so
+   far" → "the ans"). The stall path now flushes it.
+2. `:socket-timeout-sec` was documented as the LLM read timeout but the native loop
+   ignored it. The transport now takes `:socket-timeout-ms`, and the client passes
+   it from config, so the documented knob finally does what it says.
+
+**Known limitation.** The retry budget is per **step**, not per turn: a turn whose
+provider stalls intermittently on many steps could still spend several retries. That
+is deliberate — each step is an independent request and a fresh stall is
+independently worth riding out — but it means `:stream-retries` is not a cap on a
+turn's total attempts.
+
+---
+
+## ✅ #19 — A full context distills and retries; it does not kill the thread (2026-10-28)
+
+**The report.** *"It is operationally intolerable to have the thread get DESTROYED
+by overflowing context with no recovery."* It was true, and it was three defects:
+
+1. the budget was a **global constant** (`:llm :max-context-tokens`, default
+   200000) in grog.config plus a 120000 fallback in the loop. One number for every
+   model: 200k against a 32k local server is a hard 400 with no answer, and 200k
+   against a 1M-context model silently elides a conversation that fits fine;
+2. the estimate counted only `:content`, so **tool schemas** (~40 of them, riding
+   every request) and `tool_calls` were invisible — the proactive check could pass
+   on a prompt the server refuses;
+3. when the guess was wrong, the 400 **raised out of the loop**. The turn died,
+   and the caller kept the oversized history — so the NEXT turn re-sent it and died
+   identically. One overflow cost the conversation.
+
+**What it does now.**
+
+- **The budget is DERIVED** (`grog.models/context-budget`): the endpoint's window,
+  minus room to answer. The window comes from the cache → `/models` → `/props`,
+  and the cache is keyed **(url, MODEL)** — a catalogue endpoint serves hundreds of
+  models with different windows over one url, and a url-keyed cache answers for the
+  wrong model the moment you switch. Learned windows persist in
+  `context-windows.edn`.
+- **UNKNOWN means NO GUESS**: nil budget, no proactive trim, send the conversation
+  intact. There is no default constant left to be wrong.
+- **A real refusal is EVIDENCE, not a failure.** `grog.agent.context/parse-overflow`
+  reads the provider's body (Strata/llama.cpp's `context (32768)`, OpenAI's
+  `maximum context length is N`, Anthropic's `prompt is too long`), separating the
+  WINDOW from the PROMPT size — and never calling a 401 an overflow. The loop then
+  **distills** (`grog.agent.context/distill`: system + task + tail, clipped results,
+  images dropped, a ladder of harsher rungs), **remembers** the window the provider
+  named, emits a visible `[context overflow]` line, and **re-sends the same step**.
+  Bounded at two recoveries; a provider that refuses everything gets ONE exception
+  that names both sizes and says `/clear`, `/model`, or shorten.
+- **The thread survives even then**: the client's handler distills the stored
+  messages in place and says so, instead of leaving an oversized history to fail
+  again.
+- The CLI tool loop (`grog.core/chat-with-tools!`, `/jobs`, chron) gets the same
+  recovery, since it has its own transport.
+
+**Tests.** `scripts/context-overflow-test.clj` — 30 checks, no model, no network:
+the estimate counts schemas; compaction and distillation always keep the system +
+task and NAME what they dropped; six real wire messages parse (and a 401 does not);
+the loop's turn SUCCEEDS after a refusal, the second request is measurably smaller,
+`:on-overflow` fires; recovery is bounded at 3 attempts; a 401 is thrown once.
+`scripts/context-window-test.clj` gained the per-(url, model) cache and
+no-default-budget cases. Both wired into CI.
+
+---
+
+## ✅ #18 — One model, and recents (2026-10-26)
+
+**Done 2026-10-26.** The big/small model SLOTS are removed, along with `/big`,
+`/small` and `/relay`. There is one model (`:llm :url` + `:llm :model`), a
+`/model` command that lists and switches, and a **recents** shortlist.
+
+**Why it went.** The slot pair was justified by the relay cascade: a small frontline
+model answering cheap turns and deferring to a big one. It did not work well enough
+to use, and it was not free — it doubled every picker, every config key
+(`:big-model` / `:small-model` / per-project `:small-model`), every wire field
+(`:slot` / `:big` / `:small`), and every status-bar branch, and it made the model
+the user sees depend on a mode they had to remember. The honest summary is that the
+feature's cost was certain and its benefit was not.
+
+**What replaced it.** Two things, each doing one job:
+
+- **`/model`** with no argument prints the current model and the numbered list; `/model <n>`
+  switches to entry n; `/model <name>` takes a `:llm :profiles` entry or a raw id. The
+  numbers printed are the numbers accepted — the current model is always 1.
+- **Recents** — an LRU list in grog.edn (`:llm :recents`, cap `:llm :recents-max`,
+  default 10). Every pick pushes to the front; re-picking an existing entry MOVES it
+  rather than duplicating it, which is what makes the cap an LRU bound and not
+  FIFO. The picker renders it as a click-to-switch shortlist. Each row stores the
+  **pair** `{:url :model}`, so a recent switches transport too.
+
+**The status line names the provider.** A model id alone does not say where it runs
+— `qwen3.8-flash-next-unsloth-ud-q4_k_xl` is a local Strata server, `aion-2.0` is
+OpenRouter, and the same id can exist on two endpoints. The status bar and
+`/model` both render `provider · model`, and the raw endpoint is beside it.
+
+**Compatibility.** The legacy keys are still READ: `:big-model` fills in a
+`:url`/`:model` that `:llm` does not carry (so a config written before this keeps
+its model), and `:small-model` is ignored outright. Nothing writes them any more.
+`set-model-slot` is gone from the wire; a client that calls it gets an
+"unknown method" error rather than silent nonsense.
+
+**Evidence.** `scripts/recents-test.sh` — 22 checks. The discriminating one re-picks
+the OLDEST entry and asserts it moved to the front; **verified by mutation**: a
+FIFO variant (`into (vec kept) [entry]`) fails 3 checks, so the test is not
+decoration. It runs against a throwaway `GROG_CONFIG_HOME` and refuses to run
+without one — the first version of this test set a JVM system property instead,
+which the config loader ignores, and wrote the developer's real `grog.edn`. That
+is recorded in the file's own docstring, because the failure mode is invisible.
 
 ---
 

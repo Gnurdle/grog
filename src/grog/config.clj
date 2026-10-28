@@ -18,6 +18,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.platform :as platform]
+            [grog.providers :as providers]
             [grog.secrets :as secrets])
   (:import (java.io File)))
 
@@ -218,56 +219,192 @@
   [v]
   (some-> v str str/trim not-empty))
 
-(defn slot-map
-  "The grog.edn map for a model SLOT (`:big` / `:small`) — the top-level
-  `:big-model` / `:small-model` map.
+;; --- ONE model, not a big/small pair ---------------------------------------
+;;
+;; grog used to carry two model SLOTS (`:big-model` / `:small-model`), each with
+;; its own transport, and `/big` `/small` switched between them (with `/relay`
+;; running the small one as a frontline that deferred to the big one). It never
+;; earned its keep: it doubled every picker, every config key and every event
+;; field, and the relay cascade it existed for did not work well enough to use.
+;; Removed 2026-10-26 — there is now ONE model: `:llm :url` + `:llm :model`, and
+;; recents (see `recents`) to switch between the ones you use.
+;;
+;; The legacy keys are still READ, as a fallback, so an existing grog.edn keeps
+;; working: `:big-model` fills in a `:url`/`:model` that `:llm` does not carry,
+;; and `:small-model` is ignored outright (it belonged to the removed slot).
 
-  This is the SINGLE place a slot keeps its TRANSPORT (`:url`), its optional
-  `:api-key` and its model id (`:model`) TOGETHER, so each slot is
-  self-contained: the big slot and the small slot never share an endpoint by
-  accident. Empty map when absent."
-  [slot]
-  (let [m (get (grog) (if (= :small slot) :small-model :big-model))]
+(defn- legacy-model-map
+  "The legacy `:big-model` map from grog.edn, or {} — READ-ONLY compatibility.
+
+  This is the old BIG SLOT's self-contained transport. A config written before
+  2026-10-26 has the model there; nothing writes it any more."
+  []
+  (let [m (get (grog) :big-model)]
     (if (map? m) m {})))
 
+(defn- legacy-llm-map
+  "The effective `:llm` map with the legacy `:big-model` folded in UNDERNEATH it,
+  plus any session override on top.
+
+  `:llm` wins wherever it has a value; `:big-model` only fills the gaps. So a
+  config that only ever set `:big-model` keeps its model, and one that sets both
+  keeps `:llm` — the key a user reading their own file would expect to win.
+
+  `:url` AND `:model` ARE ONE UNIT. `:big-model` is a self-contained transport
+  (see `legacy-model-map`), so its model id belongs to ITS url and to no other.
+  Merging it key-by-key produced cross-transport pairings out of perfectly
+  ordinary configs: with `:llm {:url ollama}` and a `:big-model {:url openrouter
+  :model aion-labs/aion-2.0}`, the `:url` came from `:llm` and the `:model` was
+  filled from `:big-model` — an OpenRouter id grafted onto a local port, which
+  cannot resolve and reads as a deliberate choice. So the legacy pair is taken
+  WHOLE, and only when `:llm` names no transport of its own; once `:llm` has a
+  `:url`, its model is the user's business and nothing is grafted in."
+  []
+  (let [llm (effective-llm-cfg)
+        legacy (legacy-model-map)
+        legacy (if (some-> (:url llm) str str/trim not-empty)
+                 {}
+                 (select-keys legacy [:url :model]))]
+    (deep-merge legacy llm)))
+
+(defn model-map
+  "The single effective MODEL map: the legacy `:big-model` (if any) merged under
+  the session-overridden `:llm` block. Empty map when neither is set."
+  []
+  (legacy-llm-map))
+
+(defn- model-fits-transport?
+  "True when `model` can plausibly be run against the configured transport.
+
+  A model id and a transport are ONE choice. An id that names a DIFFERENT
+  provider from the configured url is not \"a model this transport can run\" — it
+  is a leftover from another endpoint, and honouring it produces the pairing the
+  user sees as a bogus model: `openrouter/deepseek/…` sent to a local port looks
+  deliberate and cannot resolve.
+
+  So an id carrying a provider prefix is accepted only when that prefix is the
+  configured transport's own catalogue id. A BARE id (no prefix) is accepted —
+  it is transport-relative by definition, and that is the normal shape of
+  `:llm :model` (see `grog.models/save-model!`),
+  e.g. `moonshotai/kimi-k3` under an openrouter url. An unknown url (no catalogue
+  entry) accepts the bare id and anything unqualified, but still refuses a
+  foreign, recognisable provider prefix — the only case where the mismatch is
+  certain."
+  [model]
+  (let [m (non-blank model)]
+    (if (nil? m)
+      false
+      (let [i (str/index-of m "/")
+            seg (when i (subs m 0 i))
+            seg-entry (when seg (try (providers/by-id seg) (catch Throwable _ nil)))
+            own-id (try (providers/id-for-url (get-in (model-map) [:url]))
+                        (catch Throwable _ nil))]
+        (cond
+          ;; no prefix: transport-relative, always the configured transport's
+          (nil? seg) true
+          ;; the prefix matches the configured transport: its own id
+          (and own-id seg (= (str/lower-case seg) (str/lower-case own-id))) true
+          ;; a prefix that names some OTHER known provider: a foreign pairing
+          seg-entry false
+          ;; an org segment we do not recognise: treat as transport-relative
+          ;; (openrouter catalog orgs look exactly like this)
+          :else true)))))
+
 (defn eca-model
-  "The BIG slot's model id: `:big-model :model`, else the legacy `:eca :model`,
-  else `:llm :model`.
+  "The model id — `:llm :model`, with the legacy `:big-model :model` as a
+  fallback (see `model-map`).
 
   nil when none is set (ECA then falls back to the `defaultModel` in its own
-  ~/.config/eca/config.json)."
-  []
-  (or (non-blank (get-in (grog) [:big-model :model]))
-      (non-blank (get-in (grog) [:eca :model]))
-      (non-blank (get-in (grog) [:llm :model]))))
+  ~/.config/eca/config.json).
 
-(defn eca-small-model
-  "The SMALL slot's model id: `:small-model :model`, else the legacy
-  `:eca :small-model`, else `:llm :small-model`.
-
-  nil when unset, which is the normal case: the feature is opt-in, and with no
-  small model anywhere a session simply keeps running the big model (`/small`
-  is then a no-op, not an error). Mirrors `eca-model` so big and small resolve
-  the same way."
+  The `:eca :model` fallback is honoured only when the id FITS the configured
+  transport (see `model-fits-transport?`). It is a leftover from the era when ECA
+  owned the model, and it is commonly provider-QUALIFIED — so honouring it blindly
+  paired `openrouter/deepseek/…` with whatever `:llm :url` says, e.g. a local
+  server. Returning nil is the honest answer there: the user is told there is no
+  model for this endpoint instead of being handed one that cannot run on it."
   []
-  (or (non-blank (get-in (grog) [:small-model :model]))
-      (non-blank (get-in (grog) [:eca :small-model]))
-      (non-blank (get-in (grog) [:llm :small-model]))))
+  (or (non-blank (get-in (model-map) [:model]))
+      (let [e (non-blank (get-in (grog) [:eca :model]))]
+        (when (model-fits-transport? e) e))))
 
 (defn eca-model-source
-  "Which key `eca-model` took its value from: `:big-model`, `:eca`, `:llm`, or
-  nil.
+  "Which key `eca-model` took its value from: `:llm` (or `:big-model`, the
+  legacy fallback), `:eca`, or nil.
 
   `grog.eca-config` needs this to qualify a config-sourced model correctly: its
-  provider is then whatever the slot's `:url` points at (falling back to
-  `:llm :url`), and saying so explicitly stops an OpenRouter org like
-  `deepseek/…` being read as a native provider of that name."
+  provider is then whatever `:llm :url` points at, and saying so explicitly
+  stops an OpenRouter org like `deepseek/…` being read as a native provider of
+  that name."
   []
   (cond
-    (non-blank (get-in (grog) [:big-model :model])) :big-model
-    (non-blank (get-in (grog) [:eca :model]))       :eca
-    (non-blank (get-in (grog) [:llm :model]))       :llm
+    (non-blank (get-in (model-map) [:model])) :llm
+    (non-blank (get-in (grog) [:eca :model])) :eca
     :else nil))
+
+;; --- recents: the models/providers you actually use -------------------------
+;;
+;; ONE flat LRU list of `{:url :model}` pairs, newest first, persisted in
+;; grog.edn under `:llm :recents`. Picking a model (from the picker, or with
+;; `/model`) pushes it to the front; anything past `:llm :recents-max` (default
+;; 10) is dropped. That is the whole feature: the picker shows the shortlist you
+;; really use instead of an unbounded catalogue you have to search every time.
+
+(def ^:private default-recents-max 10)
+
+(defn recents-max
+  "How many recents to keep — `:llm :recents-max`, default 10. A non-positive
+  value disables the list."
+  []
+  (let [v (get-in (grog) [:llm :recents-max])]
+    (if (and (number? v) (pos? (long v)))
+      (long v)
+      default-recents-max)))
+
+(defn recents
+  "The recents list, newest first, as `[{:url <str> :model <str> :provider <str|nil>}]`.
+
+  `:provider` is derived from `:url` through the shipped catalogue, so an entry
+  can be LABELLED without the reader re-deriving it. Entries are validated and
+  de-duplicated by `[url model]`: a hand-edited grog.edn with a junk row, a
+  duplicate, or a missing key yields a clean list rather than an exception on a
+  status line."
+  []
+  (let [raw (get-in (grog) [:llm :recents])
+        rows (when (sequential? raw) raw)]
+    (->> rows
+         (keep (fn [r]
+                 (when (map? r)
+                   (let [u (non-blank (:url r))
+                         m (non-blank (:model r))]
+                     (when (and u m)
+                       {:url u
+                        :model m
+                        :provider (or (non-blank (:provider r))
+                                      (try (providers/id-for-url u)
+                                           (catch Throwable _ nil)))})))))
+         (reduce (fn [acc r]
+                   (if (some #(and (= (:url %) (:url r)) (= (:model %) (:model r))) acc)
+                     acc
+                     (conj acc r)))
+                 [])
+         (vec))))
+
+(defn model-label
+  "A one-line `provider · model` label for a recents row or the live model.
+
+  This is what the status line shows: the PROVIDER beside the model, because
+  `qwen3.8-flash-next-unsloth-ud-q4_k_xl` on its own says nothing about where it
+  is running, and the same id can exist on two endpoints."
+  [{:keys [provider url model]}]
+  (let [p (or (non-blank provider)
+              (when url (try (providers/id-for-url url) (catch Throwable _ nil))))
+        m (non-blank model)]
+    (cond
+      (and p m) (str p " · " m)
+      m         m
+      p         p
+      :else     "unset")))
 
 (defn eca-provider-overrides
   "`:eca :providers` from grog.edn — provider entries grog merges into the
@@ -324,20 +461,91 @@
                      (or (System/getenv var-name) default-val ""))))))
 
 (defn llm-url
-  "Chat completions POST URL. Use :llm :url."
+  "Chat completions POST URL: `:llm :url`, with the legacy `:big-model :url` as
+  a fallback (see `model-map`)."
   []
-  (let [v (get-in (effective-llm-cfg) [:url])]
+  (let [v (get-in (model-map) [:url])]
     (or (some-> v str str/trim not-empty)
         (throw (ex-info "grog.edn missing required :llm :url"
                         {:path [:llm :url]})))))
 
 (defn llm-model
-  "Model id. Use :llm :model."
+  "Model id: `:llm :model`, with the legacy `:big-model :model` as a fallback
+  (see `model-map`)."
   []
-  (let [v (get-in (effective-llm-cfg) [:model])]
+  (let [v (get-in (model-map) [:model])]
     (or (some-> v str str/trim not-empty)
         (throw (ex-info "grog.edn missing required :llm :model"
                         {:path [:llm :model]})))))
+
+(defn model-choices
+  "The current model followed by the recents, as a numbered list
+  `[{:n <int> :url <str> :model <str> :label <str> :current? <bool>}]`.
+
+  The current model is always entry 1, so `/model 1` is a no-op and the numbering
+  the user reads is the numbering `/model <n>` accepts. A current model that is
+  ALSO in recents is not listed twice — its recent row is simply marked current."
+  []
+  (let [cur-url (try (llm-url) (catch Throwable _ nil))
+        cur-model (try (llm-model) (catch Throwable _ nil))
+        cur {:url cur-url :model cur-model}
+        same? (fn [a b] (and (= (non-blank (:url a)) (non-blank (:url b)))
+                             (= (non-blank (:model a)) (non-blank (:model b)))))
+        rows (vec (cons cur (remove #(same? % cur) (recents))))]
+    (vec (map-indexed
+          (fn [i r]
+            {:n (inc i)
+             :url (:url r)
+             :model (:model r)
+             :label (model-label r)
+             :current? (zero? i)})
+          rows))))
+
+(defn resolve-model-choice
+  "Turn what the user typed after `/model` into a choice.
+
+  `tail` is one of:
+    \"\"        -> `{:kind :list}` — show the numbered list (`model-choices`)
+    \"<n>\"     -> the n-th entry of `model-choices` (1 = the current model), as
+                  `{:kind :choice :url .. :model .. :label ..}`, or
+                  `{:kind :unknown}` when the number is out of range
+    \"<name>\"  -> a `:llm :profiles` entry, else a raw model id, as
+                  `{:kind :choice :url .. :model .. :label ..}`. A profile brings
+                  its own `:url`; a bare id keeps the configured transport."
+  [tail]
+  (let [t (str/trim (str (or tail "")))]
+    (cond
+      (str/blank? t)
+      {:kind :list}
+
+      (re-matches #"\d+" t)
+      (let [n (parse-long t)
+            choices (model-choices)
+            hit (first (filter #(= n (:n %)) choices))]
+        (if hit
+          {:kind :choice :url (:url hit) :model (:model hit) :label (:label hit)
+           :n n :from-recent? (not (:current? hit))}
+          {:kind :unknown :n n :max (count choices)}))
+
+      :else
+      (let [profiles (get-in (grog) [:llm :profiles])
+            pk (or (get (set (keys profiles)) (keyword t))
+                   (get (set (keys profiles)) t))
+            prof (when pk (get profiles pk))
+            p-url (some-> (:url prof) str str/trim not-empty)
+            p-model (some-> (:model prof) str str/trim not-empty)
+            fallback-url (try (llm-url) (catch Throwable _ nil))]
+        (cond
+          prof
+          {:kind :choice
+           :url (or p-url fallback-url)
+           :model (or p-model t)
+           :label (model-label {:url (or p-url fallback-url) :model (or p-model t)})
+           :profile (if (keyword? pk) (name pk) (str pk))}
+
+          :else
+          {:kind :choice :url fallback-url :model t
+           :label (model-label {:url fallback-url :model t})})))))
 
 (defn llm-api-key
   "API key for OpenAI-compatible providers — from the OS keyring, account
@@ -380,6 +588,18 @@
   []
   (* 1000 (long (get-in (effective-llm-cfg) [:socket-timeout-sec] 300))))
 
+(defn llm-stream-retries
+  "How many times an LLM stream attempt that received NOTHING is re-sent before
+  the turn fails. :llm :stream-retries, default 2 (three tries in total).
+
+  Only a stall that got no data at all is retried: nothing was received, so
+  re-sending cannot duplicate an answer, and a dropped connection or a cold
+  endpoint just works. A stall AFTER data arrived is never retried — that would
+  replay the text the user already watched stream in — and is instead reported
+  with the partial text attached."
+  []
+  (max 0 (long (get-in (effective-llm-cfg) [:stream-retries] 2))))
+
 (defn llm-temperature
   "Temperature for LLM requests. Default nil (provider default)."
   []
@@ -397,15 +617,22 @@
   (true? (get-in (effective-llm-cfg) [:debug-response])))
 
 (defn max-context-tokens
-  "Context token budget. When set, oldest non-system messages are dropped before each
-   request so the total stays under this limit. Rough estimate (~4 chars/token).
-   Default 200000 to stay safely under common 256K–262K provider limits."
+  "The user's context-budget OVERRIDE, or nil.
+
+  THERE IS NO DEFAULT, and that is the point. This used to return 200000 when
+  unset, which was a global constant pretending to be a per-model fact: the user
+  runs different models with different windows, and 200k is a hard 400 against a
+  32k local server and a needless truncation against a 1M model. The budget is
+  now DERIVED from the endpoint's own window (`grog.models/context-budget`), and
+  this key is only an override that may LOWER it — set it to bound spend, not to
+  tell grog how big the model is.
+
+  nil = no override. 0/negative/unset = nil (there is no 'disable = 0' any more;
+  nil already means 'no override')."
   []
   (let [v (get-in (effective-llm-cfg) [:max-context-tokens])]
-    (cond
-      (nil? v) 200000
-      (and (number? v) (pos? (long v))) (long v)
-      :else nil)))
+    (when (and (number? v) (not (boolean? v)) (pos? (long v)))
+      (long v))))
 
 (defn tool-search-threshold
   "How many tools a turn may send before the agent loop hides the MCP long tail
@@ -415,53 +642,6 @@
   []
   (let [v (get-in (effective-llm-cfg) [:tool-search-threshold])]
     (when (and (number? v) (pos? (long v))) (long v))))
-
-(defn slot-url
-  "The TRANSPORT url for a model SLOT (`:big` / `:small`): the slot's own
-  `:url` (`:big-model :url` / `:small-model :url`), else the legacy shared
-  `:llm :url`.
-
-  Each slot owns its own endpoint, so the small slot can run a local model
-  (Ollama, llama.cpp, …) while the big slot runs a remote one (OpenRouter, …)
-  without either ever being POSTed to the other's transport."
-  [slot]
-  (or (some-> (get-in (slot-map slot) [:url]) str str/trim not-empty)
-      (llm-url)))
-
-(defn slot-model-id
-  "The model id stored in a SLOT's own map (`:big-model :model` /
-  `:small-model :model`), or nil. This is the raw, unqualified catalog id; its
-  provider is whatever `slot-url` points at."
-  [slot]
-  (some-> (get-in (slot-map slot) [:model]) str str/trim not-empty))
-
-(defn slot-api-key
-  "The API key for a SLOT: the slot's own `:api-key`, else the shared keyring
-  `LLM_API_KEY`. A local endpoint ignores it; a remote one needs it."
-  [slot]
-  (or (some-> (get-in (slot-map slot) [:api-key]) str str/trim not-empty)
-      (llm-api-key)))
-
-(defn small-model-url
-  "URL (transport) for the small model slot. See `slot-url`."
-  []
-  (slot-url :small))
-
-(defn big-model-url
-  "URL (transport) for the big model slot. See `slot-url`."
-  []
-  (slot-url :big))
-
-(defn small-model-key
-  "API key for the small model slot. See `slot-api-key`."
-  []
-  (slot-api-key :small))
-
-(defn big-model-key
-  "API key for the big model slot. See `slot-api-key`."
-  []
-  (slot-api-key :big))
-
 
 (defn max-tool-result-chars
   "Max characters for individual tool results. Results longer than this are truncated

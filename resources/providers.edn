@@ -157,17 +157,29 @@
    :docs "https://lmstudio.ai/docs"
    :note "start its local server from the LM Studio UI"}
 
-  {:id "llamacpp" :label "llama.cpp server" :kind :local
+  {:id "strata" :label "Strata" :kind :local
    :url "http://localhost:8080/v1"
-   :key-env nil :sample "local-model"
-   :docs "https://github.com/ggml-org/llama.cpp"
-   :note "`llama-server` default port; -c and -ngl decide how much fits"}
+   :key-env nil
+   ;; `strata launch` serves whatever model the launch LOADED, and its id is
+   ;; launch-specific — there is no "strata" model id to name here. The old
+   ;; sample said `local-model`, which Strata does NOT answer to (with no
+   ;; `aliases` every request naming it queues against the loaded model and
+   ;; stalls). So the sample is deliberately nil and the real id comes from the
+   ;; running launch's `GET /v1/models` — see `models/live-model-id`, which is
+   ;; what the picker calls for exactly this reason.
+   :sample nil
+   :docs "https://github.com/Niko1221/Strata"
+   :note "`strata launch` serves here; port 8080 is its default. The model id is launch-specific and is NOT \"local-model\" — read the running launch's /v1/models (grog does this for you when you pick Strata)."}
 
   {:id "vllm" :label "vLLM" :kind :local
    :url "http://localhost:8000/v1"
-   :key-env nil :sample "local-model"
+   :key-env nil
+   ;; Same trap as Strata: `vllm serve <model>` serves THAT model, under its own
+   ;; path or `--served-model-name` — there is no generic "local-model" id. nil,
+   ;; so the picker asks the running server for the real one.
+   :sample nil
    :docs "https://docs.vllm.ai"
-   :note "`vllm serve` default port; OpenAI-compatible out of the box"}
+   :note "`vllm serve` default port; OpenAI-compatible out of the box. The model id is whatever you served (or --served-model-name) — read it from /v1/models."}
 
   {:id "litellm" :label "LiteLLM relay" :kind :local
    :url "http://localhost:4000/v1"

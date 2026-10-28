@@ -91,13 +91,73 @@ jobs:
       - name: Provider catalogue test
         run: bb scripts/providers-test.clj
 
-      - name: Agent loop offline tests (stop conditions + repetition guard)
+      # What a MODEL PICK actually writes. The panel sends a PLACE (`local` /
+      # `remote`) or a recents row's own `[url model]`, and the server turns that
+      # into `:llm :url` + `:llm :model`. Two reports came out of not testing it:
+      # a recents click that set the model but not the transport, and a transport
+      # pick that wrote a placeholder id ("local-model") no server answers to.
+      # Needs a throwaway config home (it writes grog.edn), hence the wrapper.
+      - name: Model picker test (what a pick writes)
+        run: ./scripts/model-picker-test.sh
+
+      - name: Model recents test (LRU order, cap, /model)
+        run: ./scripts/recents-test.sh
+
+      - name: Agent loop offline tests (stop conditions + repetition guard + stalls)
         run: |
           clojure -M scripts/stop-condition-test.clj
           clojure -M scripts/tool-search-test.clj
+          clojure -M scripts/stall-test.clj
+          clojure -M scripts/edit-file-verify-test.clj
+
+      # A shell call's timeout must END the call. `run-capture` used to read the
+      # child's stdout through a pipe in a future and deref it unbounded, so a
+      # command that backgrounded a grandchild (start-a-server-and-probe-it, the
+      # ordinary shape) left the pipe open and hung the turn FOREVER — after the
+      # timeout had already "fired". The test measures the wall clock, so a
+      # regression fails rather than hanging the suite.
+      - name: Shell tool timeout is real (no hang on a backgrounded child)
+        run: clojure -M scripts/shell-hang-test.clj
+
+      # One log file per client run holds EVERY tab's spine output, so per-session
+      # lines must carry `[<session-id>]` or the log pane's "this project" scope
+      # silently filters nothing. That tag's emitter (`grog.eca/connect!`) was
+      # deleted with ECA and the filter has been dead since; this pins it.
+      - name: Session tagging (the log pane's per-tab filter)
+        run: clojure -M scripts/session-tag-test.clj
+
+      # The context budget must fit the ENDPOINT's window, not a 200k constant.
+      # A 200k budget against a 32k local server is a hard 400 with no answer
+      # (the reported failure), so the probe + clamp get their own gate — and the
+      # cache is pinned to (url, MODEL), because a url can serve a whole catalogue.
+      - name: Context window clamp (endpoint probe, per-model cache, no model)
+        run: clojure -M scripts/context-window-test.clj
+
+      # AN OVERFLOW MUST NOT DESTROY THE THREAD. If the prompt does not fit, the
+      # loop distills, remembers the ceiling the provider named, and re-sends the
+      # same step; only a provider that refuses everything surfaces an error, and
+      # it says what happened. The fixture refuses exactly as llama.cpp does, so
+      # the recovery path is exercised without a model or a network.
+      - name: Context overflow recovery (distill + re-send, no model)
+        run: clojure -M scripts/context-overflow-test.clj
+
+      # The recents/LRU list: order is the feature, so the test re-picks an
+      # existing entry and asserts it moved to the FRONT (a FIFO list passes
+      # every other check). Run through the wrapper — it supplies the throwaway
+      # GROG_CONFIG_HOME the test refuses to run without.
+      - name: Model recents (LRU) test
+        run: sh scripts/recents-test.sh
+
+      # The mock engine runs no model and costs nothing: every eval case carries an
+      # honest AND a cheat trajectory, and the PAIR is the gate. If the cheat run
+      # ever passes, a check has stopped discriminating and the case is decoration.
+      - name: Eval checks discriminate (mock engine, no model)
+        run: |
+          clojure -M scripts/eval.clj --engine mock --strict
+          ! clojure -M scripts/eval.clj --engine mock --variant cheat --strict
 
       - name: Spine compiles
-        run: clojure -J--add-opens=java.base/java.lang=ALL-UNNAMED -M -e "(require 'grog.server 'grog.config 'grog.models 'grog.chat 'grog.client.local 'grog.eca-config 'grog.doctor) (println :SPINE-OK)"
+        run: clojure -J--add-opens=java.base/java.lang=ALL-UNNAMED -M -e "(require 'grog.server 'grog.config 'grog.models 'grog.chat 'grog.client.loop 'grog.client.remote 'grog.eca-config 'grog.doctor) (println :SPINE-OK)"
 
       - name: Build the MCP bundle jar
         working-directory: grog_mcp

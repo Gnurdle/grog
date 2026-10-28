@@ -36,18 +36,28 @@
         ;; local — no key (run the server yourself)
         :ollama     {:url "http://localhost:11434/v1"                                  :model "qwen3:8b"}
         :lmstudio   {:url "http://localhost:1234/v1"                                   :model "qwen2.5-7b-instruct"}
-        :llamacpp   {:url "http://localhost:8080/v1"                                   :model "local-model"}
-        :vllm       {:url "http://localhost:8000/v1"                                   :model "local-model"}
+        :strata     {:url "http://localhost:8080/v1"                                   :model "qwen3.8-flash-next-unsloth-ud-q4_k_xl"}
+        :vllm       {:url "http://localhost:8000/v1"                                   :model "qwen3.8-flash-next-unsloth-ud-q4_k_xl"}
         :litellm    {:url "http://localhost:4000/v1"                                   :model "gpt-4o-mini"}}}   ; a local relay in front of many providers
 
- ;; PER-SLOT MODELS (optional) — the BIG and SMALL slots each own their TRANSPORT
- ;; and their model id TOGETHER, so they never share an endpoint by accident.
- ;; `/big` runs the big slot, `/small` the small one; the Models… dialog writes
- ;; these. A slot with no map of its own falls back to the shared :llm block (the
- ;; big slot) or is simply unset (the small slot — `/small` then keeps running
- ;; big). Uncomment to set them here instead of the dialog:
- ;;   :big-model   {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k3"}
- ;;   :small-model {:url "http://localhost:11434/v1"    :model "qwen3:8b"}
+ ;; MODEL RECENTS (optional) — the shortlist the picker and `/model` offer, newest
+ ;; first. Every pick (from the dialog, `/model <n>`, or `/model <name>`) is
+ ;; written here, and the least-recently-used entry falls off past the cap. grog
+ ;; keeps this up to date for you; it is written down here so you know it exists
+ ;; (and can hand-edit or clear it). The provider is derived from :url.
+ ;;   :recents [{:url "http://localhost:8080/v1" :model "qwen3.8-flash-next-unsloth-ud-q4_k_xl"}
+ ;;             {:url "https://openrouter.ai/api/v1" :model "aion-labs/aion-2.0"}]
+ ;;   :recents-max 10                             ; how many to keep
+
+ ;; CONTEXT BUDGET (optional, and NOT how big the model is). grog derives the
+ ;; budget per model from the endpoint's own window — it asks /models and /props,
+ ;; and if a prompt is still refused it reads the ceiling out of the provider's
+ ;; error, remembers it per (url, model) in context-windows.edn, distills the
+ ;; conversation and RE-SENDS the same step. Nothing here needs setting for that
+ ;; to work, and there is no default to tune.
+ ;;   :max-context-tokens 60000                   ; an OVERRIDE that may only LOWER
+ ;;                                               ; the budget (to bound spend) —
+ ;;                                               ; it cannot raise it past the window
 
  :babashka {:enabled true}                     ; the run_babashka tool
 

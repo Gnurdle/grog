@@ -105,16 +105,23 @@
        (#(when % (subs % 0 (min 120 (count %)))))))
 
 (defn- run-argv
-  "Run argv, merged stdout/stderr, bounded wait. Never throws."
+  "Run argv, merged stdout/stderr, bounded wait. Never throws.
+
+  The child is killed as a TREE on timeout before its stream is read — a leaked
+  child (or a grandchild that inherited the pipe) would otherwise block the read
+  even though the wait already returned. Same reasoning as
+  `grog.agent.tools/run-capture`."
   [argv timeout-ms]
   (try
     (let [pb (doto (ProcessBuilder. ^java.util.List (mapv str argv))
                (.redirectErrorStream true))
           p (.start pb)
-          done (.waitFor p timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-          out (try (with-open [r (io/reader (.getInputStream p))] (slurp r))
-                   (catch Throwable _ ""))]
-      {:exit (when done (try (.exitValue p) (catch Throwable _ nil))) :output out})
+          done (.waitFor p timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)]
+      (when-not done
+        (try (platform/kill-tree! p) (catch Throwable _)))
+      (let [out (try (with-open [r (io/reader (.getInputStream p))] (slurp r))
+                     (catch Throwable _ ""))]
+        {:exit (when done (try (.exitValue p) (catch Throwable _ nil))) :output out}))
     (catch Throwable e {:exit nil :output (.getMessage e)})))
 
 (defn- probe-dep [{:keys [id names version capability hint required?]}]

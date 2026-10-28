@@ -4,7 +4,8 @@
   (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.config :as cfg])
+            [grog.config :as cfg]
+            [grog.platform :as platform])
   (:import [java.io File IOException]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files]
@@ -88,6 +89,15 @@
       (.put env "TEMP" home)
       (.put env "TMP" home))))
 
+(defn- await-limited
+  "Deref `f` for at most `ms`, returning its value or `fallback` when it is still
+  running. The fallback matters: an unbounded deref is what lets a leaked child
+  (or grandchild holding the pipe) hang the caller after the timeout has already
+  fired."
+  [f ^long ms fallback]
+  (try (deref f ms fallback)
+       (catch Throwable _ fallback)))
+
 (defn- run-bb-process!
   [bb-cmd ^File script-file ^File sandbox stdin-str timeout-sec max-out max-err]
   (let [cmd (into-array String [bb-cmd (.getCanonicalPath script-file)])
@@ -105,16 +115,22 @@
                   (.write os (.getBytes ^String stdin-str StandardCharsets/UTF_8))))
               nil
               (catch IOException e
-                (.destroyForcibly proc)
+                (platform/kill-tree! proc)
                 (json/generate-string {:error "failed writing stdin"
                                        :detail (.getMessage e)})))]
         (if (some? stdin-err)
           stdin-err
           (let [finished (.waitFor proc (long timeout-sec) TimeUnit/SECONDS)]
             (when-not finished
-              (.destroyForcibly proc))
-            (let [stdout (try @out-future (catch Exception e (str "[stdout: " (.getMessage e) "]")))
-                  stderr (try @err-future (catch Exception e (str "[stderr: " (.getMessage e) "]")))]
+              (platform/kill-tree! proc))
+            ;; BOUNDED derefs. A grandchild that inherited the pipe keeps it open
+            ;; after the child is killed, so `@out-future` could block forever —
+            ;; the same failure mode as `grog.agent.tools/run-capture`. Take what
+            ;; the drainer has after a short grace and move on.
+            (let [stdout (await-limited out-future (if finished 5000 2000)
+                                         "[stdout: reader still blocked after timeout]")
+                  stderr (await-limited err-future (if finished 5000 2000)
+                                         "[stderr: reader still blocked after timeout]")]
               (json/generate-string
                (cond-> {:exit_code (if finished (.exitValue proc) -1)
                         :timed_out (not finished)

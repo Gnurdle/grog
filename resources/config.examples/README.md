@@ -65,10 +65,13 @@ same file — add a key when you need it.
       :model  "moonshotai/kimi-k3"          ; grog's OWN model, not the chat's
       :temperature 0.7
       :max-tokens 4096
-      :max-context-tokens 200000            ; token budget; oldest msgs dropped
+      :max-context-tokens 60000             ; OPTIONAL override that may only LOWER
+                                            ; the budget grog derives from the model's
+                                            ; window (there is no default)
       :max-tool-result-chars 50000          ; cap tool-result length
       :conn-timeout-sec 60
       :socket-timeout-sec 300
+      :stream-retries 2                     ; re-send an attempt that received NOTHING
       :provider-name "OpenRouter · DeepSeek"
       :ollama-host "http://localhost:11434" ; used to list local models
       :extra-payload {:transforms ["middle-out"]}

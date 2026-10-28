@@ -276,16 +276,6 @@
   [name]
   (some-> (manifest-for name) :model str str/trim not-empty))
 
-(defn project-small-model
-  "A project's OWN SMALL-slot model, from its manifest `:small-model`, or nil.
-
-  nil is normal: the small slot then falls back to the global small model, and
-  with no small model anywhere the session always runs the big model. The big
-  slot keeps living in `:model` (see `project-model`) so existing manifests and
-  readers are untouched."
-  [name]
-  (some-> (manifest-for name) :small-model str str/trim not-empty))
-
 (defn write-manifest!
   "Write/update a project's `project.edn`, preserving other keys. `m` is a map
   of manifest fields (:description :model :mcp :appearance ...)."
@@ -303,17 +293,6 @@
   [name model]
   (let [m (some-> model str str/trim not-empty)]
     (when m (write-manifest! name {:model m}))
-    m))
-
-(defn set-project-small-model!
-  "Record `model` as `name`'s SMALL-slot model in its manifest (the per-project
-  small default). Returns the model, or nil when it was blank.
-
-  A blank value is a no-op, matching `set-project-model!`: clearing the small
-  slot back to *none* is a deliberate separate act, not an accidental empty box."
-  [name model]
-  (let [m (some-> model str str/trim not-empty)]
-    (when m (write-manifest! name {:small-model m}))
     m))
 
 (defn ensure-project-dir!

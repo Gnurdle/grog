@@ -8,6 +8,7 @@
             [grog.brave :as brave]
             [grog.config :as config]
             [grog.babashka :as babashka]
+            [grog.agent.context :as ctx]
             [grog.chat-context :as chat-ctx]
             [grog.chron :as chron]
             [grog.jobs :as jobs]
@@ -16,6 +17,7 @@
             [grog.md-stream :as md-stream]
             [grog.mcp :as mcp]
             [grog.mcp-store :as mcp-store]
+            [grog.models :as models]
             [grog.projects :as projects]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
@@ -364,7 +366,14 @@
         ;; (headless CLI, /jobs, chron). Bound in this outer scope so the outer
         ;; catch clause can detect a user-initiated stop.
         cancel-state (:cancel-state stream-opts)
-        trimmed-msgs (trim-messages-to-budget messages (config/max-context-tokens))
+        ;; DERIVE the budget from the endpoint's own window (cached probe). There
+        ;; is no configured number any more: `context-budget` returns nil when the
+        ;; window cannot be learned, and nil means DO NOT TRIM — send the
+        ;; conversation intact and let an actual refusal teach us the limit
+        ;; (`chat-with-tools!` handles that by distilling and retrying the round).
+        ;; A constant here was the bug: right for no model in particular.
+        budget (models/context-budget)
+        trimmed-msgs (trim-messages-to-budget messages budget)
         url (str (str/trim (config/llm-url)) "/chat/completions")
         payload (let [base {:model (config/model)
                             :messages trimmed-msgs
@@ -399,8 +408,17 @@
           (let [body-str (try (slurp ^java.io.InputStream (:body resp)) (catch Exception _ nil))]
             (when (config/llm-debug-payload?)
               (binding [*out* *err*] (println "grog: LLM error response:" body-str)))
-            {:ok false :error (str "HTTP " status " " (str/trim (or body-str "")))
-             :live-thinking-printed? false :live-content-printed? false})
+            ;; A CONTEXT OVERFLOW IS CARRIED, not just printed: the round loop
+            ;; (`chat-with-tools!`) can DISTILL and re-send this round, and the
+            ;; ceiling the provider names is the best evidence there is about the
+            ;; real window. Every other non-200 stays a plain failure.
+            (merge {:ok false :error (str "HTTP " status " " (str/trim (or body-str "")))
+                    :live-thinking-printed? false :live-content-printed? false}
+                   (let [o (ctx/parse-overflow status body-str)]
+                     (when o
+                       {:overflow? true
+                        :context-limit (:context-limit o)
+                        :prompt-tokens (:prompt-tokens o)}))))
           (with-open [^java.io.Closeable stream (:body resp)]
             (let [think-buf (StringBuilder.)
                   content-buf (StringBuilder.)
@@ -775,7 +793,11 @@
          iter-max (when tool-limit (inc tool-limit))]
      (loop [msgs messages
             n 0
-            last-thinking nil]
+            last-thinking nil
+            ;; how many times this ROUND has been distilled and re-sent after a
+            ;; real context overflow. Bounded, and each attempt is strictly
+            ;; smaller, so this cannot loop.
+            recoveries 0]
        (mcp/reap-idle-servers!)
        (if (and tool-limit (> n tool-limit))
          {:ok false
@@ -785,10 +807,37 @@
                                     :thinking-iter (inc n)}
                             iter-max (assoc :thinking-max iter-max)
                             (:cancel-state opts) (assoc :cancel-state (:cancel-state opts)))
-               {:keys [ok body error live-thinking-printed? live-content-printed?]}
+               {:keys [ok body error live-thinking-printed? live-content-printed?]
+                :as round}
                (chat-round! msgs tools stream-opts)]
            (if-not ok
-             {:ok false :error error :thinking last-thinking}
+             (if (and (:overflow? round) (< recoveries 2))
+               ;; THE PROMPT DID NOT FIT. That is evidence about the model, not the
+               ;; end of the job: learn the window the provider named, distill the
+               ;; conversation hard, and re-send THIS ROUND. Before this, the
+               ;; overflow was returned as a string, the caller reported it, and
+               ;; the job died with nothing learned.
+               (let [limit (:context-limit round)
+                     _ (when limit
+                         (try (models/remember-context-window! (config/llm-url) (config/model) limit)
+                              (catch Throwable _ nil)))
+                     target (when limit
+                              (max 512 (- (long limit)
+                                          (long (or (try (models/completion-reserve limit)
+                                                         (catch Throwable _ 2048))
+                                                    2048)))))
+                     smaller (ctx/distill msgs {:budget target})]
+                 (binding [*out* *err*]
+                   (println (str "grog: context overflow — distilled " (count msgs) " message(s) to fit "
+                                 (or limit "the model's window") " and retrying this round")))
+                 (if (and (= (count smaller) (count msgs))
+                          (>= (ctx/est-tokens smaller) (ctx/est-tokens msgs)))
+                   ;; Nothing left to shrink: a prompt this small being refused is
+                   ;; not a size problem we can solve here. Report it honestly
+                   ;; rather than looping.
+                   {:ok false :error error :thinking last-thinking}
+                   (recur smaller n last-thinking (inc recoveries))))
+               {:ok false :error error :thinking last-thinking})
              (let [m (:message body)
                    thinking (message-thinking body m)
                    tcalls (message-tool-calls m)
@@ -797,7 +846,8 @@
                (if (seq tcalls)
                  (recur (into (conj msgs m) (tool-result-messages tcalls))
                         (inc n)
-                        (or thinking last-thinking))
+                        (or thinking last-thinking)
+                        recoveries)
                  {:ok true :content content :thinking (or thinking last-thinking)
                   :live-thinking-printed? (boolean live-thinking-printed?)
                   :live-content-printed? (boolean live-content-printed?)
@@ -854,9 +904,18 @@
     :grog.core/quit    — the app should exit
     :grog.core/clear   — caller should clear its history
     :grog.core/handled — a command handler consumed the line
-    :grog.core/llm     — not a command; send it to the LLM"
+    :grog.core/llm     — not a command; send it to the LLM
+
+  TRIM FIRST. The GUI sends what its input box holds, and Enter (or a pasted
+  command) leaves a trailing newline — so the line arrives as `\"/clear\\n\"`. The
+  exact-set match below missed it, the line fell through to `::llm`, and the user
+  watched a 1-step LLM turn answer the WORD `/clear` while the context they asked
+  to drop stayed exactly where it was (seen 2026-10-27: `worker take: \"/clear\\n\"`
+  followed by `loop turn: :done steps= 1`). Every handler here already trims its
+  own argument (`/tools`, `/shell`, `/model`, …); the two exact-set matches were
+  the only ones that did not, so the trim belongs at the dispatch, once."
   [line]
-  (let [lc (str/lower-case line)]
+  (let [lc (-> (str/trim (str line)) str/lower-case)]
     (cond
       (#{"quit" "exit" "/quit" "/exit"} lc)
       ::quit
@@ -898,7 +957,7 @@
   (let [name (config/provider-name)
         url (config/llm-url)
         model (config/llm-model)]
-    (str name " — " model
+    (str name " — " (config/model-label {:url url :model model})
          " @ " url
          (if (config/llm-api-key)
            " (auth: api-key)"
@@ -922,7 +981,7 @@
     ""
     "Config merges: resources/grog.edn → user grog.edn (~/.config/grog/grog.edn or $XDG_CONFIG_HOME, Windows C:\\Users\\<you>\\.config\\grog\\grog.edn; override with $GROG_CONFIG_HOME). There is no ./grog.edn fragment."
     "Required: :llm {:url \"…/v1\" :model \"…\"}"
-    "Optional: :llm {:max-context-tokens N} — drop oldest non-system messages before each request; default 200000 (nil to disable); rough estimate (~4 chars/token)"
+    "Optional: :llm {:max-context-tokens N} — an OVERRIDE that may only LOWER the context budget; there is no default: the budget is derived per model from the endpoint's own window (asked at /models, /props, or learned from a refusal). A prompt that still does not fit is distilled and re-sent, never fatal."
     "          :llm {:max-tool-result-chars N} — cap individual tool result length; default 50000 (nil to disable); longer results are truncated with a note"
     "          :llm {:extra-payload {:transforms [\"middle-out\"]} — provider-specific fields merged into every request payload"
     "          :llm {:profiles {:local {:model \"qwen2.5-coder:7b-instruct\" :url \"http://localhost:11434/v1\"} …}} — named model presets; switch with /model <profile>"
@@ -970,10 +1029,12 @@
     "  /reset — FACTORY RESET (airbag): /reset prints a plan and changes nothing; /reset --yes moves the config home + the getting-started project into a timestamped backup, removes the saved sessions, and deletes the credentials grog created (from the secret ledger). Your other projects are untouched. Restart after."
     "  /mcp — MCP in edn-store (/mcp help); add|remove|update|list|set|show|load|save|reload"
     "  /soul show|path|add <text>|reload — SOUL.md (reload re-reads grog.edn + SOUL path + MCP store file for active project); `## Startup snark` lines (optional) join a random pool for the final banner line each launch"
-    "  /model — show current LLM model and URL, plus any :llm :profiles"
+    "  /model — the current model + the numbered recents list"
+    "  /model <n> — switch to entry <n> of that list (1 = the current model)"
     "  /model reset — clear the session model override"
     "  /model <name> — switch to a model name for this session (e.g. qwen2.5-coder:7b-instruct)"
     "  /model <profile> — switch to a named profile from :llm :profiles (can override :url, :model, etc.)"
+    "           every pick is remembered in :llm :recents (LRU, :llm :recents-max, default 10)"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
     ""
@@ -1436,42 +1497,63 @@
         (println "SOUL: unknown; try show | path | add … | reload")))
     true))
 
+(defn- print-model-list!
+  "Print the numbered model list (`/model` with no argument): the CURRENT model
+  as 1, then the recents LRU. The numbers are exactly what `/model <n>` accepts."
+  []
+  (println "Current model:" (config/model-label {:url (try (config/llm-url) (catch Throwable _ nil))
+                                                 :model (try (config/llm-model) (catch Throwable _ nil))}))
+  (let [choices (config/model-choices)
+        recents (rest choices)]
+    (if (seq recents)
+      (do
+        (println "Recents (newest first) — /model <n> to switch:")
+        (doseq [{:keys [n label current?]} choices]
+          (println (format "  %d. %s%s" n label (if current? "  (current)" "")))))
+      (do
+        (println "No recents yet — pick one in Settings → Models…, or `/model <name>`.")
+        (println "  (a pick is remembered here, newest first)"))))
+  (when-let [ps (seq (get-in (config/grog) [:llm :profiles]))]
+    (println "Profiles:" (str/join ", " (map #(if (keyword? %) (name %) (str %)) ps)))))
+
 (defn- handle-model-command!
-  "Switch the active LLM model or profile for this session."
+  "The `/model` command — show the current model, or switch to one.
+
+    /model            current model + the numbered recents list
+    /model <n>        switch to entry <n> of that list
+    /model <name>     switch to a `:llm :profiles` entry, or a raw model id
+    /model reset      drop any session override (there is none under the loop
+                      adapter; kept because older sessions and scripts use it)
+
+  Switching records the pick in recents (LRU), so the thing you just used is
+  next to you. This handles the CLI and the `:model-command!` session hook; the
+  GUI's `/model` goes through the session (see `grog.chat/handle-turn!`)."
   [line]
   (when-let [[_ rest] (re-matches #"(?i)^/model(?:\s+(.*))?$" (str/trim line))]
-    (let [tail (str/trim (or rest ""))
-          profiles (get-in (config/grog) [:llm :profiles])
-          profile-key (when (seq tail)
-                        (or (get (set (keys profiles)) (keyword tail))
-                            (get (set (keys profiles)) tail)
-                            (keyword tail)))]
+    (let [tail (str/trim (or rest ""))]
       (cond
-        (str/blank? tail)
-        (do (println "Current LLM:" (config/provider-name) "-" (config/llm-model)
-                     "@" (config/llm-url))
-            (when (seq profiles)
-              (println "Profiles:" (str/join ", " (map #(if (keyword? %) (name %) (str %)) (keys profiles))))
-              (doseq [[k v] profiles]
-                (println " " (if (keyword? k) (name k) k) "->"
-                         (or (some-> (:model v) str str/trim not-empty) (config/llm-model))
-                         "@"
-                         (or (some-> (:url v) str str/trim not-empty) (config/llm-url))))))
-
         (= "reset" (str/lower-case tail))
         (do (config/clear-llm-override!)
-            (println "Cleared session LLM override; now using" (config/llm-model) "@" (config/llm-url)))
-
-        (contains? profiles profile-key)
-        (let [profile (get profiles profile-key)]
-          (config/set-llm-override! profile)
-          (println "Switched to profile" (pr-str (if (keyword? profile-key) (name profile-key) profile-key))
-                   "-" (config/llm-model) "@" (config/llm-url)))
+            (println "Cleared session LLM override; now using"
+                     (config/llm-model) "@" (config/llm-url)))
 
         :else
-        (do (config/set-llm-override! {:model tail})
-            (println "Switched to model" (pr-str tail)
-                     "-" (config/llm-model) "@" (config/llm-url)))))
+        (let [c (config/resolve-model-choice tail)]
+          (case (:kind c)
+            :list (print-model-list!)
+
+            :unknown
+            (println "No model numbered" (:n c) "— the list has" (:max c)
+                     "entries. Run /model with no argument to see them.")
+
+            :choice
+            (do (config/set-llm-override! (cond-> {:model (:model c)}
+                                            (:url c) (assoc :url (:url c))))
+                ;; remember the pick, so it shows up in the numbered list next time
+                (try (models/push-recent! (:url c) (:model c)) (catch Throwable _ nil))
+                (println (str "Switched to " (:label c)
+                              (when (:profile c) (str " (profile " (:profile c) ")"))))
+                (println "  " (config/llm-model) "@" (config/llm-url)))))))
     true))
 
 (defn run-once!
@@ -1574,23 +1656,28 @@
       (chron/start!)
       (loop [history []]
         (if-some [line (read-chat-line-with-context! history)]
-          (let [line (if (= "/paste" (str/lower-case line))
+          (let [line (if (= "/paste" (str/lower-case (str/trim line)))
                        (or (read-paste-block!) ::cancel)
-                       line)]
+                       line)
+                ;; TRIM FIRST — the same rule `route-slash-command!` now applies:
+                ;; an exact-set match on an untrimmed line misses `/clear ` or a
+                ;; pasted `/clear\n`, and the command would be sent to the model
+                ;; instead of clearing.
+                lc (-> (str/trim (str line)) str/lower-case)]
             (if (= ::cancel line)
               (recur history)
               (cond
-                (#{"quit" "exit" "/quit" "/exit"} (str/lower-case line))
+                (#{"quit" "exit" "/quit" "/exit"} lc)
                 nil
-                (= "/shutdown" (str/lower-case line))
+                (= "/shutdown" lc)
                 (handle-shutdown-command! history)
-                (= "/help" (str/lower-case line))
+                (= "/help" lc)
                 (do (println (help-text)) (println) (recur history))
             (handle-tools-command! line)
             (recur history)
             (handle-skills-command! line)
             (recur history)
-            (#{"/clear" "/fresh"} (str/lower-case line))
+            (#{"/clear" "/fresh"} lc)
             (do (println "History cleared.") (recur []))
             (handle-shell-command! line)
             (recur history)

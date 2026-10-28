@@ -24,9 +24,13 @@
      a running stream; a blocking single-threaded transport cannot without a
      second connection. Steering between steps is real, useful and honest — and it
      is stated here rather than implied.
-  5. The context budget is enforced by COMPACTION, not by hoping. Old tool results
-     are elided (they are the bulk and the least needed) with a visible marker, so
-     a long session degrades in a way the model can see and react to.
+  5. The context budget is DERIVED from the endpoint's own window
+     (`grog.models/context-budget`) and enforced in two layers: gentle compaction
+     before each step, and — if the endpoint still refuses the prompt — DISTILL,
+     LEARN and RE-SEND the same step. A real overflow is evidence about the model,
+     not the end of the conversation: see `max-overflow-recoveries` and
+     `grog.agent.context/distill`. There is no global budget constant, because a
+     number that is right for one model is wrong for the next.
   6. The toolbelt is LAZY. With more than `default-tool-threshold` tools available
      (grog attaches ~65 MCP schemas; a measured turn spent 8,611 of 8,611 prompt
      tokens on schema + conversation), only `tool_search` + the tools the session
@@ -40,6 +44,7 @@
      had no MCP tools at all (and would grep the disk for an Odoo question)."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
+            [grog.agent.context :as ctx]
             [grog.agent.mcp :as mcp]
             [grog.agent.tool-search :as tool-search]
             [grog.agent.tools :as tools]
@@ -170,39 +175,52 @@
        (catch Throwable _ (str name " " (pr-str (or args {}))))))
 
 ;; --- context budget ----------------------------------------------------------
+;;
+;; TWO LAYERS, and they are not interchangeable:
+;;
+;;   PROACTIVE — `compact-messages` before every step, at a budget DERIVED from
+;;   the endpoint's window (`grog.models/context-budget`). Cheap and gentle; it
+;;   only elides the middle when the conversation is genuinely over budget.
+;;
+;;   RECOVERY — a real 400 saying the prompt did not fit. That is EVIDENCE, not a
+;;   failure to report: the prompt is distilled hard
+;;   (`grog.agent.context/distill`), the window learned from the provider's own
+;;   words is remembered, and the SAME step is re-sent. Before this, one overflow
+;;   raised out of the loop, killed the turn, and left an oversized history in
+;;   place — so every LATER turn re-sent it and died again. That is the "thread
+;;   destroyed by context overflow" report.
+;;
+;; There is no default budget constant any more: an unknown window means NO
+;; proactive trim (send it intact, learn from the first refusal). A hardcoded
+;; number was the bug — it is either too big for a small model or too small for a
+;; big one, and it cannot be both.
 
-(def ^:private default-max-context-tokens 120000)
+(def ^:private max-overflow-recoveries
+  "How many times ONE turn may distill-and-retry after a real overflow. Each
+  retry is strictly smaller than the last, so this is only a guard against a
+  provider that refuses any prompt at all; a second failure is reported with both
+  sizes in the message rather than looped on."
+  2)
 
 (defn- est-tokens
-  "A deliberately rough estimate (4 chars ≈ 1 token). It does not need to be
-  exact — it needs to fire BEFORE the provider 400s."
-  [msgs]
-  (quot (reduce + 0 (map #(count (str (:content %))) msgs)) 4))
+  "The shared estimate (`grog.agent.context/est-tokens`) — kept under this name so
+  the loop reads the same. `extra` is the tool schemas riding the same request."
+  ([msgs] (ctx/est-tokens msgs))
+  ([msgs extra] (ctx/est-tokens msgs extra)))
 
 (defn- compact-messages
   "Elide the middle of the conversation when it exceeds `budget`.
 
-  Keeps: the system message, the FIRST user message (the task), and the last 12
-  messages (the live working set). What goes is the middle — overwhelmingly old
-  tool results — and it goes with a marker saying so, because a model that thinks
-  it has seen the whole history is worse than one that knows it has not."
-  [msgs budget]
-  (if (<= (est-tokens msgs) budget)
-    msgs
-    (let [sys? (= "system" (:role (first msgs)))
-          sys (when sys? (first msgs))
-          rest-msgs (vec (if sys? (rest msgs) msgs))
-          head (first rest-msgs)
-          tail (vec (take-last 12 rest-msgs))
-          elided (- (count rest-msgs) (count tail) (if head 1 0))]
-      (vec (concat (when sys [sys])
-                   (when head [head])
-                   (when (pos? elided)
-                     [{:role "user"
-                       :content (str "[" elided " earlier message(s) were elided to fit the context "
-                                     "budget. Re-read a file or re-run a command if you need that "
-                                     "detail again.]")}])
-                   tail)))))
+  See `grog.agent.context/compact`. `extra` is the tool schemas riding the same
+  request: they are part of the prompt the server measures, so a check that
+  ignores them can pass on a request that is refused."
+  ([msgs budget] (ctx/compact msgs budget))
+  ([msgs budget extra]
+   (if (or (nil? extra) (nil? budget))
+     (ctx/compact msgs budget)
+     ;; The toolbelt is NOT elidable, so it comes off the budget first — the only
+     ;; honest way to compare the conversation against what the server counts.
+     (ctx/compact msgs (max 1 (- (long budget) (long (ctx/est-tokens [] extra))))))))
 
 ;; --- dispatch ----------------------------------------------------------------
 
@@ -274,6 +292,45 @@
     (and (number? a) (number? b)) (+ a b)
     :else b))
 
+;; --- overflow: distill, learn, re-send ----------------------------------------
+
+(defn- overflow-error?
+  "Is `e` the endpoint refusing the prompt because it does not fit?"
+  [e]
+  (boolean (and (instance? clojure.lang.ExceptionInfo e)
+                (:overflow? (ex-data e)))))
+
+(defn- overflow-target
+  "The token target a distilled prompt should fit under, given the ceiling the
+  provider named. Room for the ANSWER is held back — a prompt that fills the window
+  to the last token is refused from the other side (`prompt + max tokens exceeds
+  the context`). Best effort: a missing config namespace yields the conservative
+  reserve rather than an exception."
+  [context-limit]
+  (when (and context-limit (pos? (long context-limit)))
+    (let [reserve (try
+                    (if-let [f (requiring-resolve 'grok.models/completion-reserve)]
+                      (long (f context-limit))
+                      2048)
+                    (catch Throwable _ 2048))]
+      (max 512 (- (long context-limit) (long reserve))))))
+
+(defn- learn-from-overflow!
+  "Turn a real refusal into knowledge: the provider named a ceiling, so remember
+  it for this (url, model) and forget any smaller figure a probe had guessed.
+
+  Best effort on purpose — `grog.models` is a CONFIG namespace and the loop must
+  not depend on being able to load it (a headless eval may not have a grog.edn at
+  all). The window is also handed to the caller's `:on-overflow` so the client can
+  persist it with whatever config it already has."
+  [{:keys [url model]} limit]
+  (when (and url limit (pos? (long limit)))
+    (try
+      (when-let [f (requiring-resolve 'grog.models/remember-context-window!)]
+        (f url model limit))
+      (catch Throwable _ nil))
+    limit))
+
 (defn run-turn!
   "Run one turn to completion.
 
@@ -282,7 +339,24 @@
    :cancel <atom> :steer <atom of [string]> :approve <fn> :approval :none|:mutating|:all
    :approved-tools #{name} :max-context-tokens n
    :extra-tools [schema] :local-handlers {name fn}
-   :tool-threshold n :loaded-tools [name]}
+   :tool-threshold n :loaded-tools [name]
+   :on-overflow (fn [{:keys [step attempt estimate limit]}) …]}
+
+  `:max-context-tokens` is the PROACTIVE budget for `compact-messages`. nil means
+  NO proactive trimming, which is the honest default when the endpoint's window
+  could not be learned — the turn then relies on the overflow RECOVERY below,
+  which only fires on real evidence. Pass `(grog.models/context-budget)` here; do
+  not invent a number, because a number that fits one model does not fit the next.
+
+  OVERFLOW RECOVERY. If the endpoint answers that the prompt does not fit, the
+  turn is NOT failed. The loop distills the conversation
+  (`grog.agent.context/distill`), remembers the window the provider named
+  (`:on-overflow` lets the caller persist it — `grok.models/remember-context-window!`),
+  emits a `:tool` segment saying what it did, and RE-SENDS the same step. It does
+  this at most `max-overflow-recoveries` times per turn, and each attempt is
+  strictly smaller, so the worst case is a visible report with both sizes rather
+  than a dead thread. `:overflow-budget` overrides the distillation target (tests
+  use it to force the last rung).
 
   Returns {:status :done|:max-steps|:cancelled :messages [...] :steps n :usage …
            :text :reasoning :tool-log [...] :loaded-tools [name]}.
@@ -307,12 +381,19 @@
   `scripts/tool-search-test.clj`)."
   [{:keys [llm message cwd mcp on-event max-steps history system cancel steer
            approve approval approved-tools max-context-tokens tool-threshold
-           extra-tools local-handlers loaded-tools max-loaded-tools]}]
+           extra-tools local-handlers loaded-tools max-loaded-tools
+           on-overflow overflow-budget]}]
   (let [;; `:or` does NOT cover a key that is present-but-nil (a caller reading an
         ;; unset config knob passes nil), and `(> step nil)` is a NullPointer.
         ;; Normalise here, once.
         max-steps (or max-steps default-max-steps)
-        max-context-tokens (or max-context-tokens default-max-context-tokens)
+        ;; NO DEFAULT. nil means 'the window is unknown; do not guess' — see this
+        ;; fn's docstring and `grog.models/context-budget`. The old
+        ;; `(or max-context-tokens 120000)` was a global constant wearing a
+        ;; per-model label, and it is why a 32k server got a 38k prompt.
+        max-context-tokens (when (and (number? max-context-tokens)
+                                      (pos? (long max-context-tokens)))
+                             (long max-context-tokens))
         tool-threshold (or tool-threshold default-tool-threshold)
         !cancel (or cancel (atom false))
         emit (fn [seg] (when on-event (on-event seg)))
@@ -417,24 +498,104 @@
                     (when (seq pending)
                       (swap! !msgs into (map (fn [s] {:role "user" :content (str s)}) pending))
                       (emit {:kind :tool :text (str "[steer] " (str/join " | " pending))}))))
-              _ (reset! !msgs (compact-messages @!msgs max-context-tokens))
+              ;; THE PROACTIVE TRIM. `prompt-tools` is a fn, so the loaded belt is
+              ;; resolved here, once, and used for BOTH the budget arithmetic and
+              ;; the request — the schemas are part of the prompt the server
+              ;; measures, and a budget check that ignores them can pass on a
+              ;; request that is refused.
+              step-tools (prompt-tools)
+              _ (reset! !msgs (compact-messages @!msgs max-context-tokens step-tools))
+              ;; THE RECOVERY LOOP. One iteration per ATTEMPT at this step. A
+              ;; context overflow is the one failure the loop can FIX, so it is
+              ;; caught here rather than escaping and killing the turn (and taking
+              ;; the thread with it, because the caller then keeps an oversized
+              ;; history that every later turn re-sends). Each retry is strictly
+              ;; smaller than the last, and bounded — and the retry is decided
+              ;; OUTSIDE the catch, because `recur` may not cross a `try`.
               {:keys [text reasoning tool-calls malformed usage]}
-              (transport/stream-chat! (assoc llm
-                                             :messages @!msgs
-                                             ;; RE-COMPUTED EACH STEP (prompt-tools is
-                                             ;; a fn, not a value): a `tool_search` this
-                                             ;; step attaches a schema for the NEXT one.
-                                             :tools (prompt-tools)
-                                             :on-delta (fn [c] (emit {:kind :answer :text c}))
-                                             :on-reasoning (fn [c] (emit {:kind :thinking :text c}))))]
+              (loop [attempt 1]
+                (let [outcome
+                      (try
+                        (transport/stream-chat! (assoc llm
+                                                       :messages @!msgs
+                                                       :tools step-tools
+                                                       :on-delta (fn [c] (emit {:kind :answer :text c}))
+                                                       :on-reasoning (fn [c] (emit {:kind :thinking :text c}))))
+                        (catch Throwable e
+                          (if-not (overflow-error? e)
+                            (throw e)
+                            (let [d (ex-data e)
+                                  context-limit (:context-limit d)
+                                  prompt-tokens (:prompt-tokens d)
+                                  too-big? (pos? (long (or prompt-tokens 0)))
+                                  ;; Learn the window from the provider's own words:
+                                  ;; the highest-quality number grog can get, and it
+                                  ;; is persisted, so the next turn starts knowing
+                                  ;; rather than guessing.
+                                  _ (learn-from-overflow! llm context-limit)
+                                  _ (when on-overflow
+                                      (on-overflow {:step step :attempt attempt
+                                                    :estimate (est-tokens @!msgs step-tools)
+                                                    :limit context-limit
+                                                    :prompt-tokens prompt-tokens}))
+                                  before (est-tokens @!msgs step-tools)
+                                  ;; Distill toward what the server will take, MINUS
+                                  ;; room for the answer — the same reserve the
+                                  ;; budget uses.
+                                  target (overflow-target context-limit)
+                                  had (count @!msgs)]
+                              (if (>= attempt (inc (long max-overflow-recoveries)))
+                                ;; Already shrunk and been refused again. Report it
+                                ;; AS an overflow, with both sizes and what to do —
+                                ;; never as a bare 400 the user has to decode, and
+                                ;; never by silently dropping the conversation.
+                                (throw (ex-info
+                                        (str "context overflow: the prompt (~" before
+                                             " tokens estimated, "
+                                             (when too-big? (str prompt-tokens " by the server's count, "))
+                                             "tool schemas included) does not fit the model's context window"
+                                             (when context-limit (str " (" context-limit " tokens)"))
+                                             ". Tried " attempt " times, distilling harder each time, and was "
+                                             "refused again — the conversation is kept, so nothing was lost, "
+                                             "but this model cannot take it. Start a new session (/clear), pick "
+                                             "a larger-context model (/model), or shorten the request.")
+                                        d))
+                                (let [distilled (ctx/distill @!msgs {:budget (or overflow-budget target)})
+                                      after (est-tokens distilled step-tools)]
+                                  (reset! !msgs distilled)
+                                  (emit {:kind :tool
+                                         :text (str "[context overflow] the prompt did not fit "
+                                                    (or context-limit "the model's window")
+                                                    " — distilled " had " message(s) from ~" before
+                                                    " to ~" after " tokens and retrying this step"
+                                                    (str " (attempt " (inc attempt) " of "
+                                                         (inc max-overflow-recoveries) ")"))})
+                                  {:retry true}))))))]
+                  (if (:retry outcome)
+                    (recur (inc attempt))
+                    outcome)))]
           (when usage (swap! !usage merge-usage usage))
           (doseq [m malformed]
             (emit {:kind :tool :text (str "[bad arguments] " (:why m) " raw=" (:raw m))}))
           (if (empty? tool-calls)
             (do (emit {:kind :usage :text (pr-str (or @!usage {}))})
-                {:status :done :messages @!msgs :steps step :usage @!usage
-                 :text text :reasoning reasoning :tool-log @!log
-                 :loaded-tools (vec @!loaded)})
+                ;; THE ANSWER IS PART OF THE CONVERSATION. `:messages` is what the
+                ;; caller replays on the NEXT turn (grog.client.loop stores it in
+                ;; the session's `!messages`), and until now the final assistant
+                ;; text lived only in `:text`, never in `:messages`. So a session
+                ;; handed the model its own questions and tool traffic but NOT its
+                ;; own previous answers — "as I said earlier" was unrecoverable,
+                ;; and a follow-up turn could re-do work it had already reported
+                ;; doing. The tool-call branch below already appends its assistant
+                ;; message; the terminal branch was the gap. Blank text appends
+                ;; nothing, so a turn that produced no answer cannot inject an
+                ;; empty turn some providers reject.
+                (let [answered (when (seq (str/trim (str text)))
+                                 {:role "assistant" :content (str text)})]
+                  (when answered (swap! !msgs conj answered))
+                  {:status :done :messages @!msgs :steps step :usage @!usage
+                   :text text :reasoning reasoning :tool-log @!log
+                   :loaded-tools (vec @!loaded)}))
             (do
               (swap! !msgs conj
                      {:role "assistant"

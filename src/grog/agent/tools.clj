@@ -22,7 +22,9 @@
             [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [grog.fs.walk :as walk])
+            [grog.brave :as brave]
+            [grog.fs.walk :as walk]
+            [grog.platform :as platform])
   (:import (java.nio.file FileSystems LinkOption Path Paths)
            (java.util.regex Pattern)
            (java.util.concurrent TimeUnit)))
@@ -119,32 +121,57 @@
                        (str/replace text old new)
                        (str (subs text 0 (first hits)) new (subs text (+ (first hits) (count old)))))
                 replaced (if all_occurrences n 1)
-                ;; THE COUNT OF ANCHORS *BEFORE* THE EDIT. The success test used
-                ;; to demand `(zero? old-left)` — zero anchors left in the result —
-                ;; which is false for any edit that keeps the anchor and adds text
-                ;; around it (an append below the anchor: the ordinary case). That
-                ;; reported a LANDED write as "EDIT FAILED VERIFICATION ... written=N
-                ;; read-back=N" — the write had happened, the report denied it. It is
-                ;; the inverted twin of the 2026-10-14 incident (a tool that said
-                ;; success and did nothing), and it hit twice on 2026-10-19.
+                ;; DIAGNOSTIC ONLY — the anchor count is reported, never asserted
+                ;; on. See the verification rule below.
                 n-before (count (re-seq (re-pattern (java.util.regex.Pattern/quote old)) text))]
             (spit p want :encoding "UTF-8")
             (let [got (read-text p)
+                  ;; WHAT CAN BE ASSERTED: the bytes on disk are exactly what we set
+                  ;; out to write. `want` is computed from `text` (which we read and
+                  ;; checked for a present, unambiguous anchor before touching the
+                  ;; file), so `ok?` alone IS the proof the edit landed — and proof
+                  ;; of the absence of the 2026-10-14 failure (a tool claiming a
+                  ;; replacement it never made: there `got` = `text` ≠ `want`).
                   ok? (= want got)
                   old-left (count (re-seq (re-pattern (java.util.regex.Pattern/quote old)) got))
                   new-times (count (re-seq (re-pattern (java.util.regex.Pattern/quote new)) got))
-                  ;; landed = the file is what we wrote, and we did not ADD an
-                  ;; occurrence of the anchor. `>` not `>=`: a replacement whose
-                  ;; new_content contains the anchor legitimately keeps the count.
-                  landed? (and ok? (or all_occurrences (<= old-left n-before)))]
-              (if landed?
-                (ok (str "edited " p " — " replaced " replacement(s), verified by reading it back\n"
-                         "  - " (clip old) "\n  + " (clip new)))
+                  ;; WHAT CANNOT: an anchor-COUNT heuristic. Counting anchors in the
+                  ;; result was the original test and it is unfixable as a
+                  ;; correctness check, because whether the count rises, falls or
+                  ;; stays is a property of the REPLACEMENT TEXT, not of the edit:
+                  ;;   - `(zero? old-left)` (the original) FAILED every edit that
+                  ;;     kept its anchor, i.e. the ordinary "append below" — a
+                  ;;     LANDED write reported as failed (hit twice 2026-10-19);
+                  ;;   - `(<= old-left n-before)` (the first fix, #14) fixed that
+                  ;;     and still FAILED when `new` CONTAINS `old` — replacing "a"
+                  ;;     with "aa" grows the count and was rejected although the
+                  ;;     file was correct (measured 2026-10-23, see
+                  ;;     scripts/edit-file-verify-test.clj).
+                  ;; Any rule of the form "the count must not increase" therefore
+                  ;; loses a legitimate edit; there is no threshold to tune. The
+                  ;; counts are kept in the messages as evidence for the human, and
+                  ;; the VERDICT is `ok?`.
+                  no-op? (= want text)]
+              (cond
+                (not ok?)
                 (bad (str "EDIT FAILED VERIFICATION in " p " — the file does not contain what we wrote. "
                           "No success is being claimed.\n"
                           "written=" (count want) " read-back=" (count got)
-                          " anchor-remaining=" old-left
-                          " new-occurrences=" new-times))))))))))
+                          " anchor " n-before " -> " old-left
+                          " new-occurrences=" new-times))
+
+                ;; A NO-OP IS NOT AN EDIT. Reporting "1 replacement(s)" for a file
+                ;; that did not change is the same lie in miniature: an effect was
+                ;; claimed and none exists. Say the effect is absent so the model
+                ;; re-reads the file instead of believing it changed something.
+                no-op?
+                (bad (str "NO CHANGE: " p " already reads exactly like the requested edit — "
+                          "the replacement would leave the file byte-for-byte identical, so nothing "
+                          "was changed. Re-read the file and check the anchor/text you meant to use."))
+
+                :else
+                (ok (str "edited " p " — " replaced " replacement(s), verified by reading it back\n"
+                         "  - " (clip old) "\n  + " (clip new)))))))))))
 
 (defn list-dir* [{:keys [cwd path]}]
   (let [p (expand cwd (or path "."))]
@@ -158,18 +185,46 @@
                   (str/join "\n"))))))
 
 (defn- run-capture
-  "Run argv with a timeout, merged stdout+stderr. Returns {:out :exit :timeout?}."
+  "Run argv with a timeout, merged stdout+stderr. Returns {:out :exit :timeout?}.
+
+  OUTPUT GOES TO A TEMP FILE, NOT A PIPE — and that is the whole fix.
+
+  The old version read the child's stdout through a pipe in a `future` and then
+  deref'd it with no bound. `destroyForcibly` does not close that pipe: a command
+  that backgrounds a grandchild (`python3 server.py & …`) hands the write end to
+  the grandchild, so the reader blocks on a read that will never return and the
+  turn hangs forever — with the tool's own timeout having already 'fired' and
+  reported `timeout? true`. That is exactly how a shell call hung a turn here.
+
+  A file has no such failure mode: the bytes are on disk whatever the process
+  tree does, so once `.waitFor` returns (or the timeout fires) the output is
+  simply read back, no reader thread and no dangling write end. The child is
+  still killed as a TREE (`platform/kill-tree!`), because killing only the
+  wrapper leaves the real work running."
   [argv cwd timeout-ms]
-  (let [pb (ProcessBuilder. ^java.util.List (vec argv))]
-    (when cwd (.directory pb (io/file cwd)))
-    (doto pb (.redirectErrorStream true))
-    (let [proc (.start pb)
-          out (future (slurp (io/reader (.getInputStream proc))))
-          done? (.waitFor proc (long timeout-ms) TimeUnit/MILLISECONDS)]
-      (if done?
-        {:out @out :exit (.exitValue proc) :timeout? false}
-        (do (.destroyForcibly proc)
-            {:out (str @out "\n[killed after " timeout-ms "ms]") :exit nil :timeout? true})))))
+  (let [pb (ProcessBuilder. ^java.util.List (vec argv))
+        t (long timeout-ms)
+        out-file (java.io.File/createTempFile "grog-shell-" ".out")]
+    (try
+      (when cwd (.directory pb (io/file cwd)))
+      (doto pb
+        (.redirectErrorStream true)
+        (.redirectOutput out-file))
+      (let [proc (.start pb)
+            done? (.waitFor proc t TimeUnit/MILLISECONDS)
+            text (try (slurp out-file :encoding "UTF-8") (catch Throwable _ ""))]
+        (if done?
+          {:out text :exit (.exitValue proc) :timeout? false}
+          (do
+            (platform/kill-tree! proc)
+            ;; give a killed tree a beat to flush what it had buffered, then read
+            ;; again — the file already holds everything written so far.
+            (Thread/sleep 150)
+            {:out (str (try (slurp out-file :encoding "UTF-8") (catch Throwable _ text))
+                       "\n[killed after " t "ms]")
+             :exit nil :timeout? true})))
+      (finally
+        (try (.delete out-file) (catch Throwable _))))))
 
 (defn- name-matcher
   "A filename predicate from a glob (`*.clj`) or, failing that, a regex."
@@ -276,6 +331,21 @@
                        (when (seq left)
                          (str "\n… bounded to one filesystem; skipped "
                               (count left) " other mount(s), not searched")))))))))))
+
+(defn brave-web-search*
+  "Search the public web via Brave. Returns the formatted results, or — when we
+  cannot run — a message naming the account to set.
+
+  THIS IS A FIRST-CLASS LOCAL TOOL ON PURPOSE. `brave_web_search` also exists as
+  the MCP tool `grog-mcp__brave_web_search`, but that one is DEFERRED: the model
+  only sees it after calling `tool_search`. A weak local model that never
+  reaches for `tool_search` therefore behaves as if it cannot search the web at
+  all — the exact failure this tool removes. Attached to every turn, unprefixed,
+  so any model can call it directly."
+  [{:keys [query count]}]
+  (if (str/blank? (str query))
+    (bad "brave_web_search needs a non-empty `query`")
+    (ok (brave/run-web-search! {:query query :count count}))))
 
 (defn shell* [{:keys [cwd command timeout_ms]}]
   (when (str/blank? (str command))
@@ -660,15 +730,45 @@
     :description "Run a git subcommand in the working directory and return its output."
     :parameters {:type "object" :properties {:args {:type "array" :items {:type "string"}}}
                  :required ["args"]}
-    :handler git*}])
+    :handler git*}
+
+   ;; WEB SEARCH, ALWAYS ATTACHED. Same tool as the deferred
+   ;; `grog-mcp__brave_web_search`, but in the LOCAL belt so neither model has to
+   ;; call `tool_search` first. See `brave-web-search*`. Its schema is dropped
+   ;; when no Brave key is configured (`toolbelt`), so an unconfigured install
+   ;; does not advertise a tool that can only explain its own absence.
+   {:name "brave_web_search"
+    :description (str "Search the public web via Brave Search. Use whenever a current, factual, "
+                      "or web-sourced answer is needed. Attached by default — no tool_search needed.")
+    :parameters {:type "object"
+                 :properties {:query {:type "string" :description "Search query (keywords or question)."}
+                              :count {:type "integer" :description "Max results (1–10, default 5)."}}
+                 :required ["query"]}
+    :handler brave-web-search*}])
+
+(defn- brave-configured?
+  "Is a Brave key present? Guarded — a keyring failure must not break the belt."
+  []
+  (try (brave/brave-search-configured?) (catch Throwable _ false)))
+
+(defn toolbelt
+  "The static belt, minus `brave_web_search` when no Brave key is configured.
+  Kept as one function so the schema list (`provider-tools`) and the handler table
+  (`handlers`) can NEVER disagree about whether the tool exists — advertising a
+  schema whose handler is missing is how a model calls a tool that cannot run."
+  []
+  (if (brave-configured?)
+    tools
+    (vec (remove #(= "brave_web_search" (:name %)) tools))))
 
 (defn provider-tools
-  "OpenAI `tools` for the static belt plus any session tools the loop supplies."
+  "OpenAI `tools` for the static belt (minus an unconfigured `brave_web_search`)
+  plus any session tools the loop supplies."
   ([cwd] (provider-tools cwd []))
   ([_cwd extra-tools]
    (mapv (fn [{:keys [name description parameters]}]
            {:type "function" :function {:name name :description description :parameters parameters}})
-         (concat tools extra-tools))))
+         (concat (toolbelt) extra-tools))))
 
 (defn norm-args
   "JSON arrives with STRING keys; the handlers destructure KEYWORDS. Normalise at
@@ -681,12 +781,14 @@
 
 (defn handlers
   "The static belt as a name->fn table (`:cwd` injected), with any session
-  handlers merged OVER it — a session tool may replace a static one by name."
+  handlers merged OVER it — a session tool may replace a static one by name.
+  Reads `toolbelt`, so the handler for `brave_web_search` exists iff its schema
+  was advertised."
   ([cwd] (handlers cwd {}))
   ([cwd extra]
    (merge (into {} (map (fn [{:keys [name handler]}]
                           [name (fn [args] (handler (assoc (norm-args args) :cwd cwd)))]))
-                 tools)
+                 (toolbelt))
           extra)))
 
 (defn call

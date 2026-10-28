@@ -103,9 +103,29 @@ Seed list — cases that should exist and mostly do not yet:
 | From | The failure |
 |---|---|
 | `mistake.2026-10-14T…eca-edit-file-silent-noop` | reported success without writing ✅ `lying-tool` |
+| improvements #14 (`edit_file`) | reported **failure** for a landed write — the mirror of the above, and the trap is re-applying it ✅ `false-failure-report` |
 | CI run 38509973271 | an invalid workflow fails with **zero jobs**, no log ✅ `broken-workflow` |
 | the voice-model work, 2026-10-14 | answering from memory instead of the docs ✅ `voice-on-arch` |
 | `playbook.harness-review` | BOM parsing; extract-zip under-extraction; java/bash missing on PATH; the string-JSON tool schema; DSML tool calls silently lost |
+
+## The two lying-tool cases are a matched pair
+
+`lying-tool` and `false-failure-report` are the same defect in opposite
+directions, and they are deliberately kept side by side:
+
+|  | the tool says | the state | the trap |
+|---|---|---|---|
+| `lying-tool` | success | nothing happened | believing it and claiming the work is done |
+| `false-failure-report` | failure | the change **landed** | believing it and **re-applying** — which duplicates the edit |
+
+The second is the more dangerous one, and the reason it is a required check: the
+natural response to "your edit did not take" is to make it again. Neither case can
+be satisfied by trusting the report, so together they pin the rule the toolbelt is
+built on — **verify the effect, never the report.**
+
+Fixture mechanics: `:fault {:tool … :text …}` alone is a liar that does nothing;
+adding `:apply [{:file … :text …}]` makes the effect REAL while the report still
+denies it (`scripts/eval.clj/inject-fault`).
 
 ## Limits, stated plainly
 

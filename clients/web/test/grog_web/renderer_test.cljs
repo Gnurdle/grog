@@ -220,6 +220,116 @@
                                                      (str (:text %)))
                                            (transcript))))))
 
+      ;; ---------------------------------------------------------------------
+      ;; the MODEL PICKER panel. Reported: "picking one from the history list
+      ;; doesn't set it correctly", and a transport pick showing a BOGUS model.
+      ;; The panel's job is small and easy to get subtly wrong: a click must send
+      ;; the WHOLE pick (model AND the transport it was remembered with), the box
+      ;; must end up showing what is actually in force, and a pick with nothing to
+      ;; name must say so rather than silently doing nothing.
+      ;; ---------------------------------------------------------------------
+      (.then (fn [_]
+               (println "\nthe models panel: clicking a RECENT sends the pair (url + model):")
+               (reset! sent [])
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :models-draft "typed-but-stale" :models-global? false}])
+               (rf/dispatch-sync [:set-model "s#1" "a-local-model" nil
+                                  {:global false :url "http://localhost:8080/v1"}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the recents pick carries the model AND its transport"
+                       ["set-model" {:id "s#1" :model "a-local-model" :global false
+                                     :url "http://localhost:8080/v1"}]
+                       (first @sent))
+               (check! "and the panel re-reads the lists it labels itself from"
+                       ["recents" "providers"] (mapv first (rest @sent)))
+               (check! "it does NOT force a global write when the tick is off"
+                       false (get-in @sent [0 1 :global]))))
+
+      (.then (fn [_]
+               (println "\nclicking a recent WITH the global tick:")
+               (reset! sent [])
+               (rf/dispatch-sync [:renderer-test/seed
+                                  {:home-project "grog" :active "s#1"
+                                   :sessions {"s#1" {:id "s#1" :project "grog"
+                                                     :input "" :attachments []}}
+                                   :models-global? true}])
+               (rf/dispatch-sync [:set-model "s#1" "a-local-model" nil
+                                  {:global true :url "http://localhost:8080/v1"}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the tick is honoured"
+                       true (get-in @sent [0 1 :global]))))
+
+      ;; A pick with NEITHER a model nor a url is genuinely empty: it must say so.
+      ;; It used to return silently, so Apply looked dead.
+      (.then (fn [_]
+               (println "\nan Apply with nothing picked says so:")
+               (reset! sent [])
+               (rf/dispatch-sync [:renderer-test/seed
+                                  {:home-project "grog" :active "s#1"
+                                   :sessions {"s#1" {:id "s#1" :project "grog"
+                                                     :input "" :attachments []}}
+                                   :dialog :models :models-draft ""}])
+               (rf/dispatch-sync [:set-model "s#1" "" nil {:global false}])
+               (tick)))
+      (.then (fn [_]
+               (check! "nothing was sent to the spine" [] @sent)
+               (check! "and it is explained, not silent"
+                       true (boolean (some #(re-find #"no model picked" (str (:text %)))
+                                           (transcript))))))
+
+      ;; THE STALENESS BUG. The box must follow the model the server reports — a
+      ;; transport pick can legitimately clear it (no model named), and the box
+      ;; showing the OLD id while the session runs nothing is precisely the "bogus
+      ;; model" the user saw.
+      (.then (fn [_]
+               (println "\nthe box follows the server's model (a cleared one goes blank):")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :models-draft "a-stale-id" :models-draft-dirty? false}])
+               (rf/dispatch-sync [:ev {:type "model" :sessionId "s#1" :value "" :provider "strata"
+                                       :url "http://localhost:8080/v1" :label "strata · unset"}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the box goes BLANK rather than keeping the stale id"
+                       "" (:models-draft (sub)))
+               (check! "and the session carries the transport it switched to"
+                       "http://localhost:8080/v1" (get-in (sub) [:sessions "s#1" :url]))))
+
+      ;; …but a box the user is mid-edit must NOT be yanked out from under them.
+      (.then (fn [_]
+               (println "\na box being typed in is left alone:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :models-draft "half-typed" :models-draft-dirty? true}])
+               (rf/dispatch-sync [:ev {:type "model" :sessionId "s#1" :value "server-id"}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the half-typed id survives the server's model event"
+                       "half-typed" (:models-draft (sub)))))
+
+      ;; A model event for ANOTHER session must not touch this dialog's box.
+      (.then (fn [_]
+               (println "\na model event for another session is ignored by the dialog:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :models-draft "mine" :models-draft-dirty? false}])
+               (rf/dispatch-sync [:ev {:type "model" :sessionId "other#9" :value "theirs"}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the box still shows this session's model"
+                       "mine" (:models-draft (sub)))))
+
       (.then (fn [_]
                (println)
                (if (seq @failures)

@@ -55,29 +55,35 @@
   Keys (initial values come from the caller, so `build-session!` keeps its
   existing expressions for `:chat-id` / `:model`):
 
-    :project :chat-id :status :model :trust :usage :connected :running?
+    :project :chat-id :status :model :model-label :provider :url
+    :trust :usage :connected :running?
     :history :last-sent :pending-steer     — chat-loop state
-    :model-slot :big-model :small-model    — the big/small slots (see below)
     :subs                                  — event-stream subscribers
 
   The core calls it `:trust`; `build-session!` keeps the local name `yolo-ref`
   so its downstream references don't churn.
 
-  BIG/SMALL SLOTS — `:model` is the EFFECTIVE model (what a turn actually runs);
-  `:big-model`/`:small-model` are each slot's resolved id, and `:model-slot`
-  (`:big` by default) says which one is active. `grog.client.loop` owns the
-  resolution (project manifest, else the global default; a small slot with no
-  small model keeps running big), so the core only carries the three atoms and
-  reports them in `snapshot` — a client can show both models and the active one
-  without knowing the fallback rules."
-  [{:keys [project chat-id model model-slot big-model small-model]}]
+  ONE MODEL (2026-10-26) — `:model` is the model id a turn runs, and
+  `:model-label` / `:provider` / `:url` say WHERE it runs, which is what a status
+  line needs. grog used to carry two slots (`:big`/`:small`, with `/big` `/small`
+  to switch and `/relay` to cascade) and this map carried three more atoms for
+  them; that apparatus is gone."
+  [{:keys [project chat-id session-id model model-label provider url]}]
   (let [st {:project   (some-> project str)
+            ;; THE TAG THE LOG PANE FILTERS BY. `<project>#<nanoTime>`, minted by
+            ;; `grog.client.loop/make-session!` and identical to the `:sessionId`
+            ;; the server stamps on every wire event — the same id the renderer
+            ;; keys its tabs by. Diagnostic lines carry it so a line can be
+            ;; attributed to a TAB rather than guessed at from a project name.
+            :session-id (some-> session-id str)
             :chat-id   (atom chat-id)
             :status    (atom "idle")
             :model     (atom model)
-            :model-slot  (atom (or model-slot :big))
-            :big-model   (atom big-model)
-            :small-model (atom small-model)
+            ;; the provider beside the model — the status line shows both, because
+            ;; a model id alone does not say which endpoint it runs against.
+            :model-label (atom model-label)
+            :provider  (atom provider)
+            :url       (atom url)
             :trust     (atom false)
             :usage     (atom {:turn-tokens 0 :turn-cost 0.0
                               :session-tokens 0 :session-cost nil})
@@ -108,13 +114,42 @@
    :chat-id   @(:chat-id state)
    :status    @(:status state)
    :model     @(:model state)
-   :model-slot  @(:model-slot state)
-   :big-model   @(:big-model state)
-   :small-model @(:small-model state)
+   :model-label @(:model-label state)
+   :provider  @(:provider state)
+   :url       @(:url state)
    :trust     @(:trust state)
    :usage     @(:usage state)
    :connected @(:connected state)
    :running?  @(:running? state)})
+
+(defn session-tag
+  "The `[<session-id>]` prefix a session's DIAGNOSTIC lines carry, or \"\" when the
+  session has no id.
+
+  WHY THIS EXISTS. grog writes ONE log per client run (`~/grog.<pid>.log`), and
+  every tab's spine output lands in it together — so `worker take: \"…\"` from
+  four different projects interleaves with nothing saying which is which. The log
+  pane solves that by FILTERING on this tag (`log-foreign?` in the renderer), and
+  that filter silently matched nothing once `grog.eca/connect!` — its original
+  emitter — was deleted with ECA. Restoring the tag is what makes the pane's
+  \"this project\" scope real instead of a no-op.
+
+  The id is the SAME one the server stamps as `:sessionId` on every wire event,
+  so the renderer's session keys and this tag cannot drift apart."
+  [state]
+  (if-let [sid (some-> (:session-id state) str not-empty)]
+    (str "[" sid "] ")
+    ""))
+
+(defn tagged!
+  "Write a diagnostic LINE to stderr with this session's tag in front, so the log
+  pane can attribute it to a tab. Use for anything per-session; leave client-wide
+  lines untagged (the pane shows untagged lines in every scope on purpose — a
+  line we cannot place is kept, never hidden)."
+  [state & xs]
+  (let [text (str (session-tag state) (apply str (interpose " " (map str xs))))]
+    (.println System/err text)
+    text))
 
 ;; ---------------------------------------------------------------------------
 ;; Event stream
@@ -263,20 +298,26 @@
     :send       (fn [history text contexts] -> history)  hand an LLM turn over
     :set-model! (fn [name])  /eca-model — qualify, push to ECA, footer, status
     :set-yolo!  (fn [on?])   /yolo (nil toggles)
-    :set-model-slot! (fn [:big|:small])  /big and /small — switch the active slot
-                 (the slot itself is resolved by the adapter: a small slot with
-                 no small model configured keeps running big)
+    :model-command! (fn [line])  /model — show or switch the session's model
     :console    (fn [] -> Writer)  called once per turn; `*out*`/`*err*` bind
                  to it so slash-command output lands in the transcript. The
                  GUI supplies a fresh `transcript/console-writer` (it buffers
                  until flush, then appends a status line); nil keeps the
                  process streams — what a headless server wants.
+    :clear!     (fn [])  `/clear` — wipe the ENGINE's conversation. The core
+                 drops its own `:history` here, but the adapter owns what a turn
+                 actually replays (the message list, the lazily-loaded tool set,
+                 the todo list, the cost meter); those live outside this
+                 namespace and only the adapter can reset them. See the
+                 `::clear` branch — a transcript wipe that leaves them is the
+                 bug where `/clear` looked like it worked and the model still
+                 quoted the previous conversation.
     :quit!      (fn [])  /quit; defaults to System/exit
 
   The console binding wraps the whole route (the `:user` echo publishes
   before it, as before), because `route-slash-command!` prints its handlers'
   output to `*out*`."
-  [state {:keys [send set-model! set-yolo! set-model-slot! console quit!]} text contexts]
+  [state hooks text contexts]
   (cancel/clear!)
   ;; echo the user's input (prompt or command) as a bubble. `/secret KEY VALUE`
   ;; carries a credential: publish a MASKED form so the value never reaches the
@@ -284,7 +325,8 @@
   ;; See grog.secrets/redact-secret-command.
   (when (seq (str/trim text))
     (publish! state {:type :user :text (secrets/redact-secret-command (str text))}))
-  (let [route (fn []
+  (let [{:keys [send set-model! set-yolo! model-command! console clear! quit!]} hooks
+        route (fn []
                 (cond
                   (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))
                   (let [m (re-matches #"(?i)^/eca-model\s+(.+)$" (str/trim text))]
@@ -297,14 +339,13 @@
                     (when set-yolo! (set-yolo! on?))
                     @(:history state))
 
-                  ;; /big and /small switch the model SLOT. Handled here (not in
-                  ;; `grog.core`) because the slot is session state the adapter
-                  ;; owns; and handled BEFORE the `route-slash-command!` fallback
-                  ;; so these never reach the LLM as a prompt.
-                  (re-matches #"(?i)^/(big|small)$" (str/trim text))
-                  (let [m (re-matches #"(?i)^/(big|small)$" (str/trim text))]
-                    (when set-model-slot! (set-model-slot! (keyword (str/lower-case (second m)))))
-                    @(:history state))
+                  ;; `/model` in a GUI session: switch the model the SESSION
+                  ;; runs. The `:model-command!` hook owns the resolution
+                  ;; (number from the recents list, profile, or raw id) and the
+                  ;; recents push; `grog.core`'s handler is the CLI's.
+                  (re-matches #"(?i)^/model(?:\s+.*)?$" (str/trim text))
+                  (do (when model-command! (model-command! (str/trim text)))
+                      @(:history state))
 
                   :else
                   (case (core/route-slash-command! text)
@@ -318,6 +359,13 @@
                       ;; auto-approve so a fresh transcript starts clean
                       (publish! state {:type :clear})
                       (when set-yolo! (set-yolo! false))
+                      ;; THE ADAPTER'S SIDE OF THE WIPE. `:history` below is the
+                      ;; core's bookkeeping; the ENGINE replays its own message
+                      ;; list, and `/clear` used to leave it, the loaded tool set
+                      ;; and the todo list untouched — so the screen went blank
+                      ;; while the next turn still carried the entire previous
+                      ;; conversation (the reported "currently it's not" reset).
+                      (when clear! (clear!))
                       (println "History cleared.")
                       [])
 
@@ -347,9 +395,10 @@
        (when-let [item (.take queue)]
          ;; a queue item is {:text … :contexts …}; tolerate a bare string
          (let [{:keys [text contexts]} (if (map? item) item {:text item})]
-           (binding [*out* *err*]
-             ;; never log a credential: mask `/secret KEY VALUE` before printing
-             (println "worker take:" (pr-str (secrets/redact-secret-command (str text)))))
+           ;; THE TAG IS THE POINT: every tab's spine output shares one log file,
+           ;; so without `[<session-id>]` a `worker take:` line says nothing about
+           ;; which tab asked. The log pane filters on exactly this prefix.
+           (tagged! state "worker take:" (pr-str (secrets/redact-secret-command (str text))))
            (try
              (reset! (:history state) (handle-turn! state hooks text contexts))
              (catch Throwable e
