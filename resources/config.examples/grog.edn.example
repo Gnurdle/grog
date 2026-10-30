@@ -33,7 +33,11 @@
         :hyperbolic {:url "https://api.hyperbolic.xyz/v1"                              :model "meta-llama/Llama-3.3-70B-Instruct"}
         :reflection {:url "https://api.reflection.ai/openai/v1"                        :model "Beam-501B-A23B"}
 
-        ;; local — no key (run the server yourself)
+        ;; local — no key (run the server yourself). These are DEFAULTS: a local
+        ;; server can run on any port, and if you run more than one of a kind
+        ;; (two Strata launches) put the port in the url — `http://localhost:8081/v1`
+        ;; — or use the Models dialog (its URL field holds the port) or
+        ;; `/provider strata 8081`. See USERS-GUIDE §4.6.
         :ollama     {:url "http://localhost:11434/v1"                                  :model "qwen3:8b"}
         :lmstudio   {:url "http://localhost:1234/v1"                                   :model "qwen2.5-7b-instruct"}
         :strata     {:url "http://localhost:8080/v1"                                   :model "qwen3.8-flash-next-unsloth-ud-q4_k_xl"}

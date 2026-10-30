@@ -90,7 +90,10 @@
 (def ^:private help-rows
   [["/help"    "this list — everything grog can be told to do"           "—"]
    ["/project" "list · switch · create (/project new <name>) · delete"   "Ctrl+T new tab · Ctrl+W close · Ctrl+Tab cycle · Ctrl+1‑9 jump"]
-   ["/model"   "show the current model + recents, or switch: /model <n> / <name>" "status-bar model · ⚙ Settings → Models…"]
+   ["/model"   "show the current model + recents, or switch: /model <n> / <name>" "the Models dialog (Ctrl+M) — and the status bar's model line"]
+   ["/provider"
+    "list the transport catalogue, or set it: /provider <id> · add a port for a LOCAL server (/provider strata 8081 — a second launch)"
+    "the Models dialog (Ctrl+M) — a model's URL holds its host and port"]
    ["/secret"  "store or remove a key — values are never printed"        "—"]
    ["/clear"   "start a fresh conversation"                              "—"]
    ["/doctor"  "check what is installed and whether it holds together"   "—"]
@@ -135,24 +138,32 @@
      ;; onboarding page instead of a transcript.
      :home-project nil :bootstrap-needed? false :bootstrap-configured? false
      :bootstrap-dismissed? false :bootstrap-mcps nil :docs-dir nil :first-run? false
-     ;; model picker: the catalogue from the server, which source is being
-     ;; browsed, and the search string. `:model-info` (from the server) holds the
-     ;; transport url / provider / sources / recents for the ONE model.
-     :catalogue nil :model-source nil :model-query ""
-     :model-sources [["local" "Local"]] :model-info nil :recents []
-     ;; provider picker (transport): the shipped catalogue (resources/
-     ;; providers.edn via the server's `providers` method) + what the picked slot
-     ;; points at. `:provider-query` / `:provider-open?` drive the searchable combo.
-     :providers nil :provider-current nil :provider-query "" :provider-open? false
-     ;; The composer draft and its attachments are PER SESSION
+     ;; THE MODELS DIALOG's whole state (it is a self-contained dialog now — see
+     ;; `models-dialog`). A model is a NAMED CHOICE: {name url model}, picked by
+     ;; name. `:choices` is the list from the spine (`choices` RPC), `:templates`
+     ;; the baked-in endpoints a new row starts from, `:model-info` the live
+     ;; transport (what a session runs right now), `:recents` the LRU shortlist
+     ;; for anything that is NOT a named choice.
+     :choices [] :templates [] :model-info nil :model-sources [["local" "Local"]]
+     :recents []
+     ;; the editor form. `:choice-edit` is the name being edited, or "new".
+     ;; nil = the dialog is showing only the list. The draft fields are the
+     ;; user's text and are NEVER overwritten by a refresh while editing.
+     :choice-edit nil :choice-name "" :choice-url "" :choice-model ""
+     ;; a per-choice browse list: the endpoint of the row being edited, keyed by
+     ;; url in `:choice-catalogue` (the spine caches per url, see the `models` RPC)
+     :choice-browse nil :choice-catalogue {} :choice-query ""
+     ;; the "start from a baked-in endpoint" list's search box
+     :template-query ""
+     ;; what the last save/probe/remove said, shown IN the form rather than only
+     ;; in the status line — a validation failure must appear beside the field
+     ;; that caused it.
+     :choice-msg nil :choice-busy? false
+     ;; the composer draft and its attachments are PER SESSION
      ;; ([:sessions sid :input] / [:sessions sid :attachments]) so swapping
      ;; projects cannot leak one project's text or image into another — they are
      ;; not top-level keys. See the :input / :attach-* events and their subs.
-     :voice nil :recording? false :transcribing? false
-     ;; MODELS dialog: the editable model id and the "also set as the global
-     ;; default" tick. One model now (the big/small slot tabs are gone), so there
-     ;; is no `:models-slot` to focus.
-     :models-draft "" :models-global? false}))
+     :voice nil :recording? false :transcribing? false}))
 
 (rf/reg-sub :db (fn [db _] db))
 (defn- sess-of [db id] (get-in db [:sessions id]))
@@ -558,26 +569,28 @@
 
 (rf/reg-event-fx :dialog-open
   (fn [{:keys [db]} [_ kind initial]]
-    (let [sess (get-in db [:sessions (:active db)])]
-      (cond-> {:db (assoc db :dialog kind :dialog-input (or initial "")
-                          ;; the provider combo starts collapsed / unsearched
-                          :provider-query "" :provider-open? false)}
-        ;; the project picker needs the live list from the server
-        (= kind :projects) (assoc :dispatch [:fetch-projects])
-        ;; the settings dialog loads the provider catalogue + the model list
-        ;; (its model section is read-only now — editing models happens in the
-        ;; Models… dialog)
-        (= kind :settings) (assoc :dispatch-n [[:providers-load] [:models-fetch nil]])
-        ;; the MODELS dialog seeds the draft from the session's resolved model and
-        ;; loads the transport catalogue + the provider list to browse. The box
-        ;; starts CLEAN, so the server's model may fill it in.
-        (= kind :models)
-        (assoc :db (assoc db :dialog :models :model-query ""
-                          :models-draft (or (:model sess) "")
-                          :models-draft-dirty? false
-                          :models-global? false
-                          :catalogue nil)
-               :dispatch-n [[:providers-load] [:models-fetch nil]])))))
+    (cond-> {:db (assoc db :dialog kind :dialog-input (or initial ""))}
+      ;; the project picker needs the live list from the server
+      (= kind :projects) (assoc :dispatch [:fetch-projects])
+      ;; Settings is appearance + voice ONLY. Model selection is NOT in here —
+      ;; it is a dialog of its own (see `:models`), because cramming a transport
+      ;; combo, a port box, a catalogue list and a raw model id into the same
+      ;; panel as the font size is what made it unusable. Settings keeps a
+      ;; read-only "current model" line and the button that opens the real one.
+      (= kind :settings) (assoc :dispatch [:choices-load])
+      ;; THE MODELS DIALOG. Self-contained: it loads its own list (named choices
+      ;; + baked-in templates) and the recents shortlist, and it starts with the
+      ;; editor CLOSED — the list is the front door, because picking a model you
+      ;; already set up is the common case. The per-endpoint browse cache is
+      ;; dropped with the last dialog: a list fetched for another endpoint would
+      ;; be shown as if it were this row's.
+      (= kind :models)
+      (assoc :db (assoc db :dialog :models
+                           :choice-edit nil :choice-name "" :choice-url ""
+                           :choice-model "" :choice-browse nil :choice-query ""
+                           :choice-msg nil :choice-busy? false
+                           :choice-catalogue {})
+             :dispatch-n [[:choices-load] [:recents-fetch]]))))
 
 ;; --- project list (server `projects` method) -------------------------------
 
@@ -592,92 +605,274 @@
     {}))
 (rf/reg-event-db :dialog-input (fn [db [_ s]] (assoc db :dialog-input s)))
 (rf/reg-event-db :dialog-close (fn [db _] (assoc db :dialog nil)))
-;; models dialog: the draft model id and its "global default" tick.
+;; =============================================================================
+;; THE MODELS DIALOG — one self-contained selection layer
+;; =============================================================================
 ;;
-;; `:models-draft-dirty?` marks the box as HOLDING USER INPUT. While it is set,
-;; the box is the user's and no server state may overwrite it mid-edit; once a
-;; pick lands (or the dialog opens) it clears and the box mirrors what is
-;; actually configured. Without this the box was permanently "dirty" in spirit —
-;; it kept the last thing typed even after the model changed underneath, so the
-;; panel advertised one model while the session ran another.
-(rf/reg-event-db :models-draft
-  (fn [db [_ v]] (assoc db :models-draft v :models-draft-dirty? true)))
-;; a pick has LANDED: the box stops being the user's and mirrors the server again
-(rf/reg-event-db :models-draft-synced
-  (fn [db _] (assoc db :models-draft-dirty? false)))
-(rf/reg-event-db :models-global
-  (fn [db [_ on?]] (assoc db :models-global? (boolean on?))))
-;; The recents list arrived from the server (`recents` broadcast / snapshot).
-(rf/reg-event-db :recents-loaded
-  (fn [db [_ xs]]
-    (assoc db :recents (vec (js->clj (or xs []) :keywordize-keys true)))))
-
-;; --- model picker ----------------------------------------------------------
+;; A model, as the user knows it, is a NAME: `workstation` means "that qwen on
+;; port 8081". Everything here exists to make NAME the unit of every operation —
+;; pick one, add one, edit one, remove one, each one click from the list — and to
+;; keep the three fields a name stands for (`name`, `url`, `model`) in ONE form
+;; that is written in ONE call.
 ;;
-;; The catalogue lives on the SERVER (it has the config and the provider
-;; fetchers). `models` answers from cache, and a slow source is refreshed in the
-;; background — the refreshed list arrives as a `models` broadcast, so a first
-;; click on Local/Remote shows "loading…" and then fills in, rather than freezing
-;; the dialog.
+;; What this replaces, and why: the panel used to spread one decision across a
+;; provider combo, a separate port box, a raw model-id box and a catalogue list —
+;; four controls that only make sense together, with three separate RPCs to land
+;; one change. That shape produced the reported bugs one after another (the port
+;; that would not stick, the bogus model, the recents row that switched the id but
+;; not the endpoint), and each fix added another field to keep in sync. There is
+;; no separate port field here: the URL is a text field the user owns, port
+;; included, so there is nothing left to desync.
+;;
+;; The spine owns the state (`choices` / `save-choice` / `remove-choice`); this
+;; side holds only what is on screen. A validation failure comes back as an error
+;; whose MESSAGE is the sentence to show, and it is shown IN THE FORM
+;; (`:choice-msg`), not only in the status line — a user who mistyped a URL needs
+;; the reason beside the field they mistyped.
 
-(rf/reg-event-fx :models-source
-  "Switch the browsed source AND ask for its models. Switching without asking
-  left every tab except the one the dialog opened on empty, with nothing to do
-  but press ↻ — which is why the local tab looked broken."
-  (fn [{:keys [db]} [_ source]]
-    {:db (assoc db :model-source source :model-query "")
-     ;; the server answers from its cache instantly and refreshes in the
-     ;; background, so this is cheap on a source we already have
-     :dispatch [:models-fetch nil]}))
+(defn- choices-load-failure [e what]
+  (rf/dispatch [:status-line nil (str "[grog] " what " failed: " (.-message e))]))
 
-(defn- model-sources
-  "The sources the models dialog offers, from the server's model info —
-  `[[id label] …]`. Falls back to the (older) top-level key, then Local only."
-  [db]
-  (or (seq (get-in db [:model-info :sources]))
-      (seq (:model-sources db))
-      [["local" "Local"]]))
-
-(defn- effective-source
-  "Which picker source is being browsed.
-
-  A source the user actually picked always wins (while it is still offered);
-  until they pick one: `remote` when offered, else `local`."
-  [db]
-  (let [ids (set (map first (model-sources db)))]
-    (cond
-      (contains? ids (:model-source db)) (:model-source db)
-      (contains? ids "remote")           "remote"
-      :else                              "local")))
-
-(rf/reg-event-db :model-query
-  (fn [db [_ q]] (assoc db :model-query q)))
-
-(rf/reg-event-db :catalogue
-  (fn [db [_ cat]] (assoc db :catalogue (js->clj cat :keywordize-keys true))))
-
-(rf/reg-event-db :models-source-loaded
-  (fn [db [_ {:keys [source models]}]]
-    (assoc-in db [:catalogue (keyword source)] (vec models))))
-
-(rf/reg-event-fx :models-fetch
-  "Ask the server for `source`'s models (default: whichever source is being
-  browsed). `force` re-fetches a source we already have cached."
-  (fn [{:keys [db]} [_ force]]
-    (-> (.call js/window.grogAPI
-               "models"
-               (clj->js (cond-> {:source (effective-source db)}
-                          force (assoc :force true))))
-        (.then (fn [cat] (rf/dispatch [:catalogue cat])))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] models failed: " (.-message e))]))))
+(rf/reg-event-fx :choices-load
+  "Read the named models + the baked-in templates. Cheap and network-free on the
+  spine (it answers from the config), so this runs every time the dialog opens
+  and after every write — the list the user sees is always the file."
+  (fn [_ _]
+    (-> (.call js/window.grogAPI "choices" (clj->js {}))
+        (.then (fn [m] (rf/dispatch [:choices-loaded m])))
+        (.catch (fn [e] (choices-load-failure e "choices"))))
     {}))
+
+(rf/reg-event-db :choices-loaded
+  (fn [db [_ m]]
+    (let [m (js->clj m :keywordize-keys true)]
+      (-> db
+          (assoc :choices (vec (:choices m)))
+          ;; the baked-in endpoints, kept for the "start from one" picker
+          (assoc :templates (vec (:templates m)))
+          ;; the LIVE transport (what a session actually runs) rides along, so
+          ;; the dialog can mark the row that is in force without a second call
+          (assoc :model-info (or (:current m) (:model-info db)))
+          (assoc :model-sources (or (seq (get-in m [:current :sources]))
+                                    (:model-sources db)))))))
+
+;; --- the editor form --------------------------------------------------------
+;;
+;; One form, three fields, opened from a row (edit) or from a baked-in template
+;; (add). The drafts are the user's text: nothing a refresh returns may overwrite
+;; them while the form is open.
+
+(defn- choice-row
+  "The stored choice with this name, or nil (case-insensitive — the spine folds
+  every name to lower case)."
+  [db name]
+  (let [n (some-> name str str/trim str/lower-case not-empty)]
+    (when n (first (filter #(= n (:name %)) (:choices db))))))
+
+(rf/reg-event-fx :choice-edit
+  "Open the form on an existing row: its name (shown, and used as the key), its
+  url and its model id, and start browsing ITS endpoint — not the configured
+  transport's. Opening a row and seeing some other server's model list is how a
+  user ends up saving a model id that endpoint has never heard of."
+  (fn [{:keys [db]} [_ name]]
+    (let [c (choice-row db name)]
+      {:db (assoc db :choice-edit (:name c)
+                     :choice-name (str (:name c))
+                     :choice-url (str (or (:url c) ""))
+                     :choice-model (str (or (:model c) ""))
+                     :choice-query "" :choice-msg nil :choice-busy? false
+                     :choice-browse (some-> (:url c) str str/trim (str/replace #"/+$" "") not-empty))
+       :dispatch (when-let [u (:url c)] [:choice-catalogue-fetch u nil])})))
+
+(rf/reg-event-fx :choice-new
+  "Open a blank form, optionally PRE-FILLED from a baked-in endpoint
+  (`{:template {:id \"strata\" :url \"…\" :sample \"…\"}}`). The template is a
+  starting point the user then edits — the baked-in list is a template, not a
+  cage."
+  (fn [{:keys [db]} [_ {:keys [template]}]]
+    (let [t (or template {})
+          url (str (or (:url t) ""))]
+      {:db (assoc db :choice-edit "new"
+                     :choice-name (str (or (:id t) ""))
+                     ;; the sample is a SUGGESTION, so it lands in a field the
+                     ;; user can clear — not in a locked value
+                     :choice-url url
+                     :choice-model (str (or (:sample t) ""))
+                     :choice-query "" :choice-msg nil :choice-busy? false
+                     :choice-browse (some-> url str/trim (str/replace #"/+$" "") not-empty))
+       :dispatch (when (seq url) [:choice-catalogue-fetch url nil])})))
+
+(rf/reg-event-db :choice-cancel
+  (fn [db _]
+    (-> db (assoc :choice-edit nil :choice-msg nil :choice-busy? false
+                  :choice-query "" :choice-browse nil))))
+
+(rf/reg-event-db :choice-field
+  "One field of the form. `k` is :name / :url / :model."
+  (fn [db [_ k v]]
+    (assoc db (case k :name :choice-name :url :choice-url :model :choice-model)
+              (str (or v "")))))
+
+(rf/reg-event-db :choice-msg
+  (fn [db [_ m]] (assoc db :choice-msg (some-> m str not-empty))))
+
+(rf/reg-event-fx :choice-save
+  "Save the form. ONE call, THREE fields — name, URL (port included, because it
+  is part of the URL the user typed) and model id.
+
+  On a validation failure the spine's message goes into `:choice-msg`, i.e. into
+  the form itself; the list is NOT re-read, because the file did not change and
+  re-reading would blow away the half-typed fields the user still needs to fix."
+  (fn [{:keys [db]} _]
+    (let [editing (:choice-edit db)
+          new? (= "new" editing)
+          nm (if new? (:choice-name db) (or (:choice-name db) editing))]
+      (if (and new? (str/blank? (str nm)))
+        ;; the message is shown in the form, not the status line: the field the
+        ;; user has to fix is right there on screen
+        {:db (assoc db :choice-msg "give it a NAME — that is what you pick a model with (/model <name>)")}
+        (do
+          (-> (.call js/window.grogAPI "save-choice"
+                     (clj->js {:name nm :url (:choice-url db) :model (:choice-model db)}))
+              (.then (fn [_]
+                       ;; landed: the form closes, the list re-reads, and the
+                       ;; status line says what happened
+                       (rf/dispatch [:choice-cancel])
+                       (rf/dispatch [:choices-load])
+                       (rf/dispatch [:status-line nil
+                                     (str "[grog] saved model " (str/lower-case (str nm))
+                                          " — pick it with /model " (str/lower-case (str nm)))])))
+              (.catch (fn [e] (rf/dispatch [:choice-msg (.-message e)]))))
+          {:db (assoc db :choice-busy? true)})))))
+
+(rf/reg-event-fx :choice-remove
+  "Delete a named model. It is removed from the FILE (the spine also drops the
+  legacy :profiles key it came from), so it cannot reappear on the next read —
+  and the row that is currently IN FORCE stays in force: removing a name does not
+  stop a session that is running it."
+  (fn [{:keys [db]} [_ name]]
+    (-> (.call js/window.grogAPI "remove-choice" (clj->js {:name name}))
+        (.then (fn [_]
+                 (rf/dispatch [:choices-load])
+                 (rf/dispatch [:status-line nil (str "[grog] removed model " name)])))
+        (.catch (fn [e] (choices-load-failure e (str "remove-choice " name)))))
+    {:db (cond-> db
+           (= name (:choice-edit db)) (assoc :choice-edit nil :choice-msg nil))}))
+
+;; --- picking ---------------------------------------------------------------
+
+(rf/reg-event-fx :choice-pick
+  "PICK a named model — the button on the row, and the whole point of the dialog.
+
+  The spine resolves the NAME to the `[url model]` pair it stands for
+  (`pick-choice`), and the pair is then written through the SAME `set-model` call
+  every other pick uses: one write path for the transport, the model, the recents
+  row and the session's pinned endpoint, so the dialog, `/model <name>` and the
+  project manifest cannot drift apart.
+
+  A named model is a machine-level thing, so a pick is GLOBAL (it writes
+  grog.edn), and it takes effect on the NEXT turn — the running session re-reads
+  its pinned transport when the spine pushes the `model` event back."
+  (fn [{:keys [db]} [_ sid name]]
+    ;; the spine resolves the name, THEN the client writes the pair it stands for
+    ;; through set-model. One write path, so the dial, /model and the manifest do
+    ;; the same thing.
+    (-> (.call js/window.grogAPI "pick-choice" (clj->js {:name name}))
+        (.then (fn [c]
+                 (let [c (js->clj c :keywordize-keys true)]
+                   (.call js/window.grogAPI "set-model"
+                          (clj->js {:id sid :model (:model c) :global true
+                                    :url (:url c)})))))
+        (.then (fn [_]
+                 (rf/dispatch [:choices-load])
+                 (rf/dispatch [:recents-fetch])))
+        ;; a name that cannot be picked (no model id yet) says why, in the dialog
+        (.catch (fn [e]
+                  (rf/dispatch [:choice-msg (.-message e)])
+                  (rf/dispatch [:choices-load]))))
+    {:db db}))
+
+;; --- what an endpoint actually serves --------------------------------------
+
+(rf/reg-event-fx :choice-catalogue-fetch
+  "The model list for ONE endpoint url — the row being edited, which need not be
+  the transport grog currently runs. Keyed by url on the spine (it caches per
+  endpoint), answered from cache instantly, and a slow endpoint is fetched on a
+  background thread and arrives as a `models` broadcast carrying that url."
+  (fn [{:keys [db]} [_ url force]]
+    (let [u (some-> url str str/trim (str/replace #"/+$" "") not-empty)]
+      (if (nil? u)
+        {}
+        (do
+          (-> (.call js/window.grogAPI "models" (clj->js (cond-> {:url u} force (assoc :force true))))
+              (.then (fn [cat] (rf/dispatch [:choice-catalogue-loaded cat])))
+              (.catch (fn [_] nil)))
+          ;; the browse box follows the endpoint the form is pointed at, even
+          ;; before the fetch lands — so it can say "loading…" for the RIGHT url
+          {:db (assoc db :choice-browse u)
+           :dispatch-n [(when (= u (:choice-browse db)) [:choice-catalogue-loaded
+                                                        {:url u :models (get-in db [:choice-catalogue u])}])]})))))
+
+(rf/reg-event-db :choice-catalogue-loaded
+  "Fill the browse box of ONE endpoint. TWO shapes arrive here: the RPC response
+  (a raw JS object) and the spine's `models` broadcast (already CLJS, converted in
+  `:notify`). Accepting only one is how a list that WAS fetched never shows up —
+  the box says 'ask this URL what it serves' forever, which reads as a dead
+  button."
+  (fn [db [_ m]]
+    (let [m (cond (nil? m) {}
+                  (map? m) m
+                  :else (js->clj m :keywordize-keys true))
+          u (some-> (:url m) str str/trim (str/replace #"/+$" "") not-empty)]
+      (if (nil? u)
+        db
+        (assoc-in db [:choice-catalogue u]
+                  ;; nil models = never fetched (keep whatever was there);
+                  ;; a list = what that endpoint says it serves
+                  (if-let [ms (:models m)] (vec ms) (get-in db [:choice-catalogue u])))))))
+
+(rf/reg-event-db :choice-query
+  (fn [db [_ q]] (assoc db :choice-query (or q ""))))
+
+(rf/reg-event-db :template-query
+  (fn [db [_ q]] (assoc db :template-query (or q ""))))
+
+(rf/reg-event-fx :choice-probe
+  "\"What is actually there\" for one row: does the endpoint answer, what does it
+  serve, what window does it accept. Network, so it is a button the user presses,
+  never part of a plain list read."
+  (fn [{:keys [db]} [_ name]]
+    (-> (.call js/window.grogAPI "choice-probe" (clj->js {:name name}))
+        (.then (fn [r]
+                 (rf/dispatch [:choice-probed (js->clj r :keywordize-keys true)])))
+        (.catch (fn [e]
+                  (rf/dispatch [:choice-msg (str "could not reach " name ": " (.-message e))]))))
+    {:db db}))
+
+(rf/reg-event-db :choice-probed
+  "Merge one probed row into the list — the answer arrives from the spine both as
+  this call's result (a JS object) and (for other clients) as a `choice`
+  broadcast (already CLJS). Both shapes are accepted, for the reason given on
+  `:choice-catalogue-loaded`."
+  (fn [db [_ r]]
+    (let [r (cond (nil? r) {}
+                  (map? r) r
+                  :else (js->clj r :keywordize-keys true))
+          n (:name r)]
+      (if (nil? n)
+        db
+        (update db :choices
+                (fn [xs]
+                  (mapv (fn [c] (if (= (:name c) n)
+                                  (merge c (select-keys r [:reachable? :models :context-window :port :provider]))
+                                  c))
+                        xs)))))))
 
 ;; --- recents (the LRU shortlist) -------------------------------------------
 ;;
-;; The picker is for FINDING a model; recents is for getting back to one you
-;; already use. The list is maintained by the SPINE (it owns grog.edn): every
-;; pick pushes to the front and anything past the cap falls off. This side only
-;; reads it and offers a forget.
+;; Recents is the shortlist for anything that is NOT a named choice — a model id
+;; tried once, an endpoint nothing was saved for. Named choices are the durable
+;; list; this is the scratch pad, and it is kept short on purpose.
 
 (rf/reg-event-fx :recents-fetch
   (fn [_ _]
@@ -686,86 +881,41 @@
         (.catch (fn [_] nil)))
     {}))
 
+(rf/reg-event-db :recents-loaded
+  (fn [db [_ xs]]
+    (assoc db :recents (vec (js->clj (or xs []) :keywordize-keys true)))))
+
 (rf/reg-event-fx :recents-forget
   (fn [_ [_ url model]]
     (-> (.call js/window.grogAPI "forget-recent" (clj->js {:url url :model model}))
         (.then (fn [_] (rf/dispatch [:recents-fetch])))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] forget-recent failed: " (.-message e))]))))
+        (.catch (fn [e] (choices-load-failure e "forget-recent"))))
     {}))
 
-;; --- provider picker -------------------------------------------------------
+;; --- picking a raw model id / a recent --------------------------------------
 ;;
-;; The catalogue is DATA shipped with the app (resources/providers.edn), served
-;; by the spine's `providers` method so the renderer never hard-codes a host.
-;; Picking one writes :llm :url (:model) into grog.edn — a GLOBAL change that
-;; lands on the next start (config is snapshotted per session), so the status
-;; line says "restart" instead of pretending it took effect.
+;; A named choice is the front door, but a user must still be able to run a model
+;; they never saved: a row from recents (which carries its OWN url, so it switches
+;; the transport too) or an id typed into the dialog. Both go through `set-model`
+;; — the same single write path — with `:global true`, because a model picked from
+;; the dialog is a machine-level choice, not a one-session experiment (that is
+;; what `/model <id>` in the composer is for).
 
-(rf/reg-event-db :providers-loaded
-  (fn [db [_ m]]
-    (let [m (js->clj m :keywordize-keys true)
-          info (or (:info m) (:model-info db))
-          ;; the TRANSPORT pick path lands here (it does not go through
-          ;; `:set-model`), so this is where the dialog must pick up a model the
-          ;; server CLEARED — a blank box is the honest "choose one" the user
-          ;; asked for, and keeping the old id would advertise a model that is no
-          ;; longer in force.
-          ;; A box the user is typing in is left alone (see `:models-draft`).
-          synced (if (:models-draft-dirty? db)
-                   db
-                   (assoc db :models-draft (str (or (:model info) ""))))]
-      (assoc synced
-             :providers (vec (:providers m))
-             :provider-current (:current m)
-             ;; the server's current model info (transport/provider/sources)
-             :model-info info
-             :recents (or (seq (:recents m)) (:recents db))))))
-
-(rf/reg-event-db :provider-current
-  (fn [db [_ _slot cur]]
-    (-> db
-        (assoc :provider-current cur)
-        (assoc :model-info (merge (:model-info db) cur)))))
-
-(rf/reg-event-fx :providers-load
-  (fn [_ _]
-    (-> (.call js/window.grogAPI "providers" (clj->js {}))
-        (.then (fn [m] (rf/dispatch [:providers-loaded m])))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] providers failed: " (.-message e))]))))
-    {}))
-
-(rf/reg-event-fx :set-provider
-  (fn [_ [_ id]]
-    (-> (.call js/window.grogAPI "set-provider" (clj->js {:id id}))
-        (.then (fn [m]
-                 (let [m (js->clj m :keywordize-keys true)]
-                   ;; the whole info map (url, provider, model, sources) so the
-                   ;; dialog's transport label AND source tabs follow the change
-                   (rf/dispatch [:provider-current nil m])
-                   (rf/dispatch [:models-fetch :force])
-                   (rf/dispatch [:recents-fetch])
-                   (rf/dispatch [:status-line nil
-                                 (str "[grog] transport -> " (:url m))]))))
-        (.catch (fn [e] (rf/dispatch [:status-line nil (str "[grog] set-provider failed: " (.-message e))]))))
-    {}))
-
-;; --- the provider combo box -------------------------------------------------
-;; A native <select> can be neither sorted nor searched, so the settings picker
-;; is a small combo: a search field that filters the shipped catalogue and a
-;; list sorted by label. `:provider-query` is the search string, `:provider-open?`
-;; whether the list is showing.
-
-(rf/reg-event-db :provider-query
-  (fn [db [_ q]] (assoc db :provider-query (or q "") :provider-open? true)))
-
-(rf/reg-event-db :provider-open
-  (fn [db [_ open?]] (assoc db :provider-open? (boolean open?))))
-
-;; choose a provider: close + clear the box, then do the real work.
-(rf/reg-event-fx :provider-pick
-  (fn [{:keys [db]} [_ id]]
-    {:db (assoc db :provider-query "" :provider-open? false)
-     :dispatch [:set-provider id]}))
+(rf/reg-event-fx :pick-url-model
+  (fn [{:keys [db]} [_ sid model url]]
+    (let [m (some-> model str str/trim not-empty)]
+      (if (nil? m)
+        ;; an empty pick says so, in the dialog, rather than doing nothing
+        {:db (assoc db :choice-msg "no model picked — click one from the list, or type an id")}
+        (do
+          (-> (.call js/window.grogAPI "set-model"
+                     (clj->js (cond-> {:id sid :model m :global true}
+                                (seq (str (or url ""))) (assoc :url (str url)))))
+              (.then (fn [_]
+                       (rf/dispatch [:choices-load])
+                       (rf/dispatch [:recents-fetch])))
+              (.catch (fn [e] (choices-load-failure e "set-model"))))
+          {:db db})))))
 
 (rf/reg-event-db :status-line
   (fn [db [_ sid text]]
@@ -823,23 +973,18 @@
         (= :trust kind)    (assoc-in db [:sessions sid :trust] (boolean (:value ev)))
         (= :model kind)    (cond-> (assoc-in db [:sessions sid :model] (:value ev))
                              ;; the `model` event also carries WHERE it runs — the
-                             ;; provider and label the status line shows.
+                             ;; provider and label the status line shows, and the
+                             ;; NAME the user gave that url+model pair when they
+                             ;; gave one (the spine matches it, so the label can
+                             ;; say `workstation` instead of a url nobody chose).
                              (contains? ev :label)
                              (assoc-in [:sessions sid :model-label] (:label ev))
                              (contains? ev :provider)
                              (assoc-in [:sessions sid :provider] (:provider ev))
                              (contains? ev :url)
                              (assoc-in [:sessions sid :url] (:url ev))
-                             ;; …and the MODELS dialog's box follows it, for the
-                             ;; session it is showing. Without this the box kept
-                             ;; whatever was typed before the pick while the model
-                             ;; actually in force was something else — the panel
-                             ;; and the session disagreeing about the model is the
-                             ;; "nothing is wired together" complaint, and it made
-                             ;; Apply look like it had not taken. A box the user is
-                             ;; still typing in is left alone.
-                             (and (= sid (:active db)) (not (:models-draft-dirty? db)))
-                             (assoc :models-draft (str (or (:value ev) ""))))
+                             (contains? ev :choice)
+                             (assoc-in [:sessions sid :model-choice] (:choice ev)))
         (= :vision kind)   (assoc-in db [:sessions sid :vision?] (:value ev))
         (= :clear kind)    (assoc-in db [:sessions sid :transcript] [])
         (= :approval kind) (assoc-in db [:sessions sid :pending-approval] (dissoc ev :answer))
@@ -894,6 +1039,12 @@
   (fn [{:keys [db]} _]
     (let [sid (:active db) sess (sess-of db sid)]
       (cond
+        ;; Escape in the Models dialog steps OUT one level: the editor closes
+        ;; first, the dialog second. A user who hits Escape expecting to back out
+        ;; of a form must not lose the list they came from.
+        (and (= :models (:dialog db)) (:choice-edit db))
+        {:db (-> db (assoc :choice-edit nil :choice-msg nil))}
+
         (:dialog db)            {:db (assoc db :dialog nil)}
         (and (:focused? db) (:pending-approval sess))
         {:dispatch [:answer-approval sid (:id (:pending-approval sess)) :reject]}
@@ -911,8 +1062,14 @@
                                     [:retry-status (select-keys (:params msg) [:attempts :nextRetryAt :retrying])]
                                     [:retry-open]]}
       "server-down"   {:dispatch [:status-line nil (:text (:params msg))]}
-      ;; a background OpenRouter/Ollama refresh landed
-      "models"        {:dispatch [:models-source-loaded (:params msg)]}
+      ;; a per-endpoint model list landed from the spine's background fetch. It
+      ;; carries the URL it belongs to, so it can only fill the browse box of the
+      ;; row that asked for it — a list from another endpoint showing up under
+      ;; this one is how a model id nobody serves gets saved.
+      "models"        {:dispatch [:choice-catalogue-loaded (:params msg)]}
+      ;; a probe of one choice's endpoint landed (server `choice-probe`): merge
+      ;; the answer into that row rather than re-reading the whole list
+      "choice"        {:dispatch [:choice-probed (:params msg)]}
       nil)))
 
 ;; --- commands --------------------------------------------------------------
@@ -1042,55 +1199,14 @@
           (.catch (fn [e] (rf/dispatch [:status-line id (str "[grog] set-trust failed: " (.-message e))]))))
       {:db (assoc-in db [:sessions id :trust] on)})))
 
-(rf/reg-event-fx :set-model
-  (fn [{:keys [db]} [_ id model source opts]]
-    (let [m (str/trim (str model))
-          url (:url opts)
-          global? (boolean (:global opts))]
-      ;; A pick needs a model OR a transport. A blank model with a url is a
-      ;; legitimate "just switch where models come from" (that is what a recents
-      ;; row carries), so it is NOT discarded here — dropping it was why a recents
-      ;; click could appear to do nothing. Only a pick with neither is a no-op,
-      ;; and it says so instead of silently returning.
-      (if (or (seq m) (seq url))
-        (do
-          ;; `source` is the picker's PLACE ("local"/"remote"). The server turns
-          ;; that into a provider before qualifying — it knows the config; this
-          ;; side only knows the tab. `:global` writes the GLOBAL default into
-          ;; grog.edn instead of this project's manifest.
-          (-> (.call js/window.grogAPI "set-model"
-                     (clj->js (cond-> {:id id :model m :global global?}
-                                (seq url) (assoc :url (str url))
-                                source (assoc :source (str source)))))
-              ;; the write changed the transport and/or the model, so re-read BOTH
-              ;; the recents list and the transport the dialog labels. Without the
-              ;; providers refresh the dialog kept showing the OLD endpoint after
-              ;; a pick — the panel and the config disagreeing is exactly what
-              ;; makes it feel like nothing is wired together.
-              ;;
-              ;; The draft is marked CLEAN on success: the pick has landed, so the
-              ;; box goes back to mirroring the server (which may have CLEARED the
-              ;; model — see `models/clear-model!` — and that blank is the honest
-              ;; answer the user asked for).
-              (.then (fn [_]
-                       ;; ordered: mark the box clean, then re-read the lists
-                       (rf/dispatch [:models-draft-synced])
-                       (rf/dispatch [:recents-fetch])
-                       (rf/dispatch [:providers-load])))
-              (.catch (fn [e] (rf/dispatch [:status-line id (str "[grog] set-model failed: " (.-message e))]))))
-          ;; the models dialog stays open (it has its own Close); the server
-          ;; pushes the new model state back as a `model` event.
-          {:db db})
-        {:db db
-         :dispatch [:status-line id "[grog] no model picked — click one from the list, or type an id"]}))))
-
-(rf/reg-event-fx :settings-save
-  "Save the Settings dialog's model AND dismiss the dialog. A `Save` button is
-  expected to close; `:set-model` alone deliberately does not (that behaviour is
-  for the models dialog's Apply, which has its own Close). `source` is
-  forwarded so a double-click from the catalogue still qualifies the provider."
-  (fn [_ [_ id model source]]
-    {:dispatch-n [[:set-model id model source] [:dialog-close]]}))
+;; (The model-selection events this file used to carry — `:set-model`,
+;; `:models-apply`, `:settings-save`, and the port-draft pairing between them —
+;; are gone. They were the old three-RPC dance: set the transport, then the port,
+;; then the model, chaining dispatches so the writes would not race, and
+;; reconciling the field each one had touched. The Models dialog writes a NAMED
+;; model in ONE call (`:choice-pick`, `:choice-save`, `:pick-url-model` above), so
+;; there is nothing left to order or reconcile. The composer's `/model` goes to
+;; the spine, which owns the config; it never used these.)
 
 (rf/reg-event-fx :answer-approval
   (fn [{:keys [db]} [_ sid approval-id decision]]
@@ -1215,16 +1331,25 @@
 (rf/reg-sub :ui-dialog (fn [db _] (:dialog db)))
 (rf/reg-sub :dialog-input (fn [db _] (:dialog-input db)))
 (rf/reg-sub :projects (fn [db _] (:projects db)))
-(rf/reg-sub :catalogue (fn [db _] (:catalogue db)))
-;; [[id label] …] from the server's `open` snapshot — Local and Remote.
-(rf/reg-sub :model-sources (fn [db _] (:model-sources db)))
-(rf/reg-sub :model-query (fn [db _] (:model-query db)))
-;; provider picker: the shipped catalogue + what :llm currently points at.
-(rf/reg-sub :providers (fn [db _] (:providers db)))
-(rf/reg-sub :provider-current (fn [db _] (:provider-current db)))
-;; the provider combo box's search string + open flag.
-(rf/reg-sub :provider-query (fn [db _] (:provider-query db)))
-(rf/reg-sub :provider-open? (fn [db _] (:provider-open? db)))
+
+;; --- the Models dialog's subscriptions --------------------------------------
+;; the named list, the baked-in templates, the live transport, the shortlist
+(rf/reg-sub :choices (fn [db _] (:choices db)))
+(rf/reg-sub :templates (fn [db _] (:templates db)))
+(rf/reg-sub :model-info (fn [db _] (:model-info db)))
+(rf/reg-sub :recents (fn [db _] (:recents db)))
+;; the editor form
+(rf/reg-sub :choice-edit (fn [db _] (:choice-edit db)))
+(rf/reg-sub :choice-name (fn [db _] (:choice-name db)))
+(rf/reg-sub :choice-url (fn [db _] (:choice-url db)))
+(rf/reg-sub :choice-model (fn [db _] (:choice-model db)))
+(rf/reg-sub :choice-msg (fn [db _] (:choice-msg db)))
+(rf/reg-sub :choice-busy? (fn [db _] (boolean (:choice-busy? db))))
+(rf/reg-sub :choice-browse (fn [db _] (:choice-browse db)))
+(rf/reg-sub :choice-query (fn [db _] (:choice-query db)))
+(rf/reg-sub :choice-catalogue (fn [db _] (:choice-catalogue db)))
+;; the baked-in template picker's search box
+(rf/reg-sub :template-query (fn [db _] (:template-query db)))
 (rf/reg-sub :pending-questions
   (fn [db _] (->> (:sessions db) (keep (fn [[id s]] (when (:pending-question s) id))) set)))
 
@@ -1813,6 +1938,14 @@
                :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
                :on-click #(rf/dispatch [:attach-pick])}
       "📎"]
+     ;; MODEL — the dialog, from the toolbar as well as the status bar. The whole
+     ;; subject opens in one place (Ctrl+M); a button here is what makes the help
+     ;; text true and gives a user with NO model set a way in that does not
+     ;; require knowing a shortcut or reading a status line.
+     [:button {:disabled (not active) :title "Models — pick one, or add your own (Ctrl+M)"
+               :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
+               :on-click #(rf/dispatch [:dialog-open :models ""])}
+      (str "model" (when-let [m (:model-choice sess)] (str " · " m)))]
      [:button {:disabled (not active) :title "Settings"
                :class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300 disabled:opacity-40"
                :on-click #(rf/dispatch [:dialog-open :settings (get-in @(rf/subscribe [:sessions]) [active :model])])}
@@ -1912,16 +2045,17 @@
      [:span {:class "flex items-center gap-1.5"}
       [:span {:class (str "w-2 h-2 rounded-full " (if connected? "bg-emerald-400" "bg-rose-500"))}]
       (if connected? "server attached" "server unreachable")]
-     ;; MODEL + PROVIDER — the thing that tells you which model a turn will run
-     ;; and WHERE it runs. The provider is shown because a model id alone does
-     ;; not say it (a local Strata server and OpenRouter can serve the same id),
-     ;; and clicking it opens the picker. `/model` prints the same label plus the
-     ;; numbered recents.
+     ;; MODEL — the NAME the user gave it, when they gave one; and always the
+     ;; id + endpoint, because a name that only exists in the user's head still
+     ;; has to be checkable. Clicking opens the Models dialog (Ctrl+M), which is
+     ;; the whole of model selection; `/model` in the composer prints the same
+     ;; state as a numbered/named list.
      (when sess
        [:span {:class "cursor-pointer hover:underline text-sky-300"
-               :title "the model this session runs · click to change (or type /model)"
+               :title "the model this session runs · click to choose another (Ctrl+M, or type /model)"
                :on-click #(rf/dispatch [:dialog-open :models ""])}
-        (str "model: " (or (:model-label sess) (:model sess) "?"))])
+        (let [nm (:model-choice sess)]
+          (str "model: " (if nm (str nm " · ") "") (or (:model sess) "?")))])
      ;; the raw endpoint, so a confusing pick is diagnosable without opening a
      ;; dialog. Truncated; the tooltip has the whole URL.
      (when (and sess (:url sess))
@@ -2074,60 +2208,338 @@
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
                  :on-click #(rf/dispatch [:dialog-close])} "Cancel"]]]]))
 
-(defn- provider-combo
-  "Sorted, searchable provider picker. `ps` is the shipped catalogue and
-  `cur-id` the provider currently in grog.edn. A native <select> cannot be
-  sorted or searched, so this is a small combo box: a search field that opens a
-  list of providers sorted by label, filtered on label / id / url."
-  [ps cur-id]
-  (let [q @(rf/subscribe [:provider-query])
-        open? @(rf/subscribe [:provider-open?])
-        cur (first (filter #(= cur-id (:id %)) ps))
-        sorted (sort-by (comp str/lower-case str :label) ps)
+;; =============================================================================
+;; THE MODELS DIALOG — one self-contained selection layer (see the events above)
+;; =============================================================================
+;;
+;; The whole of model selection, in one place, in ONE vocabulary: a model has a
+;; NAME, a URL and an id, and the dialog's only jobs are to list them, pick one,
+;; and let a row be added or edited. It opens from the status bar's model line and
+;; from the toolbar's `model` button — NOT from inside Settings, which is where
+;; the old one hid a provider combo, a port box, a raw id box and a catalogue
+;; list underneath a font-size control.
+;;
+;; Three states, in the order a user needs them:
+;;   1. the LIST of named models, the one in force marked, each row one click from
+;;      picked / edited / removed;
+;;   2. the FORM — name, URL, model id — opened on a row or blank, with that row's
+;;      own endpoint's model list below it to click an id from;
+;;   3. the baked-in endpoints (`resources/providers.edn`, served by the spine) as
+;;      TEMPLATES: one click pre-fills the form with a known base URL and, for a
+;;      running server, the model id it actually answers to.
+;;
+;; A note on the URL field: it is a plain text field, port included. There is no
+;; separate "port" control, because the port IS part of the URL — the old split
+;; (catalogue entry + a port draft kept in a separate db key) is what produced
+;; "I change the port and Apply doesn't stick": two fields, two writers, and a
+;; button wired to only one of them.
+
+(defn- named-model-row
+  "One row of the named list. The NAME is the row's identity and the thing a
+  session runs; the URL and id sit under it in mono so a wrong one is visible at a
+  glance. The dot carries the probe result — nil (never asked) is grey, so a row
+  never looks confirmed when it has not been checked."
+  [sid c in-force?]
+  (let [n (:name c)
+        prov (:provider c)
+        url (:url c)
+        model (:model c)]
+    ^{:key n}
+    [:div {:class (str "rounded-md border px-2 py-1.5 space-y-1 "
+                       (if in-force?
+                         "border-sky-500/50 bg-sky-950/30"
+                         "border-slate-700 bg-[#121212] hover:border-slate-600"))}
+     [:div {:class "flex items-center gap-2"}
+      [:span {:class (str "w-1.5 h-1.5 rounded-full shrink-0 "
+                          (cond (nil? (:reachable? c)) "bg-slate-600"
+                                (:reachable? c) "bg-emerald-400"
+                                :else "bg-rose-500"))
+              :title (cond (nil? (:reachable? c)) "not checked"
+                           (:reachable? c) "the endpoint answers"
+                           :else "nothing answered at that URL")}]
+      [:button {:class "text-left flex-1 min-w-0 text-slate-100 text-xs font-medium truncate"
+                :title (if sid
+                         "pick this model — writes grog.edn, used from the next turn on"
+                         "no session open — saving it is still enough; grog runs it when a session opens")
+                :on-click #(when sid (rf/dispatch [:choice-pick sid n]))}
+       (str n (when in-force? "  ← in use"))]
+      (when-let [w (:context-window c)]
+        [:span {:class "text-[0.62rem] text-slate-500 shrink-0"
+                :title "the context window this endpoint reports"}
+         (str (quot w 1000) "k")])
+      [:button {:class "text-[0.64rem] text-slate-400 hover:text-sky-300 shrink-0"
+                :title "ask that endpoint what it serves"
+                :on-click #(rf/dispatch [:choice-probe n])} "check"]
+      [:button {:class "text-[0.64rem] text-slate-400 hover:text-slate-100 shrink-0"
+                :title "edit its URL / model id"
+                :on-click #(rf/dispatch [:choice-edit n])} "edit"]
+      [:button {:class "text-[0.64rem] text-slate-500 hover:text-rose-300 shrink-0"
+                :title "remove it from grog.edn"
+                :on-click #(rf/dispatch [:choice-remove n])} "✕"]]
+     [:div {:class "text-[0.64rem] font-mono text-slate-500 truncate"
+            :title (str url)}
+      (str (or prov "?") " · " (or url "(no url — the transport in force)"))]
+     (if (seq model)
+       [:div {:class "text-[0.64rem] font-mono text-slate-400 truncate" :title model} model]
+       [:div {:class "text-[0.64rem] text-amber-300"}
+         "no model id — edit it, or start the server and press check"])]))
+
+(defn- template-picker
+  "The baked-in endpoints, as TEMPLATES: pick one and the form opens pre-filled
+  with its base URL (and its sample id, which the user may clear). This is the
+  \"baked in models are a template\" half of the request — a starting point, not a
+  menu of fixed choices."
+  []
+  (let [ts (or @(rf/subscribe [:templates]) [])
+        q  @(rf/subscribe [:template-query])
         shown (if (str/blank? q)
-                sorted
+                ts
                 (let [qq (str/lower-case q)]
-                  (filterv (fn [{:keys [id label url]}]
-                             (or (str/includes? (str/lower-case (str label)) qq)
-                                 (str/includes? (str/lower-case (str id)) qq)
-                                 (str/includes? (str/lower-case (str url)) qq)))
-                           sorted)))]
-    [:div {:class "space-y-1"}
-     [:div {:class "flex items-center gap-1"}
-      [:input {:value q
-               :placeholder (if cur (str (:label cur) " · " (:id cur)) "search providers…")
-               :on-focus #(rf/dispatch [:provider-open true])
-               :on-change #(rf/dispatch [:provider-query (.. % -target -value)])
-               :on-key-down #(case (.-key %)
-                               "Escape" (do (rf/dispatch [:provider-open false])
-                                            (.blur (.-target %)))
-                               "Enter" (when-let [f (first shown)]
-                                         (.preventDefault %)
-                                         (rf/dispatch [:provider-pick (:id f)]))
-                               nil)
-               :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-      [:button {:class "px-2 py-2 rounded-md bg-slate-800 border border-slate-700 text-slate-300 text-xs shrink-0"
-                :title (if open? "hide the provider list" "browse all providers")
-                :on-click #(rf/dispatch [:provider-open (not open?)])}
-       (if open? "▴" "▾")]]
-     (when open?
-       (into [:div {:class "max-h-56 overflow-y-auto rounded-md border border-slate-700"}]
-             (if (seq shown)
-               (for [{:keys [id label url]} shown]
-                 ^{:key id}
-                 [:button {:class (str "w-full text-left px-3 py-1.5 hover:bg-slate-800 "
-                                       (if (= id cur-id) "text-sky-300" "text-slate-200"))
-                           :title url
-                           :on-click #(rf/dispatch [:provider-pick id])}
-                  [:div {:class "text-xs"}
-                   (str label (when (= id cur-id) "  ✓"))]
-                  [:div {:class "text-[0.64rem] font-mono text-slate-500 truncate"} url]])
-               [[:div {:class "p-2 text-xs text-slate-500"}
-                 (str "no provider matches “" q "”")]])))
-     [:div {:class "text-[0.7rem] text-slate-500"}
-      (if cur
-        (str "selected: " (:label cur) " · " (:id cur))
-        (str (count ps) " providers · type to filter, click to choose"))]]))
+                  (filterv #(or (str/includes? (str/lower-case (str (:label %))) qq)
+                                (str/includes? (str/lower-case (str (:id %))) qq)
+                                (str/includes? (str/lower-case (str (:url %))) qq))
+                           ts)))]
+    [:div {:class "space-y-1.5"}
+     [:div {:class "flex items-center gap-2"}
+      [:span {:class "text-[0.7rem] text-slate-400"} "start from a known endpoint"]
+      [:input {:value q :placeholder "filter (strata, ollama, openrouter…)"
+               :on-change #(rf/dispatch [:template-query (.. % -target -value)])
+               :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1 text-[0.7rem] text-slate-200 outline-none focus:border-sky-500"}]]
+     (into [:div {:class "grid grid-cols-2 gap-1 max-h-40 overflow-y-auto"}]
+           (for [t shown]
+             ^{:key (:id t)}
+             [:button {:class (str "text-left rounded border border-slate-700 bg-[#121212] hover:border-sky-500/60 px-2 py-1 "
+                                   (when (:current? t) "border-sky-500/40"))
+                       :title (str (:url t) (when-let [nn (:note t)] (str "\n" nn)))
+                       :on-click #(rf/dispatch [:choice-new {:template t}])}
+              [:div {:class "text-[0.7rem] text-slate-200 truncate"}
+               (str (:label t) (when (:local? t) "  · local")
+                    (when (:current? t) "  ← current"))]
+              [:div {:class "text-[0.62rem] font-mono text-slate-500 truncate"} (:url t)]]))
+     [:div {:class "text-[0.64rem] text-slate-500"}
+      "pre-fills the URL and the model id a running server answers to — then you edit it"]]))
+
+(defn- choice-form
+  "The editor: THREE fields, one Save. Name, URL, model id — and the model field
+  comes with whatever that URL actually serves, clickable.
+
+  One Save writes all three in a single call, so there is no ordering to get
+  wrong and no second button wired to only half the form. A click on a listed id
+  fills the field; it never writes, so nothing changes behind the form.
+
+  The message line is where a validation failure lands — the spine's own
+  sentence, beside the fields that caused it."
+  []
+  (let [editing @(rf/subscribe [:choice-edit])
+        nm      @(rf/subscribe [:choice-name])
+        url     @(rf/subscribe [:choice-url])
+        model   @(rf/subscribe [:choice-model])
+        msg     @(rf/subscribe [:choice-msg])
+        busy?   @(rf/subscribe [:choice-busy?])
+        browse  @(rf/subscribe [:choice-browse])
+        cat     @(rf/subscribe [:choice-catalogue])
+        q       @(rf/subscribe [:choice-query])
+        key     (some-> browse str (str/replace #"/+$" ""))
+        ids     (or (get cat key) [])
+        shown   (if (str/blank? q)
+                  ids
+                  (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) ids))
+        new?    (= "new" editing)]
+    [:div {:class "rounded-lg border border-sky-500/40 bg-sky-950/20 p-3 space-y-2"}
+     [:div {:class "flex items-center gap-2"}
+      [:span {:class "text-[0.7rem] text-slate-200 font-medium"}
+       (if new? "add a model" (str "edit: " editing))]
+      [:button {:class "ml-auto text-[0.64rem] text-slate-400 hover:text-slate-100"
+                :title "discard this form (Escape)"
+                :on-click #(rf/dispatch [:choice-cancel])} "close"]]
+
+     [:div {:class "flex items-center gap-2"}
+      [:label {:class "text-[0.68rem] text-slate-400 w-14 shrink-0" :for "gm-name"} "name"]
+      [:input {:id "gm-name" :value nm :autoFocus true
+               :placeholder "workstation"
+               :on-change #(rf/dispatch [:choice-field :name (.. % -target -value)])
+               :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-sky-500"}]
+      [:span {:class "text-[0.62rem] text-slate-500 w-44 shrink-0"}
+       (str "how you pick it — /model " (or (some-> nm str/lower-case) "<name>"))]]
+
+     [:div {:class "flex items-center gap-2"}
+      [:label {:class "text-[0.68rem] text-slate-400 w-14 shrink-0" :for "gm-url"} "url"]
+      [:input {:id "gm-url" :value url :placeholder "http://localhost:8081/v1"
+               :on-change #(rf/dispatch [:choice-field :url (.. % -target -value)])
+               :on-key-down #(when (= "Enter" (.-key %))
+                               (rf/dispatch [:choice-catalogue-fetch url :force]))
+               :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
+      [:button {:class "text-[0.64rem] text-slate-400 hover:text-slate-100 shrink-0"
+                :title "ask this URL what it serves (Enter in the field does the same)"
+                :on-click #(rf/dispatch [:choice-catalogue-fetch url :force])} "list ↻"]]
+
+     [:div {:class "flex items-start gap-2"}
+      [:label {:class "text-[0.68rem] text-slate-400 w-14 shrink-0 pt-1.5" :for "gm-model"} "model"]
+      [:div {:class "flex-1 min-w-0 space-y-1"}
+       [:input {:id "gm-model" :value model :placeholder "an id this endpoint answers to"
+                :on-change #(rf/dispatch [:choice-field :model (.. % -target -value)])
+                :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:choice-save]))
+                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
+       (when (seq browse)
+         [:div {:class "space-y-1"}
+          [:input {:value q
+                   :placeholder (str "filter " (count ids) " ids from " browse "…")
+                   :on-change #(rf/dispatch [:choice-query (.. % -target -value)])
+                   :class "w-full rounded-md bg-[#121212] border border-slate-700 px-2 py-1 text-[0.66rem] text-slate-300 outline-none focus:border-sky-500"}]
+          (into [:div {:class "max-h-40 overflow-y-auto rounded-md border border-slate-700"}]
+                (cond
+                  ;; asked, not answered yet
+                  (nil? (get cat key))
+                  [[:div {:class "p-2 text-[0.68rem] text-slate-500"}
+                    (str "asking " browse "…")]]
+
+                  (empty? shown)
+                  [[:div {:class "p-2 text-[0.68rem] text-slate-500"}
+                    (if (seq ids)
+                      (str "no id matches “" q "”")
+                      (str "nothing answered at " browse " — is that server running?"))]]
+
+                  :else
+                  (for [m shown]
+                    ^{:key m}
+                    [:button {:class (str "block w-full text-left px-2 py-0.5 text-[0.68rem] font-mono hover:bg-slate-800 "
+                                          (if (= m model) "text-sky-300" "text-slate-300"))
+                              :on-click #(rf/dispatch [:choice-field :model m])}
+                     m])))])
+       [:div {:class "text-[0.62rem] text-slate-500"}
+        (if (seq browse)
+          "click an id to fill the box — Save is what writes it"
+          "type the id yourself, or press list ↻ to see what this URL serves")]]]
+
+     [:div {:class "flex items-center gap-2"}
+      [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 text-xs font-medium"
+                :disabled (boolean busy?)
+                :on-click #(rf/dispatch [:choice-save])}
+       (if busy? "saving…" "Save")]
+      (when-not new?
+        [:span {:class "text-[0.62rem] text-slate-500"}
+         "saving edits the name; what is running keeps running until you pick it"])
+      (when msg
+        [:span {:class "text-[0.66rem] text-rose-300"} msg])]]))
+
+(defn- recent-row
+  "One row of the recents shortlist — the escape hatch for a model that was never
+  saved as a name. A recent carries its OWN url, so picking one switches the
+  transport with it (which is why the pair is stored)."
+  [sid r]
+  ^{:key (str (:url r) "|" (:model r))}
+  [:div {:class "flex items-center gap-2 text-[0.68rem] font-mono rounded px-1.5 py-0.5 hover:bg-slate-800 cursor-pointer"
+         :title (str (:url r))
+         :on-click #(rf/dispatch [:pick-url-model sid (:model r) (:url r)])}
+   [:span {:class "text-slate-500 shrink-0 w-24 truncate"} (or (:provider r) "?")]
+   [:span {:class "text-slate-200 flex-1 min-w-0 truncate"} (:model r)]
+   [:button {:class "text-slate-600 hover:text-rose-300 px-1 shrink-0"
+             :title "forget this one"
+             :on-click (fn [e] (.stopPropagation e)
+                         (rf/dispatch [:recents-forget (:url r) (:model r)]))}
+    "✕"]])
+
+(defn- models-dialog
+  "The model selection dialog — SELF-CONTAINED, opened by Ctrl+M, the toolbar's
+  `model` button, the status bar's model line, or Settings' `change…`. It is not a
+  tab inside Settings: a model is a decision of its own, and it used to be spread
+  across a provider combo, a port box, an id box and a catalogue list that needed
+  three RPCs to land one change.
+
+  The shape now: the NAMED list is the front door (it loads its own data, so this
+  dialog never depends on anything else having been opened), one click picks, and
+  adding is either **your own URL** (the primary path — a gateway or a server on a
+  port nobody has heard of has to be typeable) or a baked-in endpoint used as a
+  TEMPLATE. Every change is ONE call to the spine."
+  []
+  (let [active  @(rf/subscribe [:active])
+        sess    (get-in @(rf/subscribe [:sessions]) [active])
+        db      @(rf/subscribe [:db])
+        choices @(rf/subscribe [:choices])
+        recents @(rf/subscribe [:recents])
+        info    (:model-info db)
+        editing @(rf/subscribe [:choice-edit])
+        msg     @(rf/subscribe [:choice-msg])
+        in-force (fn [c] (boolean (:current? c)))
+        ;; a session can be running a model its project pinned (`project.edn
+        ;; :model`), which is NOT the global choice — the dialog says so rather
+        ;; than marking nothing and looking broken.
+        sess-model (:model sess)
+        sess-url   (:url sess)]
+    [overlay
+     [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[680px] max-h-[88vh] overflow-y-auto"}
+      [:div {:class "flex items-baseline gap-3"}
+       [:div {:class "text-slate-100 text-sm font-medium"} "Models"]
+       [:div {:class "text-[0.68rem] text-slate-500"}
+        (str "named models · pick one, or add your own (name + URL + model id)")]
+       [:button {:class "ml-auto text-[0.7rem] text-slate-400 hover:text-slate-100"
+                 :on-click #(rf/dispatch [:dialog-close])} "close ✕"]]
+
+      ;; what is running NOW, in one line: the NAME when there is one, the id and
+      ;; the endpoint always. This is the answer to "which of these is live?".
+      [:div {:class "rounded-md border border-slate-700 bg-[#121212] px-2 py-1.5 text-[0.68rem]"}
+       [:span {:class "text-slate-500"} "in use: "]
+       [:span {:class "text-slate-100"}
+        (or (:model-choice sess) (:choice info) "—")]
+       [:span {:class "text-slate-400 font-mono"}
+        (str "  " (or sess-model (:model info) "(no model)"))]
+       [:span {:class "text-slate-500 font-mono"}
+        (str "  @ " (or sess-url (:url info) "(no endpoint)"))]
+       (when (and sess-model (:model info) (not= sess-model (:model info)))
+         [:div {:class "text-[0.62rem] text-amber-300 mt-0.5"}
+          "this project pins its own model (project.edn :model) — picking a name below changes the global default, not this project's"])
+       (when (and (nil? sess-model) (nil? (:model info)))
+         [:div {:class "text-[0.62rem] text-amber-300 mt-0.5"}
+          "no model is set — pick one below, or add one from a known endpoint"])]
+
+      ;; THE LIST
+      (if (seq choices)
+        (into [:div {:class "space-y-1.5"}]
+              (for [c choices] ^{:key (:name c)} [named-model-row active c (in-force c)]))
+        [:div {:class "rounded-md border border-dashed border-slate-700 p-3 text-[0.7rem] text-slate-500"}
+         "no named models yet. Add one yourself — NAME it, type its URL (port "
+         "included), pick the id it answers to. Or start from a known endpoint below: "
+         "grog fills in the URL and, for a running server, the id it serves. Then pick "
+         "it with /model <name>, or from here."])
+
+      ;; the editor, when open
+      (when editing [choice-form])
+
+      ;; otherwise: how to ADD. YOUR OWN endpoint comes first, because that is the
+      ;; case the shipped catalogue cannot cover — a gateway, a relay, a server on
+      ;; a port nobody has heard of. The baked-in endpoints are the shortcut below
+      ;; it, not the only door.
+      (when-not editing
+        [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
+         [:div {:class "flex items-center gap-2"}
+          [:button {:class "px-3 py-1.5 rounded-md bg-sky-500/15 border border-sky-500/50 text-sky-200 text-[0.7rem] font-medium"
+                    :title "name a model yourself: a URL and the id it answers to"
+                    :on-click #(rf/dispatch [:choice-new {}])} "+ add a model (your own URL)"]
+          [:span {:class "text-[0.64rem] text-slate-500"}
+           "give it a NAME, type its URL (port included), pick the id it serves"]]
+         (template-picker)])
+
+      ;; recents: the shortlist of models tried but never named
+      (when (seq recents)
+        [:div {:class "border-t border-slate-700 pt-3 space-y-1"}
+         [:div {:class "flex items-center gap-2"}
+          [:span {:class "text-[0.68rem] text-slate-400"} "recently used (unnamed)"]
+          [:button {:class "ml-auto text-[0.62rem] text-slate-500 hover:text-slate-300"
+                    :title "re-read the list"
+                    :on-click #(rf/dispatch [:recents-fetch])} "↻"]]
+         (into [:div {:class "space-y-0.5"}]
+               (for [r recents] ^{:key (str (:url r) "|" (:model r))} [recent-row active r]))
+         [:div {:class "text-[0.62rem] text-slate-500"}
+          "a pick lands here automatically; save it as a name to keep it"]])
+
+      ;; the message line, when an action (not the form) produced one
+      (when (and msg (not editing))
+        [:div {:class "text-[0.68rem] text-rose-300"} msg])
+
+      [:div {:class "text-[0.62rem] text-slate-500 border-t border-slate-700 pt-2"}
+       "a named model is one record — name, URL, model id — written in one step and "
+       "picked by name: here, or with " [:code "/model <name>"] " (also "
+       [:code "/model new <endpoint>"] " and " [:code "/model rm <name>"] ")."]]]))
 
 (defn- seg-style-row
   "One kind's font / size / colour controls. Empty controls mean `inherit`, so
@@ -2160,101 +2572,31 @@
                :on-click #(rf/dispatch [:reset-seg-style kind])} "reset"]]))
 
 (defn- settings-dialog []
-  (let [in @(rf/subscribe [:dialog-input]) active @(rf/subscribe [:active])
-        sess (get-in @(rf/subscribe [:sessions]) [active])
-        src (effective-source @(rf/subscribe [:db]))
-        pickers (or (seq @(rf/subscribe [:model-sources])) [["local" "Local"]])
-        q @(rf/subscribe [:model-query])
-        cat @(rf/subscribe [:catalogue])
-        all (get cat (keyword src))
-        all (or all [])
-        shown (if (str/blank? q)
-                all
-                (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
-        ;; `:loading` holds keywords; `src` is the string from the source list
-        loading-src? (some #(= (keyword src) %) (:loading cat))]
+  "Appearance and voice. Model selection is NOT here — it is its own dialog
+  (`models-dialog`), opened by the button below, the status bar's model line, or
+  the toolbar's `model` button.
+
+  Settings used to carry a provider combo, a raw model-id box and a catalogue
+  list, and that is where the complaint came from: a font-size control and a
+  four-part model editor sharing one panel, with no way to see which of the four
+  had to be touched. Settings now shows the model that IS running, one line, and
+  hands the whole subject to the dialog that owns it."
+  (let [active @(rf/subscribe [:active])
+        sess (get-in @(rf/subscribe [:sessions]) [active])]
     [overlay
      [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[520px] max-h-[85vh] overflow-y-auto"}
-      [:div {:class "text-slate-200 text-sm font-medium"} "Settings"]
-      [:div {:class "text-xs text-slate-400"} (str "project: " (:project sess))]
-      [:label {:class "text-xs text-slate-400"} "model"]
-      [:input {:value in :autoFocus true :placeholder (or (:model sess) "provider/model")
-               :on-change #(rf/dispatch [:dialog-input (.. % -target -value)])
-               :on-key-down #(when (= "Enter" (.-key %)) (rf/dispatch [:settings-save active in]))
-               :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"}]
-      [:div {:class "text-[0.7rem] text-slate-500"} "sets THIS project's model — saved to the project, used by every session in it"]
-      ;; the fuller editor: transport + model + the recents shortlist
-      [:div {:class "flex items-center gap-2"}
-       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-200 text-xs"
-                 :on-click #(rf/dispatch [:dialog-open :models ""])} "Models…"]
-       [:span {:class "text-[0.7rem] text-slate-500"}
-        "transport, model id, and the recents you switch between"]]
-
-      ;; provider picker — the shipped catalogue (resources/providers.edn, over
-      ;; the server's `providers` method). Picking one writes :llm :url to
-      ;; grog.edn: the "get the ball rolling" step — choose where models come
-      ;; from, then /secret set the key. Global change; applies on restart.
-      (let [ps @(rf/subscribe [:providers])
-            cur @(rf/subscribe [:provider-current])
-            cur-id (:provider cur)]
-        [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
-         [:label {:class "text-xs text-slate-400"} "provider"]
-         (if (seq ps)
-           ;; a sorted, searchable combo box, not a wall of buttons — one
-           ;; control, and it scales to the whole catalogue without re-flowing
-           ;; the dialog.
-           [provider-combo ps cur-id]
-           [:div {:class "text-xs text-slate-500"} "loading…"])
-         [:div {:class "text-[0.7rem] text-slate-500"}
-          (if cur
-            (str "current: " (:url cur) (when (:model cur) (str " · " (:model cur))))
-            "current: from grog.edn")]
-         [:div {:class "text-[0.7rem] text-slate-500"}
-          "writes the BIG slot's transport to grog.edn · applied live · keys via /secret"]])
-
-      ;; browse + search + pick. The list comes from the server; a source that
-      ;; has never been fetched shows "loading…" and fills in via broadcast.
-      [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
-       [:div {:class "flex items-center gap-1"}
-                 (into [:span {:class "flex items-center gap-1"}]
-                       (for [[id label] pickers]
-                ^{:key id}
-                [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
-                                      (if (= id src)
-                                        "bg-sky-600 border-sky-500 text-slate-950 font-medium"
-                                        "bg-slate-800 border-slate-700 text-slate-300"))
-                          :on-click #(rf/dispatch [:models-source id])}
-                 label]))
-        [:button {:class "ml-auto px-2 py-1 rounded text-[0.7rem] bg-slate-800 border border-slate-700 text-slate-300"
-                  :title "refresh this source"
-                  :on-click #(rf/dispatch [:models-fetch :force])} "↻"]]
-       [:input {:value q :placeholder "search models…"
-                :on-change #(rf/dispatch [:model-query (.. % -target -value)])
-                :on-key-down #(when (= "Escape" (.-key %)) (rf/dispatch [:model-query ""]))
-                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-500"}]
-       (into [:div {:class "max-h-48 overflow-y-auto rounded-md border border-slate-700"}]
-             (cond
-               loading-src?
-               [[:div {:class "p-2 text-xs text-slate-500"} (str "loading " src "…")]]
-
-               (empty? shown)
-               [[:div {:class "p-2 text-xs text-slate-500"}
-                 (if (nil? (get cat (keyword src)))
-                   "press ↻ to fetch"
-                   (if (= "local" src)
-                     "no local models — is ollama running?"
-                     "the provider listed no models"))]]
-
-               :else
-               (for [m shown]
-                 ^{:key m}
-                 [:div {:class "px-2 py-1 text-[0.7rem] font-mono text-slate-300 hover:bg-slate-800 cursor-pointer"
-                        :on-click #(rf/dispatch [:dialog-input m])
-                        :on-double-click #(rf/dispatch [:settings-save active m src])}
-                  m])))
-       [:div {:class "text-[0.7rem] text-slate-500"}
-        (str (count shown) " model" (when (not= 1 (count shown)) "s")
-             " · click fills the box, double-click applies")]]
+      [:div {:class "flex items-baseline gap-3"}
+       [:div {:class "text-slate-200 text-sm font-medium"} "Settings"]
+       [:div {:class "text-[0.68rem] text-slate-500"} (str "project: " (:project sess))]]
+      ;; the model, READ ONLY, with the way to change it. One line the user can
+      ;; verify, and one button — no half-editors in here.
+      [:div {:class "flex items-center gap-2 rounded-md border border-slate-700 bg-[#121212] px-2 py-1.5"}
+       [:span {:class "text-[0.68rem] text-slate-500 shrink-0"} "model"]
+       [:span {:class "text-[0.7rem] text-slate-200 flex-1 min-w-0 truncate"
+               :title (str (:url sess))}
+        (or (:model-choice sess) (:model-label sess) (:model sess) "(none set)")]
+       [:button {:class "px-2 py-1 rounded-md bg-sky-500 text-slate-950 text-[0.7rem] font-medium shrink-0"
+                 :on-click #(rf/dispatch [:dialog-open :models ""])} "change…"]]
       [:div {:class "border-t border-slate-700 pt-3 space-y-1"}
        [:label {:class "text-xs text-slate-400"} "font size"]
        [:div {:class "flex items-center gap-2"}
@@ -2283,158 +2625,12 @@
             (str "off — " (or (:reason st) "set GROG_VOICE_COMMAND"))))]
        [:div {:class "text-[0.7rem] text-slate-500"}
         "mic + transcription stay on this machine; nothing is sent to the server"]]
-      [:div {:class "flex gap-2 justify-end text-sm"}
+      ;; every section in here saves itself the moment it is touched, so the
+      ;; dialog has no Save — a button implying pending changes that do not exist
+      ;; is its own kind of confusion.
+      [:div {:class "flex gap-2 justify-end text-sm border-t border-slate-700 pt-3"}
        [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
-                 :on-click #(rf/dispatch [:dialog-close])} "Cancel"]
-       [:button {:class "px-3 py-1.5 rounded-md bg-sky-500 text-slate-950 font-medium"
-                 :on-click #(rf/dispatch [:settings-save active in])} "Save"]]]]))
-
-(defn- models-dialog
-  "The model editor. ONE model now: its transport (a provider combo) and its id,
-  plus a RECENTS shortlist — the LRU list of models you actually switch between,
-  newest first. Applying writes the project manifest (or, with the tick, the
-  global default) and the server pushes the new state back as a `model` event, so
-  the dialog can stay open.
-
-  Recents is the answer to the picker's real problem: browsing a full catalogue is
-  how you FIND a model you have never used, and the wrong way to get back to the
-  two you use daily. Clicking a recent switches immediately — no search."
-  []
-  (let [active @(rf/subscribe [:active])
-        sess   (get-in @(rf/subscribe [:sessions]) [active])
-        db     @(rf/subscribe [:db])
-        draft  (or (:models-draft db) "")
-        global? (boolean (:models-global? db))
-        info   (:model-info db)
-        cur-prov (:provider info)
-        cur-url  (:url info)
-        recents (vec (:recents db))
-        src    (effective-source db)
-        pickers (model-sources db)
-        provs  (or (seq @(rf/subscribe [:providers])) [])
-        q      @(rf/subscribe [:model-query])
-        cat    @(rf/subscribe [:catalogue])
-        all    (or (get cat (keyword src)) [])
-        shown  (if (str/blank? q)
-                 all
-                 (filterv #(str/includes? (str/lower-case %) (str/lower-case q)) all))
-        loading-src? (some #(= (keyword src) %) (:loading cat))
-        apply! (fn [v] (rf/dispatch [:set-model active (str v) src {:global global?}]))
-        pick-recent! (fn [{:keys [url model]}]
-                       ;; a recent carries its OWN url, so switching to it also
-                       ;; switches transport — that is the whole point of storing
-                       ;; the pair rather than a bare id.
-                       ;;
-                       ;; It respects the "global default" tick, like Apply does.
-                       ;; It used to hard-code `:global true`, so clicking a recent
-                       ;; silently rewrote the GLOBAL default even when the box was
-                       ;; unticked — the same click meant two different things
-                       ;; depending on which control you used.
-                       (rf/dispatch [:set-model active model nil
-                                     {:global global? :url url}]))]
-    [overlay
-     [:div {:class "card rounded-xl shadow-2xl p-4 space-y-3 w-[620px] max-h-[88vh] overflow-y-auto"}
-      [:div {:class "flex items-center justify-between"}
-       [:div {:class "text-slate-200 text-sm font-medium"} "Models"]
-       [:div {:class "text-[0.7rem] text-slate-500"} (str "project: " (:project sess))]]
-      [:div {:class "text-[0.7rem] text-slate-500"}
-       "A project's own model beats the global default. Picking one remembers it in Recents; the list is capped and the least-recently-used entry falls off."]
-
-      ;; RECENTS — the shortlist. Click to switch (transport and all).
-      (when (seq recents)
-        [:div {:class "rounded-lg border border-sky-500/30 p-3 space-y-1"}
-         [:div {:class "flex items-baseline gap-2"}
-          [:span {:class "text-[0.7rem] text-slate-400"} "recents"]
-          [:span {:class "text-[0.62rem] text-slate-500"} "newest first · click to switch · LRU"]
-          [:button {:class "ml-auto text-[0.62rem] text-slate-500 hover:text-rose-300"
-                    :title "refresh the list"
-                    :on-click #(rf/dispatch [:recents-fetch])} "↻"]]
-         (into [:div {:class "space-y-0.5"}]
-               (for [r recents]
-                 ^{:key (str (:url r) "|" (:model r))}
-                 [:div {:class "flex items-center gap-2 text-[0.7rem] font-mono rounded px-1.5 py-0.5 hover:bg-slate-800 cursor-pointer"
-                        :title (str (:url r))
-                        :on-click #(pick-recent! r)}
-                  [:span {:class "text-slate-500 shrink-0 w-24 truncate"} (or (:provider r) "?")]
-                  [:span {:class "text-slate-200 flex-1 min-w-0 truncate"} (:model r)]
-                  [:button {:class "text-slate-600 hover:text-rose-300 px-1 shrink-0"
-                            :title "forget this one"
-                            :on-click (fn [e]
-                                        (.stopPropagation e)
-                                        (rf/dispatch [:recents-forget (:url r) (:model r)]))}
-                   "✕"]]))])
-
-      ;; the model: its TRANSPORT (provider) + id + global tick
-      [:div {:class "rounded-lg border border-slate-600 p-3 space-y-2"}
-       [:div {:class "flex items-center gap-2"}
-        [:span {:class "text-[0.7rem] w-16 text-slate-400"} "transport"]
-        (if (seq provs)
-          [provider-combo provs cur-prov]
-          [:div {:class "text-xs text-slate-500"} "loading…"])]
-       [:div {:class "text-[0.65rem] font-mono text-slate-500 truncate"}
-        (str "endpoint: " (or cur-url "(unset)"))]
-       [:div {:class "flex items-center gap-2"}
-        [:span {:class "text-[0.7rem] w-16 text-slate-400"} "model"]
-        [:input {:value draft
-                 :placeholder "provider/model"
-                 :on-change #(rf/dispatch [:models-draft (.. % -target -value)])
-                 :on-key-down #(when (= "Enter" (.-key %)) (apply! draft))
-                 :class "flex-1 rounded-md bg-[#121212] border border-slate-700 px-2 py-1.5 text-xs font-mono text-slate-200 outline-none focus:border-sky-500"}]
-        [:button {:class "px-2 py-1.5 rounded-md bg-sky-500 text-slate-950 text-xs font-medium"
-                  :on-click #(apply! draft)} "Apply"]]
-       [:label {:class "flex items-center gap-1 cursor-pointer text-[0.64rem] text-slate-500"}
-        [:input {:type "checkbox" :checked global?
-                 :on-change #(rf/dispatch [:models-global (.. % -target -checked)])}]
-        "also set as the global default"]]
-
-      ;; catalogue for the current transport
-      [:div {:class "border-t border-slate-700 pt-3 space-y-2"}
-       [:div {:class "text-[0.7rem] text-slate-400"}
-        "browse the transport's models — click fills the box, double-click applies"]
-       [:div {:class "flex items-center gap-1"}
-        (into [:span {:class "flex items-center gap-1"}]
-              (for [[id label] pickers]
-                ^{:key id}
-                [:button {:class (str "px-2 py-1 rounded text-[0.7rem] border "
-                                      (if (= id src)
-                                        "bg-sky-600 border-sky-500 text-slate-950 font-medium"
-                                        "bg-slate-800 border-slate-700 text-slate-300"))
-                          :on-click #(rf/dispatch [:models-source id])}
-                 label]))
-        [:button {:class "ml-auto px-2 py-1 rounded text-[0.7rem] bg-slate-800 border border-slate-700 text-slate-300"
-                  :title "refresh this source"
-                  :on-click #(rf/dispatch [:models-fetch :force])} "↻"]]
-       [:input {:value q :placeholder "search models…"
-                :on-change #(rf/dispatch [:model-query (.. % -target -value)])
-                :on-key-down #(when (= "Escape" (.-key %)) (rf/dispatch [:model-query ""]))
-                :class "w-full rounded-md bg-[#121212] border border-slate-700 px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-500"}]
-       (into [:div {:class "max-h-48 overflow-y-auto rounded-md border border-slate-700"}]
-             (cond
-               loading-src?
-               [[:div {:class "p-2 text-xs text-slate-500"} (str "loading " src "…")]]
-
-               (empty? shown)
-               [[:div {:class "p-2 text-xs text-slate-500"}
-                 (if (nil? (get cat (keyword src)))
-                   "press ↻ to fetch"
-                   (if (= "local" src)
-                     "no local models — is ollama running?"
-                     "the provider listed no models"))]]
-
-               :else
-               (for [m shown]
-                 ^{:key m}
-                 [:div {:class (str "px-2 py-1 text-[0.7rem] font-mono cursor-pointer hover:bg-slate-800 "
-                                    (when (= m draft) "bg-slate-800 text-sky-300"))
-                        :on-click #(rf/dispatch [:models-draft m])
-                        :on-double-click #(do (rf/dispatch [:models-draft m]) (apply! m))}
-                  m])))
-       [:div {:class "text-[0.7rem] text-slate-500"}
-        (str (count shown) " model" (when (not= 1 (count shown)) "s")
-             " · click fills the box · double-click applies")]]
-      [:div {:class "flex justify-end"}
-       [:button {:class "px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700 text-slate-300"
-                 :on-click #(rf/dispatch [:dialog-close])} "Close"]]]]))
+                 :on-click #(rf/dispatch [:dialog-close])} "close ✕"]]]]))
 
 (defn- mcp-row
   "One shipped MCP server: label, what it gives you, and either a readiness word
@@ -2649,6 +2845,11 @@
      [approval-dialog]
      (when (= :projects dialog) [project-manager])
      (when (= :settings dialog) [settings-dialog])
+     ;; The Models dialog is NOT gated on a session being open, unlike Settings:
+     ;; a launch with no model at all is exactly the case where the user needs it,
+     ;; and the getting-started page points here. The actions inside it that need
+     ;; a session (picking) read the active id and are harmless when there is
+     ;; none — the list, the editor and the templates all work regardless.
      (when (= :models dialog) [models-dialog])]))))
 
 ;; --- init ------------------------------------------------------------------
@@ -2692,6 +2893,12 @@
          (and ctrl (re-matches #"[1-9]" k)) (do (.preventDefault e) (rf/dispatch [:jump (js/parseInt k)]))
          (and ctrl shift (= (str/lower-case k) "e")) (do (.preventDefault e) (rf/dispatch [:export-html]))
          (and ctrl (= k "e")) (do (.preventDefault e) (rf/dispatch [:copy-transcript]))
+         ;; the Models dialog, on a key: model selection is a first-class
+         ;; activity now, not something buried behind ⚙. Ctrl+M works from
+         ;; anywhere, including the boot screen and the getting-started page —
+         ;; which is where a user who has no model yet needs it most.
+         (and (not shift) ctrl (= (str/lower-case k) "m"))
+         (do (.preventDefault e) (rf/dispatch [:dialog-open :models ""]))
          (and ctrl (or (= k "=") (= k "+"))) (do (.preventDefault e) (rf/dispatch [:bump-font 1]))
          (and ctrl (= k "-")) (do (.preventDefault e) (rf/dispatch [:bump-font -1]))
          (and ctrl (= k "0")) (do (.preventDefault e) (rf/dispatch [:set-font-size 16]))

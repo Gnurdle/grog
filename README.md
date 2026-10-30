@@ -161,6 +161,13 @@ These are **user** commands, not model tools.
 | `/job`, `/jobs` | Project job queue in the project home (`~/grog-projects/<proj>/jobs/`): **`add` \| `list` \| `next` \| `status`** |
 | `/tasks` | **Per-project tasks** (`~/grog-projects/<proj>/tasks.edn`), always user-instigated: **`add <title>`** (`|due +Nh` / `HH:mm` / `@epochms`, `|every Nh` for recurring), **`done <id>`**, **`rm <id>`**, **`due`**. Ask "what needs doing?" for reminders. |
 | `/chron` | Show whether the **`:chron`** scheduler is running |
+| `/model` | Show the current model + the numbered recents + the **named** list; **`<n>`** switches, **`<name>`** picks a named model (its url AND model), a bare id is a raw id on the current transport |
+| `/model new <endpoint> [name]` | Create a named model from a **baked-in endpoint** (strata, ollama, openrouter, …) — the template fills the URL, grog reads the id off the running server, the name defaults to the endpoint |
+| `/model rm <name>` | Delete a named model |
+| `/provider` | List the transport catalogue, marking the current one |
+| `/provider <id>` | Set the transport (strata, vllm, ollama, openrouter, …) |
+| `/provider <id> <port>` | Set it **and repoint a LOCAL server at `<port>`** — how a second Strata/vLLM launch is told from the first (the label then reads `strata:8081`) |
+| `/provider url <base>` | Set an explicit base URL (non-catalogue endpoint) |
 | `/secret` | Keyring **`grog`** (or file fallback) — `set <KEY> <value>` / `rm <KEY>` / `file` / `backend`; values never printed |
 | `/shell` | `sh -lc` under the active project cwd (fallback: repo root), or interactive subshell |
 | `/mcp` | MCP server list: **help** \| **status** \| **show** \| **load** \| **save** \| **reload** \| **set** *edn* |
@@ -331,6 +338,11 @@ Save as **`./grog.edn`** next to your project or under your user config home (ev
        ;; :profiles {:local    {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct" :api-key nil}
        ;;            :big      {:model "qwen3.5:32b"}
        ;;            :openai   {:url "https://api.openai.com/v1" :model "gpt-4o" :api-key "${OPENAI_API_KEY}"}}
+       ;; Named models — THE list the Models dialog and /model <name> use (the
+       ;; profiles above are the legacy form; a name written once replaces it).
+       ;; Written by the dialog's Save, or `/model new strata`.
+       ;; :choices [{:name "workstation" :url "http://localhost:8081/v1" :model "qwen3-32b"}
+       ;;           {:name "cloud"       :url "https://openrouter.ai/api/v1" :model "aion-labs/aion-2.0"}]
        ;; Recents: the shortlist the picker and /model offer, newest first. grog
        ;; writes this on every pick and drops the least-recently-used past the cap
        ;; — it is listed here so you know it exists (and can hand-edit it).
@@ -338,17 +350,28 @@ Save as **`./grog.edn`** next to your project or under your user config home (ev
        ;;           {:url "https://openrouter.ai/api/v1" :model "aion-labs/aion-2.0"}]
        ;; :recents-max 10
        ;;
-       ;; HOW A PICK DECIDES :url AND :model (Models… dialog):
+       ;; HOW A PICK DECIDES :url AND :model (the Models dialog, Ctrl+M):
+       ;;   * A MODEL IS A NAME. `:llm :choices` holds the named list — each row
+       ;;     is {:name "workstation" :url "http://localhost:8081/v1" :model
+       ;;     "qwen3-32b"} — and the name is what you pick by, in the dialog or
+       ;;     with /model workstation. One row, one Save; the GUI's transport
+       ;;     combo, separate port box and Apply button are gone (they were three
+       ;;     writers for one decision, which is what made picks not stick).
        ;;   * a RECENTS row carries its own url, so clicking one switches BOTH the
        ;;     transport and the model — that is why the pair is stored, not a bare id.
-       ;;   * picking a TRANSPORT only changes :url. It never leaves the PREVIOUS
-       ;;     model in place (a remote id against a local port) and never invents
-       ;;     one: an entry with no usable sample leaves :model unset until you
-       ;;     choose a model. A missing model is shown as missing; a wrong one is
-       ;;     worse than nothing.
-       ;;   * a TRANSPORT with no model id of its own is read from its /v1/models
-       ;;     ("what this server actually serves"), so a local launch records the
-       ;;     id it was started with rather than a catalogue placeholder.
+       ;;   * the SHIPPED PROVIDERS ARE A TEMPLATE, not a menu: picking "strata"
+       ;;     pre-fills a NEW row's url (and the id a running server answers to),
+       ;;     and every pre-filled value is editable.
+       ;;   * a URL with no model id of its own is read from its /v1/models
+       ;;     ("what this endpoint actually serves"), so a local launch records the
+       ;;     id it was started with rather than a catalogue placeholder. Nothing
+       ;;     answering leaves the id BLANK — a missing model is honest, a wrong
+       ;;     one is worse than nothing.
+       ;;   * a LOCAL server can run on any port (and two of a kind at once, e.g.
+       ;;     two Strata launches) — the port lives IN THE URL, so there is no
+       ;;     second control to desync. grog also keeps the kind as :llm :provider
+       ;;     ("strata") so the label can say `strata:8081` rather than guess.
+       ;;     `/provider strata 8081` is the console form of the same edit.
        }
 
  :skills {:roots ["skills"]}
@@ -421,7 +444,7 @@ At the prompt in the GUI:
 
 For cloud providers (OpenAI, OpenRouter, Groq, etc.), store the key as **`LLM_API_KEY`** (or use `:api-key` with `${LLM_API_KEY}` env-var interpolation in `grog.edn`):
 
-- **GUI:** Settings → Models → *Set default API key…* (and *Clear API key*).
+- **GUI:** no key field — type **`/secret set LLM_API_KEY <key>`** in the composer.
 - **Chat:** `/secret set LLM_API_KEY <key>`.
 
 ---

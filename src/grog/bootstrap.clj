@@ -120,9 +120,11 @@
    "echoed back. Until then there is no brain and no chat.\n\n"
    "## Getting help\n\n"
    "Type `/help` for every command. `/project` lists, switches and creates projects;\n"
-   "`/model` shows or switches the model for this session; `/clear` starts a fresh\n"
-   "conversation; `/doctor` checks whether the setup holds together; `/reset` is the\n"
-   "factory reset if things get too wonky.\n\n"
+   "`/model` shows or switches the model for this session; `/provider` lists the\n"
+   "transport catalogue (and `strata 8081` repoints a local server at its port, for\n"
+   "when you run more than one of a kind); `/clear` starts a fresh conversation;\n"
+   "`/doctor` checks whether the setup holds together; `/reset` is the factory\n"
+   "reset if things get too wonky.\n\n"
    "## Documentation map\n\n"
    (docs/doc-map-markdown (str docs-workspace-name "/"))
    "\n"))

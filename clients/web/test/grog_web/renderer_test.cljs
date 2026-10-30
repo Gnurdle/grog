@@ -33,13 +33,26 @@
 
 (defn- stub!
   "The renderer only ever reaches the main process through `window.grogAPI`, so a
-  stub that records calls is enough to observe what was sent."
-  []
-  (set! (.-window js/globalThis)
-        #js {:grogAPI #js {:call (fn [method payload]
-                                   (swap! sent conj [method (js->clj payload :keywordize-keys true)])
-                                   (js/Promise.resolve nil))}
-             :localStorage #js {:getItem (fn [_] nil) :setItem (fn [_ _] nil)}}))
+  stub that records calls is enough to observe what was sent.
+
+  `answers` optionally gives per-method REPLIES — the model dialog's operations
+  are request/response (a pick asks the spine to resolve a name; a save can be
+  refused), so a test has to be able to hand back what the spine would, including
+  an error."
+  ([] (stub! {}))
+  ([answers]
+   (set! (.-window js/globalThis)
+         #js {:grogAPI #js {:call (fn [method payload]
+                                    ;; `method` is already a JS string, and CLJS
+                                    ;; strings ARE JS strings — no conversion.
+                                    (let [_ (swap! sent conj [method (js->clj payload :keywordize-keys true)])]
+                                      (if-let [a (get answers method)]
+                                        ;; an Error reply REJECTS, like a failed RPC
+                                        (if (instance? js/Error a)
+                                          (js/Promise.reject a)
+                                          (js/Promise.resolve (clj->js a)))
+                                        (js/Promise.resolve nil))))}
+              :localStorage #js {:getItem (fn [_] nil) :setItem (fn [_ _] nil)}})))
 
 ;; --- seeding ----------------------------------------------------------------
 ;;
@@ -83,6 +96,12 @@
 ;; later event does NOT drain it. So wait a macrotask after anything that can
 ;; dispatch, rather than assuming the queue is empty.
 (defn- tick [] (js/Promise. (fn [res] (js/setTimeout res 0))))
+
+;; A promise-returning handler that dispatches further events (set-provider
+;; resolves, THEN dispatches providers-load, which re-frame processes on its own
+;; tick) needs more than one macrotask to settle — ONE tick is flaky. Chain a few.
+(defn- settle []
+  (-> (tick) (.then (fn [_] (tick))) (.then (fn [_] (tick)))))
 
 (defn- seed-onboarding!
   "A db shaped like a real onboarding launch: ouroboros open, landing showing."
@@ -138,7 +157,26 @@
                (check! "the landing steps aside" false (needed?))
                (check! "and /help was answered locally (nothing sent to the spine)" [] @sent)
                (check! "the command list landed in the transcript"
-                       [:user :answer] (mapv :kind (transcript)))))
+                       [:user :answer] (mapv :kind (transcript)))
+               ;; The `/help` reply is built from `help-rows`, and a command that
+               ;; is missing from that table is a command the GUI user cannot
+               ;; discover — the reported "there doesn't seem to be any help for
+               ;; your last change (set the port)". So assert the COMMANDS, not
+               ;; just that some table rendered: `/provider` and its port form
+               ;; must appear, and the port row must say what a port is FOR.
+               (let [text (->> (transcript) (filter #(= :answer (:kind %)))
+                               (map :text) (apply str))]
+                 (check! "the help mentions /provider" true
+                         (boolean (re-find #"/provider" text)))
+                 (check! "…and how to repoint a LOCAL server" true
+                         (boolean (re-find #"/provider <id>|/provider strata 8081" text)))
+                 ;; the GUI row must name the dialog the model is actually picked
+                 ;; in — pointing at a port field that no longer exists is the
+                 ;; same dead end as no help at all.
+                 (check! "…and points at the Models dialog, not a field that is gone"
+                         true (boolean (re-find #"Models dialog" text)))
+                 (check! "…never mentioning a port FIELD (the port lives in the URL now)"
+                         false (boolean (re-find #"port field" text))))))
 
       ;; A blank send must NOT dismiss: nothing was asked, so there is no output
       ;; to reveal, and taking the page away would be pure loss.
@@ -220,116 +258,335 @@
                                                      (str (:text %)))
                                            (transcript))))))
 
+
       ;; ---------------------------------------------------------------------
-      ;; the MODEL PICKER panel. Reported: "picking one from the history list
-      ;; doesn't set it correctly", and a transport pick showing a BOGUS model.
-      ;; The panel's job is small and easy to get subtly wrong: a click must send
-      ;; the WHOLE pick (model AND the transport it was remembered with), the box
-      ;; must end up showing what is actually in force, and a pick with nothing to
-      ;; name must say so rather than silently doing nothing.
+      ;; THE MODELS DIALOG. Rewritten after: "I am extremely disappointed on how
+      ;; the model selection is implemented. It is a damn mess, and virtually
+      ;; impossible to use." The old panel spread ONE decision over a provider
+      ;; combo, a port box, a model-id box and a catalogue list, and needed three
+      ;; RPCs to land it — every reported bug (the port that would not stick, the
+      ;; bogus model, the recent that switched the id but not the endpoint) came
+      ;; from that shape. What it is now: a model is a NAMED record {name url
+      ;; model}, the baked-in endpoints are TEMPLATES for a new one, and every
+      ;; operation is one call. These check the CONTRACT of each operation,
+      ;; because that is what the old panel kept breaking.
       ;; ---------------------------------------------------------------------
       (.then (fn [_]
-               (println "\nthe models panel: clicking a RECENT sends the pair (url + model):")
+               (println "\nthe dialog opens on the LIST, with its own data:")
                (reset! sent [])
                (rf/dispatch-sync
                 [:renderer-test/seed
                  {:home-project "grog" :active "s#1"
                   :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
-                  :dialog :models :models-draft "typed-but-stale" :models-global? false}])
-               (rf/dispatch-sync [:set-model "s#1" "a-local-model" nil
-                                  {:global false :url "http://localhost:8080/v1"}])
-               (tick)))
+                  ;; stale crud from an earlier visit must not survive
+                  :dialog nil :choice-edit "strata" :choice-name "strata"
+                  :choice-url "http://nowhere" :choice-model "stale"
+                  :choice-catalogue {"http://nowhere" ["stale"]} :recents []}])
+               (rf/dispatch-sync [:dialog-open :models ""])
+               (settle)))
       (.then (fn [_]
-               (check! "the recents pick carries the model AND its transport"
-                       ["set-model" {:id "s#1" :model "a-local-model" :global false
+               (check! "it loads the named list and the recents itself"
+                       ["choices" "recents"] (mapv first @sent))
+               (check! "the editor starts CLOSED — picking is the front door, not editing"
+                       nil (:choice-edit (sub)))
+               (check! "and no leftover form is left on screen"
+                       "" (:choice-model (sub)))
+               (check! "the previous endpoint's model list is dropped with the dialog"
+                       {} (:choice-catalogue (sub)))
+               (check! "Settings is NOT a model dialog any more (it loads the list, nothing picks)"
+                       ["choices"] (mapv first (filter #(= "choices" (first %)) @sent)))))
+
+      ;; A NAMED pick is the whole point: the NAME is what the user chose, so the
+      ;; spine resolves it and the pair it stands for is written — the transport
+      ;; AND the id, together, through the same set-model every other pick uses.
+      ;; (The old bug: a recent/repoint wrote the id and left the endpoint alone.)
+      (.then (fn [_]
+               (println "\npicking a NAMED model resolves the name and writes the pair:")
+               (reset! sent [])
+               (stub! {"pick-choice" #js {:name "workstation"
+                                          :url "http://localhost:8081/v1"
+                                          :model "qwen3-32b"}})
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models
+                  :choices [{:name "workstation" :url "http://localhost:8081/v1"
+                             :model "qwen3-32b" :provider "strata"}]}])
+               (rf/dispatch-sync [:choice-pick "s#1" "workstation"])
+               (settle)))
+      (.then (fn [_]
+               (check! "first the name is resolved by the spine, never in the client"
+                       "pick-choice" (first (first @sent)))
+               (check! "then the RESOLVED pair is written — url and model together"
+                       ["set-model" {:id "s#1" :model "qwen3-32b" :global true
+                                     :url "http://localhost:8081/v1"}]
+                       (first (filter #(= "set-model" (first %)) @sent)))
+               (check! "a dialog pick is machine-level, so it writes the default (global)"
+                       true (get-in @sent [1 1 :global]))))
+
+      ;; A name that cannot be picked — a row saved with no model id yet — must
+      ;; explain itself IN THE FORM, since that is where the user is looking.
+      (.then (fn [_]
+               (println "\na name with no model id says why, in the dialog:")
+               (reset! sent [])
+               (stub! {"pick-choice" (js/Error. "grog knows \"strata\" but it has no model id — edit it, or start the server and press check")})
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :choice-edit "strata"}])
+               (rf/dispatch-sync [:choice-pick "s#1" "strata"])
+               (settle)))
+      (.then (fn [_]
+               (check! "nothing was written" [] (filter #(= "set-model" (first %)) @sent))
+               (check! "the reason is the spine's own sentence, in the form"
+                       true (boolean (re-find #"no model id" (:choice-msg (sub)))))))
+
+      ;; A recent is the escape hatch for a model nobody named, and it carries its
+      ;; OWN url — picking it therefore switches the transport too.
+      (.then (fn [_]
+               (println "\na RECENT carries its model and its own endpoint:")
+               (reset! sent [])
+               (stub!)
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models}])
+               (rf/dispatch-sync
+                [:pick-url-model "s#1" "a-local-model" "http://localhost:8080/v1"])
+               (settle)))
+      (.then (fn [_]
+               (check! "one set-model, carrying BOTH halves"
+                       ["set-model" {:id "s#1" :model "a-local-model" :global true
                                      :url "http://localhost:8080/v1"}]
-                       (first @sent))
-               (check! "and the panel re-reads the lists it labels itself from"
-                       ["recents" "providers"] (mapv first (rest @sent)))
-               (check! "it does NOT force a global write when the tick is off"
-                       false (get-in @sent [0 1 :global]))))
+                       (first @sent))))
 
+      ;; An empty pick used to do nothing at all, which read as a dead button.
       (.then (fn [_]
-               (println "\nclicking a recent WITH the global tick:")
+               (println "\nan empty pick is refused in words, not silence:")
                (reset! sent [])
-               (rf/dispatch-sync [:renderer-test/seed
-                                  {:home-project "grog" :active "s#1"
-                                   :sessions {"s#1" {:id "s#1" :project "grog"
-                                                     :input "" :attachments []}}
-                                   :models-global? true}])
-               (rf/dispatch-sync [:set-model "s#1" "a-local-model" nil
-                                  {:global true :url "http://localhost:8080/v1"}])
-               (tick)))
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models}])
+               (rf/dispatch-sync [:pick-url-model "s#1" "   " "http://localhost:8080/v1"])
+               (settle)))
       (.then (fn [_]
-               (check! "the tick is honoured"
-                       true (get-in @sent [0 1 :global]))))
+               (check! "nothing was sent" [] @sent)
+               (check! "and the form says what to do instead"
+                       true (boolean (re-find #"no model picked" (:choice-msg (sub)))))))
 
-      ;; A pick with NEITHER a model nor a url is genuinely empty: it must say so.
-      ;; It used to return silently, so Apply looked dead.
+      ;; SAVE: three fields, ONE write. The reported failure mode was a button
+      ;; wired to only part of the form — so this asserts the whole payload.
       (.then (fn [_]
-               (println "\nan Apply with nothing picked says so:")
+               (println "\nsaving a model writes name + url + model in ONE call:")
                (reset! sent [])
-               (rf/dispatch-sync [:renderer-test/seed
-                                  {:home-project "grog" :active "s#1"
-                                   :sessions {"s#1" {:id "s#1" :project "grog"
-                                                     :input "" :attachments []}}
-                                   :dialog :models :models-draft ""}])
-               (rf/dispatch-sync [:set-model "s#1" "" nil {:global false}])
-               (tick)))
-      (.then (fn [_]
-               (check! "nothing was sent to the spine" [] @sent)
-               (check! "and it is explained, not silent"
-                       true (boolean (some #(re-find #"no model picked" (str (:text %)))
-                                           (transcript))))))
-
-      ;; THE STALENESS BUG. The box must follow the model the server reports — a
-      ;; transport pick can legitimately clear it (no model named), and the box
-      ;; showing the OLD id while the session runs nothing is precisely the "bogus
-      ;; model" the user saw.
-      (.then (fn [_]
-               (println "\nthe box follows the server's model (a cleared one goes blank):")
                (rf/dispatch-sync
                 [:renderer-test/seed
                  {:home-project "grog" :active "s#1"
                   :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
-                  :dialog :models :models-draft "a-stale-id" :models-draft-dirty? false}])
-               (rf/dispatch-sync [:ev {:type "model" :sessionId "s#1" :value "" :provider "strata"
-                                       :url "http://localhost:8080/v1" :label "strata · unset"}])
-               (tick)))
+                  :dialog :models :choice-edit "new" :choice-name "Workstation"
+                  :choice-url "http://localhost:8081/v1" :choice-model "qwen3-32b"}])
+               (rf/dispatch-sync [:choice-save])
+               (settle)))
       (.then (fn [_]
-               (check! "the box goes BLANK rather than keeping the stale id"
-                       "" (:models-draft (sub)))
-               (check! "and the session carries the transport it switched to"
-                       "http://localhost:8080/v1" (get-in (sub) [:sessions "s#1" :url]))))
+               (check! "exactly one write to the spine"
+                       ["save-choice"] (mapv first (filter #(= "save-choice" (first %)) @sent)))
+               (check! "with all three fields, port inside the url"
+                       {:name "Workstation" :url "http://localhost:8081/v1"
+                        :model "qwen3-32b"}
+                       (second (first (filter #(= "save-choice" (first %)) @sent))))
+               (check! "no half-write rides along (no separate provider/port call)"
+                       [] (filter #(= "set-provider" (first %)) @sent))
+               (check! "the form closed and the list re-read, so the file is what shows"
+                       ["choices"] (mapv first (filter #(= "choices" (first %)) @sent)))
+               (check! "the status line says how to USE it, not just that it saved"
+                       true (boolean (re-find #"/model workstation"
+                                              (:text (last (transcript))))))))
 
-      ;; …but a box the user is mid-edit must NOT be yanked out from under them.
+      ;; A name is the identity — without it there is nothing to pick by. Refused
+      ;; client-side (no round trip), and the message sits in the form.
       (.then (fn [_]
-               (println "\na box being typed in is left alone:")
+               (println "\n saving with no name is refused, in the form:")
+               (reset! sent [])
                (rf/dispatch-sync
                 [:renderer-test/seed
                  {:home-project "grog" :active "s#1"
                   :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
-                  :dialog :models :models-draft "half-typed" :models-draft-dirty? true}])
-               (rf/dispatch-sync [:ev {:type "model" :sessionId "s#1" :value "server-id"}])
-               (tick)))
+                  :dialog :models :choice-edit "new" :choice-name "  "
+                  :choice-url "http://localhost:8081/v1" :choice-model "qwen3-32b"}])
+               (rf/dispatch-sync [:choice-save])
+               (settle)))
       (.then (fn [_]
-               (check! "the half-typed id survives the server's model event"
-                       "half-typed" (:models-draft (sub)))))
+               (check! "nothing was written" [] @sent)
+               (check! "the reason names the field that is missing"
+                       true (boolean (re-find #"NAME" (:choice-msg (sub)))))))
 
-      ;; A model event for ANOTHER session must not touch this dialog's box.
+      ;; A validation failure from the spine (a bad URL, an id with a space in it)
+      ;; must appear BESIDE THE FIELDS, and must not blow away the half-typed form
+      ;; the user still has to fix.
       (.then (fn [_]
-               (println "\na model event for another session is ignored by the dialog:")
+               (println "\na rejected save keeps the form and shows the spine's reason:")
+               (reset! sent [])
+               (stub! {"save-choice" (js/Error. "grog.edn: url must be an http(s) endpoint — got \"localhost:8081\"")})
                (rf/dispatch-sync
                 [:renderer-test/seed
                  {:home-project "grog" :active "s#1"
                   :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
-                  :dialog :models :models-draft "mine" :models-draft-dirty? false}])
-               (rf/dispatch-sync [:ev {:type "model" :sessionId "other#9" :value "theirs"}])
+                  :dialog :models :choice-edit "new" :choice-name "strata2"
+                  :choice-url "localhost:8081" :choice-model "qwen3-32b"}])
+               (rf/dispatch-sync [:choice-save])
+               (settle)))
+      (.then (fn [_]
+               (check! "the spine's sentence is in the form"
+                       true (boolean (re-find #"must be an http" (:choice-msg (sub)))))
+               (check! "the form is still open" "new" (:choice-edit (sub)))
+               (check! "and the half-typed url is untouched, ready to fix"
+                       "localhost:8081" (:choice-url (sub)))))
+
+      ;; EDIT: opening a row points the model list at THAT ROW'S endpoint. Seeing
+      ;; some other server's ids under a row is how an id nobody serves gets saved.
+      (.then (fn [_]
+               (println "\nediting a row browses that row's OWN endpoint:")
+               (reset! sent [])
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models
+                  ;; the live transport is somewhere else entirely
+                  :model-info {:url "http://other:9999/v1" :model "other-model"}
+                  :choices [{:name "workstation" :url "http://localhost:8081/v1"
+                             :model "qwen3-32b"}]
+                  :choice-browse "http://other:9999/v1"}])
+               (rf/dispatch-sync [:choice-edit "workstation"])
+               (settle)))
+      (.then (fn [_]
+               (check! "the form holds the row's three fields"
+                       ["workstation" "http://localhost:8081/v1" "qwen3-32b"]
+                       ((juxt :choice-name :choice-url :choice-model) (sub)))
+               (check! "the browse box is pointed at the ROW's url"
+                       "http://localhost:8081/v1" (:choice-browse (sub)))
+               (check! "and that endpoint was asked (not the one in force)"
+                       [["models" {:url "http://localhost:8081/v1"}]] (filter #(= "models" (first %)) @sent))))
+
+      ;; ADD from a baked-in endpoint: the template pre-fills, and everything it
+      ;; fills is editable — a template, not a cage.
+      (.then (fn [_]
+               (println "\nstarting from a baked-in endpoint pre-fills an EDITABLE form:")
+               (reset! sent [])
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :templates [{:id "strata" :url "http://localhost:8080/v1"
+                                               :sample "qwen3-32b"}]}])
+               (rf/dispatch-sync [:choice-new {:template {:id "strata"
+                                                          :url "http://localhost:8080/v1"
+                                                          :sample "qwen3-32b"}}])
+               (settle)))
+      (.then (fn [_]
+               (check! "it is a NEW row, so nothing existing is edited behind the user"
+                       "new" (:choice-edit (sub)))
+               (check! "the name, url and a sample id are pre-filled"
+                       ["strata" "http://localhost:8080/v1" "qwen3-32b"]
+                       ((juxt :choice-name :choice-url :choice-model) (sub)))
+               (check! "the sample is a field, so clearing it is allowed"
+                       "" (do (rf/dispatch-sync [:choice-field :model ""])
+                              (:choice-model (sub))))
+               (check! "nothing was WRITTEN — a template is not a pick"
+                       [] (filter #(#{"save-choice" "set-model" "set-provider"} (first %)) @sent))
+               (check! "but the endpoint WAS asked, so the id list is ready to click"
+                       [["models" {:url "http://localhost:8080/v1"}]]
+                       (filter #(= "models" (first %)) @sent))))
+
+      ;; A per-endpoint list arrives on its own broadcast (the spine fetches a slow
+      ;; endpoint in the background). It may only fill the box of the endpoint it
+      ;; belongs to.
+      (.then (fn [_]
+               (println "\na models broadcast fills only its OWN endpoint's box:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :choice-browse "http://localhost:8081/v1"
+                  :choice-catalogue {"http://localhost:8081/v1" ["mine"]}}])
+               (rf/dispatch-sync [:choice-catalogue-loaded
+                                  #js {:url "http://elsewhere:1/v1" :models #js ["theirs"]}])
                (tick)))
       (.then (fn [_]
-               (check! "the box still shows this session's model"
-                       "mine" (:models-draft (sub)))))
+               (check! "this row's list is untouched"
+                       ["mine"] (get-in (sub) [:choice-catalogue "http://localhost:8081/v1"]))
+               (check! "and the other endpoint is kept under ITS OWN url"
+                       ["theirs"] (get-in (sub) [:choice-catalogue "http://elsewhere:1/v1"]))))
 
+      ;; Escape steps out ONE level: a form closes, the list stays. A user backing
+      ;; out of a form must not lose the list they came from.
+      (.then (fn [_]
+               (println "\nEscape in the editor closes the editor, not the dialog:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :choice-edit "workstation"}])
+               (rf/dispatch-sync [:key-escape])
+               (tick)))
+      (.then (fn [_]
+               (check! "the form is gone" nil (:choice-edit (sub)))
+               (check! "the dialog is still open" :models (:dialog (sub)))
+               (rf/dispatch-sync [:key-escape])
+               (tick)))
+      (.then (fn [_]
+               (check! "a second Escape closes the dialog" nil (:dialog (sub)))
+               (check! "and no stale error is left for the next visit"
+                       nil (:choice-msg (sub)))))
+
+      ;; The status bar carries the NAME, not just the id — that is what makes a
+      ;; named model feel like the thing you are running.
+      ;; THE PRIMARY PATH, and the one the request was actually about: a model the
+      ;; shipped catalogue has never heard of (a gateway, a relay, a server on a
+      ;; port nobody knows) has to be TYPEABLE, not picked from a list. A blank
+      ;; form, NAME FIRST, and nothing fetched — there is no endpoint to ask yet.
+      (.then (fn [_]
+               (println "\nadding YOUR OWN model opens a blank form, not a catalogue entry:")
+               (reset! sent [])
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}
+                  :dialog :models :templates [{:id "strata" :url "http://localhost:8080/v1"}]}])
+               (rf/dispatch-sync [:choice-new {}])
+               (settle)))
+      (.then (fn [_]
+               (check! "a NEW row, blank in all three fields"
+                       ["new" "" "" ""]
+                       ((juxt :choice-edit :choice-name :choice-url :choice-model) (sub)))
+               (check! "nothing was fetched or written — there is no endpoint to ask yet"
+                       [] @sent)
+               (check! "and typing a URL then asking it is the next step, and it browses THAT url"
+                       "http://gateway.example/v1"
+                       (do (rf/dispatch-sync [:choice-field :url "http://gateway.example/v1"])
+                           (rf/dispatch-sync [:choice-catalogue-fetch "http://gateway.example/v1"])
+                           (:choice-browse (sub))))
+               (check! "…asked once, for the typed url"
+                       [["models" {:url "http://gateway.example/v1"}]]
+                       (filter #(= "models" (first %)) @sent))))
+
+      (.then (fn [_]
+               (println "\nthe status bar shows the NAME the session runs:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []
+                                    :model "qwen3-32b" :url "http://localhost:8081/v1"
+                                    :model-choice "workstation"}}}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the session carries the choice it came from"
+                       "workstation" (get-in (sub) [:sessions "s#1" :model-choice]))))
       (.then (fn [_]
                (println)
                (if (seq @failures)

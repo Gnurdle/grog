@@ -42,28 +42,68 @@
                                         instead of the project manifest)
     set-trust       {:id .. :on ..}                     -> nil
     providers       {}                                  -> {:providers [catalogue ..]
-                                                            :current {:url .. :provider ..}
+                                                            :current {:url .. :provider .. :port ..}
                                                             :info {:url :model :provider
-                                                                   :sources :recents}}
+                                                                   :port :sources :recents}}
                                         the shipped provider catalogue (grog.providers)
                                         plus the current transport and recents.
-    set-provider    {:id? .. :url? .. :model? ..}       -> {:url .. :model ..
+    set-provider    {:id? .. :url? .. :port? .. :model? ..}
+                                                        -> {:url .. :model ..
                                                             :restart-required true}
                                         write the transport url (+ sample :model)
                                         for a catalogue :id (or an explicit :url).
+                                        :port repoints a LOCAL entry at the port
+                                        the user runs it on (two Strata launches).
                                         GLOBAL change, applied on the NEXT start.
     recents         {}                                  -> [{:url .. :model .. :provider ..} ..]
                                         the LRU shortlist, newest first
     forget-recent   {:url .. :model ..}                 -> nil
-    models          {:source? .. :force? ..}            -> {:local [..]
+    choices         {}                                  -> {:choices [{:name .. :url ..
+                                                                        :model .. :provider ..
+                                                                        :port .. :current? ..
+                                                                        :label ..} ..]
+                                                            :templates [baked-in ..]
+                                                            :current {slot-info}}
+                                        EVERY model the user can pick BY NAME:
+                                        `:llm :choices` (what the dialog writes)
+                                        with the legacy `:llm :profiles` folded
+                                        in. No network on a plain read.
+    save-choice     {:name .. :url? .. :model? ..}      -> {:choice .. :choices [..]}
+                                        create/replace a named model. The name is
+                                        the key; the url is free text the user
+                                        owns. Validation failures come back as a
+                                        server error whose MESSAGE is the sentence
+                                        to show in the form.
+    seed-choice     {:template <catalogue id|url> :name? ..}
+                                                        -> {:choice .. :choices [..]}
+                                        create one from a BAKED-IN endpoint: the
+                                        template fills the URL, grog reads the
+                                        model id off the running server, and the
+                                        name defaults to the endpoint (port
+                                        suffix when it is not the default port).
+    remove-choice   {:name ..}                          -> {:choices [..]}
+    choice-probe    {:name ..}                          -> {:reachable? .. :models [..]
+                                                            :context-window ..}
+                                        ask that choice's endpoint what it serves
+                                        (also broadcast as `choice`)
+    pick-choice     {:name ..}                          -> {:url .. :model .. :name ..}
+                                        resolve a NAME to the [url model] a pick
+                                        needs; the caller then sends `set-model`,
+                                        so the write path stays in one place
+    models          {:source? .. :force? .. :url? ..}   -> {:local [..]
                                                             :remote [..]
                                                             :loading [..]}
+                                                          or {:url .. :models [..]
+                                                              :loading ..}
                                         the model catalogue. Answers from cache;
                                         an uncached (or :force'd) source is
                                         fetched on a BACKGROUND thread and
                                         arrives later as a `models` notification,
                                         so a slow network never blocks this
-                                        request loop.
+                                        request loop. `:source` is a PLACE
+                                        (local or remote); `:url` browses a
+                                        saved choice's OWN endpoint without
+                                        repointing the live transport.
     answer-question {:question-id .. :result ..}        -> nil
     projects        {}                                  -> [{:name .. :description ..} ..]
     create-project  {:name .. :description ..}          -> nil
@@ -423,16 +463,29 @@
               ;; other client) for up to the HTTP timeout. The refreshed list
               ;; arrives as a `models` broadcast. `:source` is a PLACE
               ;; ("local"/"remote").
-              "models" (let [src  (keyword (or (:source params) "remote"))
-                             known (models/catalogue)]
-                         (when (or (boolean (:force params))
-                                   (nil? (get known src)))
-                           (models/fetch-async!
-                            src
-                            (fn [s ms]
-                              (broadcast! "models" {:source (name s)
-                                                    :models ms}))))
-                         known)
+              ;;
+              ;; `:url` is the OTHER kind of place: a saved model choice's own
+              ;; endpoint. The dialog browses any row it opens without repointing
+              ;; the live transport, so a url-keyed fetch has its own cache slot
+              ;; (see `models/url-catalogue`) and its broadcast carries the url.
+              "models" (if-let [u (some-> (:url params) str str/trim not-empty)]
+                         (let [known (models/url-catalogue u)]
+                           (when (or (boolean (:force params))
+                                     (nil? (:models known)))
+                             (models/fetch-url-async!
+                              u
+                              (fn [url ms] (broadcast! "models" {:url url :models ms}))))
+                           known)
+                         (let [src  (keyword (or (:source params) "remote"))
+                               known (models/catalogue)]
+                           (when (or (boolean (:force params))
+                                     (nil? (get known src)))
+                             (models/fetch-async!
+                              src
+                              (fn [s ms]
+                                (broadcast! "models" {:source (name s)
+                                                      :models ms}))))
+                           known))
               ;; The picker sends a PLACE ("local"/"remote"); qualification needs
               ;; a PROVIDER, resolved from the transport url. Translate here,
               ;; where the config is known — losing that signal made remote picks
@@ -489,7 +542,8 @@
                              :info info
                              :recents (try (config/recents) (catch Throwable _ []))
                              :current {:url (:url llm) :model (:model llm)
-                                       :provider (models/provider-prefix-for-url (:url llm))}})
+                                       :port (:port info)
+                                       :provider (models/provider-for-endpoint (:url llm))}})
               ;; A transport pick changes WHERE models come from. It must NOT
               ;; change WHICH model unless the catalogue entry actually names
               ;; one: several local entries ship `:sample nil` precisely because
@@ -498,29 +552,48 @@
               ;; remote id would point e.g. a Cerebras id at a local server. So:
               ;; with no sample, leave the model field ALONE and let the picker's
               ;; catalogue (and the user) name it — never a placeholder.
+              ;;
+              ;; `:port` (optional) repoints a LOCAL entry at the port the user is
+              ;; actually running it on — the way to tell one Strata launch from
+              ;; another. The whole pick is applied by `models/set-provider!`, the
+              ;; SAME fn the CLI's `/provider` calls, so the two cannot drift.
               "set-provider"
-              (let [{:keys [id url model]} params
-                    entry (when id (providers/by-id id))
-                    old-url (try (config/llm-url) (catch Throwable _ nil))
-                    new-url (or url (:url entry))
-                    new-model (or (some-> model str str/trim not-empty)
-                                  (models/live-model-id new-url (:sample entry)))]
-                (when (str/blank? (str new-url))
-                  (throw (ex-info "set-provider needs :id or :url" {:id id})))
-                (models/save-model-url! new-url)
-                (cond
-                  ;; the entry (or the live endpoint) names a model: take it
-                  (some-> new-model str str/trim not-empty)
-                  (models/save-model! new-model)
+              (do (models/set-provider! (select-keys params [:id :url :port :model]))
+                  (reload-config!)
+                  (assoc (models/slot-info nil) :restart-required false))
 
-                  ;; the transport CHANGED and nothing names a model now: drop the
-                  ;; old id rather than leave it paired with the new endpoint.
-                  ;; Keeping it is the "bogus model" report — a remote id bound
-                  ;; to a local port looks deliberate and cannot work.
-                  (not= (some-> old-url str str/trim) (some-> new-url str str/trim))
-                  (models/clear-model!))
-                (reload-config!)
-                (assoc (models/slot-info nil) :restart-required false))
+              ;; --- NAMED MODEL CHOICES ------------------------------------
+              ;;
+              ;; The Models dialog's list: every model the user can pick BY NAME
+              ;; (`:llm :choices`, plus the legacy `:llm :profiles` folded in).
+              ;; `choices` answers instantly and does NO network probing — the
+              ;; dialog opens fast and says "check them" for reachability.
+              ;;
+              ;; `save-choice` / `remove-choice` validate in `grog.models` and
+              ;; their ex-info MESSAGE is what the dialog shows, so a half-filled
+              ;; form produces a sentence instead of a broken row. `pick-choice`
+              ;; resolves a name to `[url model]` and lets the SAME `set-model`
+              ;; path below write it — one write path, so the GUI, `/model <name>`
+              ;; and the project manifest cannot drift.
+              "choices" {:choices (models/choices-info)
+                         :templates (models/choice-templates)
+                         :current (models/slot-info nil)}
+              "choice-probe" (let [info (models/probe-choice (:name params))]
+                               (when info (broadcast! "choice" info))
+                               info)
+              "save-choice" (let [r (models/save-choice!
+                                     {:name (:name params) :url (:url params)
+                                      :model (:model params)})]
+                              (reload-config!)
+                              (assoc r :choices (models/choices-info)))
+              "seed-choice" (let [r (models/seed-choice! (:template params) (:name params))]
+                              (reload-config!)
+                              (assoc r :choices (models/choices-info)))
+              "remove-choice" (do (models/remove-choice! (:name params))
+                                  (reload-config!)
+                                  {:choices (models/choices-info)})
+              "pick-choice" (let [c (models/use-choice (:name params))]
+                              {:url (:url c) :model (:model c) :name (:name c)})
               ;; Recents: the LRU shortlist the picker offers. `forget-recent`
               ;; drops one entry; the list is otherwise maintained by every
               ;; `set-model`/`set-provider` pick.

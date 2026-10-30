@@ -19,6 +19,7 @@
             [grog.mcp-store :as mcp-store]
             [grog.models :as models]
             [grog.projects :as projects]
+            [grog.providers :as providers]
             [grog.project-dialog :as project-dialog]
             [grog.readline :as gread]
             [grog.secrets :as secrets]
@@ -866,7 +867,8 @@
 (declare help-text handle-shell-command! handle-jobs-command! handle-chron-command!
          handle-mcp-command! handle-project-command! handle-secret-command!
          handle-doctor-command! handle-reset-command!
-         handle-soul-command! handle-model-command! handle-tasks-command!)
+         handle-soul-command! handle-model-command! handle-tasks-command!
+         handle-provider-command!)
 
 (defn- kv-save-state!
   "Persist a JSON snapshot of current session state to the KV restore key
@@ -944,6 +946,7 @@
       (handle-doctor-command! line) ::handled
       (handle-reset-command! line)  ::handled
       (handle-soul-command! line)   ::handled
+      (handle-provider-command! line) ::handled
       (handle-model-command! line)  ::handled
       :else ::llm)))
 
@@ -1035,6 +1038,10 @@
     "  /model <name> — switch to a model name for this session (e.g. qwen2.5-coder:7b-instruct)"
     "  /model <profile> — switch to a named profile from :llm :profiles (can override :url, :model, etc.)"
     "           every pick is remembered in :llm :recents (LRU, :llm :recents-max, default 10)"
+    "  /provider — list known providers, marking the current transport"
+    "  /provider <id> — set the transport to that provider (strata, vllm, ollama, openrouter, …)"
+    "  /provider <id> <port> — set it AND repoint it at <port> (a second local server, e.g. a Strata launch on 8081)"
+    "  /provider url <base> — set an explicit base URL (e.g. http://localhost:8081/v1)"
     "  @path — inline a file (whitespace-separated tokens; echoed when read)"
     "  quit | exit | /quit"
     ""
@@ -1499,43 +1506,159 @@
 
 (defn- print-model-list!
   "Print the numbered model list (`/model` with no argument): the CURRENT model
-  as 1, then the recents LRU. The numbers are exactly what `/model <n>` accepts."
+  as 1, then the recents LRU. The numbers are exactly what `/model <n>` accepts.
+
+  Below them, the NAMED models — the rows the Models dialog maintains (`:llm
+  :choices`, plus the legacy `:llm :profiles`) — printed by NAME, because a name
+  is what `/model <name>` takes and a number is not stable across an edit of the
+  list. A name with no model id is marked as such: it is a row to complete, not a
+  model to run."
   []
   (println "Current model:" (config/model-label {:url (try (config/llm-url) (catch Throwable _ nil))
                                                  :model (try (config/llm-model) (catch Throwable _ nil))}))
   (let [choices (config/model-choices)
-        recents (rest choices)]
+        recents (rest choices)
+        named (config/named-models)]
     (if (seq recents)
       (do
         (println "Recents (newest first) — /model <n> to switch:")
         (doseq [{:keys [n label current?]} choices]
           (println (format "  %d. %s%s" n label (if current? "  (current)" "")))))
       (do
-        (println "No recents yet — pick one in Settings → Models…, or `/model <name>`.")
-        (println "  (a pick is remembered here, newest first)"))))
-  (when-let [ps (seq (get-in (config/grog) [:llm :profiles]))]
-    (println "Profiles:" (str/join ", " (map #(if (keyword? %) (name %) (str %)) ps)))))
+        (println "No recents yet — pick one in the Models dialog, or `/model <name>`.")
+        (println "  (a pick is remembered here, newest first)")))
+    ;; the named list, by NAME: `/model <name>` is how these are picked, and a
+    ;; number would not survive an edit of the list
+    (if (seq named)
+      (do
+        (println "Named models — /model <name> to switch:")
+        (doseq [{:keys [name url model]} named
+                :let [prov (try (models/provider-for-endpoint url) (catch Throwable _ nil))]]
+          (println (format "  %-16s %s%s"
+                           name
+                           (config/model-label {:url url :provider prov :model model})
+                           (when (nil? model) "   <- NO MODEL ID (complete it in the Models dialog)"))))
+        (println (str "  add one in the Models dialog (or under :llm :choices in grog.edn); "
+                      "start from a baked-in endpoint with `/model new <endpoint>`")))
+      (println "No named models yet — the Models dialog names them; `/model <name>` picks one."))))
+
+(defn- print-provider-list!
+  "Print the shipped provider catalogue, marking the current transport, with a
+  reminder of the port syntax for local servers."
+  []
+  (let [cur-url (try (config/llm-url) (catch Throwable _ nil))
+        cur-prov (try (models/provider-for-endpoint cur-url) (catch Throwable _ nil))]
+    (println "Providers (pick one with `/provider <id>`; add a port for a local server):")
+    (doseq [{:keys [id label kind url]} (providers/entries)]
+      (println (format "  %-12s %-18s %-6s %s%s"
+                       id label (name kind) url
+                       (if (= id cur-prov) "   <= current" ""))))
+    (when (and cur-url (providers/loopback-url? cur-url))
+      (println (str "  current port: " (or (providers/port-of-url cur-url) "(none)")
+                    " — e.g. `/provider strata 8081` to switch launches")))
+    (println "  …local servers can be repointed: /provider strata 8081")))
+
+(defn- handle-provider-command!
+  "The `/provider` command — show the catalogue, or set the transport (and,
+  for a local server, the PORT).
+
+    /provider                show the catalogue, marking the current one
+    /provider <id>           set the transport to that catalogue entry
+    /provider <id> <port>    set it AND repoint it at <port> (a second Strata
+                             launch, a vLLM on a non-default port, …)
+    /provider url <base>     set an explicit base URL
+
+  A pick writes `:llm :url` (and the provider id) through the SAME
+  `models/set-provider!` the GUI uses, so the console and the dialog cannot
+  drift. Local servers serve ONE model each and it is launch-specific, so the
+  model is asked from the endpoint (never a placeholder) — a transport change
+  with nothing to name DROPS the old id rather than pair it with the new port."
+  [line]
+  (when-let [[_ rest] (re-matches #"(?i)^/provider(?:\s+(.*))?$" (str/trim line))]
+    (let [tail (str/trim (or rest ""))
+          toks (when-not (str/blank? tail) (str/split tail #"\s+"))]
+      (cond
+        (str/blank? tail)
+        (print-provider-list!)
+
+        ;; explicit url
+        (and (= "url" (str/lower-case (first toks))) (second toks))
+        (let [info (models/set-provider! {:url (second toks)})]
+          (println (str "Transport -> " (get-in info [:url])
+                        "  (" (or (get-in info [:provider]) "?") ")"))
+          (when (get-in info [:model])
+            (println "  live model:" (get-in info [:model]))))
+
+        :else
+        (let [id (first toks)
+              port (second toks)
+              entry (providers/by-id id)]
+          (if (nil? entry)
+            (do (println (str "No provider '" id "' in the catalogue. Run /provider to list them."))
+                (println "  (…or `/provider url <base>` for an explicit endpoint.)"))
+            (let [info (models/set-provider! (cond-> {:id id}
+                                               port (assoc :port port)))]
+              (println (str "Transport -> " (get-in info [:url])
+                            "  (" (or (get-in info [:provider]) "?") ")"))
+              (if (get-in info [:model])
+                (println "  live model:" (get-in info [:model]))
+                (println "  model: (none — the server named no id; pick one from"
+                         "the catalogue, or start the launch)")))))))
+    true))
 
 (defn- handle-model-command!
   "The `/model` command — show the current model, or switch to one.
 
-    /model            current model + the numbered recents list
-    /model <n>        switch to entry <n> of that list
-    /model <name>     switch to a `:llm :profiles` entry, or a raw model id
-    /model reset      drop any session override (there is none under the loop
-                      adapter; kept because older sessions and scripts use it)
+    /model                 current model + the numbered recents + the named list
+    /model <n>             switch to entry <n> of that list
+    /model <name>          switch to a NAMED model (`:llm :choices`, or the legacy
+                           `:llm :profiles`) — its url AND model, together
+    /model <id>            a raw model id on the configured transport
+    /model new <endpoint> [name]
+                           create a named model from a BAKED-IN endpoint
+                           (strata, ollama, openrouter, …) — the template fills
+                           the URL, grog reads the model id off the running
+                           server, and the name defaults to the endpoint
+    /model rm <name>       delete a named model
+    /model reset           drop any session override (there is none under the loop
+                           adapter; kept because older sessions and scripts use it)
 
   Switching records the pick in recents (LRU), so the thing you just used is
   next to you. This handles the CLI and the `:model-command!` session hook; the
   GUI's `/model` goes through the session (see `grog.chat/handle-turn!`)."
   [line]
   (when-let [[_ rest] (re-matches #"(?i)^/model(?:\s+(.*))?$" (str/trim line))]
-    (let [tail (str/trim (or rest ""))]
+    (let [tail (str/trim (or rest ""))
+          toks (when-not (str/blank? tail) (str/split tail #"\s+"))
+          head (some-> (first toks) str str/lower-case)]
       (cond
         (= "reset" (str/lower-case tail))
         (do (config/clear-llm-override!)
             (println "Cleared session LLM override; now using"
                      (config/llm-model) "@" (config/llm-url)))
+
+        ;; create a named model from a baked-in endpoint — the same template the
+        ;; dialog offers, so the console cannot drift from the GUI
+        (and (= "new" head) (second toks))
+        (let [template (second toks)
+              name (nth toks 2 nil)]
+          (try
+            (let [{:keys [choice]} (models/seed-choice! template name)]
+              (println (str "Added model choice " (:name choice)
+                            "  " (config/model-label choice)))
+              (println (str "  pick it with /model " (:name choice)
+                            (when (nil? (:model choice))
+                              "  (no model id yet — the endpoint named nothing; start the server and pick one)"))))
+            (catch Throwable e
+              (println (.getMessage e)))))
+
+        (= "rm" head)
+        (if-let [name (second toks)]
+          (try
+            (models/remove-choice! name)
+            (println (str "Removed model choice " (models/choice-name name)))
+            (catch Throwable e (println (.getMessage e))))
+          (println "usage: /model rm <name>"))
 
         :else
         (let [c (config/resolve-model-choice tail)]
@@ -1546,13 +1669,16 @@
             (println "No model numbered" (:n c) "— the list has" (:max c)
                      "entries. Run /model with no argument to see them.")
 
+            :incomplete
+            (println (:msg c))
+
             :choice
             (do (config/set-llm-override! (cond-> {:model (:model c)}
                                             (:url c) (assoc :url (:url c))))
                 ;; remember the pick, so it shows up in the numbered list next time
                 (try (models/push-recent! (:url c) (:model c)) (catch Throwable _ nil))
                 (println (str "Switched to " (:label c)
-                              (when (:profile c) (str " (profile " (:profile c) ")"))))
+                              (when-let [n (:profile c)] (str " (named: " n ")"))))
                 (println "  " (config/llm-model) "@" (config/llm-url)))))))
     true))
 
@@ -1692,6 +1818,8 @@
             (handle-secret-command! line)
             (recur history)
             (handle-soul-command! line)
+            (recur history)
+            (handle-provider-command! line)
             (recur history)
             (handle-model-command! line)
             (recur history)

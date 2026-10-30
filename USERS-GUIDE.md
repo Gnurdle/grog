@@ -141,6 +141,12 @@ like a packaged install.)*
        ;; optional: named presets for `/model`
        ;; :profiles {:local  {:url "http://localhost:11434/v1" :model "qwen2.5-coder:7b-instruct"}
        ;;            :remote {:url "https://openrouter.ai/api/v1" :model "moonshotai/kimi-k2.7-code"}}
+       ;; LOCAL servers (Strata, vLLM, ollama…) run on whatever port you started
+       ;; them on, and you may run two of a kind at once — those differ ONLY by
+       ;; port, so the port goes IN THE URL (or `/provider strata 8081`, or the
+       ;; URL field of a model in the Models dialog). See §4.6.
+       ;; :provider "strata"   ; the kind, kept alongside a non-default url so the
+       ;;                      ; picker/status line can name the server you chose
        }
 
  :soul {:path "SOUL.md"}         ; persistent instructions (system prompt)
@@ -157,8 +163,10 @@ like a packaged install.)*
        :format-markdown true}}
 ```
 
-> The **GUI Settings** dialog (Models / Appearance / Terminal / General tabs) can
-> edit most of this for you and writes it back to the same file.
+> The **GUI** dialogs write most of this back to the same file: **⚙ Settings** is
+> appearance and voice (it shows the model in force, with one button that opens
+> the model editor), and **Models** (`Ctrl+M`) is where models live — the named
+> list, the URL of each one, and its model id (§4.7).
 
 ---
 
@@ -206,7 +214,8 @@ In **chat** (GUI or terminal):
 /secret backend                  # show the keyring status
 ```
 
-**In the GUI**: Settings → Models → **Set default API key…** (or Clear API key).
+**In the GUI**: there is no key field in the GUI — use `/secret …` in the composer
+(the GUI's composer is a chat input, so the command works there too).
 
 > `Startup banner` or `/secret` show the keyring status. If it says the keyring
 > is unreachable, make sure a Secret Service (e.g. `gnome-keyring-daemon`) is
@@ -245,6 +254,98 @@ Use `/secret set LLM_API_KEY <key>` then leave `:api-key` **unset** in
 `grog.edn`. grog reads `LLM_API_KEY` automatically.
 
 That's all you need for any OpenAI-compatible cloud provider.
+
+### 4.6 Local servers — and running more than one of a kind
+
+A local entry (`ollama`, `lmstudio`, `strata`, `vllm`, `litellm`, …) is a server
+**you** run. The catalogue ships only that kind's **default** port, so a server
+running anywhere else needs its port supplied. Two Strata launches at once is the
+case this exists for: they differ by nothing but the port.
+
+Three ways to set one, all writing the same `:llm :url`:
+
+| How | Example |
+|---|---|
+| Console | `/provider strata 8081` — the id plus the port |
+| Explicit base URL | `/provider url http://localhost:8081/v1`, or the **url** field of a model in the Models dialog |
+| Config file | `:llm {:url "http://localhost:8081/v1" :model "…"}` |
+
+There is deliberately **no separate port control** in the GUI. The port is part of
+the URL, so the URL is one text field and the port is typed inside it. An earlier
+design kept the port in its own box next to a provider combo, and that split is
+what produced "I changed the port and Apply didn't stick": two fields, two
+writers, and a button wired to only one of them.
+
+Once a local server is on a non-default port, grog keeps the **provider id** with
+the url (`:llm :provider "strata"`) so the picker can show your actual choice
+rather than re-guessing it — a bare `localhost` cannot say which kind of server is
+there. The status line then labels it **`strata:8081 · <model>`**; on the default
+port the port is left off, so an ordinary 8080 Strata still reads `strata ·
+<model>`. The id is only trusted when it points at the same **host** as `:llm
+:url`, so a stale one can never mislabel a transport you have since switched to.
+
+Local servers advertise whatever model their launch loaded, so a transport pick
+asks the running endpoint for the real id (`/v1/models`) instead of writing a
+placeholder. If nothing answers, the model is left **blank** — honest, and you
+name it — rather than paired with an id that cannot work.
+
+### 4.7 Models: one name, three fields, one dialog
+
+Open it with **`Ctrl+M`**, the **model** line in the status bar, or the toolbar's
+**model** button. It is a dialog of its own — not a tab inside Settings — because
+a model is a decision of its own.
+
+**A model is a NAME.** `workstation` means "that qwen on port 8081", and the name
+is the unit of every operation: you pick by name, edit by name, delete by name.
+Under the name sit exactly three fields, written in one step:
+
+| Field | What it is |
+|---|---|
+| **name** | how you pick it — here, or with `/model <name>` |
+| **url** | the endpoint, **port included** (`http://localhost:8081/v1`) |
+| **model** | the id that endpoint answers to |
+
+What the dialog does:
+
+- **The list is the front door.** It opens on your named models, one row each,
+  with a dot for whether the endpoint has actually been checked (grey = never
+  asked, green = it answers, red = nothing there), the reported context window,
+  and **check / edit / ✕** on every row.
+- **Pick is one click.** Clicking the name resolves it to its `[url model]` pair
+  and writes both — a pick never changes the id while leaving the endpoint alone.
+- **Add your own first.** `+ add a model (your own URL)` opens a blank form: name
+  it, type its URL, and press **list ↻** to see what it serves. The shipped
+  endpoints sit below it as a shortcut, not as the only door — a gateway, a relay
+  or a server on an odd port has to be typeable.
+- **The baked-in endpoints are a TEMPLATE, not a menu.** "Start from a known
+  endpoint" pre-fills the URL (and, for a running server, the id it answers to).
+  Every pre-filled value is an editable field; you then rename it to something
+  you will remember.
+- **The model field shows what that URL really serves.** Press **list ↻** (or
+  Enter in the URL field) and the endpoint's own ids appear under the field, to
+  click. A click fills the field; **Save** is what writes.
+- **Errors appear in the form**, in the spine's own words, beside the field at
+  fault — and a rejected save keeps your half-typed text instead of wiping it.
+
+From the console, the same list:
+
+```text
+/model                    current model + the numbered recents + the named list
+/model <n>                switch to entry n of that list
+/model <name>             a NAMED model — its url AND model, together
+/model <id>               a raw model id on the configured transport
+/model new strata [name]  create a named model from a baked-in endpoint
+/model rm workstation     delete a named model
+```
+
+A **recents** shortlist sits under the named list: models you ran but never named,
+each carrying its own endpoint. Picking one switches the transport with it; save
+it as a name to keep it.
+
+> A named model lives in `grog.edn` under `:llm :choices`, so the console, the
+> GUI and a `project.edn` `:model` pin all read the same record. A project that
+> pins its own model says so in the dialog — picking a name there changes the
+> global default, not that project's pin.
 
 ---
 
@@ -313,6 +414,8 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | Symptom | What to check |
 |---|---|
 | "grog: LLM request failed: connection refused" | Is your local server running? Is `:llm :url` correct (`http://localhost:11434/v1`)? |
+| A local server on a non-default port is not reached | Put the port in its URL — `/provider strata 8081`, or edit the model's **url** field in the Models dialog (§4.6). The catalogue only knows each kind's default port. |
+| Two local servers of the same kind (two Strata launches) | Give each one its own URL/port; the status line then reads `strata:8081` so you can tell which one you are on. |
 | 401 Unauthorized | Missing/incorrect key. `/secret set LLM_API_KEY …` or set `:api-key`, then restart. |
 | "No API key found" in failure hint | Same as above. |
 | "OS keyring did not respond within 4s" | On Linux: ensure a Secret Service is running and unlocked; `/secret` reports the keyring unreachable until it is. |
@@ -337,6 +440,10 @@ works for the `:llm` block and MCP/Odoo/IMAP environment config.
 | `/model` | show current model / URL / profiles |
 | `/model reset` | revert session override to config file values |
 | `/model <name>` / `/model <profile>` | switch provider/model/profile for the session |
+| `/provider` | list known providers, marking the current transport |
+| `/provider <id>` | set the transport (strata, vllm, ollama, openrouter, …) |
+| `/provider <id> <port>` | set it AND repoint it at `<port>` — a second local server (e.g. a Strata launch on 8081) |
+| `/provider url <base>` | set an explicit base URL |
 | `/project`, `/project <name>` | switch per-project context home |
 | `/reset` / `/reset --yes` | factory reset — plan first, then perform (see §10) |
 

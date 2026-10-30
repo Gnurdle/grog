@@ -17,7 +17,8 @@
 ;; transport changes, so the name is declared before its definition.
 (declare forget-context-window! endpoint-context-window context-budget context-budget-for
          remember-context-window!
-         local-url? local-transport?)
+         local-url? local-transport?
+         provider-prefix-for-url slot-info live-model-id clear-model! choices choice-for)
 
 (defn- grogedn-file
   "The user's grog.edn — the CONFIG HOME, the same file `grog.config` reads.
@@ -127,6 +128,84 @@
     (when (and old (not= (str/trim (str old)) (str u)))
       (forget-context-window! old))
     url))
+
+(defn save-provider!
+  "Persist the chosen provider `id` in grog.edn atomically: `[:llm :provider]`
+  (or remove it when `id` is blank). This is a LABEL for the picker, not the
+  transport — `:llm :url` remains the single source of truth for where a turn
+  posts. Stored so a pick that also chose a port can be shown back as the exact
+  selection (see `grog.config/llm-provider`)."
+  [id]
+  (let [p (some-> id str str/trim not-empty)]
+    (persist! (fn [m]
+                (if p
+                  (assoc-in m [:llm :provider] p)
+                  (update m :llm (fn [cur] (dissoc (or cur {}) :provider))))))
+    id))
+
+(defn provider-for-endpoint
+  "The provider id a configured base URL belongs to.
+
+  An EXPLICIT `:llm :provider` wins — but only when it actually MATCHES `url`
+  (same host), which is what makes it trustworthy: it is the user's own pick and
+  the only thing that can distinguish two local servers of the same kind (two
+  Strata launches differ only by port, and the port is not in the catalogue), yet
+  a stale id must never label an endpoint it does not point at. When there is no
+  explicit id — or it belongs to another host — the catalogue/host guess is used.
+  Never throws."
+  [url]
+  (let [explicit (try (config/llm-provider) (catch Throwable _ nil))]
+    (or (when (and explicit (providers/host-matches? explicit url))
+          explicit)
+        (provider-prefix-for-url url))))
+
+(defn set-provider!
+  "Apply a provider pick to grog.edn and return the resulting model info.
+
+  `pick` is `{:id <catalogue id>}` / `{:url <explicit base>}`, optionally with
+  `:port` (a local server the user runs on a chosen port) and `:model`. This is
+  the SINGLE implementation shared by the server's `set-provider` RPC and the
+  CLI's `/provider`, so the GUI and the console cannot drift.
+
+  Rules, in order:
+    * the transport url is always written (`save-model-url!`), port included;
+    * an explicit `:model` wins; else the endpoint is asked what it serves
+      (`live-model-id`, whose hint is the catalogue `:sample`);
+    * when the transport CHANGED and nothing names a model, the old id is
+      DROPPED rather than paired with the new endpoint (a foreign id on a local
+      port looks deliberate and cannot work — the \"bogus model\" report);
+    * the provider id is persisted only when the user actually chose one, so a
+      plain url edit does not stamp a derived guess into the file.
+
+  Never throws for a blank pick; returns nil then."
+  [pick]
+  (let [{:keys [id url port model]} (or pick {})
+        entry (when id (try (providers/by-id id) (catch Throwable _ nil)))
+        old-url (try (config/llm-url) (catch Throwable _ nil))
+        base (some-> (or url (:url entry)) str str/trim not-empty)
+        ;; A PORT is only meaningful for a LOCAL server. Applying one to a remote
+        ;; base would fabricate `openrouter.ai:8081` — a stale port in the field
+        ;; must never do that, so a non-loopback base ignores it.
+        with-port (when base
+                    (if (providers/loopback-url? base)
+                      (providers/url-with-port base port)
+                      base))
+        new-url (some-> with-port str str/trim not-empty)]
+    (when (str/blank? (str new-url))
+      (throw (ex-info "set-provider needs :id or :url" {:id id :url url})))
+    (save-model-url! new-url)
+    (let [new-model (or (some-> model str str/trim not-empty)
+                        (live-model-id new-url (:sample entry)))]
+      (cond
+        (some-> new-model str str/trim not-empty)
+        (save-model! new-model)
+
+        (not= (some-> old-url str str/trim) (some-> new-url str str/trim))
+        (clear-model!)))
+    ;; persist the provider LABEL only when the user picked one by id
+    (when (some-> id str str/trim not-empty)
+      (save-provider! id))
+    (slot-info nil)))
 
 (defn save-eca-model!
   "Persist `m` as the model id (`[:llm :model]`) in grog.edn atomically — the
@@ -731,9 +810,10 @@
   (when url
     (let [u (str/lower-case (str url))]
       (or
-       ;; The catalogue knows this exact base — take its canonical id before the
-       ;; host heuristic can mangle it.
-       (providers/id-for-url url)
+       ;; The catalogue knows this base — take its canonical id before the host
+       ;; heuristic can mangle it. Matched with OR without the port so a second
+       ;; local server of a known kind (Strata on 8081) is still `strata`.
+       (providers/id-for-endpoint url)
        (cond
          (or (str/includes? u "11434")
              (str/includes? u "localhost")
@@ -999,7 +1079,13 @@
     {:slot "model"
      :url u
      :model (try (config/eca-model) (catch Throwable _ nil))
-     :provider (provider-prefix-for-url u)
+     ;; the EXPLICIT provider when the user chose one, else derived from the url;
+     ;; `:provider` is a bare id, `:provider-label` carries the `:<port>` when the
+     ;; endpoint is not on that provider's default port (two Strata servers).
+     :provider (provider-for-endpoint u)
+     :provider-label (let [p (provider-for-endpoint u)]
+                       (when p (str p (providers/port-suffix u))))
+     :port (providers/port-of-url u)
      :local? (local-url? u)
      :sources (model-sources)
      ;; WHAT THE ENDPOINT WILL ACCEPT, and what a turn will therefore use. A
@@ -1008,8 +1094,432 @@
      ;; the number is otherwise invisible until the server 400s.
      :context-window (try (endpoint-context-window u (config/eca-model)) (catch Throwable _ nil))
      :context-budget (try (context-budget-for u (config/eca-model)) (catch Throwable _ nil))
+     ;; the NAME the user gave this url+model, when they gave one — the whole
+     ;; point of a choice, and the thing the status line should show rather than a
+     ;; url the user never chose to read.
+     :choice (try (choice-for u (config/eca-model)) (catch Throwable _ nil))
      :recents (try (config/recents) (catch Throwable _ []))
      :recents-max (try (config/recents-max) (catch Throwable _ 10))
-     :label (try (config/model-label {:url u :model (config/eca-model)})
+     :label (try (config/model-label {:url u
+                                      :provider (provider-for-endpoint u)
+                                      :model (config/eca-model)})
                  (catch Throwable _ nil))}))
+
+;; =============================================================================
+;; NAMED MODEL CHOICES — the unit a user actually selects
+;; =============================================================================
+;;
+;; THE RULE, taken from the report it exists for: *"the baked in models should be
+;; used as a template, and user needs to be able to specify/edit a URL, and give
+;; that a NAME that can then be used to pick the model."*
+;;
+;; What made the old selection unusable is that a model was stored as a PAIR OF
+;; LOOSE FIELDS — `[:llm :url]` and `[:llm :model]` — plus an LRU of those pairs
+;; (`:recents`) and a map of provider presets (`:llm :profiles`). None of those
+;; has a name. So the best the UI could put in front of a user was a transport
+;; combo, a port box and a raw catalogue id: three controls that only make sense
+;; together, no way to say "use the workstation model", and no way to keep a
+;; thing you configured on purpose. Every bug this file already documents — the
+;; bogus model, the port that would not stick, the recents row that switched the
+;; id but not the endpoint — is that split showing itself in the UI.
+;;
+;; A CHOICE is one record, and it is what the user picks:
+;;
+;;     {:name "workstation" :url "http://localhost:8081/v1" :model "qwen3-32b"}
+;;
+;; The name is the key (case-insensitive, and it is what `/model <name>` takes);
+;; the url is the transport; the model id is transport-relative. Selecting one
+;; sets BOTH halves in one operation, because a model id and its endpoint are one
+;; decision.
+;;
+;; The shipped catalogue (`resources/providers.edn`) is the TEMPLATE source:
+;; starting from "Strata" pre-fills its base url and reads the model off the
+;; running server (`live-model-id`). A template is a pre-fill, not a cage — once
+;; saved, the url is the user's own text, and a choice whose url drifts away from
+;; the catalogue keeps working (its derived `:provider` is simply dropped).
+;;
+;; `:llm :profiles` — the map the example config and every existing install
+;; carries — is FOLDED IN as choices rather than migrated on disk: it holds
+;; exactly the same three facts, `/model strata` must keep resolving the way it
+;; always did, and the file is only rewritten when the user actually edits a row
+;; (at which point the shadowed `:profiles` key is dropped in the same write, so
+;; grog.edn says one thing about `strata`, not two).
+
+(def choice-name-re
+  "A choice name: a letter, then letters/digits/`-`/`_`/`.`. Deliberately
+  restricted — a name is a KEY the user types into `/model <name>` and reads in a
+  list, so it must be one unambiguous token, never a number, never a path."
+  #"[a-z][a-z0-9._-]{0,63}")
+
+(defn choice-name
+  "`s` as a valid choice name, or nil. Trimmed, lower-cased, inner whitespace
+  folded to `-` (typing `Work Mac` gives `work-mac`), validated against
+  `choice-name-re`. Never throws."
+  [s]
+  (let [raw (some-> s str str/trim not-empty)
+        s (when raw (-> raw str/lower-case (str/replace #"\s+" "-")))]
+    (when (and s (re-matches choice-name-re s)) s)))
+
+(defn- choice-url
+  "A normalised endpoint url for a choice, or nil for junk.
+
+  Trimmed; trailing slashes removed; a scheme supplied when the user typed a bare
+  host (`localhost:8081/v1` — an overwhelmingly common edit). NOTHING ELSE is
+  rewritten: the path is exactly the user's business, because
+  `api.z.ai/api/paas/v4` and `api.groq.com/openai/v1` are not interchangeable
+  with `/v1`, and a wrong path is a 404 on the first prompt."
+  [s]
+  (when-let [raw (some-> s str str/trim (str/replace #"/+$" "") not-empty)]
+    ;; re-FIND, not re-matches: the pattern names a PREFIX (a scheme followed by
+    ;; ://), and re-matches demands a whole-string match — which prefixed
+    ;; `http://` onto urls that already had one and saved `http://http://host`
+    ;; as the endpoint. Caught by driving the dialog's own save-choice call.
+    (let [u (if (re-find #"(?i)^[a-z][a-z0-9+.-]*://" raw) raw (str "http://" raw))]
+      (try (let [^java.net.URI x (java.net.URI. u)]
+             (when (and (#{"http" "https"} (str/lower-case (.getScheme x)))
+                        (seq (.getHost x))
+                        ;; a doubled scheme (`http://http://x`) is a half-typed
+                        ;; field, not an endpoint — saving it produces a
+                        ;; connection failure nobody can explain.
+                        (<= (count (re-seq #"://" u)) 1))
+               u))
+           (catch Throwable _ nil)))))
+
+(defn normalize-choice
+  "`m` as a validated choice row, or nil when it names nothing usable.
+
+  A row needs a valid name and at least one of a usable url / a model id (the
+  latter meaning \"this model on the transport already configured\"). A
+  placeholder id (`local-model` and friends, see `placeholder-model-ids`) is
+  dropped rather than kept: a blank model is visibly blank and fixable, a
+  placeholder looks like a decision and cannot work. Junk rows — a hand-edited
+  grog.edn, a half-typed dialog save — fall out here instead of becoming the
+  reason a session 400s."
+  [m]
+  (when (map? m)
+    (let [n (choice-name (:name m))
+          u (choice-url (:url m))
+          mid (some-> (:model m) str str/trim not-empty)]
+      (when (and n (or u (and mid (not (placeholder-model-id? mid)))))
+        (cond-> {:name n :url u :model (when-not (placeholder-model-id? mid) mid)}
+          ;; the shipped-catalogue kind the url belongs to, when it still matches
+          ;; one: what lets a row say "strata" beside a url the user moved to
+          ;; another port, and what keeps the provider label honest
+          u (assoc :provider (try (providers/id-for-endpoint u) (catch Throwable _ nil)))
+          ;; which config key this name came from — only the legacy map is worth
+          ;; saying, so the list can mark those rows
+          (= "profiles" (:source m)) (assoc :legacy "profiles")
+          (:api-key m) (assoc :api-key (:api-key m))
+          (:legacy m) (assoc :legacy (:legacy m)))))))
+
+(defn choices
+  "Every named model choice, sorted by name and validated.
+
+  The rows come from `grog.config/named-models` — ONE reader that folds `:llm
+  :choices` (what the dialog writes) over the legacy `:llm :profiles` map (what
+  the example config and every existing install carries), so the CLI's `/model
+  <name>` and this list can never disagree about what a name means.
+
+  ONE list, one vocabulary — the user sees named models; where a row came from is
+  shown as `:legacy` but never changes how it is picked."
+  []
+  (keep normalize-choice (config/named-models)))
+
+(defn find-choice
+  "The choice named `name` (case- and whitespace-insensitive), or nil."
+  [name]
+  (when-let [n (choice-name name)]
+    (first (filter #(= n (:name %)) (choices)))))
+
+(defn choice-templates
+  "The shipped catalogue as templates, in file order — the list a new choice
+  starts from. Each carries `:url :sample :note :docs :key-env :local?` and
+  whether it is the endpoint configured RIGHT NOW (so \"start from what I am
+  already running\" is obvious).
+
+  A template is a pre-fill and nothing more."
+  []
+  (mapv (fn [{:keys [id label kind url sample note docs key-env]}]
+          {:id id :label label :kind (some-> kind name) :url url
+           :sample (some-> sample str not-empty) :note note :docs docs
+           :key-env key-env :local? (= :local kind)
+           :current? (try (= (str (config/llm-url)) (str url))
+                          (catch Throwable _ false))})
+        (providers/entries)))
+
+(defn choice-template
+  "The one template with this catalogue `id`, or whose `:url` matches `s` — nil
+  when nothing does."
+  [s]
+  (when-let [x (some-> s str str/trim not-empty)]
+    (or (providers/by-id x)
+        (providers/by-url x))))
+
+(defn save-choice!
+  "Write `m` as a named choice — the ONLY writer of `:llm :choices`.
+
+  Validates first, and throws `ex-info` whose MESSAGE is what the dialog should
+  show: a name that cannot be typed into `/model`, a url that is present but
+  unusable, a placeholder model id. Those are the exact three ways a user can
+  half-fill the form, and each gets a sentence rather than a saved row that fails
+  later. A BLANK url is legal and means \"this model on the configured
+  transport\" — which is why a present-but-junk url must be an error rather than
+  silently normalising to nil: that would quietly turn \"my server on 8081\" into
+  \"whatever is configured\".
+
+  Same name -> REPLACED. When the row being replaced lives in the legacy
+  `:profiles` map, that key is dropped in the same write, so the new
+  `:choices` row is the only thing the file says about that name.
+
+  Saves a choice; does NOT select it (that is `use-choice!`). Returns
+  `{:choice <row> :choices [the stored rows]}`."
+  [m]
+  (let [n (choice-name (:name m))
+        _ (when (nil? n)
+            (throw (ex-info (str "the name " (pr-str (:name m)) " is not usable — start with a letter, "
+                                 "then letters, digits, '-', '_' or '.' (e.g. \"workstation\", \"strata-8081\")")
+                            {:name (:name m) :reason :name})))
+        raw-u (:url m)
+        u (choice-url raw-u)
+        _ (when (and (some-> raw-u str str/trim not-empty) (nil? u))
+            (throw (ex-info (str "that is not a URL I can use: " (pr-str raw-u)
+                                 " — e.g. \"http://localhost:8081/v1\" or \"https://openrouter.ai/api/v1\"."
+                                 " (Leave it blank to mean the transport you are already on.)")
+                            {:url raw-u :reason :url})))
+        mid (some-> (:model m) str str/trim not-empty)
+        _ (when (placeholder-model-id? mid)
+            (throw (ex-info (str "\"" mid "\" names no model — it is the placeholder some servers ship with. "
+                                 "Pick an id from the endpoint's list, or leave the model blank and let grog read it.")
+                            {:model mid :reason :model})))
+        _ (when (and (nil? u) (nil? mid))
+            (throw (ex-info "a choice needs a URL, or a model id to run on the transport you are already on"
+                            {:name n :reason :empty})))
+        row (normalize-choice (assoc m :name n :url u :model mid))
+        written (persist!
+                 (fn [cfg]
+                   (let [cur (get-in cfg [:llm :choices])
+                         cur (if (sequential? cur) (vec cur) [])
+                         ;; stored rows are de-duplicated by name on the way in,
+                         ;; so rows hand-written with duplicates collapse to the
+                         ;; one just saved rather than shadowing each other
+                         kept (vec (remove #(= n (choice-name (:name %))) cur))
+                         profiles (get-in cfg [:llm :profiles])
+                         profiles (when (map? profiles) profiles)
+                         shadowed (when profiles
+                                    (filter #(= n (str/lower-case (if (keyword? %) (name %) (str %))))
+                                            (keys profiles)))
+                         llm (-> (get cfg :llm {})
+                                 (assoc :choices (into kept [row])))]
+                     (assoc cfg :llm (if (seq shadowed)
+                                       (apply dissoc (dissoc llm :profiles) shadowed)
+                                       llm)))))]
+    (reload-config!)
+    {:choice row :choices (get-in written [:llm :choices])}))
+
+(defn remove-choice!
+  "Delete the choice named `name`. A row that also exists in the legacy
+  `:profiles` map clears that key in the same write — the user clicked remove,
+  and it must STAY removed rather than reappear from the legacy map on the next
+  read.
+
+  Returns the remaining `:llm :choices` rows."
+  [name]
+  (let [n (choice-name name)]
+    (when (nil? n)
+      (throw (ex-info (str "no model choice named " (pr-str name)) {:name name})))
+    (let [written (persist!
+                   (fn [cfg]
+                     (let [cur (get-in cfg [:llm :choices])
+                           cur (if (sequential? cur) (vec cur) [])
+                           kept (vec (remove #(= n (choice-name (:name %))) cur))
+                           profiles (get-in cfg [:llm :profiles])
+                           profiles (when (map? profiles) profiles)
+                           shadowed (when profiles
+                                      (filter #(= n (str/lower-case (if (keyword? %) (name %) (str %))))
+                                              (keys profiles)))
+                           llm (-> (get cfg :llm {}) (assoc :choices kept))]
+                       (assoc cfg :llm (if (seq shadowed)
+                                         (apply dissoc (dissoc llm :profiles) shadowed)
+                                         llm)))))]
+      (reload-config!)
+      (vec (get-in written [:llm :choices])))))
+
+(defn choice-info
+  "A choice, annotated for the UI:
+
+    :provider        the catalogue kind (`strata`, `openrouter`, …) or nil
+    :port            the port in force — the ONLY thing that tells two local
+                     servers of one kind apart
+    :current?        is this exactly what a session would run right now?
+    :label           `name · provider · model` — the row a user reads
+    :reachable?      did `GET <url>/models` answer? nil until asked
+    :models          the ids it advertises, when probed
+    :context-window  what that endpoint will accept, when probed
+
+  Read-only and never throws: a choice aimed at a server that is DOWN is still a
+  choice, and still the very row the user wants to open and fix the port on."
+  ([c] (choice-info c {}))
+  ([c {:keys [probe] :as _opts}]
+   (when-let [c (normalize-choice c)]
+     (let [u (:url c)
+           cur-url (try (config/llm-url) (catch Throwable _ nil))
+           cur-model (try (config/eca-model) (catch Throwable _ nil))
+           eff-url (or u cur-url)
+           prov (or (:provider c)
+                    (try (provider-for-endpoint eff-url) (catch Throwable _ nil)))
+           live (when (and probe u) (try (fetch-provider-models u) (catch Throwable _ [])))
+           win (when (and probe u (:model c))
+                 (try (endpoint-context-window u (:model c)) (catch Throwable _ nil)))]
+       (cond-> (assoc c :provider prov
+                         :port (providers/port-of-url eff-url)
+                         :current? (and (= (some-> eff-url str) (some-> cur-url str))
+                                       (= (:model c) cur-model))
+                         :label (str (:name c) " · "
+                                     (config/model-label {:url eff-url :provider prov
+                                                          :model (:model c)})))
+         (some? live) (assoc :models (vec live) :reachable? (boolean (seq live)))
+         (some? win)  (assoc :context-window win))))))
+
+(defn choice-for
+  "The NAMED choice that matches a `[url model]` pair, or nil.
+
+  This is what lets the status line say `workstation · strata:8081 · qwen3-32b`
+  instead of a url and an id the user never chose to read: the pair a session runs
+  is matched back to the name the user gave it. Exact match on both halves (the
+  same normalisation `choices` applies), so it can never claim a name for a
+  transport someone hand-edited out from under it."
+  [url model]
+  (let [u (some-> url str (str/replace #"/+$" "") str/trim not-empty)
+        m (some-> model str str/trim not-empty)]
+    (when (and u m)
+      (first (keep (fn [c] (when (and (= u (some-> (:url c) str (str/replace #"/+$" "")))
+                                      (= m (:model c)))
+                             (:name c)))
+                   (choices))))))
+
+(defn choices-info
+  "The whole list annotated (see `choice-info`).
+
+  `{:probe true}` ALSO asks every endpoint what it serves and what window it
+  accepts. That is one network call per choice, so the dialog asks for it
+  explicitly (\"check them\") and a plain read never pays for it."
+  ([] (choices-info {}))
+  ([opts] (mapv #(choice-info % opts) (choices))))
+
+(defn seed-choice!
+  "Create a choice from a shipped-catalogue template — the \"baked in models are a
+  template\" half of the request.
+
+  `template` is a catalogue id (`\"ollama\"`) or a url. The name defaults to that
+  id, with the port appended (`strata-8081`) when the url is NOT on that kind's
+  default port — two launches of one server must not collide on one name. The
+  model comes from the RUNNING endpoint when it answers, else the template's
+  `:sample` for a remote endpoint, else blank; never a placeholder
+  (`live-model-id` implements exactly that order). The user edits any of it after.
+
+  Returns what `save-choice!` returns."
+  [template & [name]]
+  (let [t (or (choice-template template)
+              (throw (ex-info (str "no baked-in template for " (pr-str template)
+                                   " — pick one from the list, or type the URL yourself")
+                              {:template template})))
+        base (choice-url (:url t))
+        nm (or (choice-name name)
+               (let [id (str (:id t))
+                     p (providers/port-of-url base)
+                     dp (some-> (:url t) providers/port-of-url)]
+                 (choice-name (if (and p (not= p dp)) (str id "-" p) id))))
+        mid (live-model-id base (:sample t))]
+    (save-choice! {:name nm :url base :model mid})))
+
+(defn probe-choice
+  "Ask one choice's endpoint what it serves — its model ids and its context
+  window. This is the dialog's \"what is actually there\" button: it turns a
+  greyed-out row into either a list to click or a clear 'nothing is listening'.
+
+  Never throws; `{:reachable? false}` is the answer for a server that is down."
+  [name]
+  (when-let [c (find-choice name)]
+    (choice-info c {:probe true})))
+
+;; --- browsing a CHOICE's endpoint ------------------------------------------
+;;
+;; The `models` RPC browses the CONFIGURED transport, keyed by the PLACE a tab is
+;; named after (`local`/`remote`). A saved choice is a fourth kind of place: its
+;; own url, whether or not it is the one grog currently runs. Keying those fetches
+;; by url means the dialog can open ANY row, list what that endpoint serves, and
+;; click an id into the editor — without touching the live transport, and without
+;; the two places colliding in one cache (a Strata on 8080 and one on 8081 are the
+;; same PLACE and different servers).
+;;
+;; A slow endpoint must never block the server's single request loop, so this
+;; reuses the same answer-now / fetch-in-the-background shape as the tabs: the
+;; first call says `:loading true`, the list arrives as a `models` broadcast
+;; keyed by that same url.
+
+(defn- url-source-key [url] (str "url:" (some-> url str (str/replace #"/+$" ""))))
+
+(defn fetch-url-async!
+  "Refresh `url`'s model list on a background thread. Calls `(done! url ids)` when
+  it lands; returns true when a fetch was actually started (a repeat click while
+  one is running starts nothing)."
+  [url done!]
+  (let [u (some-> url str str/trim (str/replace #"/+$" "") not-empty)]
+    (if (nil? u)
+      false
+      (let [k (url-source-key u)]
+        (if (contains? @inflight* k)
+          false
+          (do
+            (swap! inflight* conj k)
+            (future
+              (let [ms (try (vec (fetch-provider-models u)) (catch Throwable _ []))]
+                (swap! catalogue* assoc k ms)
+                (swap! inflight* disj k)
+                (try (done! u ms) (catch Throwable _ nil))))
+            true))))))
+
+(defn url-catalogue
+  "What is known about `url` right now, for the browse list:
+
+    {:url <base> :models [...] | nil :loading <bool>}
+
+  `:models` nil means never fetched (the caller should expect `fetch-url-async!`
+  to deliver it shortly)."
+  [url]
+  (let [u (some-> url str str/trim (str/replace #"/+$" "") not-empty)]
+    (when u
+      {:url u
+       :models (get @catalogue* (url-source-key u))
+       :loading (boolean (contains? @inflight* (url-source-key u)))})))
+
+(defn use-choice
+  "Resolve the choice named `name` into what a pick needs:
+
+      {:name .. :url .. :model .. :provider .. :label ..}
+
+  A name that does not exist, and a choice with no model id, are BOTH errors with
+  a message the dialog can show: the endpoint may be up, but there is nothing
+  NAMED to ask, and picking a row that resolves to nothing is how a \"bogus
+  model\" gets born.
+
+  This resolves; it does not write. The write belongs to the pick path
+  (`grog.client.loop`'s set-model, which the GUI's `set-model` RPC and `/model`
+  both go through) because that is the code that knows whether the model belongs
+  to the PROJECT manifest or to grog.edn, and that is what updates the running
+  session's pinned transport and pushes the recents row. Duplicating it here is
+  how the GUI and the console drift."
+  [name]
+  (let [c (or (find-choice name)
+              (throw (ex-info (str "no model choice named " (pr-str name)
+                                   " — the choices are: "
+                                   (str/join ", " (map :name (choices))))
+                              {:name name :reason :unknown})))
+        _ (when (nil? (:model c))
+            (throw (ex-info (str "\"" (:name c) "\" has no model id — open it, pick one from the "
+                                 "endpoint's list (or type the id it answers to), and save")
+                            {:name (:name c) :reason :model})))
+        url (or (:url c) (try (config/llm-url) (catch Throwable _ nil)))]
+    {:name (:name c) :url url :model (:model c) :provider (:provider c)
+     :label (config/model-label {:url url :provider (:provider c) :model (:model c)})}))
 

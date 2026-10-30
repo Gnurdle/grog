@@ -35,6 +35,7 @@ left out (several were, and the sources list says what they were).
 | 17 | A stalled stream: retry before data, diagnose after it | retry/backoff on transient transport failure | ✅ 2026-10-22 |
 | 18 | One model + recents (the big/small slots and relay are gone) | — (grog's own) | ✅ 2026-10-26 |
 | 19 | Context overflow: derive the budget per model, and DISTILL + RETRY instead of dying | — (grog's own) | ✅ 2026-10-28 |
+| 20 | Model selection as ONE dialog, with a NAME as the unit | — (grog's own) | ✅ 2026-10-30 |
 
 ---
 
@@ -563,6 +564,132 @@ decoration. It runs against a throwaway `GROG_CONFIG_HOME` and refuses to run
 without one — the first version of this test set a JVM system property instead,
 which the config loader ignores, and wrote the developer's real `grog.edn`. That
 is recorded in the file's own docstring, because the failure mode is invisible.
+
+---
+
+## ✅ #20 — Model selection is ONE dialog, and a NAME is the unit (2026-10-30)
+
+
+**Done 2026-10-30.** Model selection moved out of Settings into its own dialog
+(`Ctrl+M`), and a model became a **named record** — `{name url model}` — that is
+picked, edited and deleted **by name**, written in **one call**. The baked-in
+providers are now **templates** for a new row, not a menu of fixed choices.
+
+**The report.** *"I am extremely disappointed on how the model selection is
+implemented. It is a damn mess, and virtually impossible to use. … The model
+selection should be a self contained dialog (break out of settings) and it needs
+to MAKE SENSE. The baked in models should be used as a template, and user needs to
+be able to specify/edit a URL, and give that a NAME that can be then used to pick
+the model."*
+
+**What was actually wrong.** Not the widgets — the shape. One decision (which
+model runs) was spread over four controls that only make sense **together**: a
+provider combo, a separate port box, a raw model-id box, and a catalogue list.
+Landing one change took **three RPCs**. That shape had already produced this
+string of reports, one per session:
+
+| Report | Cause, in that shape |
+|---|---|
+| "the port doesn't stick" | the port lived in its own db key; **Apply** dispatched `:set-model` only, so nothing wrote it |
+| "picking strata gives a BOGUS model" | a transport pick wrote `local-model` — a placeholder nobody serves — because the id box and the transport were separate |
+| "a history pick doesn't set it correctly" | a recents row carries its **own url**; the click set the id and left the endpoint alone |
+| "there's no help for your last change" | `/help` pointed at a GUI field the user could not find |
+
+Each fix **added another field to keep in sync**. That is the diagnosis: the panel
+was a set of writers racing over one record, so every repair created the next
+bug. The redesign removes the second writer rather than reconciling writers.
+
+**The rule now.** `name` **is** the model. Everything else is a field of it.
+
+```
+:llm :choices [{:name "workstation" :url "http://localhost:8081/v1" :model "qwen3-32b"}]
+```
+
+- **One list.** Open `Ctrl+M` (or the toolbar **model** button, or the status bar's
+  model line) and it opens on your named models — it loads its own data, so the
+  dialog never depends on Settings having been opened.
+- **Three fields, one Save.** Name, URL (**port inside the URL** — there is no
+  port control to desync), model id. `save-choice` writes all three.
+- **Pick is one click.** The spine resolves the NAME to its `[url model]` pair
+  (`pick-choice`) and the client writes that pair through the SAME `set-model`
+  every other pick uses. One write path for the dialog, `/model <name>` and a
+  project's `:model` pin.
+- **Templates, not a menu.** Picking `strata` opens a NEW row pre-filled with its
+  URL and — for a running server — the id it actually answers to. Every pre-filled
+  value is an editable field.
+- **The endpoint's own ids, under the field.** `list ↻` asks that URL what it
+  serves; a click fills the model field. A click never writes — Save does.
+- **Errors land in the form**, in the spine's own sentence, beside the field at
+  fault; a rejected save keeps the half-typed text instead of wiping it.
+- **Console parity**: `/model new strata [name]`, `/model rm <name>`,
+  `/model <name>` — the same list, so the GUI and the console cannot drift.
+
+**What was deleted.** The provider combo, the port box, `models-apply`,
+`provider-pick`, `models-draft`, the `:slot`-shaped catalogue fetch, and Settings'
+whole model tab (Settings now shows one read-only line and a **change…** button).
+Removing those is the point: 16 renderer checks about port-draft staleness and
+Apply ordering stopped being a thing that could be wrong, because the state they
+described no longer exists.
+
+**The bug the rewrite's own test caught.** Driving `save-choice` against a real
+spine showed every typed URL being stored with a **doubled scheme**:
+
+```
+save-choice {:url "http://127.0.0.1:9/v1"}  ->  stored "http://http://127.0.0.1:9/v1"
+```
+
+`re-matches` was used with a pattern that describes a **prefix**
+(`^[a-z][a-z0-9+.-]*://`). `re-matches` demands a whole-string match, so a URL that
+already had a scheme failed the test and got `http://` glued on the front. Every
+model saved from the dialog would have been stored wrong, surfacing much later as
+"connection refused" against a host that never existed. Nothing in the repo tested
+the URL field, because nothing tested the URL field. `scripts/url-normalization-test.sh`
+now pins that one function's boundaries (bare host → scheme added, odd path left
+alone, doubled scheme and non-http refused rather than "repaired").
+
+**A gap the redesign itself missed, caught by re-reading the request.** The first
+version of the dialog offered only "start from a known endpoint" as the way to
+*add* a model — i.e. the baked-in catalogue as the only door. That is the opposite
+of what was asked ("the user needs to be able to specify/edit a URL"). Fixed: the
+add section now leads with **`+ add a model (your own URL)`** — a blank form, name
+first — and the shipped endpoints sit beneath it as the shortcut they were meant
+to be. A gateway, a relay, or a server on a port nobody has heard of has to be
+typeable, not selectable from a list grog chose.
+
+**A second class of failure, recorded honestly.** Rewriting ~1300 lines of
+`core.cljs` in one pass broke the *reader* of two files (`core.clj`,
+`client/loop.clj`) and left `server.clj`'s `ns` docstring closed early by literal
+quotes inside it — all three compiled nothing, and the breakage surfaced only when
+a spine test ran. Bracket imbalance is invisible to a text diff. The fix is in the
+toolbox, not in care: `pcheck.py`-style balance scanning per top-level form, and
+running the **spine** compile after any spine edit, not just the client's.
+
+**Evidence.**
+- `npm run test:renderer` — 63 checks, 38 of them the dialog: it opens on the list
+  with its own data and the editor **closed**; a named pick writes the resolved
+  `[url model]` pair; an unpickable name says why **in the form**; Save writes all
+  three fields in ONE call and no `set-provider` rides along; a rejected save keeps
+  the half-typed URL; editing a row browses **that row's** endpoint, not the one in
+  force; a template pre-fills but writes nothing; a `models` broadcast fills only
+  its own URL's box; Escape steps out one level. The stub now supports per-method
+  **replies**, including rejections — the old stub answered every call with `nil`,
+  which is why a whole class of "the response was never read" bug was untestable.
+- `scripts/model-picker-test.sh` §10 — the dialog's RPC contract: name in, pair
+  out, and the three kinds of half-filled form refused with a message that names
+  the field.
+- `scripts/url-normalization-test.sh` — the URL field.
+- **Verified by mutation**: restoring `re-matches` for one line makes §10 fail 7
+  checks. The tests discriminate.
+- The 16 obsolete port/Apply checks were **deleted, not left failing** — a green
+  suite that skips a removed feature is worse than one that no longer asks.
+
+**What this does NOT claim.** No screenshot was taken of the new dialog: the
+renderer has no DOM in tests, and driving Electron headless to click into a dialog
+was not worth the complexity here. What is verified is that the bundle **compiles
+clean** (`shadow-cljs compile app`, 0 warnings), that Electron brings up the built
+renderer (`scripts/electron-smoke.js`: *transport up + renderer loaded*), and that
+every handler and RPC the components call does the right thing. The first real
+clicks are the user's.
 
 ---
 

@@ -395,16 +395,36 @@
 
   This is what the status line shows: the PROVIDER beside the model, because
   `qwen3.8-flash-next-unsloth-ud-q4_k_xl` on its own says nothing about where it
-  is running, and the same id can exist on two endpoints."
+  is running, and the same id can exist on two endpoints.
+
+  The provider carries a `:<port>` when the endpoint is on a port that is NOT
+  that provider's catalogue default (a second Strata launch on 8081, say): two
+  servers of the same kind must be tellable apart, and `strata · model` alone
+  cannot say which one. The default port is left bare, so an ordinary 8080
+  Strata still reads simply `strata · model`."
   [{:keys [provider url model]}]
-  (let [p (or (non-blank provider)
-              (when url (try (providers/id-for-url url) (catch Throwable _ nil))))
+  (let [base (or (non-blank provider)
+                 (when url (try (providers/id-for-endpoint url) (catch Throwable _ nil))))
+        p (when base (str base (when url (providers/port-suffix url))))
         m (non-blank model)]
     (cond
       (and p m) (str p " · " m)
       m         m
       p         p
       :else     "unset")))
+
+(defn llm-provider
+  "The explicit provider id for the configured model transport — `:llm :provider`,
+  or nil.
+
+  Normally the provider is DERIVED from `:llm :url` (`models/provider-prefix-for-url`),
+  which is enough because a base URL names exactly one endpoint. It is persisted
+  when the user picks a provider whose port they also chose (see
+  `grog.models/set-provider!`), so the picker combo can show the actual selection
+  rather than re-guessing it — and so the choice survives a hand-edit of the url.
+  Never read for model qualification; that stays URL-derived."
+  []
+  (some-> (get-in (effective-llm-cfg) [:provider]) str str/trim not-empty))
 
 (defn eca-provider-overrides
   "`:eca :providers` from grog.edn — provider entries grog merges into the
@@ -478,6 +498,68 @@
         (throw (ex-info "grog.edn missing required :llm :model"
                         {:path [:llm :model]})))))
 
+(defn named-models
+  "Every NAMED model in grog.edn, as `[{:name <str> :url <str|nil> :model <str|nil>}]`,
+  sorted by name.
+
+  A NAME is what the user asked to pick a model with, and there are two places a
+  name can live in the file:
+
+    :llm :choices  [{:name \"workstation\" :url \"…\" :model \"…\"} …]
+                   what the Models dialog writes, and the shape to hand-edit
+    :llm :profiles {:strata {:url \"…\" :model \"…\"} …}
+                   the legacy map — the example config ships it for every known
+                   provider, so every existing install already has a dozen named
+                   models in it
+
+  Both are READ, and `:choices` wins a name clash (it is the newer, explicit
+  shape; the writer drops the shadowed `:profiles` key in the same write). Folding
+  them here rather than migrating on disk means `/model strata` keeps resolving
+  exactly as it always did, a hand-written profiles block keeps working, and the
+  file is only rewritten when the user actually edits a row.
+
+  Raw rows with no url/name validation — `grog.models/choices` is the layer that
+  validates and annotates them. This lives here because it is a pure read of the
+  config map, and BOTH the CLI (`resolve-model-choice`) and the dialog need it:
+  two readers of these two keys is how the console and the GUI drift.
+
+  Each row carries `:source` (`\"choices\"` or `\"profiles\"`) so a caller can say
+  where a name came from."
+  []
+  (let [llm (get-in (grog) [:llm])
+        choices (get llm :choices)
+        choices (when (sequential? choices) choices)
+        profiles (get llm :profiles)
+        profiles (when (map? profiles) profiles)
+        rows (concat
+              (keep (fn [m]
+                      (when (map? m)
+                        (when-let [n (some-> (:name m) str str/trim (str/replace #"\s+" "-")
+                                             str/lower-case not-empty)]
+                          {:name n :url (non-blank (:url m)) :model (non-blank (:model m))
+                           :api-key (:api-key m) :source "choices"})))
+                    choices)
+              (keep (fn [[k v]]
+                      (when (map? v)
+                        (when-let [n (some-> (if (keyword? k) (name k) (str k))
+                                            str str/trim (str/replace #"\s+" "-")
+                                            str/lower-case not-empty)]
+                          {:name n :url (non-blank (:url v)) :model (non-blank (:model v))
+                           :api-key (:api-key v) :source "profiles"})))
+                    profiles))
+        seen (atom #{})]
+    (->> rows
+         (filter (fn [{:keys [name]}]
+                   (if (contains? @seen name) false (do (swap! seen conj name) true))))
+         (sort-by :name)
+         (vec))))
+
+(defn named-choice
+  "The `named-models` row with this name (case- and whitespace-insensitive), or nil."
+  [name]
+  (when-let [n (some-> name str str/trim (str/replace #"\s+" "-") str/lower-case not-empty)]
+    (first (filter #(= n (:name %)) (named-models)))))
+
 (defn model-choices
   "The current model followed by the recents, as a numbered list
   `[{:n <int> :url <str> :model <str> :label <str> :current? <bool>}]`.
@@ -509,9 +591,15 @@
     \"<n>\"     -> the n-th entry of `model-choices` (1 = the current model), as
                   `{:kind :choice :url .. :model .. :label ..}`, or
                   `{:kind :unknown}` when the number is out of range
-    \"<name>\"  -> a `:llm :profiles` entry, else a raw model id, as
-                  `{:kind :choice :url .. :model .. :label ..}`. A profile brings
-                  its own `:url`; a bare id keeps the configured transport."
+    \"<name>\"  -> a NAMED model (`named-models`: `:llm :choices` or the legacy
+                  `:llm :profiles`), else a raw model id, as
+                  `{:kind :choice :url .. :model .. :label ..}`. A named model
+                  brings its own `:url` and its own `:model`; a bare id keeps the
+                  configured transport.
+
+  A name that carries NO model is not a choice — it is a row the user should
+  complete — so it comes back as `{:kind :incomplete ..}` with a message rather
+  than as a pick that resolves to nothing (the \"bogus model\" report)."
   [tail]
   (let [t (str/trim (str (or tail "")))]
     (cond
@@ -528,21 +616,24 @@
           {:kind :unknown :n n :max (count choices)}))
 
       :else
-      (let [profiles (get-in (grog) [:llm :profiles])
-            pk (or (get (set (keys profiles)) (keyword t))
-                   (get (set (keys profiles)) t))
-            prof (when pk (get profiles pk))
-            p-url (some-> (:url prof) str str/trim not-empty)
-            p-model (some-> (:model prof) str str/trim not-empty)
-            fallback-url (try (llm-url) (catch Throwable _ nil))]
+      (let [fallback-url (try (llm-url) (catch Throwable _ nil))
+            named (named-choice t)]
         (cond
-          prof
-          {:kind :choice
-           :url (or p-url fallback-url)
-           :model (or p-model t)
-           :label (model-label {:url (or p-url fallback-url) :model (or p-model t)})
-           :profile (if (keyword? pk) (name pk) (str pk))}
+          ;; a named model: its url and its model id travel together
+          (and named (:model named))
+          (let [u (or (:url named) fallback-url)
+                m (:model named)]
+            {:kind :choice :url u :model m
+             :label (model-label {:url u :model m})
+             :profile (:name named) :named? true})
 
+          ;; a named model with no id: say so instead of picking nothing
+          named
+          {:kind :incomplete :name (:name named) :url (:url named)
+           :msg (str "\"" (:name named) "\" has no model id — give it one in the "
+                     "Models dialog (or :llm :choices in grog.edn)")}
+
+          ;; anything else is a raw model id on the configured transport
           :else
           {:kind :choice :url fallback-url :model t
            :label (model-label {:url fallback-url :model t})})))))

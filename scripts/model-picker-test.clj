@@ -443,6 +443,164 @@
         (str "global url=" (get-in (cfg) [:llm :url])))
 
 (println)
+(println "=== 9. a local provider can be given a PORT (two Strata launches) ===")
+
+;; The ask: "for strata, we will need a way to edit the url, or at least provide
+;; a local port." A local provider is a SERVER you run, more than one at a time on
+;; whatever port you choose — the catalogue can only name one default per kind, so
+;; a pick must be able to carry the port. Everything below drives the REAL
+;; `set-provider` RPC, the same one the GUI calls.
+
+(def ^:private port-8081 "http://localhost:8081/v1")
+
+(write-config! {:llm {:url "https://openrouter.ai/api/v1"
+                      :model "aion-labs/aion-2.0"}})
+
+;; (a) pick strata on a non-default port
+(result-of "set-provider" {:id "strata" :port 8081})
+(let [c (cfg-llm)]
+  (eq! "the port replaces the catalogue default in the url"
+       port-8081 (:url c))
+  (eq! "…and the provider id is recorded so the picker shows the choice"
+       "strata" (:provider c))
+  (check! "…and the model is still never a placeholder"
+          (not (models/placeholder-model-id? (:model c)))
+          (str "model=" (pr-str (:model c)))))
+
+;; (b) the provider is STILL strata (the kind), and the label carries the port so
+;;     two launches are tellable apart. The provider is KNOWN here: for a loopback
+;;     url the bare host cannot distinguish two local kinds, so the explicit
+;;     provider (recorded by the pick) is what names it — see `llm-provider`.
+(eq! "an 8081 Strata still names the strata provider"
+     "strata" (models/provider-for-endpoint port-8081))
+(eq! "…and its label carries the port"
+     "strata:8081 · qwen3.8-x"
+     (config/model-label {:provider "strata" :url port-8081 :model "qwen3.8-x"}))
+(eq! "the DEFAULT port is left bare (an ordinary 8080 Strata reads simply)"
+     "strata · qwen3.8-x"
+     (config/model-label {:provider "strata" :url "http://localhost:8080/v1" :model "qwen3.8-x"}))
+
+;; (c) port helpers, directly
+(eq! "url-with-port swaps the port"
+     "http://localhost:8081/v1" (providers/url-with-port "http://localhost:8080/v1" 8081))
+(eq! "…accepts a string port"
+     "http://localhost:8081/v1" (providers/url-with-port "http://localhost:8080/v1" "8081"))
+(eq! "…a blank port leaves the url alone"
+     "http://localhost:8080/v1" (providers/url-with-port "http://localhost:8080/v1" ""))
+(eq! "…an invalid port leaves the url alone"
+     "http://localhost:8080/v1" (providers/url-with-port "http://localhost:8080/v1" "notaport"))
+(eq! "port-of-url reads the port" 8081 (providers/port-of-url "http://localhost:8081/v1"))
+(eq! "…and is nil with none" nil (providers/port-of-url "https://openrouter.ai/api/v1"))
+
+;; (d) an explicit url pick (`/provider url …`) also records it
+(result-of "set-provider" {:url "http://127.0.0.1:9999/v1"})
+(eq! "an explicit url pick writes that url"
+     "http://127.0.0.1:9999/v1" (get-in (cfg) [:llm :url]))
+
+;; (e) the `providers` RPC reports the live port. There is NO port control in the
+;;     GUI any more (the port lives in a model's URL), but the port is still what
+;;     distinguishes two local launches, so it stays reported for the label and
+;;     for `/provider <id> <port>`.
+(write-config! {:llm {:url port-8081 :provider "strata" :model "x"}})
+(let [p (result-of "providers" {})]
+  (eq! "providers reports the current port" 8081 (get-in p [:current :port]))
+  (eq! "…and the explicit provider" "strata" (get-in p [:current :provider]))
+  (eq! "…and the model info carries it too" 8081 (get-in p [:info :port])))
+
+;; (f) picking a DIFFERENT transport must NOT carry the old port onto it — a port
+;;     belongs to the pick, not to the session. OpenRouter has no port to set.
+(write-config! {:llm {:url port-8081 :provider "strata" :model "x"}})
+(result-of "set-provider" {:id "openrouter"})
+(eq! "a remote pick ignores any stale port"
+     "https://openrouter.ai/api/v1" (get-in (cfg) [:llm :url]))
+
+;; (g) a STALE explicit provider must not mislabel an endpoint on another host:
+;;     `:llm :provider` is only trusted when it points at the SAME host as the url.
+(eq! "an explicit provider on a matching host is trusted"
+     "strata"
+     (do (write-config! {:llm {:url port-8081 :provider "strata" :model "x"}})
+         (models/provider-for-endpoint "http://localhost:8081/v1")))
+(eq! "…but a stale one on ANOTHER host is ignored (the url is the truth)"
+     "openrouter"
+     (do (write-config! {:llm {:url "https://openrouter.ai/api/v1"
+                              :provider "strata" :model "x"}})
+         (models/provider-for-endpoint "https://openrouter.ai/api/v1")))
+
+;; (h) a port is only meaningful for a LOCAL base — a stale port must never be
+;;     stamped onto a remote host.
+(eq! "a port on a REMOTE base is ignored (no openrouter.ai:8081)"
+     "https://openrouter.ai/api/v1"
+     (:url (do (write-config! {:llm {:url "https://openrouter.ai/api/v1" :model "x"}})
+               (models/set-provider! {:id "openrouter" :port 8081}))))
+(eq! "…while a port on a LOCAL base is applied"
+     port-8081
+     (:url (do (write-config! {:llm {:url "https://openrouter.ai/api/v1" :model "x"}})
+               (models/set-provider! {:id "strata" :port 8081}))))
+
+(println)
+(println "=== 10. the Models dialog's own calls: NAME in, [url model] out ===")
+;;
+;; The dialog is one list of NAMED models and one Save. What it does NOT do is
+;; decide anything: it sends `save-choice` with three fields and `pick-choice`
+;; with a NAME, and the spine answers with the record and the pair. If this
+;; contract drifts — a url rewritten on the way in, a name that resolves to only
+;; half a pair — the dialog cannot be made to work from its own side.
+(let [dead "http://127.0.0.1:59322/v1"]
+  (write-config! {:llm {:url "https://openrouter.ai/api/v1" :model "someone-elses-model"}})
+
+  ;; (a) THE URL BUG. Driving this call is what found `re-matches` used with a
+  ;;     prefix pattern: a url that already had a scheme came back with a SECOND
+  ;;     one glued on the front, i.e. every model typed into the dialog was
+  ;;     stored wrong.
+  (let [r (result-of "save-choice" {:name "Workstation" :url (str dead "/") :model "qwen3-32b"})]
+    (eq! "save-choice stores the url EXACTLY (no second scheme)"
+         dead (get-in r [:choice :url]))
+    (eq! "…and folds the name to what /model accepts"
+         "workstation" (get-in r [:choice :name])))
+
+  ;; (b) it is in the list the dialog reads, with its provider and label
+  (let [rows (get-in (result-of "choices" {}) [:choices])
+        row (first (filter #(= "workstation" (:name %)) rows))]
+    (check! "the named row appears in `choices`" (some? row))
+    (eq! "…with the url and model the form wrote" dead (:url row))
+    (eq! "…and the model id" "qwen3-32b" (:model row))
+    (check! "…and a label the row can render" (boolean (:label row))))
+
+  ;; (c) PICK BY NAME: one name in, the WHOLE pair out. The client then writes
+  ;;     that pair through `set-model` (section 1-3 above cover what that writes),
+  ;;     so a name can never change the model while leaving the endpoint behind.
+  (let [p (result-of "pick-choice" {:name "WorkStation"})]
+    (eq! "pick-choice resolves the name (case-free) to its url" dead (:url p))
+    (eq! "…and its model, in the same answer" "qwen3-32b" (:model p)))
+
+  ;; (d) a row with no model id cannot be picked, and the MESSAGE is the sentence
+  ;;     the dialog prints — "why is this row not working" answered at the row.
+  (result-of "save-choice" {:name "noserver" :url dead :model ""})
+  (let [e (:error (rpc "pick-choice" {:name "noserver"}))]
+    (check! "a name with no model id is refused" (some? e))
+    (check! "…in words that say what to do"
+            (boolean (re-find #"(?i)model id" (str (:message e))))))
+
+  ;; (e) three kinds of half-filled form are REFUSED rather than saved, each with
+  ;;     a message the form shows beside the field at fault.
+  (doseq [[label url] [["a sentence" "not a url"]
+                       ["a doubled scheme" "http://http://localhost:9/v1"]]]
+    (let [e (:error (rpc "save-choice" {:name "row" :url url :model "x"}))]
+      (check! (str "save-choice refuses " label) (some? e))
+      (check! "…naming the url field" (boolean (re-find #"(?i)url" (str (:message e)))))))
+  (let [e (:error (rpc "save-choice" {:name "173" :url dead :model "x"}))]
+    (check! "a name that cannot be typed into /model is refused" (some? e)))
+  (check! "a BLANK url is legal (means the configured transport)"
+          (some? (result-of "save-choice" {:name "on-this-transport" :url "" :model "x"})))
+
+  ;; (f) remove is a FILE edit: the row must stay gone, including when it came
+  ;;     from the legacy :profiles map.
+  (result-of "remove-choice" {:name "Workstation"})
+  (check! "remove-choice drops the row"
+          (not-any? #(= "workstation" (:name %)) (get-in (result-of "choices" {}) [:choices])))
+  (result-of "remove-choice" {:name "on-this-transport"}))
+
+(println)
 (if (pos? @fails)
   (do (println (str "model-picker-test: FAILED — " @fails " check(s)"))
       (System/exit 1))

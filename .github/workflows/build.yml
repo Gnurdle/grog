@@ -91,14 +91,28 @@ jobs:
       - name: Provider catalogue test
         run: bb scripts/providers-test.clj
 
-      # What a MODEL PICK actually writes. The panel sends a PLACE (`local` /
-      # `remote`) or a recents row's own `[url model]`, and the server turns that
-      # into `:llm :url` + `:llm :model`. Two reports came out of not testing it:
-      # a recents click that set the model but not the transport, and a transport
-      # pick that wrote a placeholder id ("local-model") no server answers to.
+      # What a MODEL PICK actually writes. The Models dialog sends a NAMED choice
+      # (`pick-choice` -> the spine resolves NAME -> `[url model]`) or a recents
+      # row's own `[url model]`, and the server turns that into `:llm :url` +
+      # `:llm :model`. Three reports came out of not testing it: a recents click
+      # that set the model but not the transport, a transport pick that wrote a
+      # placeholder id ("local-model") no server answers to, and (section 10) a
+      # typed URL stored with a DOUBLED scheme. Section 10 is the dialog's own
+      # contract: name in, pair out, and every half-filled form refused with a
+      # message the form can show.
+      # Also covers the LOCAL PORT: a pick carrying `:port` repoints a local
+      # server (two Strata launches differ only by port), a port on a remote base
+      # is ignored, and an explicit provider is only trusted on a matching host.
       # Needs a throwaway config home (it writes grog.edn), hence the wrapper.
       - name: Model picker test (what a pick writes)
         run: ./scripts/model-picker-test.sh
+
+      # The URL FIELD of the Models dialog, exactly. `re-matches` with a prefix
+      # pattern once stored `http://http://localhost:8080/v1` for every model a
+      # user typed — invisible in any diff, and it only shows up as "connection
+      # refused" against a host that never existed.
+      - name: Model URL normalization test
+        run: ./scripts/url-normalization-test.sh
 
       - name: Model recents test (LRU order, cap, /model)
         run: ./scripts/recents-test.sh

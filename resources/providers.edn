@@ -169,7 +169,7 @@
    ;; what the picker calls for exactly this reason.
    :sample nil
    :docs "https://github.com/Niko1221/Strata"
-   :note "`strata launch` serves here; port 8080 is its default. The model id is launch-specific and is NOT \"local-model\" — read the running launch's /v1/models (grog does this for you when you pick Strata)."}
+   :note "`strata launch` serves here; port 8080 is its default. Several launches can run at once — put the port in the URL (`http://localhost:8081/v1`, or `/provider strata 8081`) and the label shows which one (`strata:8081`). The model id is launch-specific and is NOT \"local-model\" — read the running launch's /v1/models (grog does this for you when you pick Strata)."}
 
   {:id "vllm" :label "vLLM" :kind :local
    :url "http://localhost:8000/v1"
@@ -179,7 +179,7 @@
    ;; so the picker asks the running server for the real one.
    :sample nil
    :docs "https://docs.vllm.ai"
-   :note "`vllm serve` default port; OpenAI-compatible out of the box. The model id is whatever you served (or --served-model-name) — read it from /v1/models."}
+   :note "`vllm serve` default port; OpenAI-compatible out of the box. Give a pick its port (Settings → Models… \"port\", or `/provider vllm 8001`) if you serve on another. The model id is whatever you served (or --served-model-name) — read it from /v1/models."}
 
   {:id "litellm" :label "LiteLLM relay" :kind :local
    :url "http://localhost:4000/v1"

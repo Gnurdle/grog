@@ -163,12 +163,17 @@
   The status line needs the provider beside the model: `qwen3.8-…` on its own
   does not say it is a local Strata server, and `aion-2.0` does not say
   openrouter. Both come from the resolved transport, so they are correct even
-  when the model id carries no provider prefix of its own."
+  when the model id carries no provider prefix of its own.
+
+  `:choice` is the NAME the user gave this url+model pair, when they gave one.
+  It is reported separately from `:label` rather than folded into it: the label is
+  also what logs and old clients read, and the name is only worth showing to a
+  client that knows what a choice is."
   [model-id source]
   (let [r (try (resolve-llm model-id source nil) (catch Throwable _ nil))
         url (:url r)
         prov (or (some-> source str str/trim not-empty)
-                 (try (models/provider-prefix-for-url url) (catch Throwable _ nil)))
+                 (try (models/provider-for-endpoint url) (catch Throwable _ nil)))
         label (try (config/model-label {:provider prov :url url :model (or (:model r) model-id)})
                    (catch Throwable _ (str model-id)))]
     {:value (or (:model r) model-id)
@@ -176,6 +181,7 @@
      :url url
      :provider prov
      :label label
+     :choice (try (models/choice-for url (:model r)) (catch Throwable _ nil))
      :text (str "model: " label)}))
 
 (defn- session-llm
@@ -729,14 +735,40 @@
                               (if next "ON — tool calls auto-approved" "off")))))
 
         ;; `/model` inside a session: resolve what the user typed against the
-        ;; numbered recents list / profiles / a raw id, then switch for real
+        ;; numbered recents list / a NAMED model / a raw id, then switch for real
         ;; (the same path a picker click takes, recents push included).
         model-command-fn
         (fn [line]
           (let [m (re-matches #"(?i)^/model(?:\s+(.*))?$" (str/trim (str line)))
-                tail (str/trim (str (or (second m) "")))]
-            (if (= "reset" (str/lower-case tail))
+                tail (str/trim (str (or (second m) "")))
+                toks (when-not (str/blank? tail) (str/split tail #"\s+"))
+                head (some-> (first toks) str str/lower-case)]
+            (cond
+              (= "reset" (str/lower-case tail))
               (line! state "No session override to clear — grog runs the configured model. Use /model <n> or /model <name>.")
+
+              ;; the NAMED list is editable from the composer too, so the console
+              ;; and the Models dialog cannot drift: `/model new <endpoint>` builds
+              ;; a choice from a baked-in template, `/model rm <name>` drops one.
+              (and (= "new" head) (second toks))
+              (try
+                (let [{:keys [choice]} (models/seed-choice! (second toks) (nth toks 2 nil))]
+                  (line! state (str "added model choice " (:name choice) "  "
+                                    (config/model-label choice)))
+                  (line! state (str "  pick it with /model " (:name choice)
+                                    (when (nil? (:model choice))
+                                      "  (no model id yet — start the server and pick one)"))))
+                (catch Throwable e (line! state (.getMessage e))))
+
+              (= "rm" head)
+              (if-let [name (second toks)]
+                (try
+                  (models/remove-choice! name)
+                  (line! state (str "removed model choice " (models/choice-name name)))
+                  (catch Throwable e (line! state (.getMessage e))))
+                (line! state "usage: /model rm <name>"))
+
+              :else
               (let [c (try (config/resolve-model-choice tail) (catch Throwable _ {:kind :list}))]
                 (case (:kind c)
                   :list
@@ -747,11 +779,21 @@
                                                            (map (fn [{:keys [n label current?]}]
                                                                   (str n ". " label (when current? " (current)")))
                                                                 choices))))
-                          (line! state "no recents yet — pick one in Settings → Models…, or /model <name>"))))
+                          (line! state "no recents yet — pick one in the Models dialog, or /model <name>")))
+                      (if-let [named (seq (config/named-models))]
+                        (line! state (str "named: "
+                                          (str/join "   "
+                                                    (map (fn [{:keys [name model]}]
+                                                           (str name (when (nil? model) " (NO MODEL ID)")))
+                                                         named)))
+                          (line! state "no named models — the Models dialog names them; /model new <endpoint> also works")))
 
                   :unknown
                   (line! state (str "no model numbered " (:n c) " — the list has " (:max c)
                                     " entries; run /model to see them"))
+
+                  :incomplete
+                  (line! state (:msg c))
 
                   :choice
                   ;; set-model-fn persists the pick, updates the session state and
@@ -760,10 +802,10 @@
                   (set-model-fn (:model c) nil
                                 (cond-> {}
                                   (:url c) (assoc :url (:url c))
-                                  ;; a numbered recent was, by definition, a
-                                  ;; deliberate choice — write it globally so it
-                                  ;; survives a project switch.
-                                  (:from-recent? c) (assoc :global true))))))))
+                                  ;; a numbered recent or a NAMED model was, by
+                                  ;; definition, a deliberate choice — write it
+                                  ;; globally so it survives a project switch.
+                                  (or (:from-recent? c) (:named? c)) (assoc :global true)))))))))
 
         disconnect-fn!
         (fn []
