@@ -208,6 +208,37 @@
   ([msgs] (ctx/est-tokens msgs))
   ([msgs extra] (ctx/est-tokens msgs extra)))
 
+(defn- token-rate
+  "Tokens per second for ONE streamed step, or nil when it cannot honestly be
+  computed.
+
+  `gen-ms` is the time spent PRODUCING tokens — the step's elapsed time minus the
+  wait for the first frame — because prompt processing happens before that first
+  frame and has nothing to do with generation speed (see
+  `transport/stream-chat!`'s `:first-frame-ms`). Dividing the whole step by the
+  whole elapsed time is the version that looks plausible and is wrong by whatever
+  fraction of the step was prefill.
+
+  `out-tok` is the provider's own `completion_tokens`. nil is returned rather
+  than a guess whenever the provider did not report it, or when the step did not
+  actually STREAM (`frames` < 2) — a single frame is a buffered response, where
+  `gen-ms` is not a span of generation at all but a rounding error. A number that
+  is not measured is worse than no number: it is the same shape as the budget
+  constant that fitted one model and not the next.
+
+  The test is 'did it stream', NOT 'one frame per token'. Some providers batch
+  several tokens into a frame, so frame count says nothing about token count —
+  and batching does no harm here, because `gen-ms` is wall-clock: a batched stream
+  still SPANS the generation period, so the rate is right. Requiring a frame per
+  token would have silently disabled this number on exactly the providers that
+  batch, for no gain in correctness."
+  [out-tok gen-ms frames]
+  (let [tok (long (or out-tok 0))
+        ms  (long (or gen-ms 0))
+        fr  (long (or frames 0))]
+    (when (and (pos? tok) (>= ms 100) (>= fr 2))
+      (/ (double tok) (/ (double ms) 1000.0)))))
+
 (defn- compact-messages
   "Elide the middle of the conversation when it exceeds `budget`.
 
@@ -461,6 +492,13 @@
                                  [{:role "user" :content message}])))
         !log (atom [])
         !usage (atom nil)
+        ;; The turn's TOKEN-RATE accumulator: generation time and generated
+        ;; tokens summed across the turn's steps. Kept separate from `!usage`
+        ;; because these are MEASUREMENTS, not billing — `merge-usage` adds
+        ;; numbers like `prompt_tokens` too, and dividing by a sum that includes
+        ;; prefill is the wrong rate. Only steps that produced output contribute.
+        !gen-ms (atom 0)
+        !gen-tok (atom 0)
         gate! (fn [name args]
                 (cond
                   (contains? @!approved name) :approve
@@ -512,7 +550,8 @@
               ;; history that every later turn re-sends). Each retry is strictly
               ;; smaller than the last, and bounded — and the retry is decided
               ;; OUTSIDE the catch, because `recur` may not cross a `try`.
-              {:keys [text reasoning tool-calls malformed usage]}
+              {:keys [text reasoning tool-calls malformed usage
+                      elapsed-ms first-frame-ms frames]}
               (loop [attempt 1]
                 (let [outcome
                       (try
@@ -575,6 +614,28 @@
                     (recur (inc attempt))
                     outcome)))]
           (when usage (swap! !usage merge-usage usage))
+          ;; THE RATE, per STEP. The client's status bar ticks a live counter
+          ;; from its own view of the stream (it is the only party that sees the
+          ;; bytes arrive), but this is the one number that can be MEASURED
+          ;; rather than estimated: the provider's `completion_tokens` over the
+          ;; step's own generation time. Emitting it as its own segment gives
+          ;; the live estimate something to settle onto, and makes a slow
+          ;; endpoint diagnosable from the transcript after the fact.
+          ;;
+          ;; `:usage` (the accumulated turn total) still follows on the final
+          ;; step, where it is complete; this rides every step.
+          (let [gen-ms (max 0 (- (long (or elapsed-ms 0)) (long (or first-frame-ms 0))))
+                r (token-rate (:completion_tokens usage) gen-ms frames)]
+            (when r
+              (swap! !gen-ms + gen-ms)
+              (swap! !gen-tok + (long (or (:completion_tokens usage) 0)))
+              (emit {:kind :rate
+                     :text (format "%.1f tok/s (%.1f avg · %d tok in %.1fs)"
+                                   (double r)
+                                   (double (/ (double @!gen-tok)
+                                              (max 0.001 (/ (double @!gen-ms) 1000.0))))
+                                   (long (or (:completion_tokens usage) 0))
+                                   (/ (double gen-ms) 1000.0))})))
           (doseq [m malformed]
             (emit {:kind :tool :text (str "[bad arguments] " (:why m) " raw=" (:raw m))}))
           (if (empty? tool-calls)

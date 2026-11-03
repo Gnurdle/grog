@@ -17,6 +17,7 @@
   touching the UI thread. The timeout is the wedge guard — an unanswered
   question rejects rather than hanging forever."
   (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [grog.agent.context :as ctx]
@@ -434,7 +435,25 @@
                                             :content {:type "thinking" :text (str (:text seg))}})
             :tool     (chat/publish! state {:type :content
                                             :content {:type "toolCallRun" :summary (str (:text seg))}})
-            :usage    nil
+            ;; THE RATE, as a line in the transcript. It is not a status-bar
+            ;; field: the live number there is ticked by the CLIENT (the only
+            ;; party that sees deltas arrive), and this is the MEASURED value it
+            ;; settles onto. Don't put the same quantity in two places and let
+            ;; them disagree.
+            ;;
+            ;; The `:usage` branch used to be a bare `nil` with no explanation —
+            ;; the loop emits `{:kind :usage :text (pr-str @!usage)}` on every
+            ;; terminal step and it was thrown away here. That was survivable
+            ;; while the loop's own result was folded in below (the meter got
+            ;; its number either way), but it is exactly the wrong default for a
+            ;; wire protocol: a segment the loop took the trouble to emit, and
+            ;; which a REMOTE client would need, silently disappearing because
+            ;; this client happened to have a faster path.
+            :rate     (chat/publish! state {:type :content
+                                            :content {:type "text" :text (str (:text seg))}})
+            :usage    (when-let [u (try (edn/read-string (str (:text seg)))
+                                        (catch Throwable _ nil))]
+                        (when (map? u) (swap! (:usage state) merge u)))
             nil))
 
         send-fn

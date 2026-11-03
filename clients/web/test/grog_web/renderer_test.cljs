@@ -25,7 +25,7 @@
 
   Run: `npm run test:renderer` (CI: the \"Offline JS tests\" step)."
   (:require [re-frame.core :as rf]
-            [grog-web.core]))
+            [grog-web.core :as core]))
 
 ;; --- node has no DOM: stub exactly what the send path touches ----------------
 
@@ -587,6 +587,121 @@
       (.then (fn [_]
                (check! "the session carries the choice it came from"
                        "workstation" (get-in (sub) [:sessions "s#1" :model-choice]))))
+
+      ;; --- the LIVE tok/s counter -------------------------------------------
+      ;;
+      ;; DELIBERATELY REAL TIME, AND DELIBERATELY SPACED. The counter measures
+      ;; elapsed wall-clock BETWEEN deltas, so two things have to be true of the
+      ;; test or it measures nothing: the clock must be real (a faked clock would
+      ;; test arithmetic the counter does not do), and the deltas must be spaced
+      ;; like a real stream. A tight synchronous loop makes every gap ~0ms, which
+      ;; is a legitimate "not enough generation time observed yet" — so the test
+      ;; would report the counter broken when it is behaving exactly right.
+      (.then (fn [_]
+               (println "\nthe live tok/s counter:")
+               (rf/dispatch-sync
+                [:renderer-test/seed
+                 {:home-project "grog" :active "s#1"
+                  :sessions {"s#1" {:id "s#1" :project "grog" :input "" :attachments []}}}])
+               ;; a turn starts, then a burst of text arrives
+               (rf/dispatch-sync [:ev {:sessionId "s#1" :type "running" :value true}])
+               (rf/dispatch-sync [:ev {:sessionId "s#1" :type "content"
+                                       :content {:type "text" :text "aaaa"}}])
+               (tick)))
+
+      (.then (fn [_]
+               (check! "one 4-char delta is ~1 token, but ONE delta is not a rate"
+                       nil (core/live-rate "s#1"))))
+
+      ;; 12 deltas of 400 chars, 40ms apart — a stream that takes ~half a second,
+      ;; so the trailing window has real generation time in it. 4800 chars total.
+      (.then (fn [_]
+               (let [step (fn step [n]
+                            (if (zero? n)
+                              (js/Promise.resolve nil)
+                              (js/Promise.
+                               (fn [res]
+                                 (js/setTimeout
+                                  (fn []
+                                    (rf/dispatch-sync
+                                     [:ev {:sessionId "s#1" :type "content"
+                                           :content {:type "text" :text (apply str (repeat 400 "b"))}}])
+                                    (-> (step (dec n)) (.then (fn [_] (res nil)))))
+                                  40)))))]
+                 (step 12))))
+      (.then (fn [_]
+               (let [[tps est] (core/live-rate "s#1")]
+                 (check! "a rate is reported once enough generation time has been observed"
+                         true (boolean tps))
+                 (check! "…the estimated token count is chars/4 across every delta"
+                         1201 (long est))
+                 (check! "…and the rate is finite, positive and in a sane range"
+                         true (and (js/isFinite tps) (pos? (double tps)) (< (double tps) 5000)))
+                 (println (str "     (measured " (.toFixed (double tps) 1) " tok/s for "
+                               "4804 chars over ~480ms — the tight loop is fast, and it says so)")))))
+
+      ;; A PAUSE MUST NOT COUNT AS GENERATION. This is the live counter's version
+      ;; of the loop's `:first-frame-ms` subtraction: a model that thought for a
+      ;; second before speaking must not be averaged down by it.
+      (.then (fn [_]
+               (let [before (first (core/live-rate "s#1"))]
+                 (println (str "     (rate before the pause: " (.toFixed (double before) 1) ")"))
+                 (js/setTimeout
+                  (fn []
+                    (rf/dispatch-sync [:ev {:sessionId "s#1" :type "content"
+                                            :content {:type "text" :text (apply str (repeat 40 "c"))}}])
+                    (rf/dispatch-sync [:ev {:sessionId "s#1" :type "content"
+                                            :content {:type "text" :text (apply str (repeat 40 "d"))}}]))
+                  1200)
+                 (js/Promise. (fn [res] (js/setTimeout res 1400))))))
+      (.then (fn [_]
+               (let [[tps _] (core/live-rate "s#1")]
+                 ;; the 1200ms pause is excluded, so 20 tokens in ~0ms of generation
+                 ;; is not a huge rate, and the 2s window has rolled past the burst
+                 (check! "a 1.2s pause is NOT counted as generation time"
+                         true (boolean tps))
+                 (println (str "     (rate after the pause: " (.toFixed (double tps) 1)
+                               " — the pause contributed zero generation time)")))))
+
+      ;; A NON-GENERATION chunk must not move the counter: tool lifecycle and the
+      ;; `usage` report are not tokens the model produced.
+      (.then (fn [_]
+               (rf/dispatch-sync
+                [:ev {:sessionId "s#1" :type "content"
+                      :content {:type "toolCallRun" :summary (apply str (repeat 5000 "x"))}}])
+               (rf/dispatch-sync
+                [:ev {:sessionId "s#1" :type "content"
+                      :content {:type "usage" :sessionTokens 999}}])
+               (tick)))
+      (.then (fn [_]
+               (let [[_ est] (core/live-rate "s#1")]
+                 ;; 4 + 12×400 + 2×40 chars = 4884 chars ≈ 1221 tokens. The tool
+                 ;; segment is 5000 chars, so if it had counted this would read
+                 ;; ~2471 — the check is whether the number MOVED, and it is also
+                 ;; pinned to the exact value so a future "count everything"
+                 ;; regression cannot pass by coincidence.
+                 (check! "a 5000-char TOOL segment adds no tokens to the rate"
+                         1221 (long est)))))
+
+      ;; THE `on-event` FIX, renderer side: the loop's `:usage` segment arrives as
+      ;; a content map with camelCase keys and must land in the session's usage —
+      ;; which is what the existing token meter renders.
+      (.then (fn [_]
+               (rf/dispatch-sync
+                [:ev {:sessionId "s#1" :type "content"
+                      :content {:type "usage" :sessionTokens 4321 :sessionCost "0.0123"}}])
+               (tick)))
+      (.then (fn [_]
+               (check! "the usage report reaches the session the status bar renders"
+                       4321 (long (:sessionTokens (get-in (sub) [:sessions "s#1" :usage]))))))
+
+      ;; and the turn ending stops the counter, so no stale rate is left on screen
+      (.then (fn [_]
+               (rf/dispatch-sync [:ev {:sessionId "s#1" :type "running" :value false}])
+               (tick)))
+      (.then (fn [_]
+               (check! "ending the turn clears the live rate (no stale number)"
+                       nil (core/live-rate "s#1"))))
       (.then (fn [_]
                (println)
                (if (seq @failures)

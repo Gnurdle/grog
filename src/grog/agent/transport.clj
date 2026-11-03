@@ -369,7 +369,17 @@
                             :usage @!usage
                             :finish-reason @!finish
                             :frames (long @!frames)
-                            :elapsed-ms (- (System/currentTimeMillis) t0)}}))))
+                            :elapsed-ms (- (System/currentTimeMillis) t0)
+                            ;; WHEN the first frame landed, measured from the
+                            ;; request — not a flag but a DURATION, because the
+                            ;; only way to report a token RATE that is not a lie
+                            ;; is to subtract the wait for the first token from
+                            ;; the total. Prompt processing is exactly that wait:
+                            ;; a big prompt on a local server can spend 20s there,
+                            ;; and counting it as "time spent producing tokens"
+                            ;; makes a fast model look slow by an order of
+                            ;; magnitude. nil when nothing arrived at all.
+                            :first-frame-ms (some-> @!first-frame-ms (- t0))}}))))
               (catch Throwable e (fail e)))))]
     (loop [n 1]
       (let [{:keys [ok error frames partial-text started? elapsed-ms]} (attempt)]

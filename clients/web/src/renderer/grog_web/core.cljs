@@ -26,6 +26,166 @@
        (when (:lastMessageCost c) (str " · msg $" (:lastMessageCost c)))
        (when (:sessionCost c) (str " · $" (:sessionCost c)))))
 
+;; --- tok/s: the LIVE counter -------------------------------------------------
+;;
+;; WHERE THE LIVE NUMBER COMES FROM, and why it cannot come from the spine. A
+;; provider reports `usage` — and therefore its own `completion_tokens` — in the
+;; FINAL frame of a stream, so a number derived from it can only ever be an
+;; AFTER-THE-FACT average. The renderer is the only party that watches the answer
+;; ARRIVE, delta by delta, so it is the only party that can show a rate WHILE the
+;; model is still talking. That is the whole reason this counter exists here and
+;; not in the status line's token meter.
+;;
+;; IT IS AN ESTIMATE, AND IT SAYS SO. Deltas are characters, and grog's own
+;; convention (`grog.agent.context/chars-per-token`) is ~4 chars per token, so the
+;; count is approximate — deliberately the SAME constant the spine uses for its
+;; budget arithmetic, so the two numbers at least agree about what a token is. The
+;; measured value arrives with the turn (see the loop's `:rate` segment, which
+;; the client draws as a transcript line); this is what you watch in the meantime.
+;;
+;; ON TIMERS. The status bar's "no JS, no timers" comment below is about the TOKEN
+;; METER, and it is right there: a timer per update would be pure waste, because
+;; that number only changes when a report arrives. This counter is the opposite
+;; case — it must keep ticking while NOTHING arrives, since a rate that freezes
+;; whenever the model pauses is how a stall goes unnoticed. So there is exactly
+;; ONE timer per streaming session (4 Hz, not 60), it starts on the first delta,
+;; it stops itself the moment the session is no longer running, and it exists only
+;; while a turn streams. Reagent re-renders on the atom it writes.
+
+(def ^:private chars-per-token
+  "≈4 chars/token, the SAME convention the spine uses for its budget arithmetic
+  (`grog.agent.context/chars-per-token`). It is a rough factor either way — the
+  point of using the same one is that the status bar and the context meter at
+  least agree about what a token is."
+  4.0)
+
+(def ^:private rate-window-ms
+  "How far back the rate looks. A whole-turn average is dominated by the opening
+  burst and a per-delta rate is unreadable noise, so this is a short trailing
+  window — long enough to be steady, short enough that a model which has slowed
+  down stops looking fast."
+  2000)
+
+(def ^:private rate-render-ms
+  "How often the counter is recomputed and repainted. 4 Hz reads as live without
+  re-rendering the status bar 60 times a second."
+  250)
+
+(def ^:private generation-pause-ms
+  "An inter-delta gap longer than this is a PAUSE, not generation: the wait for
+  the first token, a tool call between steps, or the model thinking before it
+  speaks. Those gaps are excluded from the rate's denominator. This is the live
+  counter's equivalent of the loop's `:first-frame-ms` subtraction — without it a
+  local model that spends 15s prefilling reads as 2 tok/s when it is producing
+  60."
+  1000)
+
+(def ^:private rate-stale-ms
+  "Stop the ticking timer once nothing has arrived for this long. The turn may
+  still be alive (a tool call, a long prefill) — the counter just stops claiming
+  to measure something, and restarts on the next delta. This is how the timer
+  ends without the tick having to ask re-frame whether the session is running,
+  which it cannot do from outside a reactive context anyway."
+  2500)
+
+;; One counter per session — two tabs can stream at once and each has its own
+;; rate. `r/atom`, NOT a plain atom: the status bar derefs this while rendering,
+;; and reagent only re-renders a component that derefs a REACTIVE atom.
+;;
+;; `id -> {:samples [{:at ms :chars n :gen-gap ms}]  ; trailing window
+;;         :est-tok n                                ; this turn, chars/4
+;;         :last-at ms :timer id :tick n}`
+(defonce ^:private !rates (r/atom {}))
+
+(defn- now-ms [] (.now js/Date))
+
+(def ^:private max-samples
+  "Hard cap on retained deltas, independent of the time window: a model emitting
+  one character per chunk would otherwise put thousands of samples in the vector
+  between two prunes."
+  400)
+
+(defn- prune-samples!
+  "Drop samples older than the window from `samples` (oldest first)."
+  [samples cutoff]
+  (let [kept (vec (drop-while #(< (:at %) cutoff) samples))]
+    (if (> (count kept) max-samples) (vec (take-last max-samples kept)) kept)))
+
+(defn- rate-of
+  "The live rate for `st` as `[tok-per-sec est-tokens]`, or nil when it cannot be
+  computed without dividing by nearly nothing.
+
+  Numerator: the characters in the trailing window, over the chars-per-token
+  factor. Denominator: the GENERATION time in that same window — the sum of the
+  per-sample gaps that were not pauses. Under ~250ms of generation time the
+  divisor is too small to mean anything (the first delta or two would read as
+  thousands of tok/s), so nil is returned and the bar stays quiet."
+  [{:keys [samples est-tok]}]
+  (let [cutoff (- (now-ms) rate-window-ms)
+        win (prune-samples! samples cutoff)]
+    (when (seq win)
+      (let [chars (reduce + 0 (map :chars win))
+            gen   (reduce + 0 (map :gen-gap win))]
+        (when (>= (long gen) 250)
+          [(/ (/ (double chars) chars-per-token) (/ (double gen) 1000.0))
+           (long (or est-tok 0))])))))
+
+(defn live-rate
+  "The live generation rate for `sid` as `[tok-per-sec est-tokens]`, or nil when
+  there is not yet enough measured generation time to say.
+
+  PUBLIC on purpose: the status bar and the offline renderer tests must read the
+  SAME function. A test that re-implemented the window arithmetic would keep
+  passing after the real one broke."
+  [sid]
+  (rate-of (get @!rates sid)))
+
+(defn- stop-rate!
+  "Stop the ticking timer for `sid` and forget its samples."
+  [sid]
+  (when-let [id (:timer (get @!rates sid))]
+    (js/clearInterval id))
+  (swap! !rates dissoc sid)
+  nil)
+
+(defn- tick-rate!
+  "Record one delta of `chars` characters for `sid`, now.
+
+  Generation time is accumulated HERE, per delta, from the gap since the previous
+  one — a gap longer than `generation-pause-ms` contributes ZERO, so prefill and
+  tool pauses never enter the denominator. The first delta also contributes zero:
+  everything before it was the wait for the first token."
+  [sid chars]
+  (let [t (now-ms)
+        {:keys [timer] :as st} (get @!rates sid)
+        last-at (:last-at st)
+        gap (when last-at (- t (long last-at)))
+        gen-gap (if (and gap (<= (long gap) (long generation-pause-ms))) (long gap) 0)
+        est (+ (long (or (:est-tok st) 0))
+               (long (Math/round (/ (double chars) chars-per-token))))]
+    (swap! !rates assoc sid
+           {:samples (conj (vec (:samples st)) {:at t :chars (long chars) :gen-gap gen-gap})
+            :est-tok est
+            :last-at t
+            :timer timer})))
+
+(defn- start-rate!
+  "Start the repaint timer for `sid` if it is not already running. The tick only
+  re-renders (and stops itself once the stream has gone quiet for
+  `rate-stale-ms`) — `rate-of` reads the window, so nothing is recomputed here."
+  [sid]
+  (when-not (:timer (get @!rates sid))
+    (let [id (js/setInterval
+              (fn []
+                (let [{:keys [last-at] :as st} (get @!rates sid)
+                      idle (when last-at (- (now-ms) (long last-at)))]
+                  (if (and idle (> (long idle) (long rate-stale-ms)))
+                    (stop-rate! sid)
+                    ;; writing the atom is what repaints the status bar
+                    (when st (swap! !rates update sid assoc :tick (inc (long (or (:tick st) 0))))))))
+              rate-render-ms)]
+      (swap! !rates update sid assoc :timer id))))
+
 (defn- line-of
   "Map one raw content to a transcript segment, or nil to skip it.
 
@@ -949,6 +1109,13 @@
         (= :content kind)
         (let [c (:content ev)
               usage? (= "usage" (:type c))
+              ;; THE LIVE tok/s COUNTER. A reasoning chunk is counted the same as
+              ;; an answer chunk: both are the model producing tokens, and on a
+              ;; thinking model most of the wall-clock is spent there — a counter
+              ;; that ignored it would read "0 tok/s" through the longest part of
+              ;; the turn. Tool lifecycle and `usage` are not generation.
+              gen-chars (when (contains? #{"text" "thinking" "reasonText"} (str (:type c)))
+                          (count (str (:text c))))
               db2 (cond-> db
                     ;; NOT a transcript segment (see `line-of`): appending it would
                     ;; split a running answer or thinking block in two.
@@ -956,6 +1123,12 @@
                     ;; output is flowing now, so it is no longer "waiting on the model"
                     (contains? model-output-types (str (:type c)))
                     (assoc-in [:sessions sid :waiting?] false))]
+          ;; side effect, not db state: the counter lives in its own atom (it is
+          ;; written 4× a second by its timer, and putting that in the re-frame db
+          ;; would push a whole-db event through every subscriber at that rate).
+          (when (and sid gen-chars (pos? (long gen-chars)))
+            (tick-rate! sid gen-chars)
+            (start-rate! sid))
           (if usage?
             (-> db2
                 (assoc-in [:sessions sid :usage] c)
@@ -969,7 +1142,8 @@
                              ;; ECA's own "idle" is the turn-finished signal
                              (cond-> (assoc-in db [:sessions sid :status] v)
                                (= "idle" v) (set-running sid false)))
-        (= :running kind)  (set-running db sid (boolean (:value ev)))
+        (= :running kind)  (do (when-not (:value ev) (stop-rate! sid))
+                               (set-running db sid (boolean (:value ev))))
         (= :trust kind)    (assoc-in db [:sessions sid :trust] (boolean (:value ev)))
         (= :model kind)    (cond-> (assoc-in db [:sessions sid :model] (:value ev))
                              ;; the `model` event also carries WHERE it runs — the
@@ -986,7 +1160,8 @@
                              (contains? ev :choice)
                              (assoc-in [:sessions sid :model-choice] (:choice ev)))
         (= :vision kind)   (assoc-in db [:sessions sid :vision?] (:value ev))
-        (= :clear kind)    (assoc-in db [:sessions sid :transcript] [])
+        (= :clear kind)    (do (stop-rate! sid)
+                               (assoc-in db [:sessions sid :transcript] []))
         (= :approval kind) (assoc-in db [:sessions sid :pending-approval] (dissoc ev :answer))
         (= :question kind)
         (let [q (dissoc ev :answer)
@@ -2071,6 +2246,30 @@
                  :class "usage-flash"
                  :title "session tokens · cost"}
           (usage-text u)]))
+     ;; THE LIVE RATE. It sits next to the token meter because it is the same
+     ;; subject, and it is the only thing here that changes while the model is
+     ;; still talking. Only while a turn runs: left up afterwards it would be a
+     ;; stale number pretending to describe something that has stopped, and the
+     ;; MEASURED figure (the loop's `:rate` line) is in the transcript by then.
+     ;;
+     ;; Deliberately NOT `usage-flash`: that animation means "a report arrived".
+     ;; This number is redrawn 4× a second and a flash on each would be a strobe.
+     (when (and sess (:running? sess))
+       (let [r (live-rate active)]
+         (when r
+           (let [[tps est] r]
+             [:span {:class "text-sky-300"
+                     ;; tabular-nums INLINE, not as a Tailwind class: the number is
+                     ;; rewritten 4× a second and proportional digits make it jitter.
+                     ;; An inline style needs no Tailwind rebuild to exist.
+                     :style {:font-variant-numeric "tabular-nums"}
+                     :title (str "live generation rate — estimated from streamed characters "
+                                 "at ~" chars-per-token " chars/token, over the last "
+                                 (quot rate-window-ms 1000) "s of GENERATION time "
+                                 "(pauses and prefill excluded). The measured figure arrives "
+                                 "in the transcript when the step ends.")}
+              (str "⚡" (if (>= tps 100) (js/Math.round tps) (.toFixed tps 1)) " tok/s"
+                   " · ~" est " tok")]))))
      (when sess
        (let [r? (:running? sess) w? (:waiting? sess)]
          [:span {:class (cond w? "text-fuchsia-300" r? "text-sky-300" :else "text-slate-500")}
