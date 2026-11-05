@@ -36,6 +36,12 @@ left out (several were, and the sources list says what they were).
 | 18 | One model + recents (the big/small slots and relay are gone) | — (grog's own) | ✅ 2026-10-26 |
 | 19 | Context overflow: derive the budget per model, and DISTILL + RETRY instead of dying | — (grog's own) | ✅ 2026-10-28 |
 | 20 | Model selection as ONE dialog, with a NAME as the unit | — (grog's own) | ✅ 2026-10-30 |
+| 21 | Compaction must not destroy the session record | compact boundaries + read-time projection | ⬜ |
+| 22 | Grants have lifetimes; auto mode strips earlier allow-rules | session allowlist not restored; yolo strip | ⬜ |
+| 23 | Parallel / streaming tool execution within a step | `StreamingToolExecutor`, concurrency-safe classification | ⬜ |
+| 24 | File checkpoints / rewind | `--rewind-files` + file-history | ⬜ |
+| 25 | Named subagent types, and a read-only Explore | agent registry (6 built-in) | 🅿️ fold into #10 |
+| 26 | A truncated answer is retried with more output room | max-output-token escalation | ⬜ |
 
 ---
 
@@ -693,7 +699,250 @@ clicks are the user's.
 
 ---
 
+## ⬜ #21 — Compaction must not destroy the session record
+
+**Source.** The session is **append-only**: a compact boundary records
+`headUuid` / `anchorUuid` / `tailUuid` and the session **loader patches the message
+chain at read time** — "nothing is destructively edited on disk". One of the five
+context stages, *Context Collapse*, is called a **read-time virtual projection**,
+i.e. it is not a mutation either. Their three persistence channels (session JSONL,
+global prompt history, per-subagent sidechains) are all append-oriented by design,
+and the paper names the trade-off explicitly: append-only *"favors auditability and
+simplicity over query power"*.
+
+**Why it applies here.** `grog.agent.loop` line 545 does
+`(reset! !msgs (compact-messages @!msgs max-context-tokens step-tools))` — the
+elision REPLACES the message vector, so the elided middle is gone from the in-memory
+session too, not just from the prompt. `grog.client.loop` keeps `!messages` in
+memory only (already #3's complaint). So after a compaction the user cannot see what
+the model actually saw, and there is nothing on disk to reconstruct it from. This is
+a direct collision with grog's own identity — persistence across restarts — and #19
+made compaction *more* frequent (distill → retry → continue is the good behaviour),
+so the destructive step now fires more often, not less.
+
+**Do.** Separate "what is sent" from "what is stored". Keep the full message vector
+in the session; write a boundary record naming the kept ranges (system + task + last
+N) and let the *prompt builder* apply it. Same visible marker, same budget, but the
+transcript still has the elided text, so a resume, a fork, a debug read, or a future
+`/rewind` can recover it. Prerequisite for #24.
+
+**Cheap first step.** Emit the boundary as a record even while the in-memory vector
+is still replaced — that alone makes `estimate before → after` (item #2c) auditable
+after the fact, and it is where the two items meet.
+
+---
+
+## ⬜ #22 — Grants have lifetimes, and auto mode strips earlier allow-rules
+
+**Source.** Two distinct decisions, both about *when* trust expires:
+
+1. **Session-scoped state is not restored.** On `--resume` in a NEW process the
+   session bypass flag and the session app allowlist are absent — they are not
+   written to the transcript, while resuming or forking *inside* a running session
+   keeps the grants already given. Persistent policy, session mode and temporary
+   grants have deliberately **different lifetimes**.
+2. **Entering auto mode REVOKES prior approvals.** When the classifier takes over,
+   dangerous allow-rules the user granted earlier are stripped: python, node, bash,
+   ssh, sudo, eval, exec and every process spawner come off the allowlist. The
+   classifier does not trust past approvals.
+
+The context for both: users approve **93%** of permission prompts, and Anthropic's
+response was to restructure around *boundaries* (sandbox, classifier) rather than add
+more warnings, because per-action approval stops being reviewed once habituated.
+
+**Why it applies here.** grog has the inverse posture in both places.
+`grog.agent.loop/needs-approval?` persists `:approve-tool` via
+`eca-config/approve-tool!` to `~/.config/grog/approved-tools.edn` — a grant that
+never expires and cannot be distinguished from a deliberate standing policy (the
+file is currently a flat list: `assoc_search`, `directory_tree`, `edit_file`, `git`,
+`grep`, `shell`, `write_file`, …). And `:yolo` flips session trust ON and leaves
+that persisted list untouched, so switching to "let it run" *widens* what is
+allowed without narrowing anything. The two failure modes run in opposite
+directions: a stale grant outlives the session that justified it, and yolo inherits
+approvals granted in a more careful mode.
+
+**Do.** (a) Record grants with the lifetime they were given under — `:once`,
+`:session`, `:standing` — and make the file express which. Session grants die with
+the session; only an explicit standing entry survives a restart. (b) On entering
+yolo/auto, apply the source's rule: drop the session's dangerous grants first. grog
+can do better than the source here, because it already has the classifier's job done
+by *declaration* — once #4 exists, "dangerous" is a property of the tool schema
+rather than a hard-coded name list, so the strip is one filter.
+
+**Note the trap.** `approved-tools.edn` currently has no schema beyond a list of
+names, so a format change is a migration on a user-visible file. Read both shapes.
+
+---
+
+## ⬜ #23 — Parallel / streaming tool execution within a step
+
+**Source.** Two execution paths: `StreamingToolExecutor` begins executing tools **as
+the calls stream in** (the stated purpose is latency), with a fallback `runTools`
+that classifies each tool **concurrent-safe or exclusive** and runs accordingly.
+Parallel tool calls exist as a first-class behaviour.
+
+**Why it applies here.** `grog.agent.loop` accumulates `delta.tool_calls` fragments
+by index (transport.clj) and then, at line 668, `(doseq [c tool-calls] …)` — each
+call is dispatched and its result APPENDED to `!msgs` *before* the next begins. A
+step where the model asks for five independent reads pays five sequential round
+trips for no reason. grog is unusually well-positioned for this: `dispatch!` is
+already a pure function of `{:local :mcp-conn :attach! :!deferred :!loaded}` and the
+tools are in-process, so this is latency, not architecture.
+
+**Two things that make it harder than `pmap`.**
+
+1. **The approval gate blocks.** `needs-approval?` pops a dialog and waits for a
+   human. Tools that need a gate cannot be launched in parallel — they must be
+   gathered and asked one at a time, or the dialogs stack. So the classification is
+   not just "read-only vs mutating" (that is #4), it is "can this one run without
+   asking".
+2. **The repetition guard is per-step state.** The guard counts identical calls with
+   a `swap!` on `!reps`; running the step concurrently means the count must be
+   computed *before* fan-out, or two identical calls race and both survive at the
+   warning level.
+
+**Do.** Partition the step's tool calls into (a) gate-free and (b) needs-approval;
+run (a) concurrently with a bound (a small pool, not unbounded — an MCP server
+serving one JVM serialises anyway), then handle (b) sequentially in the original
+order. Preserve **result order** in `!msgs` regardless, since providers match
+`tool_call_id`s but the model's reading of a step is positional. The cheapest honest
+version: parallelise only the *read* tools grog owns in-process
+(`read_file`, `grep`, `list_dir`, `find_files`, `directory_tree`), leave MCP calls
+sequential, and measure — MCP is where the latency actually is, so if the win is not
+measurable there it is not worth the ordering risk.
+
+**Known limitation to state up front.** Streaming execution (start on the first
+*fragment*) is not reachable for grog without holding a per-call argument buffer
+while later calls are still arriving — which breaks the malformed-JSON rejection
+path if the buffer is dispatched too early. Take the fan-out half; leave the
+"execute mid-stream" half alone.
+
+---
+
+## ⬜ #24 — File checkpoints / rewind
+
+**Source.** `--rewind-files`, backed by per-session file-history snapshots
+(`~/.claude/file-history/<session>/`), alongside fork-from-transcript. It is the
+cheapest recovery story in the whole harness: the agent's blast radius on the
+filesystem is bounded, after the fact, without a sandbox.
+
+**Why it applies here.** This is the only item in this list that is a *missing
+capability* rather than a missing discipline. grog has no `rewind`, no `checkpoint`
+and no `file-history` — a grep for all three across `src/` and `clients/` returns
+nothing. Every mutating tool grog owns already verifies what it wrote (#13), which
+means the information needed to *undo* it is right there at write time: `edit_file`
+holds the pre-image (it read `text` and computed `want`), `write_file` compares, and
+`move_file` verifies — but all of that is discarded the moment the tool returns.
+grog's safety story today is the approval gate (before) and the evals (after); there
+is nothing in between.
+
+**Do.** A pre-image snapshot keyed to the session, taken by the tools that already
+have the bytes, plus a `/rewind` that restores a file to its last snapshot. Two
+honest constraints from the source's design: snapshots are **per-session** (they are
+not a general backup, and restoring one mid-session would produce a state no turn
+ever saw), and this pairs with #21 — a rewind is only coherent if the *transcript*
+was not destructively compacted, so #21 comes first.
+
+**Note the asymmetry with git.** `git` is in `mutating-tools`, so a checkpoint that
+only covers grog's own writes does NOT cover `shell` (which can `rm`, redirect, run
+`sed -i`) or `git` itself. Say that plainly in the docs rather than implying a
+guarantee the harness does not provide; the source's snapshots have the same hole.
+
+---
+
+## 🅿️ #25 — Named subagent types, and a read-only Explore
+
+**Source.** 6 built-in types (Explore, Plan, General-purpose, Guide, Verification,
+Statusline-setup) plus custom agents from `.claude/agents/*.md`. Three isolation
+modes (worktree / remote / in-process, the last being the default), sidechain
+transcripts per subagent, and coordination by POSIX `flock()` — zero external
+dependencies.
+
+**Partly built, and this folds into #10 rather than standing alone.**
+`grog.agent.tools/session-tools` already has `spawn_agent`, running a nested
+`run-turn!` with an ISOLATED message list, no event fan-out, and the SAME approval
+gate. grog also already draws the distinction the source makes most loudly —
+`skill` **injects into the current context**, `spawn_agent` **runs in a separate
+one** — which is their SkillTool-vs-AgentTool split, arrived at independently.
+
+**What is actually missing**, in dependency order:
+
+1. a **read-only Explore** agent — and this is *blocked on #4*, because a read-only
+   agent requires a tool that knows it is read-only, which is exactly what #4 is;
+2. named types with their own instruction sets (the source's own lesson is that
+   multi-agent coordination is *prompt* architecture, not plumbing — its
+   `coordinatorMode` is system-prompt text);
+3. background execution, which wants #3 (a resumable step) to be meaningful.
+
+**Stays parked, and the reason is unchanged.** grog has no orchestration need yet.
+The source's `flock()` choice is worth remembering for when it does — grog already
+has the file-based-instinct (its own store, `<name>.db` siblings), and
+`spawn_agent`'s isolated message list is already the right boundary. Build it when a
+task needs isolation, not because the source has six of them.
+
+---
+
+## ⬜ #26 — A truncated answer is retried with more output room
+
+**Source.** Max-output-token escalation, up to **3 retries per turn**: when the
+model's answer stops because it hit the output ceiling rather than because it
+finished, the request is re-sent with a raised limit.
+
+**Why it applies here.** grog has adjacent recovery but not this one, and I checked
+the code rather than assuming: `grog.agent.transport/stream-chat!` classifies a
+**stall** (retry before data — #17) and `grog.agent.loop` reacts to a **context
+overflow refusal** (#19), but nothing looks at the third failure shape — a response
+that ended cleanly, well under the context budget, because `:max-tokens` ran out.
+
+Being precise about what already exists, because it is a near miss rather than a gap:
+`stream-chat!` **does** capture the value — `transport.clj:316` does
+`(when-let [fr (:finish_reason ch)] (reset! !finish fr))` and returns it as
+`:finish-reason` (documented on line 180). But it is **never classified**: the only
+caller that reads it is `grog.core:577`, which tests `(some? finish-reason)` purely
+to detect end-of-stream. The other caller, `grog.agent.loop` (line 558), does not
+touch it at all. So the harness knows the answer stopped and cannot tell *why* —
+`length` and `stop` take the same path. The visible symptom is the worst kind: an
+answer that looks complete-ish and stops mid-sentence, reported as a normal `:done`
+with no error.
+
+**Do.** Read the `finish-reason` grog **already has** in hand and branch on it:
+`length` → re-send the same step with a larger output allowance, bounded at 3. This
+is a classification of an existing value, not new plumbing — which is what makes it
+cheap. Do NOT charge it against `:stream-retries`: that budget is for transport
+stalls (#17), and one is "the network gave up", the other is "the model was not
+finished". Merging them would let three truncations hide a genuinely flaky endpoint,
+or vice versa.
+
+**Cheap evidence to get first.** Because the value is captured but not logged per
+turn, the frequency of this failure in grog's own history is unknown. Log the
+classification for a week before building the retry — if no turn has ever ended on
+`length`, the item is hypothetical and belongs in `Patterns deliberately NOT taken`
+instead.
+
+---
+
 ## Sources
+
+- **"Dive into Claude Code: The Design Space of Today's and Future AI Agent
+  Systems"** — VILA Lab (MBZUAI) + UCL, Jiacheng Liu, Xiaohan Zhao, Xinyi Shang,
+  Zhiqiang Shen. arXiv:2604.14228 (v1 2026-04-14; v3 2026-10-10), CC BY-NC-SA.
+  Repo: https://github.com/VILA-Lab/Dive-into-Claude-Code
+  *(source-level analysis of v2.1.88, ~1,884 files / ~512K lines. The source of
+  #21 (append-only transcripts, chain patching at read time, `headUuid`/`anchorUuid`/
+  `tailUuid`, Context Collapse as a read-time projection), #22 (session bypass flag
+  and app allowlist not persisted; the 93% approval rate; entering auto mode strips
+  earlier allow-rules), #23 (`StreamingToolExecutor`, concurrency-safe vs exclusive),
+  #24 (`--rewind-files`, file-history), #25 (6 built-in agent types, 3 isolation
+  modes, `flock()`), and #26 (max-output-token escalation). It also supplies the
+  framing used throughout: ~1.6% AI decision logic / 98.4% deterministic
+  infrastructure, and "the moat is the harness, not the model".)*
+- **"How Claude Code Actually Works: Reverse-Engineering 512K Lines of Production AI
+  Agent"** — Karan Prasad, 2026-04-02.
+  https://karanprasad.com/blog/how-claude-code-actually-works-reverse-engineering-512k-lines
+  *(the concrete numbers behind #21-#23: `--rewind-files` / `~/.claude/file-history/`,
+  append-only JSONL, `StreamingToolExecutor` vs `runTools`, the 7-permission-mode
+  table, the auto-mode classifier's two stages and 3-consecutive/20-total give-up
+  rule, and the note that a resumed session starts without session-scoped grants.)*
 
 - **"What Claude Code's Leaked Source Actually Teaches Us About Building AI
   Agents"** — Kubesimplify, Saiyam Pathak, 2026-04-01.
@@ -732,6 +981,22 @@ clicks are the user's.
 
 **Patterns deliberately NOT taken** (so the omissions are visible): the companion
 pet system, the undercover module and anti-distillation decoys (they protect a
-vendor, not a user), the `ToolSearch`-as-a-service idea, and the Zsh-specific bash
-security rules (grog runs `bash -lc` across platforms, and #4 is the real fix for
-tool risk).
+vendor, not a user), the `ToolSearch`-as-a-service idea, the React/Ink terminal
+reconciler and int32 screen buffer (grog's client is Electron + ClojureScript — a
+different world), and the Zsh-specific bash security rules (grog runs `bash -lc`
+across platforms, and #4 is the real fix for tool risk).
+
+**Related in the source, not turned into an item** (named so the omission is a
+decision): the **auto-mode ML classifier** is a real subsystem (a second LLM call,
+~64-token fast filter then 4,096-token chain-of-thought, results cached ~1 hour).
+grog deliberately does not need it yet, because #4 replaces the classifier's *job*
+— deciding risk — with a declaration on the tool schema, which is deterministic and
+free. If #4 proves insufficient for grog's MCP surface (third-party tools whose risk
+grog cannot declare), revisit here. Likewise the **shell sandbox** (7th safety
+layer) and the **7 permission modes**: grog's
+`:none | :mutating | :all` plus yolo is a smaller, honest version of the same
+spectrum, and widening it is not wanted until #22 gives grants lifetimes. Note also
+that the capture is **not open source**: Claude Code was never licensed openly, the
+source was exposed 2026-03-31 via a sourcemap in an npm release, mirrored, then
+DMCA'd. Everything above is a pattern read from public *analysis*, not code we can
+lift — which is the right posture anyway, since the patterns are the durable part.
